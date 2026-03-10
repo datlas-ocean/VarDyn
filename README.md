@@ -16,7 +16,14 @@
    conda activate env_vardyn
    ```
 
-3. **Install ```pyinterp``` librairy with conda-forge** (very long)
+3. **Install ```pyinterp``` with conda-forge** (very long)
    ```bash
    conda install -c conda-forge pyinterp
    ```
+   
+3. **Install other dependencies with pip** 
+   ```bash
+   pip install --upgrade pip setuptools wheel
+   pip install -e .
+   ```
+
