@@ -6,13 +6,13 @@ Created on Wed Jan  6 19:20:42 2021
 @author: leguillou
 """
 
-name_experiment = '2020a_BFNQG' # name of the experiment
+name_experiment = '2020a_VarDyn_QG'
 
 #################################################################################################################################
 # Global libraries     
 #################################################################################################################################
 
-from datetime import datetime, timedelta
+from datetime import datetime,timedelta
  
 #################################################################################################################################
 # EXPERIMENTAL PARAMETERS
@@ -33,11 +33,11 @@ EXP = dict(
 
     final_date = datetime(2012,12,15,0),  # final date (yyyy,mm,dd,hh) 
 
-    assimilation_time_step = timedelta(hours=3),  
+    assimilation_time_step = timedelta(hours=6),  
 
-    saveoutput_time_step = timedelta(hours=3),  # time step at which the states are saved 
+    saveoutput_time_step = timedelta(hours=6),  # time step at which the states are saved 
 
-    flag_plot = 1,
+    flag_plot = 0,
 
 )
     
@@ -48,7 +48,7 @@ NAME_GRID = 'myGRID'
 
 myGRID = dict(
 
-    super = 'GRID_GEO',
+    super = 'GRID_CAR',
 
     lon_min = 295.,                                        # domain min longitude
 
@@ -58,9 +58,7 @@ myGRID = dict(
 
     lat_max = 43.,                                         # domain max latitude
 
-    dlon = 1/4.,                                            # zonal grid spatial step (in degree)
-
-    dlat = 1/4.,                                            # meridional grid spatial step (in degree)
+    dx = 10.,                                              # grid spacinng in km
 
 )
 
@@ -69,24 +67,26 @@ myGRID = dict(
 #################################################################################################################################
 NAME_MOD = 'myMOD'
 
+
 myMOD = dict(
 
-    super = 'MOD_QG1L_NP', # 1.5-layer Qusi-Geostrophic model written in Numpy (only for BFN, use MOD_QG1L_JAX for 4Dvar). 
+    super = 'MOD_QG1L_JAX',
 
-    name_var = {'SSH':"ssh", "PV":"pv"}, # Adding PV enables to store it at every time step for the computation of nudging term
+    name_var = {'SSH':'ssh'},
 
     dtmodel = 1200, # model timestep
 
-    c0 = 2.7, # 1st baroclinic phase velocity (m/s), assumed constant all over the domain
+    time_scheme = 'rk2',
 
-    dist_sponge_bc = 50
+    c0 = 2.7,
 
+    init_from_bc = True
+    
 )
 
 #################################################################################################################################
-# Boundary conditions
+# BOUNDARY CONDITIONS
 #################################################################################################################################
-
 NAME_BC = 'myBC' # For now, only BC_EXT is available
 
 myBC = dict(
@@ -105,8 +105,99 @@ myBC = dict(
 
     name_mod_var = {'SSH':'ssh'},
 
-    dist_sponge = 50 # Peripherical band width (km) on which the boundary conditions are applied
+)
 
+#################################################################################################################################
+# OBSERVATIONAL OPERATORS
+#################################################################################################################################
+NAME_OBSOP = 'myOBSOP'
+
+myOBSOP = dict(
+
+    super = 'OBSOP_INTERP',
+
+    path_save = None, # Directory where to save observational operator
+
+    compute_op = False, # Force computing H 
+
+    Npix = 4, # Number of pixels to perform projection y=Hx
+
+)
+
+#################################################################################################################################
+# Reduced basis parameters
+#################################################################################################################################
+
+NAME_BASIS = 'myBASIS'
+
+myBASIS = dict(
+
+    super = 'BASIS_BM',
+
+    flux = False,
+
+    wavelet_init = False, # Estimate the initial state 
+
+    name_mod_var = 'ssh',
+
+    facns = 1., #factor for wavelet spacing= space
+
+    facnlt = 2., #factor for wavelet spacing= time
+
+    npsp= 3.5, # Defines the wavelet shape
+
+    facpsp= 1.5, # factor to fix df between wavelets
+
+    lmin= 80, # minimal wavelength (in km)
+
+    lmax= 970., # maximal wavelength (in km)
+
+    lmeso = 300, # Largest mesoscale wavelenght 
+
+    tmeso = 10, # Largest mesoscale time of decorrelation 
+
+    sloptdec = -.5, # Slope such as tdec = lambda^slope where lamda is the wavelength
+
+    factdec = .5, # factor to be multiplied to the computed time of decorrelation 
+
+    tdecmin = 0., # minimum time of decorrelation 
+
+    tdecmax = 20., # maximum time of decorrelation 
+
+    facQ= 1, # factor to be multiplied to the estimated Q
+
+    Qmax = .03 , # Maximim Q, such as lambda>lmax => Q=Qmax where lamda is the wavelength
+
+    slopQ = -2 # Slope such as Q = lambda^slope where lamda is the wavelength
+
+)
+
+
+#################################################################################################################################
+# Analysis parameters
+#################################################################################################################################
+NAME_INV = 'myINV'
+
+myINV = dict(
+
+    super = 'INV_4DVAR',
+
+    compute_test = False, # TLM, ADJ & GRAD tests
+
+    gtol = 1e-3, # Gradient norm must be less than gtol before successful termination.
+
+    maxiter = 200, # Maximal number of iterations for the minimization process
+
+    opt_method = 'L-BFGS-B', # method for scipy.optimize.minimize
+
+    save_minimization = False, # save cost function and its gradient at each iteration 
+
+    timestep_checkpoint = timedelta(hours=6), #  timesteps separating two consecutive analysis 
+
+    sigma_R = 1e-2, # Observational standard deviation
+
+    prec = True, # preconditoning
+ 
 )
 
 #################################################################################################################################
@@ -127,8 +218,6 @@ J1 = dict(
     name_lat = 'lat',
     
     name_var = {'SSH':'ssh_model'},
-    
-    nudging_params_ssh = {'sigma':0,'K':0.7,'Tau':timedelta(days=1)},
 
 )
 
@@ -145,8 +234,6 @@ EN = dict(
     name_lat = 'lat',
     
     name_var = {'SSH':'ssh_model'},
-    
-    nudging_params_ssh = {'sigma':0,'K':0.7,'Tau':timedelta(days=1)},
 
 )
 
@@ -163,8 +250,6 @@ TPN = dict(
     name_lat = 'lat',
     
     name_var = {'SSH':'ssh_model'},
-    
-    nudging_params_ssh = {'sigma':0,'K':0.7,'Tau':timedelta(days=1)},
 
 )
 
@@ -181,33 +266,26 @@ G2 = dict(
     name_lat = 'lat',
     
     name_var = {'SSH':'ssh_model'},
-    
-    nudging_params_ssh = {'sigma':0,'K':0.7,'Tau':timedelta(days=1)},
 
 )
 
+SWOT = dict(
 
-#################################################################################################################################
-# INVERSION
-#################################################################################################################################
-NAME_INV = 'myINV'
+    super = 'OBS_SSH_SWATH',
 
-myINV = dict(
+    path = 'data/dc_obs/2020a_SSH_mapping_NATL60_karin_swot.nc',
+
+    name_time = 'time',
     
-    super = 'INV_BFN',
+    name_lon = 'lon',
 
-    window_size = timedelta(days=7), # length of the bfn time window
+    name_lat = 'lat',
+    
+    name_xac = 'x_ac',
 
-    window_output = timedelta(days=3), # length of the output time window, in the middle of the bfn window. (need to be smaller than *bfn_window_size*)
-
-    propagation_timestep = timedelta(hours=3), # propagation time step of the BFN, corresponding to the time step at which the nudging term is computed
-
-    max_iteration = 2, # maximal number of iterations if *bfn_criterion* is not met
-
-    criterion = 1e-3 # convergence criterion 
+    name_var = {'SSH':'ssh_model'},
 
 )
-
 
 #################################################################################################################################
 # Diagnostics
@@ -233,6 +311,8 @@ myDIAG = dict(
     name_ref_lat = 'lat',
 
     name_ref_var = 'sossheig',
+
+    options_ref = {'combine':'nested', 'concat_dim':'time', 'parallel':True},
 
     name_exp_var = 'ssh',
 
