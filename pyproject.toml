@@ -33,6 +33,7 @@ dependencies = [
     "netCDF4",
     "pandas",
     "cmocean",
-    "jaxparrow"
+    "jaxparrow", 
+    "ipykernel"
 ]
 dynamic = ["version"]
