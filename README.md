@@ -12,4 +12,6 @@
    ```conda create -n env_vardyn python=3.10
    ```
 
-3. **Install ```pyinterp``` librairy**
+3. **Install ```pyinterp``` librairy** (very long)
+   ```conda install -c conda-forge pyinterp
+   ```
