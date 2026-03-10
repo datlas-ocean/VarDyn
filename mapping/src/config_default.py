@@ -752,6 +752,35 @@ INV_OI = dict(
 
 )
 
+# Back and Forth Nudging
+INV_BFN = dict(
+
+    window_size = timedelta(days=7), # length of the bfn time window
+
+    window_output = timedelta(days=3), # length of the output time window, in the middle of the bfn window. (need to be smaller than *bfn_window_size*)
+
+    propagation_timestep = timedelta(hours=1), # propagation time step of the BFN, corresponding to the time step at which the nudging term is computed
+
+    window_overlap = True, # overlap the BFN windows
+
+    criterion = 0.01, # convergence criterion. typical value: 0.01
+
+    max_iteration = 5, # maximal number of iterations if *bfn_criterion* is not met
+
+    save_trajectory = False, # save or not the back and forth iterations (for debugging)
+
+    dist_scale = 10, #
+
+    save_obs_proj = False, # save or not the projected observation as pickle format. Set to True to maximize the speed of the algorithm.
+
+    path_save_proj = None, # path to save projected observations
+
+    use_bc_as_init = False, # Whether to use boundary conditions as initialization for the first temporal window
+
+    scalenudg = None 
+
+)
+
 # 4-Dimensional Variational 
 INV_4DVAR = dict(
 
