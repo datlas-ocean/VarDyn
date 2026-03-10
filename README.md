@@ -12,6 +12,9 @@
    ```bash
    conda create -n env_vardyn python=3.10
    ```
+   ```bash
+   conda activate env_vardyn
+   ```
 
 3. **Install ```pyinterp``` librairy** (very long)
    ```bash
