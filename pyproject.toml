@@ -29,7 +29,6 @@ dependencies = [
     "functools",
     "xarray",
     "CMake",
-    "Eigen>=3.3.1",
     "pyinterp",
     "scipy",
     "logging",
