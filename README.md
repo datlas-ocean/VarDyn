@@ -8,4 +8,8 @@
    cd VarDyn
    ```
 
-1. **Clone the repository**
+2. **Create a new environment**
+   ```conda create -n env_vardyn python=3.10
+   ```
+
+3. **Install ```pyinterp``` librairy**
