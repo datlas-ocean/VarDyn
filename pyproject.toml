@@ -28,8 +28,6 @@ dependencies = [
     "matplotlib",
     "functools",
     "xarray",
-    "CMake",
-    "pyinterp",
     "scipy",
     "logging",
     "xrft",
