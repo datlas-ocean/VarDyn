@@ -26,6 +26,17 @@ dependencies = [
     "jax",
     "jaxlib",
     "matplotlib",
-    "functools"
+    "functools",
+    "xarray",
+    "pyinterp",
+    "scipy",
+    "logging",
+    "xrft",
+    "netCDF4",
+    "pandas",
+    "cmocean",
+    "jaxparrow",
+    "pickle",
+    "copy"
 ]
 dynamic = ["version"]
