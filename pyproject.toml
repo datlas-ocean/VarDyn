@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "VarDyn"
+authors = [
+    { name = "Florian Le Guillou", email = "florian.leguillou@datlas.fr" },
+    { name = "Valentin Bellemin-Laponnaz", email = "valentin.bellemin@hotmail.fr" },
+    { name = "Sammy Metref", email = "sammy.metref@datlas.fr" },
+    { name = "Clément Ubelmann", email = "clement.ubelmann@datlas.fr" },
+    { name = "Emmanuel Cosme", email = "Emmanuel.Cosme@univ-grenoble-alpes.fr" },
+]
+description = "Variational reconstruction of ocean dynamical variables."
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["variational", "ssh"]
+license = { text = "CC0-1.0" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy",
+    "jax",
+    "jaxlib",
+    "matplotlib",
+    "functools"
+]
+dynamic = ["version"]
