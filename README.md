@@ -9,9 +9,11 @@
    ```
 
 2. **Create a new environment**
-   ```conda create -n env_vardyn python=3.10
+   ```bash
+   conda create -n env_vardyn python=3.10
    ```
 
 3. **Install ```pyinterp``` librairy** (very long)
-   ```conda install -c conda-forge pyinterp
+   ```bash
+   conda install -c conda-forge pyinterp
    ```
