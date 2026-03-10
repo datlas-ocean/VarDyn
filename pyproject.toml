@@ -34,7 +34,6 @@ dependencies = [
     "netCDF4",
     "pandas",
     "cmocean",
-    "jaxparrow",
-    "copy"
+    "jaxparrow"
 ]
 dynamic = ["version"]
