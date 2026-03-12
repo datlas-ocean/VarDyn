@@ -20,7 +20,7 @@
    \
    \
    `pyinterp` provides tools for interpolating geo-referenced data used in this repository. \
-   ⚠️ Installation can be very long due to several dependencies. Use of `mamba` is strongly recommended, see [Mamba instructions](https://mamba.readthedocs.io/en/latest/installation/mamba-installation.html)]. ⚠️
+   ⚠️ Installation can be very long due to several dependencies. Use of `mamba` is strongly recommended, see [Mamba instructions](https://mamba.readthedocs.io/en/latest/installation/mamba-installation.html). ⚠️
    ```bash
    conda install -c conda-forge pyinterp
    ```
