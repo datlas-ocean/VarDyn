@@ -16,16 +16,20 @@
    conda activate env_vardyn
    ```
 
-3. **Install `pyinterp` with conda-forge** (very long, up to 2 hours)
+3. **Install `pyinterp` with conda-forge** 
+   \
+   \
+   `pyinterp` provides tools for interpolating geo-referenced data used in this repository. \
+   ⚠️ Installation can be very long due to several dependencies. Use of `mamba` is strongly recommended, see [Mamba instructions](https://mamba.readthedocs.io/en/latest/installation/mamba-installation.html)]. ⚠️
    ```bash
    conda install -c conda-forge pyinterp
    ```
-4. (OPTIONAL) **Install `jax` for GPU or TPU** 
+5. (OPTIONAL) **Install `jax` for GPU or TPU** 
 \
 \
 Users with access to GPUs or TPUs should first install `jax` separately in order to fully benefit from its high-performance computing capacities. See [JAX instructions](https://docs.jax.dev/en/latest/installation.html). By default, a CPU-only version of JAX will be installed if no other version is already present in the Python environment. 
    
-5. **Install other dependencies with pip** 
+6. **Install other dependencies with pip** 
    ```bash
    pip install --upgrade pip setuptools wheel
    pip install -e .
