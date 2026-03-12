@@ -20,8 +20,11 @@
    ```bash
    conda install -c conda-forge pyinterp
    ```
+4. (OPTIONAL) **Install `JAX` for GPU or TPU** 
+\
+Users with access to GPUs or TPUs should first install `JAX` separately in order to fully benefit from its high-performance computing capacities. See [JAX instructions](https://docs.jax.dev/en/latest/installation.html). By default, a CPU-only version of JAX will be installed if no other version is already present in the Python environment. 
    
-3. **Install other dependencies with pip** 
+5. **Install other dependencies with pip** 
    ```bash
    pip install --upgrade pip setuptools wheel
    pip install -e .
