@@ -483,7 +483,7 @@ class SW:
         return -div_nofluxbc(h_tot_flux_x, h_tot_flux_y) * self.masks.h
 
     def advection_momentum(self, u, v, omega, U_m, V_m, k_energy, p, h_tot_ugrid, h_tot_vgrid,
-                           dx_p_ref=None, dy_p_ref=None, taux=None, tauy=None):
+                           dx_p_ref=None, dy_p_ref=None, taux=None, tauy=None, h_wind=None):
         """
         Advection RHS for momentum (u, v)
         """
@@ -503,7 +503,7 @@ class SW:
         dt_v -= jnp.diff(ke_pressure, axis=-1) + _dy_p_ref
 
         # wind forcing and bottom drag
-        dt_u, dt_v = self.add_wind_forcing(dt_u, dt_v, h_tot_ugrid, h_tot_vgrid, taux=taux, tauy=tauy)
+        dt_u, dt_v = self.add_wind_forcing(dt_u, dt_v, h_tot_ugrid, h_tot_vgrid, taux=taux, tauy=tauy, h_wind=h_wind)
         dt_u, dt_v = self.add_bottom_drag(dt_u, dt_v, u, v)
         dt_u, dt_v = self.add_diffusion(dt_u, dt_v, u, v)
 
@@ -561,11 +561,14 @@ class SW:
             return self.diff_coef * lap_h * self.masks.h
         return jnp.zeros_like(h)
 
-    def add_wind_forcing(self, du, dv, h_tot_ugrid, h_tot_vgrid, taux=None, tauy=None):
+    def add_wind_forcing(self, du, dv, h_tot_ugrid, h_tot_vgrid, taux=None, tauy=None, h_wind=None):
         """
         Add wind forcing to the derivatives du, dv.
         taux/tauy: wind stress in Pa (N/m²) on (nx-1, ny) and (nx, ny-1) grids.
         If None, falls back to self.taux / self.tauy.
+        h_wind: effective mixed-layer depth for wind-stress denominator.
+                Can be a scalar or a 2D array (nx, ny) on h-grid.
+                If None, falls back to self.h_wind.
 
         Physics:
           du/dt += tau_x / (rho_water * H_ref) * dx   [m²/s²]
@@ -590,16 +593,26 @@ class SW:
 
         # Layer depth used in wind-stress denominator (in metres).
         #
-        # Two cases:
-        #   h_wind is set  →  use the prescribed physical mixed-layer depth (scalar).
-        #                     Required for 1-layer QG/SW models where the model's
-        #                     equivalent depth H = c²/g ≈ 0.4–1 m, while the real
-        #                     mixed-layer driving momentum exchange is ~50–200 m.
-        #   h_wind is None →  use self.h_ref_ugrid (model reference thickness, correct
-        #                     for multi-layer models where H is the true layer depth).
-        if self.h_wind is not None:
-            H_ref_u = float(self.h_wind)
-            H_ref_v = float(self.h_wind)
+        # Three cases:
+        #   h_wind argument →  use the passed value (scalar or 2D array on h-grid).
+        #                      Enables JAX AD differentiation through h_wind.
+        #   self.h_wind set →  use the prescribed physical mixed-layer depth (scalar).
+        #                      Required for 1-layer QG/SW models where the model's
+        #                      equivalent depth H = c²/g ≈ 0.4–1 m, while the real
+        #                      mixed-layer driving momentum exchange is ~50–200 m.
+        #   both None       →  use self.h_ref_ugrid (model reference thickness, correct
+        #                      for multi-layer models where H is the true layer depth).
+        _h_wind = h_wind if h_wind is not None else self.h_wind
+        if _h_wind is not None:
+            _h_wind = jnp.asarray(_h_wind, dtype=self.dtype)
+            if _h_wind.ndim >= 2:
+                # 2D field (nx, ny) on h-grid → interpolate to interior u/v grids
+                H_ref_u = jnp.maximum(0.5 * (_h_wind[:-1, :] + _h_wind[1:, :]), self.h_min)
+                H_ref_v = jnp.maximum(0.5 * (_h_wind[:, :-1] + _h_wind[:, 1:]), self.h_min)
+            else:
+                # scalar
+                H_ref_u = jnp.maximum(_h_wind, self.h_min)
+                H_ref_v = jnp.maximum(_h_wind, self.h_min)
         else:
             # self.h_ref_ugrid shape: (nl, nx+1, ny) for spatially-varying H,
             #                         (nl, 1, 1)     for uniform H.
@@ -709,12 +722,13 @@ class SW:
                dt_v + filt_v, \
                dt_h
 
-    def compute_time_derivatives(self, u, v, h, ref_vals=None, taux=None, tauy=None):
+    def compute_time_derivatives(self, u, v, h, ref_vals=None, taux=None, tauy=None, h_wind=None):
         """
         Computes the state variables derivatives dt_u, dt_v, dt_h.
         ref_vals: optional tuple (h_ref, h_ref_ugrid, h_ref_vgrid, dx_p_ref, dy_p_ref)
                   for pure-functional usage (needed for correct JAX AD through H).
         taux/tauy: wind stress (overrides self.taux / self.tauy if provided).
+        h_wind: effective mixed-layer depth for wind-stress (scalar or 2D on h-grid).
         """
         if ref_vals is not None:
             h_ref, h_ref_ugrid, h_ref_vgrid, dx_p_ref, dy_p_ref = ref_vals
@@ -726,7 +740,7 @@ class SW:
         dt_h = self.advection_h(U, V, h, h_ref) + self.add_h_diffusion(h)
         dt_u, dt_v = self.advection_momentum(
             u, v, omega, U_m, V_m, k_energy, p, h_tot_ugrid, h_tot_vgrid,
-            dx_p_ref, dy_p_ref, taux=taux, tauy=tauy)
+            dx_p_ref, dy_p_ref, taux=taux, tauy=tauy, h_wind=h_wind)
         if self.barotropic_filter:
             dt_u, dt_v, dt_h = self.filter_barotropic_waves(dt_u, dt_v, dt_h, u, v, h_tot_ugrid, h_tot_vgrid)
 
@@ -747,6 +761,7 @@ class SW:
         Fh=None,
         taux=None,
         tauy=None,
+        h_wind=None,
     ):
         """
         Performs nstep time-integration with RK3-SSP scheme.
@@ -789,6 +804,15 @@ class SW:
         _taux = taux if taux is not None else self.taux
         _tauy = tauy if tauy is not None else self.tauy
 
+        # Resolve h_wind: combine base (self.h_wind) with perturbation
+        if h_wind is not None:
+            if self.h_wind is not None:
+                _h_wind = self.h_wind + h_wind
+            else:
+                _h_wind = h_wind
+        else:
+            _h_wind = None  # falls back to self.h_wind inside add_wind_forcing
+
         # ----------------------------
         # Single RK3 step
         # ----------------------------
@@ -802,7 +826,7 @@ class SW:
             _gamma_h = (self.sponge_coef / self.dt) * self.sponge_h
 
             # ---- RK3-SSP with sponge damping ----
-            dt0_u, dt0_v, dt0_h = self.compute_time_derivatives(u, v, h, ref_vals, taux=_taux, tauy=_tauy)
+            dt0_u, dt0_v, dt0_h = self.compute_time_derivatives(u, v, h, ref_vals, taux=_taux, tauy=_tauy, h_wind=_h_wind)
             dt0_u = dt0_u + _gamma_u * (_u_b - u)
             dt0_v = dt0_v + _gamma_v * (_v_b - v)
             dt0_h = dt0_h + _gamma_h * (_h_b - h)
@@ -810,7 +834,7 @@ class SW:
             v = v + self.dt * dt0_v
             h = h + self.dt * dt0_h
 
-            dt1_u, dt1_v, dt1_h = self.compute_time_derivatives(u, v, h, ref_vals, taux=_taux, tauy=_tauy)
+            dt1_u, dt1_v, dt1_h = self.compute_time_derivatives(u, v, h, ref_vals, taux=_taux, tauy=_tauy, h_wind=_h_wind)
             dt1_u = dt1_u + _gamma_u * (_u_b - u)
             dt1_v = dt1_v + _gamma_v * (_v_b - v)
             dt1_h = dt1_h + _gamma_h * (_h_b - h)
@@ -818,7 +842,7 @@ class SW:
             v = v + (self.dt / 4.0) * (dt1_v - 3.0 * dt0_v)
             h = h + (self.dt / 4.0) * (dt1_h - 3.0 * dt0_h)
 
-            dt2_u, dt2_v, dt2_h = self.compute_time_derivatives(u, v, h, ref_vals, taux=_taux, tauy=_tauy)
+            dt2_u, dt2_v, dt2_h = self.compute_time_derivatives(u, v, h, ref_vals, taux=_taux, tauy=_tauy, h_wind=_h_wind)
             dt2_u = dt2_u + _gamma_u * (_u_b - u)
             dt2_v = dt2_v + _gamma_v * (_v_b - v)
             dt2_h = dt2_h + _gamma_h * (_h_b - h)
@@ -844,9 +868,9 @@ class SW:
                 Fh_v = 0.5 * (Fh_[..., 1:-1, 1:] + Fh_[..., 1:-1, :-1])
                 u = u + self.dt * (-u / h_tot_u * Fh_u)
                 v = v + self.dt * (-v / h_tot_v * Fh_v)
-            else:
-                u = u + self.dt * _Fu
-                v = v + self.dt * _Fv
+            
+            u = u + self.dt * _Fu
+            v = v + self.dt * _Fv
             h = h + self.dt * _Fh
 
             return (u, v, h), None
@@ -876,36 +900,38 @@ class SW:
 
         return u_phys, v_phys, h_phys
 
-    def step_tgl(self, u0, v0, h0, du0, dv0, dh0, H=None, dH=None, nstep=1, taux=None, tauy=None):
+    def step_tgl(self, u0, v0, h0, du0, dv0, dh0, H=None, dH=None, nstep=1, taux=None, tauy=None, h_wind=None, dh_wind=None):
         """
         Tangent Linear Model: computes the linearized evolution of perturbations.
         taux/tauy: wind stress passed through to step().
+        h_wind/dh_wind: mixed-layer depth perturbation and its tangent.
         """
         def wrapped_step(x):
-            u0, v0, h0, H = x
-            return self.step(u0, v0, h0, H, nstep=nstep, taux=taux, tauy=tauy)
+            u0, v0, h0, H, h_wind = x
+            return self.step(u0, v0, h0, H, nstep=nstep, taux=taux, tauy=tauy, h_wind=h_wind)
 
-        primals = ((u0, v0, h0, H),)
-        tangents = ((du0, dv0, dh0, dH),)
+        primals = ((u0, v0, h0, H, h_wind),)
+        tangents = ((du0, dv0, dh0, dH, dh_wind),)
 
         y, dy = jax.jvp(wrapped_step, primals, tangents)
 
         return dy  # returns (du, dv, dh)
 
-    def step_adj(self, u0, v0, h0, wuT, wvT, whT, H=None, nstep=1, taux=None, tauy=None):
+    def step_adj(self, u0, v0, h0, wuT, wvT, whT, H=None, nstep=1, taux=None, tauy=None, h_wind=None):
         """
         Adjoint Model: computes the adjoint propagation backward.
         taux/tauy: wind stress passed through to step().
+        h_wind: mixed-layer depth perturbation (differentiable).
         """
         def wrapped_step(x):
-            u0, v0, h0, H = x
-            return self.step(u0, v0, h0, H, nstep=nstep, taux=taux, tauy=tauy)
-        primals = ((u0, v0, h0, H),)
+            u0, v0, h0, H, h_wind = x
+            return self.step(u0, v0, h0, H, nstep=nstep, taux=taux, tauy=tauy, h_wind=h_wind)
+        primals = ((u0, v0, h0, H, h_wind),)
         cotangents = (wuT, wvT, whT)  
 
         y, vjp_fn = jax.vjp(wrapped_step, *primals)
         adjoints = vjp_fn(cotangents)
-        return adjoints  # returns (adj_u0, adj_v0, adj_h0, adj_H)
+        return adjoints  # returns (adj_u0, adj_v0, adj_h0, adj_H, adj_h_wind)
 
 
     def adjoint_test_sw(self, nstep=1, seed=42):
@@ -975,9 +1001,9 @@ class SW:
         # Run TLM:  (du1, dv1, dh1) = M (du0, dv0, dh0)
         du1, dv1, dh1 = self.step_tgl(u0, v0, h0, du0, dv0, dh0, nstep=nstep)
 
-        # Run ADJ:  ((au0, av0, ah0, aH),) = M* (wu, wv, wh)
+        # Run ADJ:  ((au0, av0, ah0, aH, ah_wind),) = M* (wu, wv, wh)
         adjoints = self.step_adj(u0, v0, h0, wu, wv, wh, nstep=nstep)
-        au0, av0, ah0, _aH = adjoints[0]
+        au0, av0, ah0, _aH, _ah_wind = adjoints[0]
 
         # Check for NaN
         has_nan = (jnp.any(jnp.isnan(du1)) or jnp.any(jnp.isnan(dv1)) or

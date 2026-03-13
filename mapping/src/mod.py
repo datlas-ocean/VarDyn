@@ -2690,13 +2690,8 @@ class Model_qgsw(M):
         self.sponge_coef = config.MOD.sponge_coef
 
         if self.sponge_width is not None and self.sponge_width>0:
-            mask_h = State.mask.copy()
             lon_h = State.lon
             lat_h = State.lat
-            mask_u = np.zeros((State.ny, State.nx+1), dtype=bool)
-            mask_u[:, 1:State.nx] = mask_h[:, :-1] & mask_h[:, 1:]
-            mask_v = np.zeros((State.ny+1, State.nx), dtype=bool)
-            mask_v[1:State.ny, :] = mask_h[:-1, :] & mask_h[1:, :]
             lon_u = np.zeros((State.ny, State.nx+1))
             lat_u = np.zeros((State.ny, State.nx+1))
             lon_u[:, 1:State.nx] = 0.5 * (lon_h[:, :-1] + lon_h[:, 1:])
@@ -2717,10 +2712,32 @@ class Model_qgsw(M):
             # North boundary
             lon_v[State.ny, :] = lon_h[-1, :] + 0.5 * (lon_h[-1, :] - lon_h[-2, :])
             lat_v[State.ny, :] = lat_h[-1, :] + 0.5 * (lat_h[-1, :] - lat_h[-2, :])
+            
+            if config.MOD.use_sponge_on_coast:
+                mask_h = State.mask.copy()
+                mask_u = np.zeros((State.ny, State.nx+1), dtype=bool)
+                mask_u[:, 1:State.nx] = mask_h[:, :-1] & mask_h[:, 1:]
+                mask_v = np.zeros((State.ny+1, State.nx), dtype=bool)
+                mask_v[1:State.ny, :] = mask_h[:-1, :] & mask_h[1:, :]
+                
+            else:
+                mask_h = np.zeros((State.ny, State.nx), dtype=bool)
+                mask_u = np.zeros((State.ny, State.nx+1), dtype=bool)
+                mask_v = np.zeros((State.ny+1, State.nx), dtype=bool)
 
-            sponge_h = grid.compute_weight_map(lon_h, lat_h, mask_h, config.MOD.dist_sponge_bc)
-            sponge_u = grid.compute_weight_map(lon_u, lat_u, mask_u, config.MOD.dist_sponge_bc)
-            sponge_v = grid.compute_weight_map(lon_v, lat_v, mask_v, config.MOD.dist_sponge_bc)
+            alpha = config.MOD.tangential_sponge_factor
+
+            # h: isotropic sponge everywhere
+            wc_h, wNS_h, wWE_h = grid.compute_sponge_components(lon_h, lat_h, mask_h, config.MOD.dist_sponge_bc)
+            sponge_h = 1.0 - (1.0 - wc_h) * (1.0 - wNS_h) * (1.0 - wWE_h)
+
+            # u: normal at W/E (full), tangential at N/S (reduced)
+            wc_u, wNS_u, wWE_u = grid.compute_sponge_components(lon_u, lat_u, mask_u, config.MOD.dist_sponge_bc)
+            sponge_u = 1.0 - (1.0 - wc_u) * (1.0 - alpha * wNS_u) * (1.0 - wWE_u)
+
+            # v: normal at N/S (full), tangential at W/E (reduced)
+            wc_v, wNS_v, wWE_v = grid.compute_sponge_components(lon_v, lat_v, mask_v, config.MOD.dist_sponge_bc)
+            sponge_v = 1.0 - (1.0 - wc_v) * (1.0 - wNS_v) * (1.0 - alpha * wWE_v)
 
             _, (ax1,ax2,ax3) = plt.subplots(1, 3, figsize=(15, 5))
             im1 = ax1.pcolormesh(sponge_h)
@@ -2739,9 +2756,9 @@ class Model_qgsw(M):
             sponge_v = np.zeros((State.ny+1, State.nx))
             sponge_h = np.zeros((State.ny, State.nx))
 
-        self.sponge_u = sponge_u
-        self.sponge_v = sponge_v
-        self.sponge_h = sponge_h    
+        self.sponge_u = sponge_u 
+        self.sponge_v = sponge_v 
+        self.sponge_h = sponge_h 
 
 
         # Model initialization
@@ -2815,6 +2832,12 @@ class Model_qgsw(M):
                 del dsin
             else:
                 State.params['H'] = np.zeros((State.ny,State.nx))
+        if 'h_wind' in self.name_params:
+            State.params['h_wind'] = np.zeros((State.ny, State.nx))
+        if 'bc' in self.name_params:
+            State.params['u_b'] = np.zeros((State.ny, State.nx + 1))
+            State.params['v_b'] = np.zeros((State.ny + 1, State.nx))
+            State.params['h_b'] = np.zeros((State.ny, State.nx))
         for name in self.name_var:
             State.params[self.name_var[name]] = np.zeros_like(State.var[self.name_var[name]])
 
@@ -2853,13 +2876,14 @@ class Model_qgsw(M):
         if path_wind is None or not os.path.exists(path_wind):
             return
 
-        rho_air = getattr(config.MOD, 'rho_air', 1.25)
-        Cd      = getattr(config.MOD, 'Cd_wind', 1.5e-3)
+        rho_air = getattr(config.MOD, 'rho_air', 1.225)
+        Cd      = getattr(config.MOD, 'Cd_wind', 1.3e-3)
+
         nv = getattr(config.MOD, 'name_var_wind',
                      {'lon': 'longitude', 'lat': 'latitude', 'time': 'time',
                       'u10': 'u10', 'v10': 'v10'})
 
-        ds = xr.open_dataset(path_wind)
+        ds = xr.open_mfdataset(path_wind)
 
         # --- longitude convention ---
         lon_vals = ds[nv['lon']].values
@@ -2873,6 +2897,13 @@ class Model_qgsw(M):
         u10 = ds[nv['u10']].values   # (ntime, nlat, nlon)
         v10 = ds[nv['v10']].values
         wspd   = np.sqrt(u10**2 + v10**2)
+
+        if getattr(config.MOD, 'Cd_wind_formula', None) is not None and config.MOD.Cd_wind_formula.lower()=='large & pond':
+            Cd = wspd*0
+            Cd[wspd<5] = 1.1 * 1e-3
+            Cd[wspd>=5] = (0.49 + 0.065*wspd[wspd>=5]) * 1e-3
+            Cd[wspd>=25] = 2.0 * 1e-3
+
         taux_w = rho_air * Cd * wspd * u10
         tauy_w = rho_air * Cd * wspd * v10
 
@@ -2959,8 +2990,8 @@ class Model_qgsw(M):
             return None, None
         it = int(round(t / self.wind_dt)) if self.wind_dt > 0 else 0
         it = int(np.clip(it, 0, len(self.taux_wind) - 1))
-        taux = jnp.asarray(self.taux_wind[it], dtype=self.dtype)  # (ny, nx+1)
-        tauy = jnp.asarray(self.tauy_wind[it], dtype=self.dtype)  # (ny+1, nx)
+        taux = (1 - self.sponge_u) * jnp.asarray(self.taux_wind[it], dtype=self.dtype)  # (ny, nx+1)
+        tauy = (1 - self.sponge_v) * jnp.asarray(self.tauy_wind[it], dtype=self.dtype)  # (ny+1, nx)
         return taux, tauy
 
     def _sync_layers_from_surface(self, State):
@@ -3006,6 +3037,16 @@ class Model_qgsw(M):
 
         _name_var = [self.name_var['U'], self.name_var['V'], self.name_var['SSH']] if name_var is None else name_var
 
+        # Project u,v from staggered grids onto h-grid
+        name_u = self.name_var['U']
+        name_v = self.name_var['V']
+        if name_u in State0.var:
+            u = np.array(State0.var[name_u])
+            State0.var[name_u] = 0.5 * (u[:, :-1] + u[:, 1:])
+        if name_v in State0.var:
+            v = np.array(State0.var[name_v])
+            State0.var[name_v] = 0.5 * (v[:-1, :] + v[1:, :])
+
         if 'H' in self.name_params:
             State0.var['H'] = +State.params['H']
             _name_var += ['H']
@@ -3020,11 +3061,8 @@ class Model_qgsw(M):
             ssh_bc_t[np.isnan(ssh_bc_t)] = 0.
 
             if 'U' not in var_bc or 'V' not in var_bc:
-                # Compute (u,v) from ssh (geostrophy)
-                u, v = self.ssh2uv(ssh_bc_t)
-                # TESTTING
-                u *= 0
-                v *= 0
+                u = np.zeros((self.ny, self.nx+1))
+                v = np.zeros((self.ny+1, self.nx))
             else:
                 u = +var_bc['U'][i]
                 v = +var_bc['V'][i]
@@ -3098,13 +3136,14 @@ class Model_qgsw(M):
         return h_on_v
     
     def jstep_core(self, t, u0, v0, h0, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                taux=None, tauy=None, nstep=1):
+                taux=None, tauy=None, h_wind=None, nstep=1):
         """
         taux: wind stress on u-grid, shape (ny, nx+1) in State convention, or None.
         tauy: wind stress on v-grid, shape (ny+1, nx) in State convention, or None.
         They are converted to SW model convention (nx-1, ny) and (nx, ny-1) internally.
         Fu/Fv/Fh: 2D forcing in State convention — converted to per-layer for nl>1.
         u_b/v_b/h_b: 2D BCs in State convention — converted to per-layer for nl>1.
+        h_wind: mixed-layer depth perturbation (nx, ny) in SW convention, or None.
         """
         u, v, h = u0, v0, h0
 
@@ -3148,6 +3187,7 @@ class Model_qgsw(M):
                 u_b=u_b_sw, v_b=v_b_sw, h_b=h_b_sw,
                 Fu=Fu_sw, Fv=Fv_sw, Fh=Fh_sw,
                 taux=_taux, tauy=_tauy,
+                h_wind=h_wind,
             )
 
         # Remove MDT (surface only for nl>1)
@@ -3164,58 +3204,84 @@ class Model_qgsw(M):
         return u1, v1, h1
     
     def jstep(self, t, u0, v0, h0, H, Fu, Fv, Fh, u_b, v_b, h_b,
-             taux=None, tauy=None, nstep=1):
+             taux=None, tauy=None, h_wind=None, nstep=1):
         return self.jstep_core(
             t, u0, v0, h0, H, Fu, Fv, Fh,
             u_b, v_b, h_b,
             taux=taux, tauy=tauy,
+            h_wind=h_wind,
             nstep=nstep,
         )
     
     def jstep_tgl(self, t, du0, dv0, dh0, dH, dFu, dFv, dFh, 
                 u0, v0, h0, H, Fu, Fv, Fh, 
-                u_b, v_b, h_b, taux=None, tauy=None, nstep=1):
+                u_b, v_b, h_b, taux=None, tauy=None,
+                h_wind=None, dh_wind=None,
+                du_b=None, dv_b=None, dh_b=None, nstep=1):
 
         # Define a partial function that fixes constant parameters
         # taux/tauy are prescribed forcings: closed over, not differentiated
-        f = lambda u, v, h, H, Fu, Fv, Fh: self.jstep_core_jit(
-            t, u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
+        # u_b/v_b/h_b are now in the differentiable tuple
+        f = lambda u, v, h, H, Fu, Fv, Fh, hw, ub, vb, hb: self.jstep_core_jit(
+            t, u, v, h, H, Fu, Fv, Fh, ub, vb, hb,
             taux=taux, tauy=tauy,
+            h_wind=hw,
             nstep=nstep,
         )
+
+        # Default zero tangents for BCs when not optimized
+        if du_b is None:
+            du_b = jnp.zeros_like(u_b)
+        if dv_b is None:
+            dv_b = jnp.zeros_like(v_b)
+        if dh_b is None:
+            dh_b = jnp.zeros_like(h_b)
 
         # JVP (forward mode)
         (u1, v1, h1), (du1, dv1, dh1) = jax.jvp(
             f,
-            (u0, v0, h0, H, Fu, Fv, Fh),
-            (du0, dv0, dh0, dH, dFu, dFv, dFh)
+            (u0, v0, h0, H, Fu, Fv, Fh, h_wind, u_b, v_b, h_b),
+            (du0, dv0, dh0, dH, dFu, dFv, dFh, dh_wind, du_b, dv_b, dh_b)
         )
 
         return du1, dv1, dh1
     
     def jstep_adj(self, t, adu1, adv1, adh1, adH, adFu, adFv, adFh,
                 u0, v0, h0, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                taux=None, tauy=None, nstep=1):
+                taux=None, tauy=None,
+                h_wind=None, adh_wind=None,
+                adu_b=None, adv_b=None, adh_b=None, nstep=1):
 
         # taux/tauy are prescribed forcings: closed over, not differentiated
-        f = lambda u, v, h, H, Fu, Fv, Fh: self.jstep_core_jit(
-            t, u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
+        # u_b/v_b/h_b are now in the differentiable tuple
+        f = lambda u, v, h, H, Fu, Fv, Fh, hw, ub, vb, hb: self.jstep_core_jit(
+            t, u, v, h, H, Fu, Fv, Fh, ub, vb, hb,
             taux=taux, tauy=tauy,
+            h_wind=hw,
             nstep=nstep,
         )
 
         # Build the VJP function
-        (u1, v1, h1), vjp_fun = jax.vjp(f, u0, v0, h0, H, Fu, Fv, Fh)
+        (u1, v1, h1), vjp_fun = jax.vjp(f, u0, v0, h0, H, Fu, Fv, Fh, h_wind, u_b, v_b, h_b)
 
         # Apply adjoints at output
-        adu0, adv0, adh0, _adH, _adFu, _adFv, _adFh = vjp_fun((adu1, adv1, adh1))
+        (adu0, adv0, adh0, _adH, _adFu, _adFv, _adFh,
+         _adh_wind, _adu_b, _adv_b, _adh_b) = vjp_fun((adu1, adv1, adh1))
         if adH is not None:
             adH += _adH
         adFu += _adFu
         adFv += _adFv
         adFh += _adFh
+        if adh_wind is not None:
+            adh_wind += _adh_wind
+        if adu_b is not None:
+            adu_b += _adu_b
+        if adv_b is not None:
+            adv_b += _adv_b
+        if adh_b is not None:
+            adh_b += _adh_b
         
-        return adu0, adv0, adh0, adH, adFu, adFv, adFh
+        return adu0, adv0, adh0, adH, adFu, adFv, adFh, adh_wind, adu_b, adv_b, adh_b
 
     def step(self,State,nstep=1,t=0):
 
@@ -3241,6 +3307,19 @@ class Model_qgsw(M):
             H = jnp.expand_dims(H.astype(self.dtype).T, axis=0)
         else:
             H = None
+        if 'h_wind' in self.name_params:
+            h_wind = State.params['h_wind']
+            h_wind = h_wind.astype(self.dtype).T  # (nx, ny)
+        else:
+            h_wind = None
+
+        # BC perturbation from params
+        if 'bc' in self.name_params:
+            bc_du = State.params['u_b'].astype(self.dtype)
+            bc_dv = State.params['v_b'].astype(self.dtype)
+            bc_dh = State.params['h_b'].astype(self.dtype)
+        else:
+            bc_du = bc_dv = bc_dh = None
 
         # Sub-stepping loop (limits lax.scan length for memory efficiency)
         step_done = 0
@@ -3248,9 +3327,13 @@ class Model_qgsw(M):
             n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
             t_chunk = t + step_done * self.dt
             u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            if bc_du is not None:
+                u_b = u_b + bc_du
+                v_b = v_b + bc_dv
+                h_b = h_b + bc_dh
             taux, tauy = self._get_wind_stress(t_chunk)
             u, v, h = self.jstep_jit(t_chunk, u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                                      taux=taux, tauy=tauy, nstep=n_chunk)
+                                      taux=taux, tauy=tauy, h_wind=h_wind, nstep=n_chunk)
             step_done += n_chunk
 
         if self.nl > 1:
@@ -3307,6 +3390,21 @@ class Model_qgsw(M):
             dH = jnp.expand_dims(dH.astype(self.dtype).T, axis=0)
         else:
             H = dH = None
+        if 'h_wind' in self.name_params:
+            h_wind = State.params['h_wind'].astype(self.dtype).T    # (nx, ny)
+            dh_wind = dState.params['h_wind'].astype(self.dtype).T  # (nx, ny)
+        else:
+            h_wind = dh_wind = None
+        if 'bc' in self.name_params:
+            bc_du = State.params['u_b'].astype(self.dtype)
+            bc_dv = State.params['v_b'].astype(self.dtype)
+            bc_dh = State.params['h_b'].astype(self.dtype)
+            dbc_du = dState.params['u_b'].astype(self.dtype)
+            dbc_dv = dState.params['v_b'].astype(self.dtype)
+            dbc_dh = dState.params['h_b'].astype(self.dtype)
+        else:
+            bc_du = bc_dv = bc_dh = None
+            dbc_du = dbc_dv = dbc_dh = None
         
         # Sub-stepping loop (limits lax.scan length for memory efficiency)
         step_done = 0
@@ -3314,14 +3412,21 @@ class Model_qgsw(M):
             n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
             t_chunk = t + step_done * self.dt
             u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            if bc_du is not None:
+                u_b = u_b + bc_du
+                v_b = v_b + bc_dv
+                h_b = h_b + bc_dh
             taux, tauy = self._get_wind_stress(t_chunk)
             # Propagate tangent (JVP includes forward internally)
             du, dv, dh = self.jstep_tgl_jit(t_chunk, du, dv, dh, dH, dFu, dFv, dFh,
                                             u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                                            taux=taux, tauy=tauy, nstep=n_chunk)
+                                            taux=taux, tauy=tauy,
+                                            h_wind=h_wind, dh_wind=dh_wind,
+                                            du_b=dbc_du, dv_b=dbc_dv, dh_b=dbc_dh,
+                                            nstep=n_chunk)
             # Propagate forward state for next chunk
             u, v, h = self.jstep_jit(t_chunk, u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                                      taux=taux, tauy=tauy, nstep=n_chunk)
+                                      taux=taux, tauy=tauy, h_wind=h_wind, nstep=n_chunk)
             step_done += n_chunk
 
         if self.nl > 1:
@@ -3395,6 +3500,10 @@ class Model_qgsw(M):
             H = jnp.expand_dims(H.astype(self.dtype).T, axis=0)
         else:
             H = None
+        if 'h_wind' in self.name_params:
+            h_wind = State.params['h_wind'].astype(self.dtype).T  # (nx, ny)
+        else:
+            h_wind = None
         
         # Get adjoint parameters (2D — AD traces per-layer conversion automatically)
         adFu = adState.params[self.name_var['U']]
@@ -3405,6 +3514,20 @@ class Model_qgsw(M):
             adH = jnp.expand_dims(adH.astype(self.dtype).T, axis=0)
         else:
             adH = None
+        if 'h_wind' in self.name_params:
+            adh_wind = adState.params['h_wind'].astype(self.dtype).T  # (nx, ny)
+        else:
+            adh_wind = None
+        if 'bc' in self.name_params:
+            bc_du = State.params['u_b'].astype(self.dtype)
+            bc_dv = State.params['v_b'].astype(self.dtype)
+            bc_dh = State.params['h_b'].astype(self.dtype)
+            adu_b_acc = adState.params['u_b'].astype(self.dtype)
+            adv_b_acc = adState.params['v_b'].astype(self.dtype)
+            adh_b_acc = adState.params['h_b'].astype(self.dtype)
+        else:
+            bc_du = bc_dv = bc_dh = None
+            adu_b_acc = adv_b_acc = adh_b_acc = None
 
         # Build chunk schedule
         chunks = []
@@ -3421,10 +3544,14 @@ class Model_qgsw(M):
             u_fwd, v_fwd, h_fwd = u, v, h
             for t_chunk, n_chunk in chunks[:-1]:
                 u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+                if bc_du is not None:
+                    u_b = u_b + bc_du
+                    v_b = v_b + bc_dv
+                    h_b = h_b + bc_dh
                 taux, tauy = self._get_wind_stress(t_chunk)
                 u_fwd, v_fwd, h_fwd = self.jstep_jit(
                     t_chunk, u_fwd, v_fwd, h_fwd, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                    taux=taux, tauy=tauy, nstep=n_chunk)
+                    taux=taux, tauy=tauy, h_wind=h_wind, nstep=n_chunk)
                 fwd_states.append((u_fwd, v_fwd, h_fwd))
 
         # Reverse adjoint through chunks
@@ -3432,12 +3559,19 @@ class Model_qgsw(M):
             t_chunk, n_chunk = chunks[i]
             u_i, v_i, h_i = fwd_states[i]
             u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            if bc_du is not None:
+                u_b = u_b + bc_du
+                v_b = v_b + bc_dv
+                h_b = h_b + bc_dh
             taux, tauy = self._get_wind_stress(t_chunk)
-            adu, adv, adh, adH, adFu, adFv, adFh = self.jstep_adj_jit(
+            (adu, adv, adh, adH, adFu, adFv, adFh,
+             adh_wind, adu_b_acc, adv_b_acc, adh_b_acc) = self.jstep_adj_jit(
                 t_chunk, adu, adv, adh, adH, adFu, adFv, adFh,
                 u_i, v_i, h_i, H, Fu, Fv, Fh,
                 u_b, v_b, h_b,
                 taux=taux, tauy=tauy,
+                h_wind=h_wind, adh_wind=adh_wind,
+                adu_b=adu_b_acc, adv_b=adv_b_acc, adh_b=adh_b_acc,
                 nstep=n_chunk)
 
         if self.nl > 1:
@@ -3464,6 +3598,12 @@ class Model_qgsw(M):
         if 'H' in self.name_params:
             adH = adH[0].T
             adState.params['H'] = adH
+        if 'h_wind' in self.name_params:
+            adState.params['h_wind'] = adh_wind.T  # back to State convention (ny, nx)
+        if 'bc' in self.name_params:
+            adState.params['u_b'] = adu_b_acc
+            adState.params['v_b'] = adv_b_acc
+            adState.params['h_b'] = adh_b_acc
 
         # Update adjoint parameters (2D, same for both nl=1 and nl>1)
         adState.params[self.name_var['U']] = adFu 
@@ -3478,9 +3618,9 @@ class Model_qgsw(M):
         where M = jstep_tgl and M* = jstep_adj, operating on the
         differentiated variables (u, v, h, H, Fu, Fv, Fh).
 
-        Boundary conditions (u_b, v_b, h_b) and wind stress are NOT
-        differentiated — they are closed over in the lambda inside
-        jstep_tgl / jstep_adj.
+        Boundary conditions (u_b, v_b, h_b) are differentiated when
+        'bc' is in self.name_params.
+        Wind stress (taux, tauy) is NOT differentiated.
         """
         key = jax.random.PRNGKey(seed)
         dtype = self.dtype
@@ -3526,14 +3666,23 @@ class Model_qgsw(M):
         else:
             H = None
 
+        has_hw = 'h_wind' in self.name_params
+        hw_shape = (nx, ny)
+        if has_hw:
+            key, h_wind = rand(key, hw_shape)
+        else:
+            h_wind = None
+
         key, Fu = rand(key, Fu_shape)
         key, Fv = rand(key, Fv_shape)
         key, Fh = rand(key, Fh_shape)
 
-        # boundary conditions (fixed, not differentiated)
+        # boundary conditions
         key, u_b = rand(key, ub_shape)
         key, v_b = rand(key, vb_shape)
         key, h_b = rand(key, hb_shape)
+
+        has_bc = 'bc' in self.name_params
 
         # --- TLM perturbation -----------------------------------------------
         key, du0 = rand(key, u_shape);  du0 = du0 * mask_u
@@ -3543,6 +3692,16 @@ class Model_qgsw(M):
             key, dH = rand(key, H_shape)
         else:
             dH = None
+        if has_hw:
+            key, dh_wind = rand(key, hw_shape)
+        else:
+            dh_wind = None
+        if has_bc:
+            key, du_b = rand(key, ub_shape)
+            key, dv_b = rand(key, vb_shape)
+            key, dh_b = rand(key, hb_shape)
+        else:
+            du_b = dv_b = dh_b = None
         key, dFu = rand(key, Fu_shape)
         key, dFv = rand(key, Fv_shape)
         key, dFh = rand(key, Fh_shape)
@@ -3556,7 +3715,9 @@ class Model_qgsw(M):
         du1, dv1, dh1 = self.jstep_tgl(
             0, du0, dv0, dh0, dH, dFu, dFv, dFh,
             u0, v0, h0, H, Fu, Fv, Fh,
-            u_b, v_b, h_b, nstep=nstep)
+            u_b, v_b, h_b,
+            h_wind=h_wind, dh_wind=dh_wind,
+            du_b=du_b, dv_b=dv_b, dh_b=dh_b, nstep=nstep)
 
         # --- Run ADJ --------------------------------------------------------
         # Zero accumulators so output = pure adjoint
@@ -3564,11 +3725,18 @@ class Model_qgsw(M):
         adFu_in = jnp.zeros(Fu_shape, dtype=dtype)
         adFv_in = jnp.zeros(Fv_shape, dtype=dtype)
         adFh_in = jnp.zeros(Fh_shape, dtype=dtype)
+        adh_wind_in = jnp.zeros(hw_shape, dtype=dtype) if has_hw else None
+        adu_b_in = jnp.zeros(ub_shape, dtype=dtype) if has_bc else None
+        adv_b_in = jnp.zeros(vb_shape, dtype=dtype) if has_bc else None
+        adh_b_in = jnp.zeros(hb_shape, dtype=dtype) if has_bc else None
 
-        adu0, adv0, adh0, adH_out, adFu_out, adFv_out, adFh_out = self.jstep_adj(
+        (adu0, adv0, adh0, adH_out, adFu_out, adFv_out, adFh_out,
+         adh_wind_out, adu_b_out, adv_b_out, adh_b_out) = self.jstep_adj(
             0, wu, wv, wh, adH_in, adFu_in, adFv_in, adFh_in,
             u0, v0, h0, H, Fu, Fv, Fh,
-            u_b, v_b, h_b, nstep=nstep)
+            u_b, v_b, h_b,
+            h_wind=h_wind, adh_wind=adh_wind_in,
+            adu_b=adu_b_in, adv_b=adv_b_in, adh_b=adh_b_in, nstep=nstep)
 
         # --- Check NaN ------------------------------------------------------
         has_nan = (
@@ -3596,6 +3764,12 @@ class Model_qgsw(M):
              + jnp.sum(to64(dFh) * to64(adFh_out)))
         if has_H:
             ps2 += jnp.sum(to64(dH) * to64(adH_out))
+        if has_hw:
+            ps2 += jnp.sum(to64(dh_wind) * to64(adh_wind_out))
+        if has_bc:
+            ps2 += (jnp.sum(to64(du_b) * to64(adu_b_out))
+                  + jnp.sum(to64(dv_b) * to64(adv_b_out))
+                  + jnp.sum(to64(dh_b) * to64(adh_b_out)))
 
         ratio = float(ps1 / ps2)
         print(f'  jstep adjoint test (dtype={dtype}, {nstep=}): '

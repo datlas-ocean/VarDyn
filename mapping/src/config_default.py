@@ -502,6 +502,8 @@ MOD_QGSW = dict(
 
     f0 = None, # Coriolis parameter (in s^-1). If None, f0 will be computed from the grid
 
+    constant_f = False,
+
     c0 = 2.7,
 
     filec_aux = None, # if c0==None, auxilliary file to be used as phase velocity field (the spatial interpolation is handled inline)
@@ -534,7 +536,11 @@ MOD_QGSW = dict(
 
     dist_sponge_bc = None,
 
+    use_sponge_on_coast = True,
+
     sponge_coef = 0.,
+
+    tangential_sponge_factor = 1., # factor [0,1] reducing sponge on tangential velocity at open boundaries (1=isotropic, 0=no tangential damping)
 
     visc_coef = 0., # viscosity coefficient
 
@@ -543,9 +549,11 @@ MOD_QGSW = dict(
     name_var_wind = {'lon': 'longitude', 'lat': 'latitude', 'time': 'time',
                      'u10': 'u10', 'v10': 'v10'}, # variable names in the wind NetCDF file
 
-    rho_air = 1.25, # air density (kg/m³) used in the bulk wind-stress formula
+    rho_air = 1.225, # air density (kg/m³) used in the bulk wind-stress formula
 
-    Cd_wind = 1.5e-3, # drag coefficient used in the bulk wind-stress formula tau = rho_air * Cd * |U10| * U10
+    Cd_wind = 1.3e-3, # drag coefficient used in the bulk wind-stress formula tau = rho_air * Cd * |U10| * U10
+
+    Cd_wind_formula = 'Large & Pond', # Use the Large & Pond formula for drag coefficient. Set to None to use a constant drag coefficient (Cd_wind)
 
     rho_water = 1025.0, # ocean water density (kg/m³) used to convert wind stress [Pa] to acceleration [m²/s²]: tau/(rho_water*H)*dx
 
@@ -999,6 +1007,8 @@ BASIS_GAUSS3D = dict(
 
     name_mod_var = '', # Name of the related model variable 
 
+    c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
+
     compute_velocities = False, # Whether to compute geostrophic velocities associated to the SSH basis vectors
 
     name_mod_u = 'u', # Name of the zonal-velocity model variable (if *compute_velocities* is True)
@@ -1038,6 +1048,8 @@ BASIS_GAUSS3D = dict(
 BASIS_GAUSS3D_JAX = dict(
 
     name_mod_var = '', # Name of the related model variable 
+
+    c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 
     compute_velocities = False, # Whether to compute geostrophic velocities associated to the SSH basis vectors
 
@@ -1110,6 +1122,8 @@ BASIS_BMaux = dict(
 
     name_mod_var = None, # Name of the related model variable 
 
+    c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
+
     compute_velocities = False, # Whether to compute geostrophic velocities associated to the SSH basis vectors
 
     name_mod_u = 'u', # Name of the zonal-velocity model variable (if *compute_velocities* is True)
@@ -1132,7 +1146,7 @@ BASIS_BMaux = dict(
 
     lmax = 970., # maximal wavelength (in km)
 
-    factdec = 0.5, # factor to be multiplied to the computed time of decorrelation 
+    factdec = 7.5, # factor to be multiplied to the computed time of decorrelation 
 
     tdecmin = 2.5, # minimum time of decorrelation 
 
@@ -1167,6 +1181,8 @@ BASIS_BMaux = dict(
 BASIS_BMaux_JAX = dict(
 
     name_mod_var = None, # Name of the related model variable 
+
+    c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 
     compute_velocities = False, # Whether to compute geostrophic velocities associated to the SSH basis vectors
 
@@ -1318,6 +1334,12 @@ DIAG_OSSE = dict(
     name_ref_var = '',
 
     options_ref =  {},
+
+    name_exp_time = None,
+
+    name_exp_lon = None,
+
+    name_exp_lat = None,
 
     name_exp_var = '',
 
