@@ -35,6 +35,7 @@ dependencies = [
     "cmocean",
     "jaxparrow", 
     "ipykernel",
-    "joblib"
+    "joblib", 
+    "numpy_groupies"
 ]
 dynamic = ["version"]
