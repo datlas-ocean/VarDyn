@@ -6,7 +6,7 @@ Created on Wed Jan  6 19:20:42 2021
 @author: leguillou
 """
 
-name_experiment = '2020a_VarDyn_QG'
+name_experiment = '2021a_VarDyn_QG'
 
 #################################################################################################################################
 # Global libraries     
@@ -29,9 +29,9 @@ EXP = dict(
 
     tmp_DA_path = f"scratch/{name_experiment}", # temporary data assimilation directory path,
 
-    init_date = datetime(2012,10,1,0), # initial date (yyyy,mm,dd,hh) 
+    init_date = datetime(2017,10,1,0), # initial date (yyyy,mm,dd,hh) 
 
-    final_date = datetime(2012,12,15,0),  # final date (yyyy,mm,dd,hh) 
+    final_date = datetime(2017,12,1,0),  # final date (yyyy,mm,dd,hh) 
 
     assimilation_time_step = timedelta(hours=6),  
 
@@ -50,15 +50,17 @@ myGRID = dict(
 
     super = 'GRID_CAR',
 
-    lon_min = 295.,                                        # domain min longitude
+    lon_min = 296.,                                        # domain min longitude
 
-    lon_max = 305.,                                        # domain max longitude
+    lon_max = 304.,                                        # domain max longitude
 
-    lat_min = 33.,                                         # domain min latitude
+    lat_min = 33.25,                                         # domain min latitude
 
-    lat_max = 43.,                                         # domain max latitude
+    lat_max = 42.75,                                         # domain max latitude
 
     dx = 10.,                                              # grid spacinng in km
+
+    dy = 10.,                                              # grid spacinng in km
 
 )
 
@@ -74,11 +76,13 @@ myMOD = dict(
 
     name_var = {'SSH':'ssh'},
 
-    dtmodel = 1200, # model timestep
+    dtmodel = 900, # model timestep
 
     time_scheme = 'rk2',
 
-    c0 = 2.7,
+    filec_aux = '../../aux/aux_first_baroclinic_speed.nc',
+
+    name_var_c = {'lon':'lon','lat':'lat','var':'c1'},
 
     init_from_bc = True
     
@@ -93,7 +97,7 @@ myBC = dict(
 
     super = 'BC_EXT',
 
-    file = 'data/2020a_SSH_mapping_NATL60_DUACS_en_j1_tpn_g2.nc', # netcdf file(s) in whihch the boundary conditions fields are stored
+    file = 'data/OSE_ssh_mapping_DUACS.nc', # netcdf file(s) in whihch the boundary conditions fields are stored
 
     name_lon = 'lon',
 
@@ -101,7 +105,7 @@ myBC = dict(
 
     name_time = 'time',
 
-    name_var = {'SSH':'gssh'}, # name of the boundary conditions variable
+    name_var = {'SSH':'ssh'}, # name of the boundary conditions variable
 
     name_mod_var = {'SSH':'ssh'},
 
@@ -114,7 +118,7 @@ NAME_OBSOP = 'myOBSOP'
 
 myOBSOP = dict(
 
-    super = 'OBSOP_INTERP',
+    super = 'OBSOP_INTERP_L3',
 
     path_save = None, # Directory where to save observational operator
 
@@ -132,43 +136,33 @@ NAME_BASIS = 'myBASIS'
 
 myBASIS = dict(
 
-    super = 'BASIS_BM',
+    super = 'BASIS_BMaux',
 
-    flux = False,
+    name_mod_var = 'ssh', # Name of the related model variable 
+    
+    flux = False, # Whether making a component signature in space appear/disappear in time. For dynamical mapping, use flux=False
 
-    wavelet_init = False, # Estimate the initial state 
+    facns = 1., #factor for wavelet spacing in space
 
-    name_mod_var = 'ssh',
+    facnlt = 2., #factor for wavelet spacing in time
 
-    facns = 1., #factor for wavelet spacing= space
+    npsp = 3.5, # Defines the wavelet shape
 
-    facnlt = 2., #factor for wavelet spacing= time
+    facpsp = 1.5, # factor to fix df between wavelets
 
-    npsp= 3.5, # Defines the wavelet shape
+    file_aux = '../../aux/aux_reduced_basis_BM.nc', # Name of auxilliary file in which are stored the std and tdec for each locations at different wavelengths.
 
-    facpsp= 1.5, # factor to fix df between wavelets
+    lmin = 80, # minimal wavelength (in km)
 
-    lmin= 80, # minimal wavelength (in km)
+    lmax = 900., # maximal wavelength (in km)
 
-    lmax= 970., # maximal wavelength (in km)
+    factdec = 7.5, # factor to be multiplied to the computed time of decorrelation 
 
-    lmeso = 300, # Largest mesoscale wavelenght 
-
-    tmeso = 10, # Largest mesoscale time of decorrelation 
-
-    sloptdec = -.5, # Slope such as tdec = lambda^slope where lamda is the wavelength
-
-    factdec = .5, # factor to be multiplied to the computed time of decorrelation 
-
-    tdecmin = 0., # minimum time of decorrelation 
+    tdecmin = 2., # minimum time of decorrelation 
 
     tdecmax = 20., # maximum time of decorrelation 
 
-    facQ= 1, # factor to be multiplied to the estimated Q
-
-    Qmax = .03 , # Maximim Q, such as lambda>lmax => Q=Qmax where lamda is the wavelength
-
-    slopQ = -2 # Slope such as Q = lambda^slope where lamda is the wavelength
+    facQ = 1, # factor to be multiplied to the estimated Q
 
 )
 
@@ -186,7 +180,7 @@ myINV = dict(
 
     gtol = 1e-3, # Gradient norm must be less than gtol before successful termination.
 
-    maxiter = 200, # Maximal number of iterations for the minimization process
+    maxiter = 500, # Maximal number of iterations for the minimization process
 
     opt_method = 'L-BFGS-B', # method for scipy.optimize.minimize
 
@@ -194,7 +188,7 @@ myINV = dict(
 
     timestep_checkpoint = timedelta(hours=6), #  timesteps separating two consecutive analysis 
 
-    sigma_R = 1e-2, # Observational standard deviation
+    sigma_R = 3e-2, # Observational standard deviation
 
     prec = True, # preconditoning
  
@@ -203,89 +197,140 @@ myINV = dict(
 #################################################################################################################################
 # Observation parameters
 #################################################################################################################################
-NAME_OBS = ['J1','EN','TPN','G2']
+NAME_OBS = ['ALG','H2G','J2G','J2N','J3','S3A']
 
-J1 = dict(
-
-    super = 'OBS_SSH_NADIR',
-
-    path = 'data/dc_obs/2020a_SSH_mapping_NATL60_jason1.nc',
-
-    name_time = 'time',
-    
-    name_lon = 'lon',
-
-    name_lat = 'lat',
-    
-    name_var = {'SSH':'ssh_model'},
-
-)
-
-EN = dict(
+ALG = dict(
 
     super = 'OBS_SSH_NADIR',
 
-    path = 'data/dc_obs/2020a_SSH_mapping_NATL60_envisat.nc',
+    path = 'data/dt_gulfstream_alg_phy_l3_20161201-20180131_285-315_23-53.nc',
 
     name_time = 'time',
     
-    name_lon = 'lon',
+    name_lon = 'longitude',
 
-    name_lat = 'lat',
+    name_lat = 'latitude',
     
-    name_var = {'SSH':'ssh_model'},
+    name_var = {'SSH':'sla_filtered'},
+
+    add_mdt = True, 
+
+    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+
+    name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
 )
 
-TPN = dict(
+H2G = dict(
 
     super = 'OBS_SSH_NADIR',
 
-    path = 'data/dc_obs/2020a_SSH_mapping_NATL60_topex-poseidon_interleaved.nc',
+    path = 'data/dt_gulfstream_h2g_phy_l3_20161201-20180131_285-315_23-53.nc',
 
     name_time = 'time',
     
-    name_lon = 'lon',
+    name_lon = 'longitude',
 
-    name_lat = 'lat',
+    name_lat = 'latitude',
     
-    name_var = {'SSH':'ssh_model'},
+    name_var = {'SSH':'sla_filtered'},
+
+    add_mdt = True, 
+
+    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+
+    name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
 )
 
-G2 = dict(
+J2G = dict(
 
     super = 'OBS_SSH_NADIR',
 
-    path = 'data/dc_obs/2020a_SSH_mapping_NATL60_geosat2.nc',
+    path = 'data/dt_gulfstream_j2g_phy_l3_20161201-20180131_285-315_23-53.nc',
 
     name_time = 'time',
     
-    name_lon = 'lon',
+    name_lon = 'longitude',
 
-    name_lat = 'lat',
+    name_lat = 'latitude',
     
-    name_var = {'SSH':'ssh_model'},
+    name_var = {'SSH':'sla_filtered'},
+
+    add_mdt = True, 
+
+    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+
+    name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
 )
 
-SWOT = dict(
+J2N = dict(
 
-    super = 'OBS_SSH_SWATH',
+    super = 'OBS_SSH_NADIR',
 
-    path = 'data/dc_obs/2020a_SSH_mapping_NATL60_karin_swot.nc',
+    path = 'data/dt_gulfstream_j2n_phy_l3_20161201-20180131_285-315_23-53.nc',
 
     name_time = 'time',
     
-    name_lon = 'lon',
+    name_lon = 'longitude',
 
-    name_lat = 'lat',
+    name_lat = 'latitude',
     
-    name_xac = 'x_ac',
+    name_var = {'SSH':'sla_filtered'},
 
-    name_var = {'SSH':'ssh_model'},
+    add_mdt = True, 
+
+    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+
+    name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
 )
+
+J3 = dict(
+
+    super = 'OBS_SSH_NADIR',
+
+    path = 'data/dt_gulfstream_j3_phy_l3_20161201-20180131_285-315_23-53.nc',
+
+    name_time = 'time',
+    
+    name_lon = 'longitude',
+
+    name_lat = 'latitude',
+    
+    name_var = {'SSH':'sla_filtered'},
+
+    add_mdt = True, 
+
+    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+
+    name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
+
+)
+
+S3A = dict(
+
+    super = 'OBS_SSH_NADIR',
+
+    path = 'data/dt_gulfstream_s3a_phy_l3_20161201-20180131_285-315_23-53.nc',
+
+    name_time = 'time',
+    
+    name_lon = 'longitude',
+
+    name_lat = 'latitude',
+    
+    name_var = {'SSH':'sla_filtered'},
+
+    add_mdt = True, 
+
+    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+
+    name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
+
+)
+
 
 #################################################################################################################################
 # Diagnostics
@@ -294,31 +339,37 @@ NAME_DIAG = 'myDIAG'
 
 myDIAG = dict(
 
-    super = 'DIAG_OSSE',
+    super = 'DIAG_OSE',
 
-    dir_output = f'diags/{name_experiment}',
+    dir_output = None,
 
-    time_min = datetime(2012,10,22,0),
-
-    time_max = datetime(2012,12,4,0),
-
-    name_ref = 'data/dc_ref/NATL60-CJM165_GULFSTREAM*.nc',
+    name_ref = 'data/dt_gulfstream_c2_phy_l3_20161201-20180131_285-315_23-53.nc',
 
     name_ref_time = 'time',
 
-    name_ref_lon = 'lon',
+    name_ref_lon = 'longitude',
 
-    name_ref_lat = 'lat',
+    name_ref_lat = 'latitude',
 
-    name_ref_var = 'sossheig',
+    name_ref_var = 'sla_unfiltered',
 
-    options_ref = {'combine':'nested', 'concat_dim':'time', 'parallel':True},
+    delta_t_ref = 0.9434,
+
+    velocity_ref = 6.77,
+
+    add_mdt_to_ref = True, 
+
+    lenght_scale = 1000,
+
+    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+
+    name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
     name_exp_var = 'ssh',
 
     compare_to_baseline = True,
 
-    name_bas = 'data/2020a_SSH_mapping_NATL60_DUACS_en_j1_tpn_g2.nc',
+    name_bas = 'data/OSE_ssh_mapping_DUACS.nc',
 
     name_bas_time = 'time',
 
@@ -326,6 +377,8 @@ myDIAG = dict(
 
     name_bas_lat = 'lat',
 
-    name_bas_var = 'gssh'
+    name_bas_var = 'ssh',
+
 
 )
+
