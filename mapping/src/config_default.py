@@ -770,6 +770,10 @@ INV_4DVAR = dict(
 
     maxiter = 10, # Maximal number of iterations for the minimization process
 
+    gradient_max_norm = 1e6, # If the gradient norm exceeds this, minimization will restart from best state
+    
+    max_retries = 3, # Number of times to retry minimization after crazy gradients
+
     opt_method = 'L-BFGS-B', # method for scipy.optimize.minimize
 
     save_minimization = False, # save cost function and its gradient at each iteration 

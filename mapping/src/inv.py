@@ -25,7 +25,11 @@ jax.config.update("jax_enable_x64", USE_FLOAT64)
 from . import grid
 
 
+
 class ConvergenceReached(Exception):
+    pass
+
+class CrazyGradient(Exception):
     pass
 
 
@@ -296,6 +300,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         if convergence_nit is not None:
             options['ftol'] = 0
             options['gtol'] = 0
+
+        gradient_max_norm = getattr(config.INV, 'gradient_max_norm', 1e6)
         
         # Run minimization 
         from decimal import Decimal
@@ -320,7 +326,10 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
                     f.write("Minimization\n")  # Header
                 self.convergence_count = 0
                 self.last_x = None
-                
+                # For crazy gradient recovery
+                self.best_cost = float(J0)
+                self.best_x = np.array(Xopt).copy()
+                self.best_grad_norm = float(np.max(np.abs(G0)))
 
             def __call__(self, x, *args):
                 cost, grad = fun(x)
@@ -340,6 +349,19 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
 
                 self.J_list.append(float(cost))
                 self.G_list.append(float(mean_grad))
+
+                # Track best state
+                grad_norm = np.max(np.abs(grad))
+                if np.isfinite(cost) and np.isfinite(grad_norm) and grad_norm < gradient_max_norm:
+                    if float(cost) < self.best_cost:
+                        self.best_cost = float(cost)
+                        self.best_x = np.array(x).copy()
+                        self.best_grad_norm = grad_norm
+
+                # Check for crazy gradient
+                if (not np.isfinite(cost)) or (not np.isfinite(grad_norm)) or grad_norm > gradient_max_norm:
+                    print(f"\nCrazy gradient detected (cost={cost}, grad_norm={grad_norm}). Will restart from best state.")
+                    raise CrazyGradient()
 
                 # Check sustained convergence
                 if convergence_nit is not None:
@@ -363,21 +385,33 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
                 return self.cache['grad']
         
         wrapper = Wrapper()
-        try:
-            res = opt.minimize(wrapper, Xopt,
-                            method=config.INV.opt_method,
-                            jac=wrapper.jac,
-                            options=options,
-                            callback=callback)
-            
-
-            print ('\nIs the minimization successful? {}'.format(res.success))
-            print ('\nFinal cost function value: {}'.format(res.fun))
-            print ('\nNumber of iterations: {}'.format(res.nit))
-            Xres = res.x
-        except ConvergenceReached:
-            print(f'\nNumber of iterations: {wrapper.it - 1}')
-            Xres = wrapper.last_x
+        max_retries = getattr(config.INV, 'max_retries', 3)
+        retry = 0
+        while True:
+            try:
+                res = opt.minimize(wrapper, Xopt,
+                                method=config.INV.opt_method,
+                                jac=wrapper.jac,
+                                options=options,
+                                callback=callback)
+                print ('\nIs the minimization successful? {}'.format(res.success))
+                print ('\nFinal cost function value: {}'.format(res.fun))
+                print ('\nNumber of iterations: {}'.format(res.nit))
+                Xres = res.x
+                break
+            except ConvergenceReached:
+                print(f'\nNumber of iterations: {wrapper.it - 1}')
+                Xres = wrapper.last_x
+                break
+            except CrazyGradient:
+                retry += 1
+                if retry > max_retries:
+                    print(f"Maximum retries ({max_retries}) reached. Stopping minimization.")
+                    Xres = wrapper.best_x
+                    break
+                print(f"Restarting minimization from best state (retry {retry}/{max_retries})...")
+                Xopt = wrapper.best_x
+                wrapper = Wrapper()
         
         # Save minimization trajectory
         if config.INV.save_minimization:
