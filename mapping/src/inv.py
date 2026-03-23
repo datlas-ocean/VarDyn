@@ -25,6 +25,9 @@ jax.config.update("jax_enable_x64", USE_FLOAT64)
 from . import grid
 
 
+class ConvergenceReached(Exception):
+    pass
+
 
 def Inv(config, State=None, Model=None, dict_obs=None, Obsop=None, Basis=None, Bc=None, *args, **kwargs):
 
@@ -41,10 +44,7 @@ def Inv(config, State=None, Model=None, dict_obs=None, Obsop=None, Basis=None, B
     
     print(config.INV)
     
-    if config.INV.super=='INV_OI':
-        return Inv_oi(config, State=State, dict_obs=dict_obs)
-    
-    elif config.INV.super=='INV_4DVAR':
+    if config.INV.super=='INV_4DVAR':
         return Inv_4Dvar(config, State=State, Model=Model, dict_obs=dict_obs, Obsop=Obsop, Basis=Basis, Bc=Bc)
     
     else:
@@ -65,9 +65,6 @@ def Inv_forward(config,State,Model,Bc=None):
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     
     present_date = config.EXP.init_date
-    if config.EXP.saveoutputs:
-        State.save_output(present_date,name_var=Model.var_to_save)
-        
     nstep = int(config.EXP.saveoutput_time_step.total_seconds()//Model.dt)
 
     if Bc is not None:
@@ -99,71 +96,7 @@ def Inv_forward(config,State,Model,Bc=None):
         
     return
        
-def Inv_oi(config,State,dict_obs):
-    
-    """
-    NAME
-        Inv_oi
 
-    DESCRIPTION
-        Run an optimal interpolation experiment 
-    
-    """
-    
-    from . import obs
-    
-    # Initialize variables (normally this step is done in mod.py, but here no Model object is provided)
-    for name in config.INV.name_var:
-        State.var[config.INV.name_var[name]] = np.zeros((State.ny,State.nx))
-
-    # Boundary box
-    box = [State.lon.min(),State.lon.max(),State.lat.min(),State.lat.max(),
-           None, None]
-    
-    # Time parameters
-    ndays = (config.EXP.final_date-config.EXP.init_date).total_seconds()/3600/24
-    dt = config.EXP.saveoutput_time_step.total_seconds()/3600/24
-    times = np.arange(0, ndays + dt, dt)
-
-    # Coordinates
-    lon1d = State.lon.flatten()
-    lat1d = State.lat.flatten()
-    
-    # Time loop
-    for t in times:
-
-        for name in config.INV.name_var:
-            
-            # Time boundary
-            box[4] = config.EXP.init_date + timedelta(days=t-config.INV.Lt)
-            box[5] = config.EXP.init_date + timedelta(days=t+config.INV.Lt)
-            
-            # Get obs in (time x lon x lat) cube
-            obs_val, obs_coords, _ = obs.get_obs(dict_obs, box, config.EXP.init_date, name)
-            obs_lon = obs_coords[0]
-            obs_lat = obs_coords[1]
-            obs_time = obs_coords[2]
-            
-            # Perform the optimal interpolation 
-            BHt = np.exp(-((t - obs_time[np.newaxis,:])/config.INV.Lt)**2 - 
-                        ((lon1d[:,np.newaxis] - obs_lon[np.newaxis,:])/config.INV.Lx)**2 - 
-                        ((lat1d[:,np.newaxis] - obs_lat[np.newaxis,:])/config.INV.Ly)**2)
-            HBHt = np.exp(-((obs_time[np.newaxis,:] - obs_time[:,np.newaxis])/config.INV.Lt)**2 -
-                        ((obs_lon[np.newaxis,:] - obs_lon[:,np.newaxis])/config.INV.Lx)**2 -
-                        ((obs_lat[np.newaxis,:] - obs_lat[:,np.newaxis])/config.INV.Ly)**2) 
-            R = np.diag(np.full((len(obs_val)), config.INV.sigma_R**2))
-            Coo = HBHt + R
-            Mi = np.linalg.inv(Coo)
-            sol = np.dot(np.dot(BHt, Mi), obs_val).reshape((State.ny,State.nx))
-            
-            # Set estimated variable
-            State.setvar(sol,name_var=config.INV.name_var[name])
-
-        # Save estimated fields for date t
-        date = config.EXP.init_date + timedelta(days=t)
-        State.save_output(date)
-
-    return 
 
 def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=None,Bc=None,verbose=True,gpu_device=None) :
 
@@ -356,6 +289,14 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             projg0 = np.max(np.abs(g0))
             options['gtol'] = config.INV.gtol*projg0
         
+        # Sustained convergence: override scipy stopping criteria
+        convergence_nit = getattr(config.INV, 'convergence_nit', None)
+        ftol_threshold = options.get('ftol', None)
+        gtol_threshold = options.get('gtol', None)
+        if convergence_nit is not None:
+            options['ftol'] = 0
+            options['gtol'] = 0
+        
         # Run minimization 
         from decimal import Decimal
         import time
@@ -377,6 +318,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
                 self.filename_out = os.path.join(path_save_control_vectors, 'iterations.txt')
                 with open(self.filename_out, "w") as f:
                     f.write("Minimization\n")  # Header
+                self.convergence_count = 0
+                self.last_x = None
                 
 
             def __call__(self, x, *args):
@@ -398,22 +341,43 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
                 self.J_list.append(float(cost))
                 self.G_list.append(float(mean_grad))
 
+                # Check sustained convergence
+                if convergence_nit is not None:
+                    converged = False
+                    if ftol_threshold is not None and abs(float(ftol)) <= ftol_threshold:
+                        converged = True
+                    if gtol_threshold is not None and np.max(np.abs(grad)) <= gtol_threshold:
+                        converged = True
+                    if converged:
+                        self.convergence_count += 1
+                    else:
+                        self.convergence_count = 0
+                    self.last_x = np.array(x).copy()
+                    if self.convergence_count >= convergence_nit:
+                        print(f'\nConvergence criteria met for {convergence_nit} consecutive iterations. Stopping.')
+                        raise ConvergenceReached()
+
                 return cost
 
             def jac(self, x, *args):
                 return self.cache['grad']
         
         wrapper = Wrapper()
-        res = opt.minimize(wrapper, Xopt,
-                        method=config.INV.opt_method,
-                        jac=wrapper.jac,
-                        options=options,
-                        callback=callback)
-        
+        try:
+            res = opt.minimize(wrapper, Xopt,
+                            method=config.INV.opt_method,
+                            jac=wrapper.jac,
+                            options=options,
+                            callback=callback)
+            
 
-        print ('\nIs the minimization successful? {}'.format(res.success))
-        print ('\nFinal cost function value: {}'.format(res.fun))
-        print ('\nNumber of iterations: {}'.format(res.nit))
+            print ('\nIs the minimization successful? {}'.format(res.success))
+            print ('\nFinal cost function value: {}'.format(res.fun))
+            print ('\nNumber of iterations: {}'.format(res.nit))
+            Xres = res.x
+        except ConvergenceReached:
+            print(f'\nNumber of iterations: {wrapper.it - 1}')
+            Xres = wrapper.last_x
         
         # Save minimization trajectory
         if config.INV.save_minimization:
@@ -422,8 +386,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
                              })
             ds.to_netcdf(os.path.join(path_save_control_vectors,'minimization_trajectory.nc'))
             ds.close()
-
-        Xres = res.x
     else:
         print('You ask for restart_4Dvar and maxiter==0, so we save directly the trajectory')
         Xres = +Xopt

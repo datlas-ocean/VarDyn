@@ -391,20 +391,18 @@ class SW:
         h_ref = H * self.area
         eta_ref = -H.sum(axis=-3) + reverse_cumsum(H, dim=-3)
         p_ref = jnp.cumsum(self.g_prime * eta_ref, axis=-3)
-        if H.shape[-2] != 1 and H.shape[-1] != 1:
-            _h_ref_u = jnp.pad(h_ref, ((0, 0), (1, 1), (0, 0)), mode='edge')
-            h_ref_ugrid = 0.5 * (_h_ref_u[...,1:,:] + _h_ref_u[...,:-1,:])
-            _h_ref_v = jnp.pad(h_ref, ((0, 0), (0, 0), (1, 1)), mode='edge')
-            h_ref_vgrid = 0.5 * (_h_ref_v[...,1:] + _h_ref_v[...,:-1])
-            dx_p_ref = jnp.diff(p_ref, axis=-2)
-            dy_p_ref = jnp.diff(p_ref, axis=-1)
-        else:
-            _h_ref_u = jnp.pad(h_ref, ((0, 0), (1, 1), (0, 0)), mode='edge')
-            h_ref_ugrid = 0.5 * (_h_ref_u[...,1:,:] + _h_ref_u[...,:-1,:])
-            _h_ref_v = jnp.pad(h_ref, ((0, 0), (0, 0), (1, 1)), mode='edge')
-            h_ref_vgrid = 0.5 * (_h_ref_v[...,1:] + _h_ref_v[...,:-1])
-            dx_p_ref = 0.
-            dy_p_ref = 0.
+
+        _h_ref_u = jnp.pad(h_ref, ((0, 0), (1, 1), (0, 0)), mode='edge')
+        h_ref_ugrid = 0.5 * (_h_ref_u[...,1:,:] + _h_ref_u[...,:-1,:])
+        _h_ref_v = jnp.pad(h_ref, ((0, 0), (0, 0), (1, 1)), mode='edge')
+        h_ref_vgrid = 0.5 * (_h_ref_v[...,1:] + _h_ref_v[...,:-1])
+
+        # Compute reference pressure gradients per dimension independently.
+        # The previous AND condition (shape[-2]!=1 AND shape[-1]!=1) missed
+        # the case where H varies in only one spatial dimension (nl>1).
+        dx_p_ref = jnp.diff(p_ref, axis=-2) if H.shape[-2] != 1 else 0.
+        dy_p_ref = jnp.diff(p_ref, axis=-1) if H.shape[-1] != 1 else 0.
+
         return h_ref, h_ref_ugrid, h_ref_vgrid, dx_p_ref, dy_p_ref
 
     def set_ref_values(self, H):
@@ -555,10 +553,15 @@ class SW:
         the adjoint WENO scheme.
         """
         if self.diff_coef is not None and self.diff_coef > 0:
-            h_pad = jnp.pad(h, ((0,0), (0,0), (1,1), (1,1)), mode='edge')
-            lap_h = (h_pad[..., 2:, 1:-1] - 2*h_pad[..., 1:-1, 1:-1] + h_pad[..., :-2, 1:-1]) / self.dx**2 \
-                  + (h_pad[..., 1:-1, 2:] - 2*h_pad[..., 1:-1, 1:-1] + h_pad[..., 1:-1, :-2]) / self.dy**2
-            return self.diff_coef * lap_h * self.masks.h
+            # Operate on the physical variable h_phys = h / area so that
+            # the Laplacian is correct on non-uniform grids.  The previous
+            # version applied ∇² to the scaled variable h = h_phys*area,
+            # which introduces spurious terms proportional to ∇(area).
+            h_phys = h / self.area
+            h_phys_pad = jnp.pad(h_phys, ((0,0), (0,0), (1,1), (1,1)), mode='edge')
+            lap_h_phys = (h_phys_pad[..., 2:, 1:-1] - 2*h_phys_pad[..., 1:-1, 1:-1] + h_phys_pad[..., :-2, 1:-1]) / self.dx**2 \
+                       + (h_phys_pad[..., 1:-1, 2:] - 2*h_phys_pad[..., 1:-1, 1:-1] + h_phys_pad[..., 1:-1, :-2]) / self.dy**2
+            return self.diff_coef * lap_h_phys * self.area * self.masks.h
         return jnp.zeros_like(h)
 
     def add_wind_forcing(self, du, dv, h_tot_ugrid, h_tot_vgrid, taux=None, tauy=None, h_wind=None):

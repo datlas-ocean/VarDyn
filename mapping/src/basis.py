@@ -1888,7 +1888,7 @@ class Basis_bmaux:
 
         print('Setting Basis BMaux...')
 
-        Mutltiple_basis_exp = True
+        Mutltiple_basis_exp = False
         if Mutltiple_basis_exp:  
             L_MIN = 30
             L_MAX = 1000 
@@ -1906,12 +1906,7 @@ class Basis_bmaux:
                 np.log(1./L_MIN),
                 np.log(1. / L_MAX) - np.log(1 + self.facpsp / self.npsp),
                 -np.log(1 + self.facpsp / self.npsp))[::-1]
-            #print('_',logff_all)
-            #print('A',self.lmax)
-            #print('B',(logff_all>1/self.lmax))
-            #print('C',self.lmin)
-            #print('D',(logff_all<1/self.lmin))
-            #print('E',(logff_all>1/self.lmax) & (logff_all<1/self.lmin))
+        
             logff = logff_all[(logff_all>=np.log(1/self.lmax)) & (logff_all<=np.log(1/self.lmin))] 
             ff = np.exp(logff)
             ff = ff[1/ff<=self.lmax]
@@ -1934,7 +1929,7 @@ class Basis_bmaux:
                 -np.log(1 + self.facpsp / self.npsp))[::-1]
             
             ff = np.exp(logff)
-            ff = ff[1/ff<=self.lmax]
+            #ff = ff[1/ff<=self.lmax]
             dff = ff[1:] - ff[:-1]
         
         # Ensemble of directions for the wavelets (2D plane)
@@ -2637,7 +2632,7 @@ class Basis_bmaux_jax(Basis_bmaux):
                 adState[self.name_mod_v] *= 0.
     
         return adX
-
+  
 ###############################################################################
 #                     Wavelet - multiple scale                                #
 ###############################################################################

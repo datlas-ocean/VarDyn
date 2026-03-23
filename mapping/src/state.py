@@ -106,6 +106,27 @@ class State:
             self.dx = dx
             self.dy = dy
 
+            # C-grid coordinates for u and v
+            lon_h = self.lon
+            lat_h = self.lat
+            self.lon_u = np.zeros((self.ny, self.nx+1))
+            self.lat_u = np.zeros((self.ny, self.nx+1))
+            self.lon_u[:, 1:self.nx] = 0.5 * (lon_h[:, :-1] + lon_h[:, 1:])
+            self.lat_u[:, 1:self.nx] = 0.5 * (lat_h[:, :-1] + lat_h[:, 1:])
+            self.lon_u[:, 0] = lon_h[:, 0] - 0.5 * (lon_h[:, 1] - lon_h[:, 0])
+            self.lat_u[:, 0] = lat_h[:, 0] - 0.5 * (lat_h[:, 1] - lat_h[:, 0])
+            self.lon_u[:, self.nx] = lon_h[:, -1] + 0.5 * (lon_h[:, -1] - lon_h[:, -2])
+            self.lat_u[:, self.nx] = lat_h[:, -1] + 0.5 * (lat_h[:, -1] - lat_h[:, -2])
+
+            self.lon_v = np.zeros((self.ny+1, self.nx))
+            self.lat_v = np.zeros((self.ny+1, self.nx))
+            self.lon_v[1:self.ny, :] = 0.5 * (lon_h[:-1, :] + lon_h[1:, :])
+            self.lat_v[1:self.ny, :] = 0.5 * (lat_h[:-1, :] + lat_h[1:, :])
+            self.lon_v[0, :] = lon_h[0, :] - 0.5 * (lon_h[1, :] - lon_h[0, :])
+            self.lat_v[0, :] = lat_h[0, :] - 0.5 * (lat_h[1, :] - lat_h[0, :])
+            self.lon_v[self.ny, :] = lon_h[-1, :] + 0.5 * (lon_h[-1, :] - lon_h[-2, :])
+            self.lat_v[self.ny, :] = lat_h[-1, :] + 0.5 * (lat_h[-1, :] - lat_h[-2, :])
+
             # Coriolis
             self.f = 4*np.pi/86164*np.sin(self.lat*np.pi/180)
             
@@ -363,7 +384,7 @@ class State:
         
         self.mask += (np.isnan(self.lon) + np.isnan(self.lat)).astype(bool)
             
-    def save_output(self,date,name_var=None):
+    def save_output(self,date,name_var=None,grid_type=None):
         
         filename = os.path.join(self.path_save,f'{self.name_exp_save}'\
             f'_y{date.year}'\
@@ -375,77 +396,29 @@ class State:
         coords = {}
         coords[self.name_time] = ((self.name_time), [pd.to_datetime(date)],)
 
-        if self.geo_grid:
-                coords[self.name_lon] = ((self.name_lon,), self.lon[0,:])
-                coords[self.name_lat] = ((self.name_lat,), self.lat[:,0])
-                dims = (self.name_time,self.name_lat,self.name_lon)
+        # Select lon/lat based on grid_type (C-grid staggering)
+        if grid_type == 'u':
+            _lon = self.lon_u
+            _lat = self.lat_u
+            suffix = '_u'
+        elif grid_type == 'v':
+            _lon = self.lon_v
+            _lat = self.lat_v
+            suffix = '_v'
         else:
-            coords[self.name_lon] = (('y','x',), self.lon)
-            coords[self.name_lat] = (('y','x',), self.lat)
+            _lon = self.lon
+            _lat = self.lat
+            suffix = ''
 
-        if name_var is None:
-            name_var = self.var.keys()
-         
-        var = {}              
-        for name in name_var:
-
-            var_to_save = +np.array(self.var[name])
-
-            # Apply Mask
-            try:
-                if self.mask is not None:
-                    var_to_save[self.mask] = np.nan
-            except:
-                var_to_save = var_to_save
-        
-            if len(var_to_save.shape)==2:
-                var_to_save = var_to_save[np.newaxis,:,:]
-            
-            _dims = ['time','y','x']
-            if var_to_save.shape[1]!=self.lon.shape[0]:     
-                _dims[1] += name
-            if var_to_save.shape[2]!=self.lon.shape[1]:
-                _dims[2] += name      
-            var[name] = (_dims, var_to_save)
-
-        if os.path.exists(filename):
-            ds = xr.open_dataset(filename)
-            dsout = ds.copy().load()
-            ds.close()
-            del ds 
-            for name in var.keys():
-                dsout[name] = (var[name][0], var[name][1])
-            dsout.to_netcdf(filename,
-                         unlimited_dims={'time':True})
-            
-        else:
-            ds = xr.Dataset(var, coords=coords)
-            ds.to_netcdf(filename,
-                        unlimited_dims={'time':True})
-            ds.close()
-            del ds
-        
-        return 
-
-    def save_output(self,date,name_var=None):
-        
-        filename = os.path.join(self.path_save,f'{self.name_exp_save}'\
-            f'_y{date.year}'\
-            f'm{str(date.month).zfill(2)}'\
-            f'd{str(date.day).zfill(2)}'\
-            f'h{str(date.hour).zfill(2)}'\
-            f'm{str(date.minute).zfill(2)}.nc')
-        
-        coords = {}
-        coords[self.name_time] = ((self.name_time), [pd.to_datetime(date)],)
+        lon_name = self.name_lon + suffix
+        lat_name = self.name_lat + suffix
 
         if self.geo_grid:
-                coords[self.name_lon] = ((self.name_lon,), self.lon[0,:])
-                coords[self.name_lat] = ((self.name_lat,), self.lat[:,0])
-                dims = (self.name_time,self.name_lat,self.name_lon)
+                coords[lon_name] = ((lon_name,), _lon[0,:])
+                coords[lat_name] = ((lat_name,), _lat[:,0])
         else:
-            coords[self.name_lon] = (('y','x',), self.lon)
-            coords[self.name_lat] = (('y','x',), self.lat)
+            coords[lon_name] = (('y' + suffix, 'x' + suffix), _lon)
+            coords[lat_name] = (('y' + suffix, 'x' + suffix), _lat)
 
         if name_var is None:
             name_var = self.var.keys()
@@ -466,13 +439,14 @@ class State:
                 var_to_save = var_to_save[np.newaxis,:,:]
             
             if self.geo_grid:
-                _dims = ['time','lat','lon']
+                _dims = ['time', lat_name, lon_name]
             else:
-                _dims = ['time','y','x']
-            if var_to_save.shape[1]!=self.lon.shape[0]:     
+                _dims = ['time', 'y' + suffix, 'x' + suffix]
+            # Rename dims when variable shape differs from lon/lat grid
+            if var_to_save.shape[1] != _lon.shape[0]:
                 _dims[1] += name
-            if var_to_save.shape[2]!=self.lon.shape[1]:
-                _dims[2] += name      
+            if var_to_save.shape[2] != _lon.shape[1]:
+                _dims[2] += name
             var[name] = (_dims, var_to_save)
 
         if os.path.exists(filename):
@@ -480,6 +454,10 @@ class State:
             dsout = ds.copy().load()
             ds.close()
             del ds 
+            # Add new coordinates
+            for k, v in coords.items():
+                if k not in dsout.coords:
+                    dsout = dsout.assign_coords({k: v})
             for name in var.keys():
                 dsout[name] = (var[name][0], var[name][1])
             dsout.to_netcdf(filename,
@@ -558,6 +536,10 @@ class State:
         other.mask = self.mask
         other.lon = self.lon
         other.lat = self.lat
+        other.lon_u = self.lon_u
+        other.lat_u = self.lat_u
+        other.lon_v = self.lon_v
+        other.lat_v = self.lat_v
         other.geo_grid = self.geo_grid
 
         # (deep)Copy model variables

@@ -2541,6 +2541,12 @@ class Model_qgsw(M):
                                    State.lon,
                                    State.lat)
             
+            # Replace NaN before cmin/cmax clamping (NaN < x is False,
+            # so NaN would survive the clamp and propagate to H as 0,
+            # creating sharp unphysical gradients that destabilise the model).
+            c_fill = np.nanmean(self.c)
+            self.c[np.isnan(self.c)] = c_fill
+
             if config.MOD.cmin is not None:
                 self.c[self.c<config.MOD.cmin] = config.MOD.cmin
             
@@ -2781,7 +2787,7 @@ class Model_qgsw(M):
             "compile": True,
             "slip_coef": config.MOD.slip_coef,
             "visc_coef": config.MOD.visc_coef,
-            "diff_coef": config.MOD.visc_coef,
+            "diff_coef": config.MOD.diff_coef,
             "dt": self.dt,
             "barotropic_filter": False,
             'barotropic_filter_spectral': False,

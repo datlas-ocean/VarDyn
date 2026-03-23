@@ -542,7 +542,9 @@ MOD_QGSW = dict(
 
     tangential_sponge_factor = 1., # factor [0,1] reducing sponge on tangential velocity at open boundaries (1=isotropic, 0=no tangential damping)
 
-    visc_coef = 0., # viscosity coefficient
+    visc_coef = 0., # viscosity coefficient (in m^2/s). Typical values 10–30 m²/s, 50–100 m²/s if unstable
+
+    diff_coef = 0., # diffusivity coefficient for h (in m^2/s). Typical values 20–50 m²/s, 100–200 m²/s if unstable
 
     path_wind = None, # path to NetCDF wind file containing u10/v10 (if None, no wind forcing)
 
@@ -745,50 +747,6 @@ OBSOP_INTERP_L4 = dict(
 #################################################################################################################################
 NAME_INV = None
 
-# Optimal Interpolation
-INV_OI = dict(
-
-    name_var = {'SSH':'ssh'},
-
-    Lt = 7, # days
-
-    Lx = 1, # degreee
-
-    Ly = 1, # degree
-
-    sigma_R = 5e-2 # meters
-
-)
-
-# Back and Forth Nudging
-INV_BFN = dict(
-
-    window_size = timedelta(days=7), # length of the bfn time window
-
-    window_output = timedelta(days=3), # length of the output time window, in the middle of the bfn window. (need to be smaller than *bfn_window_size*)
-
-    propagation_timestep = timedelta(hours=1), # propagation time step of the BFN, corresponding to the time step at which the nudging term is computed
-
-    window_overlap = True, # overlap the BFN windows
-
-    criterion = 0.01, # convergence criterion. typical value: 0.01
-
-    max_iteration = 5, # maximal number of iterations if *bfn_criterion* is not met
-
-    save_trajectory = False, # save or not the back and forth iterations (for debugging)
-
-    dist_scale = 10, #
-
-    save_obs_proj = False, # save or not the projected observation as pickle format. Set to True to maximize the speed of the algorithm.
-
-    path_save_proj = None, # path to save projected observations
-
-    use_bc_as_init = False, # Whether to use boundary conditions as initialization for the first temporal window
-
-    scalenudg = None 
-
-)
-
 # 4-Dimensional Variational 
 INV_4DVAR = dict(
 
@@ -807,6 +765,8 @@ INV_4DVAR = dict(
     ftol = None, # The iteration stops when (f^k - f^{k+1})/max{|f^k|,|f^{k+1}|,1} <= ftol.
 
     gtol = None, # Gradient norm must be less than gtol*g0 (g0 being the gradient at first iteration) before successful termination.
+
+    convergence_nit = None, # Number of consecutive iterations the convergence criteria (ftol/gtol) must be met before stopping. If None, scipy stops as soon as the criteria is met once.
 
     maxiter = 10, # Maximal number of iterations for the minimization process
 
@@ -1342,6 +1302,8 @@ DIAG_OSSE = dict(
     name_exp_lat = None,
 
     name_exp_var = '',
+
+    exp_grid_type = None,  # None for h-grid, 'u' for u-grid, 'v' for v-grid
 
     compare_to_baseline = False,
 
