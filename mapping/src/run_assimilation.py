@@ -351,7 +351,7 @@ def compute_weights_map(State, list_State):
     """Compute weights maps and precomputed interpolation operators for merging outputs from subprocesses.
     
     Weights use raised-cosine (Hann) tapering in both x and y directions for smooth blending 
-    with zero-derivative at subwindow boundaries.
+    with zero-derivative at subwindow boundaries. Weights are 1 at the center and 0 at the edges.
     
     Interpolation operators are precomputed once per subwindow and reused for all dates,
     avoiding the expensive Delaunay triangulation of griddata at every time step.
@@ -384,9 +384,9 @@ def compute_weights_map(State, list_State):
             # Single subwindow: uniform weights (no tapering needed)
             _weights_space = np.ones((_State.ny, _State.nx))
         else:
-            # Raised-cosine (Hann) tapering: smooth with zero-derivative at boundaries
-            ty = np.linspace(0, np.pi, _State.ny)
-            tx = np.linspace(0, np.pi, _State.nx)
+            # Raised-cosine (Hann) tapering: 1 at center, 0 at edges, smooth with zero-derivative at boundaries
+            ty = np.linspace(0, 2 * np.pi, _State.ny)
+            tx = np.linspace(0, 2 * np.pi, _State.nx)
             winy = 0.5 * (1.0 - np.cos(ty))
             winx = 0.5 * (1.0 - np.cos(tx))
             _weights_space = winy[:, np.newaxis] * winx[np.newaxis, :]
@@ -559,6 +559,14 @@ def merge_output_date(date, State, list_State, name_var_save, kernel, weights_sp
 
                 _var = _ds[name].values
                 
+                # Handle C-grid staggering: average U/V-grid variables to H-grid
+                if _var.shape == (_State.ny, _State.nx + 1):
+                    # U-grid → H-grid: average adjacent columns
+                    _var = 0.5 * (_var[:, :-1] + _var[:, 1:])
+                elif _var.shape == (_State.ny + 1, _State.nx):
+                    # V-grid → H-grid: average adjacent rows
+                    _var = 0.5 * (_var[:-1, :] + _var[1:, :])
+                
                 # Fill NaN gaps near coasts before interpolation
                 if np.any(np.isnan(_var)) and kernel is not None:
                     _var = interpolate_replace_nans(_var, kernel)
@@ -576,7 +584,8 @@ def merge_output_date(date, State, list_State, name_var_save, kernel, weights_sp
             
             _ds.close()
             del _ds
-        except:
+        except Exception as e:
+            print(f'[merge_output_date] Warning: failed to merge subwindow for date {date}: {e}')
             continue
 
     for name in name_var_save:
@@ -674,9 +683,16 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
     config0.EXP.path_save += f'/subwindow_{str(date_middle)[:10]}'
     if flag_diag and config.DIAG is not None:
         config0.DIAG = config.DIAG.copy()
-        config0.DIAG.dir_output += f'/subwindow_{str(date_middle)[:10]}'
-        config0.DIAG.time_min = date_start.strftime('%Y-%m-%d')
-        config0.DIAG.time_max = date_end.strftime('%Y-%m-%d')
+        if 'super' not in config0.DIAG:
+            for NAME_DIAG in config0.DIAG:
+                config0.DIAG[NAME_DIAG] = config.DIAG[NAME_DIAG].copy()
+                config0.DIAG[NAME_DIAG].dir_output += f'/subwindow_{str(date_middle)[:10]}'
+                config0.DIAG[NAME_DIAG].time_min = date_start.strftime('%Y-%m-%d')
+                config0.DIAG[NAME_DIAG].time_max = date_end.strftime('%Y-%m-%d')
+        else:
+            config0.DIAG.dir_output += f'/subwindow_{str(date_middle)[:10]}'
+            config0.DIAG.time_min = date_start.strftime('%Y-%m-%d')
+            config0.DIAG.time_max = date_end.strftime('%Y-%m-%d')
     
     State0 = state.State(config0, verbose=0)
     
