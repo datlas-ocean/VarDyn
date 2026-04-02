@@ -199,6 +199,7 @@ def prepare_process(config, config_eq, State,
             else:
                 lat0 = config.GRID.lat_min
                 lat1 = config.GRID.lat_max
+                _ny = ny_proc
             if lat1<config.GRID.lat_min:
                 continue
             j += 1
@@ -232,6 +233,7 @@ def prepare_process(config, config_eq, State,
                 else:
                     lon0 = config.GRID.lon_min
                     lon1 = config.GRID.lon_max
+                    _nx = nx_proc
                     
                 # create config for the subwindow
                 if lat0<0 and lat1>0:
