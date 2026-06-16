@@ -1,10 +1,15 @@
+"""
+Created by Florian Le Guillou on June 2026.
+
+Computes diagnostics and plotting products for experiments.
+"""
+
 import os, sys
 import glob
 import numpy as np
 import xarray as xr
 import netCDF4 as nc
 import pyinterp 
-import pyinterp.fill
 from scipy.interpolate import griddata
 import logging
 import scipy
@@ -19,8 +24,7 @@ import gc
 import pandas as pd 
 import subprocess
 from .tools import read_auxdata
-from . import grid
-from . import switchvar
+from . import tools as switchvar
 import cmocean
 
 
@@ -143,14 +147,20 @@ That could be due to non regular grid or bad written netcdf file')
         # Experimental data
         self.geo_grid = State.geo_grid
         self.name_exp_time = config.EXP.name_time
+        # C-grid type: None (h-grid), 'u', or 'v'
+        self.exp_grid_type = getattr(config.DIAG, 'exp_grid_type', None)
+        if self.exp_grid_type is not None:
+            suffix = '_' + self.exp_grid_type
+        else:
+            suffix = ''
         if 'name_exp_lon' in config.DIAG and config.DIAG.name_exp_lon is not None:
             self.name_exp_lon = config.DIAG.name_exp_lon
         else:
-            self.name_exp_lon = config.EXP.name_lon
+            self.name_exp_lon = config.EXP.name_lon + suffix
         if 'name_exp_lat' in config.DIAG and config.DIAG.name_exp_lat is not None:
             self.name_exp_lat = config.DIAG.name_exp_lat
         else:
-            self.name_exp_lat = config.EXP.name_lat
+            self.name_exp_lat = config.EXP.name_lat + suffix
         self.name_exp_var = config.DIAG.name_exp_var
         exp = xr.open_mfdataset(f'{config.EXP.path_save}/{config.EXP.name_exp_save}*nc',preprocess=lambda ds: ds[[self.name_exp_var]])
         exp = exp.assign_coords({self.name_exp_lon:exp[self.name_exp_lon]})
@@ -1291,7 +1301,10 @@ That could be due to non regular grid or bad written netcdf file')
         # convert data vector and time vector into xarray.Dataarray
         da = xr.DataArray(var_alongtrack, coords=_ref.coords, dims=_ref.dims)
 
-        # resample 
+        # sorting by time
+        da = da.sortby(self.name_ref_time)
+
+        # resampling
         da_resample = da.resample(time=self.bin_time_step)
 
         # compute stats
@@ -1330,6 +1343,9 @@ That could be due to non regular grid or bad written netcdf file')
         # convert data vector and time vector into xarray.Dataarray
         da = xr.DataArray(var_exp_interp, coords=_ref.coords, dims=_ref.dims)
 
+        # sorting by time
+        da = da.sortby(self.name_ref_time)
+
         # resample 
         da_resample = da.resample(time=self.bin_time_step)
 
@@ -1363,6 +1379,9 @@ That could be due to non regular grid or bad written netcdf file')
         if self.compare_to_baseline:
             # convert data vector and time vector into xarray.Dataarray
             da = xr.DataArray(var_bas_interp, coords=_ref.coords, dims=_ref.dims)
+
+            # sorting by time
+            da = da.sortby(self.name_ref_time)
 
             # resample 
             da_resample = da.resample(time=self.bin_time_step)
@@ -1398,6 +1417,9 @@ That could be due to non regular grid or bad written netcdf file')
 
         # convert data vector and time vector into xarray.Dataarray
         da = xr.DataArray(var_alongtrack - var_exp_interp, coords=_ref.coords, dims=_ref.dims)
+
+        # sorting by time
+        da = da.sortby(self.name_ref_time)
 
         # resample 
         da_resample = da.resample(time=self.bin_time_step)
@@ -1440,6 +1462,9 @@ That could be due to non regular grid or bad written netcdf file')
         if self.compare_to_baseline:
             # convert data vector and time vector into xarray.Dataarray
             da = xr.DataArray(var_alongtrack - var_bas_interp, coords=_ref.coords, dims=_ref.dims)
+
+            # sorting by time
+            da = da.sortby(self.name_ref_time)
 
             # resample 
             da_resample = da.resample(time=self.bin_time_step)

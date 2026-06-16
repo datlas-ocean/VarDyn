@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Thu Feb  4 17:26:07 2021
+Created by Florian Le Guillou on June 2026.
 
-@author: leguillou
+Loads and merges experiment configuration files.
 """
 
 
@@ -117,7 +117,6 @@ def Exp(path_config):
     config.GRID = merge_configs(config_exp,config_def,'NAME_GRID')
     config.OBS = merge_configs(config_exp,config_def,'NAME_OBS')
     config.MOD = merge_configs(config_exp,config_def,'NAME_MOD')
-    config.BC = merge_configs(config_exp,config_def,'NAME_BC')
     config.OBSOP = merge_configs(config_exp,config_def,'NAME_OBSOP')
     config.BASIS = merge_configs(config_exp,config_def,'NAME_BASIS')
     config.INV = merge_configs(config_exp,config_def,'NAME_INV')

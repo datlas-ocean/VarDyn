@@ -1,17 +1,20 @@
 
+"""
+Created by Florian Le Guillou on June 2026.
+
+Implements the 1.5-layer quasi-geostrophic model and variants.
+"""
+
 import sys 
 sys.path.insert(0, '../../src') # add src to path to import modules
 from src.config import USE_FLOAT64
 import numpy as np
 from jax import jit
 from jax import jvp, vjp
-import matplotlib.pylab as plt
-import numpy as np
-from jax.lax import scan, fori_loop, dynamic_slice, dynamic_update_slice
-from jax import vmap
+from jax.lax import scan
 from jax.scipy.sparse.linalg import cg as jcg
 from functools import partial
-
+    
 import jax
 import jax.numpy as jnp
 
@@ -110,12 +113,23 @@ class Qgm:
     ###########################################################################
     #                             Initialization                              #
     ###########################################################################
-    def __init__(self, dx=None, dy=None, dt=None, SSH=None, c=None, Kdiffus=None, upwind=3, g=9.81, f=1e-4, time_scheme='Euler', compile=True, mdt=None, bathymetry_PV_term=None, ** kwargs):
+    def __init__(self, dx=None, dy=None, dt=None, SSH=None, c=None,
+                 Kdiffus=None, upwind=3, g=9.81, f=1e-4,
+                 time_scheme='Euler', compile=True,
+                 Wbc=None, Kdiffus_trac=None, bc_trac='OBC',
+                 mdt=None,
+                 ageo_velocities=False, advect_pv=True,
+                 sponge_coef=0.,
+                 bathymetry_PV_term=None, formulation='ssh',
+                 **kwargs):
 
         if USE_FLOAT64:
             self.dtype = 'float64'
         else:
             self.dtype = 'float32'
+
+        # Formulation: 'ssh' (work in SSH space) or 'sf' (work in streamfunction space)
+        self.formulation = formulation
 
         # Grid shape
         ny, nx, = np.shape(dx)
@@ -138,11 +152,13 @@ class Qgm:
 
         # Coriolis
         if hasattr(f, "__len__"):
-            self.f = np.nanmean(f).astype(self.dtype)
+            self.f = f.astype(self.dtype)            # full 2D array (needed for sf h<->phi conversion)
+            self.f0 = np.nanmean(f).astype(self.dtype)  # scalar reference value for QG operators
             # Beta plane
             self.beta = (f[2:,:] - f[:-2,:]) / (2*self.dy)
         else:
-            self.f = f.astype(self.dtype)
+            self.f = np.array(f, dtype=self.dtype)
+            self.f0 = np.array(f, dtype=self.dtype)
             self.beta = None
 
 
@@ -151,6 +167,14 @@ class Qgm:
             self.c = np.nanmean(c).astype(self.dtype)
         else:
             self.c = c.astype(self.dtype)
+
+        # Diagnostics
+        _c0 = float(self.c)
+        _f0 = float(self.f0)
+        _Rd = _c0 / abs(_f0) / 1e3
+        print(f'  - f\u2080 (s\u207b\u00b9):             {_f0:.4e}')
+        print(f'  - c  (m/s):              {_c0:.4f}')
+        print(f'  - Rd = c/|f\u2080| (km):   {_Rd:.1f}')
 
         # MDT
         self.mdt = mdt
@@ -169,7 +193,11 @@ class Qgm:
                            np.arange(1, ny - 1, dtype=self.dtype))
         laplace_dst = 2 * (np.cos(np.pi / (nx - 1) * x) - 1) / self.dx ** 2 + \
                       2 * (np.cos(np.pi / (ny - 1) * y) - 1) / self.dy ** 2
-        self.helmoltz_dst = self.g / self.f * laplace_dst - self.g * self.f / self.c ** 2
+        self.laplace_dst = jnp.asarray(laplace_dst)  # JAX array: no host→device copy in step()
+        if self.formulation == 'sf':
+            self.helmoltz_dst = self.laplace_dst - (self.f0 / self.c) ** 2
+        else:
+            self.helmoltz_dst = self.g / self.f0 * self.laplace_dst - self.g * self.f0 / self.c ** 2
             
 
         ################
@@ -216,8 +244,26 @@ class Qgm:
         self.ind2 = mask==2
         self.ind12 = self.ind1 + self.ind2
 
-        # Diffusion coefficient 
+        # Diffusion coefficients
         self.Kdiffus = Kdiffus
+        self.Kdiffus_trac = Kdiffus_trac
+
+        # Tracer/open-boundary options
+        if Wbc is None or np.all(Wbc == 0.):
+            self.Wbc = np.zeros((ny, nx), dtype=self.dtype)
+            self.Wbc[self.ind1] = 1.
+        else:
+            self.Wbc = Wbc.astype(self.dtype)
+        self.bc_trac = bc_trac
+        self.sponge_coef = float(sponge_coef)
+        self.ocean_h = (self.ind0 == False).astype(self.dtype)
+
+        # Dynamics options
+        self.advect_pv = advect_pv
+        self.ageo_velocities = ageo_velocities
+
+        # Remember compile flag so _rebuild_helmoltz_dst can re-register JITs
+        self._compile = compile
 
         # JIT compiling functions
         if compile:
@@ -229,11 +275,25 @@ class Qgm:
             self.euler_jit = jit(self.euler)
             self.rk2_jit = jit(self.rk2)
             self.rk3_jit = jit(self.rk3)
+            self.bc_jit = jit(self.bc)
             self.one_step_jit = jit(self.one_step)
             self.one_step_for_scan_jit = jit(self.one_step_for_scan)
             self.step_jit = jit(self.step, static_argnums=2)
             self.step_tgl_jit = jit(self.step_tgl, static_argnums=3)
             self.step_adj_jit = jit(self.step_adj, static_argnums=3)
+
+    def _rebuild_helmoltz_dst(self):
+        """Recompute helmoltz_dst from the current self.c scalar.
+        Both laplace_dst and helmoltz_dst are JAX arrays, so this is a pure
+        on-device computation with no host→device copies.
+        No JIT re-registration is needed: helmoltz_dst is threaded as an
+        explicit JAX array argument through one_step → one_step_for_scan.
+        """
+        if self.formulation == 'sf':
+            self.helmoltz_dst = self.laplace_dst - (self.f0 / self.c) ** 2
+        else:
+            self.helmoltz_dst = (self.g / self.f0 * self.laplace_dst
+                                 - self.g * self.f0 / self.c ** 2)
 
     def h2uv(self, h):
         """ SSH to U,V
@@ -250,11 +310,17 @@ class Qgm:
         u = jnp.zeros((self.ny,self.nx))
         v = jnp.zeros((self.ny,self.nx))
 
-        u = u.at[1:-1,1:].set(- self.g/self.f*\
-         (h[2:,:-1]+h[2:,1:]-h[:-2,1:]-h[:-2,:-1])/(4*self.dy))
-             
-        v = v.at[1:,1:-1].set(self.g/self.f*\
-            (h[1:,2:]+h[:-1,2:]-h[:-1,:-2]-h[1:,:-2])/(4*self.dx))
+        if self.formulation == 'sf':
+            phi = (self.g / self.f) * h
+            u = u.at[1:-1,1:].set(-\
+             (phi[2:,:-1]+phi[2:,1:]-phi[:-2,1:]-phi[:-2,:-1])/(4*self.dy))
+            v = v.at[1:,1:-1].set(\
+                (phi[1:,2:]+phi[:-1,2:]-phi[:-1,:-2]-phi[1:,:-2])/(4*self.dx))
+        else:
+            u = u.at[1:-1,1:].set(- self.g/self.f0*\
+             (h[2:,:-1]+h[2:,1:]-h[:-2,1:]-h[:-2,:-1])/(4*self.dy))
+            v = v.at[1:,1:-1].set(self.g/self.f0*\
+                (h[1:,2:]+h[:-1,2:]-h[:-1,:-2]-h[1:,:-2])/(4*self.dx))
         
         u = jnp.where(jnp.isnan(u),0,u)
         v = jnp.where(jnp.isnan(v),0,v)
@@ -275,24 +341,48 @@ class Qgm:
         if c is None:
             c = self.c
 
+        # When c is a 2-D field, extract the interior and boundary sub-arrays
+        # so that all index-expressions stay shape-consistent with the sliced
+        # phi / h arrays used below.
+        if hasattr(c, 'shape') and jnp.ndim(c) == 2:
+            c_int = c[1:-1, 1:-1]      # (ny-2, nx-2) — for interior update
+            c_bdy = c[self.ind12]       # flattened boundary values
+        else:
+            c_int = c
+            c_bdy = c
+
         q = jnp.zeros((self.ny, self.nx),dtype=self.dtype)
 
-        q = q.at[1:-1, 1:-1].set(
-            self.g / self.f * \
-            ((h[2:, 1:-1] + h[:-2, 1:-1] - 2 * h[1:-1, 1:-1]) / self.dy ** 2 + \
-             (h[1:-1, 2:] + h[1:-1, :-2] - 2 * h[1:-1, 1:-1]) / self.dx ** 2) - \
-            self.g * self.f / (c ** 2) * h[1:-1, 1:-1]) 
+        # Replace NaN (land points) with 0 *before* any arithmetic so that the
+        # Laplacian never produces NaN.  The naive pattern
+        #   q = jnp.where(jnp.isnan(q), 0, q)
+        # masks forward NaN correctly but still lets JAX evaluate
+        #   d/dc[-g*f0/c² * h_land] = 2*g*f0/c³ * NaN
+        # in the backward pass, giving  0 * NaN = NaN  in the gradient w.r.t. c.
+        # Using a safe h here breaks that chain entirely.
+        h_safe = jnp.where(jnp.isnan(h), 0.0, h)
 
-        q = jnp.where(jnp.isnan(q),0,q)
+        if self.formulation == 'sf':
+            phi  = (self.g / self.f) * h_safe
+            phib = (self.g / self.f) * hb
+            q = q.at[1:-1, 1:-1].set(
+                ((phi[2:, 1:-1] + phi[:-2, 1:-1] - 2 * phi[1:-1, 1:-1]) / self.dy ** 2 +
+                 (phi[1:-1, 2:] + phi[1:-1, :-2] - 2 * phi[1:-1, 1:-1]) / self.dx ** 2) -
+                (self.f0 / c_int) ** 2 * phi[1:-1, 1:-1])
+            q = q.at[self.ind12].set(-(self.f0 / c_bdy) ** 2 * phib[self.ind12])
+        else:
+            q = q.at[1:-1, 1:-1].set(
+                self.g / self.f0 * \
+                ((h_safe[2:, 1:-1] + h_safe[:-2, 1:-1] - 2 * h_safe[1:-1, 1:-1]) / self.dy ** 2 + \
+                 (h_safe[1:-1, 2:] + h_safe[1:-1, :-2] - 2 * h_safe[1:-1, 1:-1]) / self.dx ** 2) - \
+                self.g * self.f0 / (c_int ** 2) * h_safe[1:-1, 1:-1])
+            q = q.at[self.ind12].set(-self.g * self.f0 / (c_bdy ** 2) * hb[self.ind12])
 
-        q = q.at[self.ind12].set(- \
-            self.g * self.f / (c ** 2) * hb[self.ind12])
-        
         q = q.at[self.ind0].set(0)
 
         return q
     
-    def pv2h(self, q, hb, qb):
+    def pv2h(self, q, hb, qb, helmoltz_dst):
 
         """ PV to SSH 
 
@@ -300,6 +390,8 @@ class Qgm:
             q (2D array): SSH field.
             hb (2D array): Background SSH field
             qb (2D array): Background PV field
+            helmoltz_dst: DST Helmholtz operator (explicit arg so that
+                changing self.helmoltz_dst never requires JIT re-registration).
 
         Returns:
             h: SSH field
@@ -307,18 +399,23 @@ class Qgm:
 
         # Interior pv
         qin = q[1:-1,1:-1] - qb[1:-1,1:-1]
-        
-        # Inverse sine tranfrom to get reconstructed SSH
-        h = jnp.zeros_like(q,dtype=self.dtype)
-        inv = inverse_elliptic_dst(qin, self.helmoltz_dst)
-        h = h.at[1:-1, 1:-1].set(inv)
 
-        # add the boundary value
-        h += hb
+        if self.formulation == 'sf':
+            phib = (self.g / self.f) * hb
+            phi = jnp.zeros_like(q, dtype=self.dtype)
+            inv = inverse_elliptic_dst(qin, helmoltz_dst)
+            phi = phi.at[1:-1, 1:-1].set(inv)
+            phi += phib
+            h = (self.f / self.g) * phi
+        else:
+            h = jnp.zeros_like(q, dtype=self.dtype)
+            inv = inverse_elliptic_dst(qin, helmoltz_dst)
+            h = h.at[1:-1, 1:-1].set(inv)
+            h += hb
 
         return h
 
-    def rhs(self,u,v,q,way=1):
+    def rhs(self, u, v, ua, va, var0, way=1):
 
         """ increment
 
@@ -333,7 +430,14 @@ class Qgm:
 
         """
 
-        q0 = +q
+        if len(var0.shape) == 3:
+            q0 = var0[0]
+            c0 = var0[1:]
+        else:
+            q0 = var0
+            c0 = None
+
+        incr = jnp.zeros_like(var0, dtype=self.dtype)
 
 
         #######################
@@ -347,11 +451,17 @@ class Qgm:
         vm = jnp.where(v_on_T > 0, 0, v_on_T)
 
         # PV advection
-        rhs_q = self.adv(up, vp, um, vm, q0)
+        if self.advect_pv:
+            rhs_q = self.adv(up, vp, um, vm, q0)
+        else:
+            rhs_q = jnp.zeros_like(q0, dtype=self.dtype)
 
         # Bathymetry
         if self.bathymetry_PV_term is not None:
-            rhs_q += self.adv(up, vp, um, vm, self.f * self.bathymetry_PV_term)
+            if self.formulation == 'sf':
+                rhs_q += self.adv(up, vp, um, vm, self.f * self.bathymetry_PV_term)
+            else:
+                rhs_q += self.adv(up, vp, um, vm, self.f0 * self.bathymetry_PV_term)
 
         # Beta plane
         if self.beta is not None:
@@ -371,8 +481,45 @@ class Qgm:
         rhs_q = jnp.where(jnp.isnan(rhs_q), 0, rhs_q)
         rhs_q = rhs_q.at[self.ind12].set(0)
         rhs_q = rhs_q.at[self.ind0].set(0)
-            
-        return rhs_q
+
+        if c0 is not None:
+            incr = incr.at[0].set(rhs_q)
+
+            if self.ageo_velocities:
+                ua_on_T = way * 0.5 * (ua[1:-1,1:-1] + ua[1:-1,2:])
+                va_on_T = way * 0.5 * (va[1:-1,1:-1] + va[2:,1:-1])
+                uap = jnp.where(ua_on_T < 0, 0, ua_on_T)
+                uam = jnp.where(ua_on_T > 0, 0, ua_on_T)
+                vap = jnp.where(va_on_T < 0, 0, va_on_T)
+                vam = jnp.where(va_on_T > 0, 0, va_on_T)
+                up += uap
+                um += uam
+                vp += vap
+                vm += vam
+
+            u_mask = self.ocean_h[1:-1,1:-1]
+            up = up * u_mask
+            um = um * u_mask
+            vp = vp * u_mask
+            vm = vm * u_mask
+
+            for i in range(c0.shape[0]):
+                rhs_c = self.adv(up, vp, um, vm, c0[i])
+                if self.Kdiffus_trac is not None:
+                    rhs_c = rhs_c.at[2:-2,2:-2].set(
+                        rhs_c[2:-2,2:-2] +
+                        self.Kdiffus_trac/(self.dx**2) *
+                            (c0[i,2:-2,3:-1] + c0[i,2:-2,1:-3] - 2*c0[i,2:-2,2:-2]) +
+                        self.Kdiffus_trac/(self.dy**2) *
+                            (c0[i,3:-1,2:-2] + c0[i,1:-3,2:-2] - 2*c0[i,2:-2,2:-2])
+                    )
+                rhs_c = jnp.where(jnp.isnan(rhs_c), 0, rhs_c)
+                rhs_c = rhs_c.at[self.ind0].set(0)
+                incr = incr.at[i+1].set(rhs_c)
+        else:
+            incr = rhs_q
+
+        return incr
 
     def adv(self, up, vp, um, vm, q0):
 
@@ -403,7 +550,7 @@ class Qgm:
 
         return var0 + way * self.dt * incr
 
-    def rk2(self, var0, incr, hb, qb, way):
+    def rk2(self, var0, incr, ua, va, hb, qb, way, helmoltz_dst):
 
         """
             2rd-order Runge-Kutta time scheme
@@ -413,24 +560,23 @@ class Qgm:
         var12 = var0 + 0.5*incr*self.dt
         if len(incr.shape)==3:
             q12 = var12[0]
-            c12 = var12[1:]
         else:
             q12 = +var12
-        h12 = self.pv2h_jit(q12,hb,qb)
+        h12 = self.pv2h_jit(q12,hb,qb,helmoltz_dst)
         u12,v12 = self.h2uv_jit(h12)
         u12 = jnp.where(jnp.isnan(u12),0,u12)
         v12 = jnp.where(jnp.isnan(v12),0,v12)
         if len(incr.shape)==3:
-            var12 = jnp.append(q12[jnp.newaxis,:,:],c12,axis=0)
+            var12 = jnp.append(q12[jnp.newaxis,:,:], var12[1:], axis=0)
         else:
             var12 = +q12
-        incr12 = self.rhs_jit(u12,v12,var12,way=way)
+        incr12 = self.rhs_jit(u12, v12, ua, va, var12, way=way)
 
         var1 = var0 + self.dt * incr12
 
         return var1
 
-    def rk3(self, var0, incr, hb, qb, way):
+    def rk3(self, var0, incr, ua, va, hb, qb, way, helmoltz_dst):
 
         """
             3rd-order Runge-Kutta time scheme
@@ -442,2738 +588,277 @@ class Qgm:
         var12 = var0 + 0.5 * self.dt * incr
         if len(incr.shape) == 3:
             q12 = var12[0]
-            c12 = var12[1:]
         else:
             q12 = +var12
-        h12 = self.pv2h_jit(q12, hb, qb)
+        h12 = self.pv2h_jit(q12, hb, qb, helmoltz_dst)
         u12, v12 = self.h2uv_jit(h12)
         u12 = jnp.where(jnp.isnan(u12), 0, u12)
         v12 = jnp.where(jnp.isnan(v12), 0, v12)
         if len(incr.shape) == 3:
-            var12 = jnp.append(q12[jnp.newaxis, :, :], c12, axis=0)
+            var12 = jnp.append(q12[jnp.newaxis, :, :], var12[1:], axis=0)
         else:
             var12 = +q12
-        incr12 = self.rhs_jit(u12, v12, var12, way=way)
+        incr12 = self.rhs_jit(u12, v12, ua, va, var12, way=way)
         
         # k3
         var13 = var0 - self.dt * incr + 2 * self.dt * incr12
         if len(incr.shape) == 3:
             q13 = var13[0]
-            c13 = var13[1:]
         else:
             q13 = +var13
-        h13 = self.pv2h_jit(q13, hb, qb)
+        h13 = self.pv2h_jit(q13, hb, qb, helmoltz_dst)
         u13, v13 = self.h2uv_jit(h13)
         u13 = jnp.where(jnp.isnan(u13), 0, u13)
         v13 = jnp.where(jnp.isnan(v13), 0, v13)
         if len(incr.shape) == 3:
-            var13 = jnp.append(q13[jnp.newaxis, :, :], c13, axis=0)
+            var13 = jnp.append(q13[jnp.newaxis, :, :], var13[1:], axis=0)
         else:
             var13 = +q13
-        incr13 = self.rhs_jit(u13, v13, var13, way=way)
+        incr13 = self.rhs_jit(u13, v13, ua, va, var13, way=way)
         
         var_final = var0 + (self.dt / 6) * (incr + 4 * incr12 + incr13)
         
         return var_final
 
     
-    def one_step(self, h0, q0, hb, qb, way=1):
-
-        """
-            One step forward
-        """
-
-        # Compute geostrophic velocities
-        u, v = self.h2uv_jit(h0)
-
-        # Compute increment
-        incr = self.rhs_jit(u,v,q0,way=way)
-        
-        # Time integration 
-        if self.time_scheme == 'Euler':
-            q1 = self.euler_jit(q0, incr, way)
-        elif self.time_scheme == 'rk2':
-            q1 = self.rk2_jit(q0, incr, hb, qb, way)
-        elif self.time_scheme == 'rk3':
-            q1 = self.rk3_jit(q0, incr, hb, qb, way)
-
-        # Elliptical inversion 
-        h1 = self.pv2h_jit(q1, hb, qb)
-
-        return h1, q1
-
-    def one_step_for_scan(self,X0,X):
-
-        """
-            One step forward for scan
-        """
-
-        h1, q1, hb, qb = X0
-        h1, q1 = self.one_step_jit(h1, q1, hb, qb)
-        X = (h1, q1, hb, qb)
-
-        return X,X
-
-    def step(self, h0, hb, nstep=1):
-
-        """ Propagation
-
-        Args:
-            h0 (2D array): initial SSH
-            hb (2D array): background SSH
-            nstep (int): number of time-step
-
-        Returns:
-            h1 (2D array): propagated SSH
-
-        """
-
-        # Add MDT
-        if self.mdt is not None:
-            h0 += self.mdt
-            hb += self.mdt
-
-        # Compute potential voriticy
-        q0 = self.h2pv_jit(h0, hb)
-        qb = self.h2pv_jit(hb, hb)
-
-        # Init
-        h1 = +h0
-        q1 = +q0
-    
-        # Time propagation
-        #X1, _ = scan(self.one_step_for_scan_jit, init=(h1, q1, hb, qb), xs=jnp.zeros(nstep))
-        #h1, q1, hb, qb = X1
-        for _ in range(nstep):
-            h1, q1 = self.one_step_jit(h1, q1, hb, qb)
-    
-        # Mask
-        h1 = h1.at[self.ind0].set(jnp.nan)
-
-        # Back to sla
-        if self.mdt is not None:
-            h1 -= self.mdt
-
-        return h1
-
-    def step_tgl(self, dh0, h0, hb, nstep=1):
-
-        _, dh1 = jvp(partial(self.step_jit, hb=hb, nstep=nstep), (h0,), (dh0,))
-
-        return dh1
-    
-    def step_adj(self,adh0,h0,hb,nstep=1):
-        
-        _, adf = vjp(partial(self.step_jit,hb=hb,nstep=nstep), h0)
-        
-        return adf(adh0)[0]
-    
-class Qgm_sf:
-
-    ###########################################################################
-    #                             Initialization                              #
-    ###########################################################################
-    def __init__(self, dx=None, dy=None, dt=None, SSH=None, c=None, Kdiffus=None, upwind=3, g=9.81, f=1e-4, time_scheme='Euler', compile=True, mdt=None, bathymetry_PV_term=None, ** kwargs):
-
-        # Grid shape
-        ny, nx, = np.shape(dx)
-        self.nx = nx
-        self.ny = ny
-
-        # Grid spacing
-        if hasattr(dx, "__len__"):
-            self.dx = dx[int(ny/2),int(nx/2)].astype('float64')
-            self.dy = dy[int(ny/2),int(nx/2)].astype('float64') 
-        else:
-            self.dx = dx
-            self.dy = dy
-
-        # Time step
-        self.dt = dt
-
-        # Gravity
-        self.g = g
-
-        # Coriolis
-        if hasattr(f, "__len__"):
-            self.f = f.astype('float64')
-            # Beta plane
-            self.beta = (f[2:,:] - f[:-2,:]) / (2*self.dy)
-        else:
-            self.f = f.astype('float64')
-            self.beta = None
-        
-        self.f0 = self.f.mean()
-
-
-        # Rossby radius
-        if hasattr(c, "__len__"):
-            self.c = np.nanmean(c).astype('float64')
-        else:
-            self.c = c.astype('float64')
-
-        # MDT
-        self.mdt = mdt
-
-        # Bathymetry
-        self.bathymetry_PV_term = bathymetry_PV_term
-
-        # Spatial scheme
-        self.upwind = upwind
-
-        # Time scheme
-        self.time_scheme = time_scheme
-
-        # Elliptical inversion operator
-        x, y = np.meshgrid(np.arange(1, nx - 1, dtype='float64'),
-                           np.arange(1, ny - 1, dtype='float64'))
-        laplace_dst = 2 * (np.cos(np.pi / (nx - 1) * x) - 1) / self.dx ** 2 + \
-                      2 * (np.cos(np.pi / (ny - 1) * y) - 1) / self.dy ** 2
-        self.helmoltz_dst = laplace_dst - (self.f0 / self.c) ** 2
-            
-
-        ################
-        # Mask array
-        ################
-        # mask=3 away from the coasts
-        mask = 3 * np.ones((ny,nx),dtype='int64')
-
-        # mask=1 for borders of the domain 
-        mask[0,:] = 1
-        mask[:,0] = 1
-        mask[-1,:] = 1
-        mask[:,-1] = 1
-
-        # mask=2 for pixels adjacent to the borders 
-        mask[1,1:-1] = 2
-        mask[1:-1,1] = 2
-        mask[-2,1:-1] = 2
-        mask[-3,1:-1] = 2
-        mask[1:-1,-2] = 2
-        mask[1:-1,-3] = 2
-
-        # mask=0 on land 
-        if SSH is not None:
-            isNAN = np.isnan(SSH) # get land pixels
-            mask[isNAN] = 0
-            indNan = np.argwhere(isNAN)
-            for i,j in indNan:
-                for p1 in range(-2,3):
-                    for p2 in range(-2,3):
-                        itest=i+p1
-                        jtest=j+p2
-                        if ((itest>=0) & (itest<=ny-1) & (jtest>=0) & (jtest<=nx-1)):
-                            # mask=1 for coast pixels
-                            if (mask[itest,jtest]>=2) and (p1 in [-1,0,1] and p2 in [-1,0,1]):
-                                mask[itest,jtest] = 1   
-                            # mask=1 for pixels adjacent to the coast
-                            elif (mask[itest,jtest]==3):
-                                mask[itest,jtest] = 2     
-        
-        self.mask = mask
-        self.ind0 = mask==0
-        self.ind1 = mask==1
-        self.ind2 = mask==2
-        self.ind12 = self.ind1 + self.ind2
-
-        # Diffusion coefficient 
-        self.Kdiffus = Kdiffus
-
-        # JIT compiling functions
-        if compile:
-            self.phi2uv_jit = jit(self.phi2uv)
-            self.phi2pv_jit = jit(self.phi2pv)
-            self.pv2phi_jit = jit(self.pv2phi)
-            self.rhs_jit = jit(self.rhs)
-            self.adv_jit = jit(self.adv)
-            self.euler_jit = jit(self.euler)
-            self.rk2_jit = jit(self.rk2)
-            self.rk3_jit = jit(self.rk3)
-            self.one_step_jit = jit(self.one_step)
-            self.one_step_for_scan_jit = jit(self.one_step_for_scan)
-            self.step_jit = jit(self.step, static_argnums=2)
-            self.step_tgl_jit = jit(self.step_tgl, static_argnums=3)
-            self.step_adj_jit = jit(self.step_adj, static_argnums=3)
-
-    def phi2uv(self, phi):
-        """ SSH to U,V
-
-        Args:
-            h (2D array): SSH field.
-
-        Returns:
-            u (2D array): Zonal velocity
-            v (2D array): Meridional velocity
-
-        """
-    
-        u = jnp.zeros((self.ny,self.nx))
-        v = jnp.zeros((self.ny,self.nx))
-
-        u = u.at[1:-1,1:].set(-(phi[2:,:-1]+phi[2:,1:]-phi[:-2,1:]-phi[:-2,:-1])/(4*self.dy))
-
-        v = v.at[1:,1:-1].set((phi[1:,2:]+phi[:-1,2:]-phi[:-1,:-2]-phi[1:,:-2])/(4*self.dx))
-
-        u = jnp.where(jnp.isnan(u),0,u)
-        v = jnp.where(jnp.isnan(v),0,v)
-            
-        return u,v
-
-    def phi2pv(self, phi, phib, c=None):
-        """ SSH to PV
-
-        Args:
-            h (2D array): SSH field.
-            hb (2D array): Background SSH field
-
-        Returns:
-            q: Potential Vorticity field
-        """
-
-        if c is None:
-            c = self.c
-
-        q = jnp.zeros((self.ny, self.nx),dtype='float64')
-
-        q = q.at[1:-1, 1:-1].set(
-            ((phi[2:, 1:-1] + phi[:-2, 1:-1] - 2 * phi[1:-1, 1:-1]) / self.dy ** 2 + \
-             (phi[1:-1, 2:] + phi[1:-1, :-2] - 2 * phi[1:-1, 1:-1]) / self.dx ** 2) - \
-             (self.f0 / c) ** 2 * phi[1:-1, 1:-1]) 
-
-        q = jnp.where(jnp.isnan(q),0,q)
-
-        q = q.at[self.ind12].set(- \
-            (self.f0 / c) ** 2  * phib[self.ind12])
-        
-        q = q.at[self.ind0].set(0)
-
-        return q
-    
-    def pv2phi(self, q, phib, qb):
-
-        """ PV to SSH 
-
-        Args:
-            q (2D array): SSH field.
-            hb (2D array): Background SSH field
-            qb (2D array): Background PV field
-
-        Returns:
-            h: SSH field
-        """
-
-        # Interior pv
-        qin = q[1:-1,1:-1] - qb[1:-1,1:-1]
-        
-        # Inverse sine tranfrom to get reconstructed SSH
-        phi = jnp.zeros_like(q,dtype='float64')
-        inv = inverse_elliptic_dst(qin, self.helmoltz_dst)
-        phi = phi.at[1:-1, 1:-1].set(inv)
-
-        # add the boundary value
-        phi += phib
-
-        return phi
-
-    def rhs(self,u,v,q,way=1):
-
-        """ increment
-
-        Args:
-            u (2D array): Zonal velocity
-            v (2D array): Meridional velocity
-            q : PV start
-            way: forward (+1) or backward (-1)
-
-        Returns:
-            rhs (2D array): advection increment
-
-        """
-
-        q0 = +q
-
-
-        #######################
-        # Upwind current
-        #######################
-        u_on_T = way*0.5*(u[1:-1,1:-1]+u[1:-1,2:])
-        v_on_T = way*0.5*(v[1:-1,1:-1]+v[2:,1:-1])
-        up = jnp.where(u_on_T < 0, 0, u_on_T)
-        um = jnp.where(u_on_T > 0, 0, u_on_T)
-        vp = jnp.where(v_on_T < 0, 0, v_on_T)
-        vm = jnp.where(v_on_T > 0, 0, v_on_T)
-
-        # PV advection
-        rhs_q = self.adv(up, vp, um, vm, q0)
-
-        # Bathymetry
-        if self.bathymetry_PV_term is not None:
-            rhs_q += self.adv(up, vp, um, vm, self.f * self.bathymetry_PV_term)
-
-        # Beta plane
-        if self.beta is not None:
-            rhs_q = rhs_q.at[2:-2,2:-2].set(
-                    rhs_q[2:-2,2:-2] - way * self.beta[1:-1,2:-2] * (v[2:-2,2:-2]+v[3:-1,2:-2])/2)
-            
-        # PV Diffusion
-        if self.Kdiffus is not None:
-            rhs_q = rhs_q.at[2:-2,2:-2].set(
-                rhs_q[2:-2,2:-2] +\
-                self.Kdiffus/(self.dx**2)*\
-                    (q0[2:-2,3:-1]+q0[2:-2,1:-3]-2*q0[2:-2,2:-2]) +\
-                self.Kdiffus/(self.dy**2)*\
-                    (q0[3:-1,2:-2]+q0[1:-3,2:-2]-2*q0[2:-2,2:-2])
-            )
-
-        rhs_q = jnp.where(jnp.isnan(rhs_q), 0, rhs_q)
-        rhs_q = rhs_q.at[self.ind12].set(0)
-        rhs_q = rhs_q.at[self.ind0].set(0)
-            
-        return rhs_q
-
-    def adv(self, up, vp, um, vm, q0):
-
-        """
-            3rd-order upwind scheme
-        """
-
-        ugradq = jnp.zeros_like(q0,dtype='float64')
-
-        ugradq = ugradq.at[2:-2,2:-2].set(
-            - up[1:-1,1:-1] * 1 / (6 * self.dx) * \
-            (2 * q0[2:-2, 3:-1] + 3 * q0[2:-2, 2:-2] - 6 * q0[2:-2, 1:-3] + q0[2:-2, :-4]) \
-            + um[1:-1,1:-1] * 1 / (6 * self.dx) * \
-            (q0[2:-2, 4:] - 6 * q0[2:-2, 3:-1] + 3 * q0[2:-2, 2:-2] + 2 * q0[2:-2, 1:-3]) \
-            - vp[1:-1,1:-1] * 1 / (6 * self.dy) * \
-            (2 * q0[3:-1, 2:-2] + 3 * q0[2:-2, 2:-2] - 6 * q0[1:-3, 2:-2] + q0[:-4, 2:-2]) \
-            + vm[1:-1,1:-1] * 1 / (6 * self.dy) * \
-            (q0[4:, 2:-2] - 6 * q0[3:-1, 2:-2] + 3 * q0[2:-2, 2:-2] + 2 * q0[1:-3, 2:-2])
-            )
-
-        return ugradq
-    
-    def euler(self, var0, incr, way):
-
-        """
-            Euler time scheme
-        """
-
-        return var0 + way * self.dt * incr
-
-    def rk2(self, var0, incr, phib, qb, way):
-
-        """
-            2rd-order Runge-Kutta time scheme
-        """
-
-        # k2
-        var12 = var0 + 0.5*incr*self.dt
-        if len(incr.shape)==3:
-            q12 = var12[0]
-            c12 = var12[1:]
-        else:
-            q12 = +var12
-        phi12 = self.pv2phi_jit(q12, phib, qb)
-        u12,v12 = self.phi2uv_jit(phi12)
-        u12 = jnp.where(jnp.isnan(u12),0,u12)
-        v12 = jnp.where(jnp.isnan(v12),0,v12)
-        if len(incr.shape)==3:
-            var12 = jnp.append(q12[jnp.newaxis,:,:],c12,axis=0)
-        else:
-            var12 = +q12
-        incr12 = self.rhs_jit(u12,v12,var12,way=way)
-
-        var1 = var0 + self.dt * incr12
-
-        return var1
-
-    def rk3(self, var0, incr, phib, qb, way):
-
-        """
-            3rd-order Runge-Kutta time scheme
-        """
-        # k1
-        var1 = var0 + self.dt * incr
-        
-        # k2
-        var12 = var0 + 0.5 * self.dt * incr
-        if len(incr.shape) == 3:
-            q12 = var12[0]
-            c12 = var12[1:]
-        else:
-            q12 = +var12
-        phi12 = self.pv2phi_jit(q12, phib, qb)
-        u12, v12 = self.phi2uv_jit(phi12)
-        u12 = jnp.where(jnp.isnan(u12), 0, u12)
-        v12 = jnp.where(jnp.isnan(v12), 0, v12)
-        if len(incr.shape) == 3:
-            var12 = jnp.append(q12[jnp.newaxis, :, :], c12, axis=0)
-        else:
-            var12 = +q12
-        incr12 = self.rhs_jit(u12, v12, var12, way=way)
-        
-        # k3
-        var13 = var0 - self.dt * incr + 2 * self.dt * incr12
-        if len(incr.shape) == 3:
-            q13 = var13[0]
-            c13 = var13[1:]
-        else:
-            q13 = +var13
-        phi13 = self.pv2phi_jit(q13, phib, qb)
-        u13, v13 = self.phi2uv_jit(phi13)
-        u13 = jnp.where(jnp.isnan(u13), 0, u13)
-        v13 = jnp.where(jnp.isnan(v13), 0, v13)
-        if len(incr.shape) == 3:
-            var13 = jnp.append(q13[jnp.newaxis, :, :], c13, axis=0)
-        else:
-            var13 = +q13
-        incr13 = self.rhs_jit(u13, v13, var13, way=way)
-        
-        var_final = var0 + (self.dt / 6) * (incr + 4 * incr12 + incr13)
-        
-        return var_final
-
-    
-    def one_step(self, phi0, q0, phib, qb, way=1):
-
-        """
-            One step forward
-        """
-
-        # Compute geostrophic velocities
-        u, v = self.phi2uv_jit(phi0)
-
-        # Compute increment
-        incr = self.rhs_jit(u,v,q0,way=way)
-        
-        # Time integration 
-        if self.time_scheme == 'Euler':
-            q1 = self.euler_jit(q0, incr, way)
-        elif self.time_scheme == 'rk2':
-            q1 = self.rk2_jit(q0, incr, phib, qb, way)
-        elif self.time_scheme == 'rk3':
-            q1 = self.rk3_jit(q0, incr, phib, qb, way)
-
-        # Elliptical inversion 
-        phi1 = self.pv2phi_jit(q1, phib, qb)
-
-        return phi1, q1
-
-    def one_step_for_scan(self,X0,X):
-
-        """
-            One step forward for scan
-        """
-
-        phi1, q1, phib, qb = X0
-        phi1, q1 = self.one_step_jit(phi1, q1, phib, qb)
-        X = (phi1, q1, phib, qb)
-
-        return X,X
-
-    def step(self, h0, hb, nstep=1):
-
-        """ Propagation
-
-        Args:
-            h0 (2D array): initial SSH
-            hb (2D array): background SSH
-            nstep (int): number of time-step
-
-        Returns:
-            h1 (2D array): propagated SSH
-
-        """
-
-        # Add MDT
-        if self.mdt is not None:
-            h0 += self.mdt
-            hb += self.mdt
-
-        # Compute streamfunction
-        phi0 = (self.g / self.f) * h0
-        phib = (self.g / self.f) * hb
-
-        # Compute potential voriticy
-        q0 = self.phi2pv_jit(phi0, phib)
-        qb = self.phi2pv_jit(phib, phib)
-
-        # Init
-        phi1 = +phi0
-        q1 = +q0
-    
-        # Time propagation
-        for _ in range(nstep):
-            phi1, q1 = self.one_step_jit(phi1, q1, phib, qb)
-        
-        # Mask
-        phi1 = phi1.at[self.ind0].set(jnp.nan)
-
-        # Back to SSH
-        h1 = (self.f / self.g) * phi1
-
-        # Back to sla
-        if self.mdt is not None:
-            h1 -= self.mdt
-
-        return h1
-
-    def step_tgl(self, dh0, h0, hb, nstep=1):
-
-        _, dh1 = jvp(partial(self.step_jit, hb=hb, nstep=nstep), (h0,), (dh0,))
-
-        return dh1
-    
-    def step_adj(self,adh0,h0,hb,nstep=1):
-        
-        _, adf = vjp(partial(self.step_jit,hb=hb,nstep=nstep), h0)
-        
-        return adf(adh0)[0]
-
-class QgmWithTiles(Qgm):
-    
-    def __init__(self, dx=None, dy=None, dt=None, SSH=None, c=None, Kdiffus=None,
-                 upwind=3, g=9.81, f=1e-4, time_scheme='Euler', mdt=None, 
-                 tile_size=64, tile_overlap=8, **kwargs):
-        """
-        Initialize the QGM model with tiling and overlapping.
-        """
-        super().__init__(dx, dy, dt, SSH, c, Kdiffus, upwind, g, f, time_scheme, compile=False, **kwargs)
-
-        # Coriolis
-        if hasattr(f, "__len__"):
-            self.f = f.astype('float64')
-        else:
-            self.f = (f * np.ones((self.ny,self.nx))).astype('float64')
-
-        # MDT
-        self.mdt = mdt
-
-        # Rossby radius
-        if hasattr(c, "__len__"):
-            self.c = c.astype('float64')
-        else:
-            self.c = c * np.ones((self.ny,self.nx)).astype('float64')
-
-        # Tiling parameters
-        self.tile_size = tile_size
-        self.tile_overlap = tile_overlap
-
-        # Compute tile boundaries
-        self.tiles = self.construct_overlapping_tiles()
-
-        # For Elliptical solver
-        x, y = np.meshgrid(np.arange(1, self.tile_size - 1, dtype='float64'),
-                    np.arange(1, self.tile_size - 1, dtype='float64'))
-        self.laplace_dst_tile = 2 * (np.cos(np.pi / (self.tile_size - 1) * x) - 1) / self.dx ** 2 + \
-                    2 * (np.cos(np.pi / (self.tile_size - 1) * y) - 1) / self.dy ** 2
-        
-        # Spatial window for each tile
-        win = np.ones(tile_size)
-        win[:tile_overlap] = gaspari_cohn(np.arange(0,self.tile_size),tile_overlap)[:tile_overlap][::-1]
-        win[-tile_overlap:] = gaspari_cohn(np.arange(0,self.tile_size),tile_overlap)[:tile_overlap]
-        self.weights_space = win[:,np.newaxis] * win[np.newaxis,:]
-
-        self.weights_space_sum = np.zeros((self.ny, self.nx))
-        for i,j in self.tiles:
-            self.weights_space_sum[i:i+tile_size,j:j+tile_size] += self.weights_space
-
-        # JIT compiling functions
-        self.one_step_jit = jit(self.one_step)
-        self.step_jit = jit(self.step, static_argnums=2)
-        self.step_tgl_jit = jit(self.step_tgl, static_argnums=3)
-        self.step_adj_jit = jit(self.step_adj, static_argnums=3)
-
-    def construct_overlapping_tiles(self):
-        ny, nx = self.ny, self.nx
-        tiles = []
-        
-        for y in range(0, ny, self.tile_size - self.tile_overlap):
-            for x in range(0, nx, self.tile_size - self.tile_overlap):
-                y_start = max(y, 0)
-                if y_start + self.tile_size > ny:
-                    y_start = ny - self.tile_size
-                x_start = max(x, 0)
-                if x_start + self.tile_size > nx:
-                    x_start = nx - self.tile_size
-                tiles.append((y_start, x_start))
-        
-        return tiles
-    
-    def h2uv(self, h, f):
-        """ SSH to U,V
-
-        Args:
-            h (2D array): SSH field.
-
-        Returns:
-            u (2D array): Zonal velocity
-            v (2D array): Meridional velocity
-
-        """
-    
-        u = jnp.zeros_like(h)
-        v = jnp.zeros_like(h)
-
-        u = u.at[1:-1,1:].set(- self.g/f*\
-         (h[2:,:-1]+h[2:,1:]-h[:-2,1:]-h[:-2,:-1])/(4*self.dy))
-             
-        v = v.at[1:,1:-1].set(self.g/f*\
-            (h[1:,2:]+h[:-1,2:]-h[:-1,:-2]-h[1:,:-2])/(4*self.dx))
-        
-        u = jnp.where(jnp.isnan(u),0,u)
-        v = jnp.where(jnp.isnan(v),0,v)
-            
-        return u,v
-
-    def h2pv(self, h, hb, f, c, ind12, ind0):
-        """ SSH to PV
-
-        Args:
-            h (2D array): SSH field.
-            hb (2D array): Background SSH field
-
-        Returns:
-            q: Potential Vorticity field
-        """
-
-       
-
-        q = jnp.zeros((self.tile_size, self.tile_size), dtype='float64')
-
-        q = q.at[1:-1, 1:-1].set(
-            self.g / f * \
-            ((h[2:, 1:-1] + h[:-2, 1:-1] - 2 * h[1:-1, 1:-1]) / self.dy ** 2 + \
-             (h[1:-1, 2:] + h[1:-1, :-2] - 2 * h[1:-1, 1:-1]) / self.dx ** 2) - \
-            self.g * f / (c ** 2) * h[1:-1, 1:-1])
-
-        q = jnp.where(jnp.isnan(q),0,q)
-
-        q = jnp.where(ind12, - self.g * f / (c ** 2) * hb, q)
-        
-        q = jnp.where(ind0, 0, q)
-
-        return q
-    
-    def pv2h(self, q, hb, qb, f, c):
-
-        """ PV to SSH 
-
-        Args:
-            q (2D array): SSH field.
-            hb (2D array): Background SSH field
-            qb (2D array): Background PV field
-
-        Returns:
-            h: SSH field
-        """
-
-        # Interior pv
-        qin = q[1:-1,1:-1] - qb[1:-1,1:-1]
-        
-        # Inverse sine tranfrom to get reconstructed SSH
-        h = jnp.zeros_like(q, dtype='float64')
-        helmoltz_dst  = (self.g / f * self.laplace_dst_tile - self.g * f / c ** 2)
-        inv = inverse_elliptic_dst(qin, helmoltz_dst)
-        h = h.at[1:-1, 1:-1].set(inv)
-
-        # add the boundary value
-        h += hb
-
-        return h
-
-    def rhs(self,u,v,q,ind12,ind0,way=1):
-
-        """ increment
-
-        Args:
-            u (2D array): Zonal velocity
-            v (2D array): Meridional velocity
-            q : PV start
-            way: forward (+1) or backward (-1)
-
-        Returns:
-            rhs (2D array): advection increment
-
-        """
-
-        q0 = +q
-
-
-        #######################
-        # Upwind current
-        #######################
-        u_on_T = way*0.5*(u[1:-1,1:-1]+u[1:-1,2:])
-        v_on_T = way*0.5*(v[1:-1,1:-1]+v[2:,1:-1])
-        up = jnp.where(u_on_T < 0, 0, u_on_T)
-        um = jnp.where(u_on_T > 0, 0, u_on_T)
-        vp = jnp.where(v_on_T < 0, 0, v_on_T)
-        vm = jnp.where(v_on_T > 0, 0, v_on_T)
-
-        #######################
-        # PV advection
-        #######################
-        rhs_q = self.adv(up, vp, um, vm, q0)
-
-        # PV Diffusion
-        if self.Kdiffus is not None:
-            rhs_q = rhs_q.at[2:-2,2:-2].set(
-                rhs_q[2:-2,2:-2] +\
-                self.Kdiffus/(self.dx**2)*\
-                    (q0[2:-2,3:-1]+q0[2:-2,1:-3]-2*q0[2:-2,2:-2]) +\
-                self.Kdiffus/(self.dy**2)*\
-                    (q0[3:-1,2:-2]+q0[1:-3,2:-2]-2*q0[2:-2,2:-2])
-            )
-        rhs_q = jnp.where(jnp.isnan(rhs_q), 0, rhs_q)
-        rhs_q = jnp.where(ind12, 0, rhs_q) 
-        rhs_q = jnp.where(ind0, 0, rhs_q) 
-            
-        return rhs_q
-    
-    def rk2(self, var0, incr, hb, qb, f, c, ind12, ind0, way):
-
-        """
-            2rd-order Runge-Kutta time scheme
-        """
-
-        # k2
-        var12 = var0 + 0.5*incr*self.dt
-        if len(incr.shape)==3:
-            q12 = var12[0]
-            c12 = var12[1:]
-        else:
-            q12 = +var12
-        h12 = self.pv2h(q12,hb,qb,f,c)
-        u12,v12 = self.h2uv(h12,f)
-        u12 = jnp.where(jnp.isnan(u12),0,u12)
-        v12 = jnp.where(jnp.isnan(v12),0,v12)
-        if len(incr.shape)==3:
-            var12 = jnp.append(q12[jnp.newaxis,:,:],c12,axis=0)
-        else:
-            var12 = +q12
-        incr12 = self.rhs(u12,v12,var12,ind12,ind0,way=way)
-
-        var1 = var0 + self.dt * incr12
-
-        return var1
-    
-    def one_step(self, h0, q0, hb, qb, f, c, ind12, ind0, way=1):
-
-        """
-            One step forward
-        """
-
-        # Compute geostrophic velocities
-        u, v = self.h2uv(h0, f)
-
-        # Compute increment
-        incr = self.rhs(u,v,q0,ind12,ind0,way=way)
-        
-        # Time integration 
-        if self.time_scheme == 'Euler':
-            q1 = self.euler(q0, incr, way)
-        elif self.time_scheme == 'rk2':
-            q1 = self.rk2(q0, incr, hb, qb, f, c, ind12, ind0, way)
-
-        # Elliptical inversion 
-        h1 = self.pv2h(q1, hb, qb, f, c)
-
-        return h1, q1
-
-    def one_step_for_scan(self, X0, X, f, c, ind12, ind0):
-
-        """
-            One step forward for scan
-        """
-
-        h1, q1, hb, qb = X0
-        h1, q1 = self.one_step(h1, q1, hb, qb, f, c, ind12, ind0)
-        X = (h1, q1, hb, qb)
-
-        return X,X
-    
-
-    def step_tile(self, y_start, x_start, h0, hb, nstep=1):
-
-        """ Propagation
-
-        Args:
-            h0 (2D array): initial SSH
-            hb (2D array): background SSH
-            nstep (int): number of time-step
-
-        Returns:
-            h1 (2D array): propagated SSH
-
-        """
-        # Compute potential voriticy
-        h0_tile = dynamic_slice_tile(h0, y_start, x_start, self.tile_size, self.tile_size)
-        hb_tile = dynamic_slice_tile(hb, y_start, x_start, self.tile_size, self.tile_size)
-
-        f_tile = jnp.nanmean(dynamic_slice_tile(self.f, y_start, x_start, self.tile_size, self.tile_size))
-        c_tile = jnp.nanmean(dynamic_slice_tile(self.c, y_start, x_start, self.tile_size, self.tile_size))
-
-        ind12_tile = dynamic_slice_tile(self.ind12, y_start, x_start, self.tile_size, self.tile_size)
-        ind0_tile = dynamic_slice_tile(self.ind0, y_start, x_start, self.tile_size, self.tile_size)
-
-        q0_tile = self.h2pv(h0_tile, hb_tile, f_tile, c_tile, ind12_tile, ind0_tile)
-        qb_tile = self.h2pv(hb_tile, hb_tile, f_tile, c_tile, ind12_tile, ind0_tile)
-
-        # Init
-        h1_tile = +h0_tile
-        q1_tile = +q0_tile
-    
-        # Time propagation
-        for _ in range(nstep):
-            h1_tile, q1_tile = self.one_step_jit(h1_tile, q1_tile, hb_tile, qb_tile, f_tile, c_tile, ind12_tile, ind0_tile)
-            
-        # Mask
-        h1_tile = jnp.where(ind0_tile, jnp.nan, h1_tile)
-
-        return h1_tile
-    
-
-    def compute_step_tile(self, y_start, x_start,  h, hb, nstep=1):
-        
-        h1_tile = self.step_tile(y_start, x_start,  h, hb, nstep)
-        # Create an empty array for h updates
-        h1 = jnp.zeros_like(h)
-        h1 = dynamic_update_slice(h1, self.weights_space * h1_tile, (y_start, x_start))
-        return h1
-
-    def step(self, h, hb, nstep=1):
-
-        # Add MDT
-        if self.mdt is not None:
-            h += self.mdt
-            hb += self.mdt
-
-        # Prepare arguments for all tiles
-        tiles_args = jnp.array(self.tiles, dtype=jnp.int32)
-
-        # Compute updates for all tiles in parallel
-        h1_map = jax.vmap(lambda args: partial(self.compute_step_tile, h=h, hb=hb, nstep=nstep)(*args))(tiles_args)
-
-        # Combine updates from all tiles
-        h1 = jnp.sum(h1_map, axis=0) / self.weights_space_sum
-
-        # Back to SLA
-        if self.mdt is not None:
-            h1 -= self.mdt
-
-        return h1
-    
-    def step_tgl(self, dh0, h0, hb, nstep=1):
-
-        _, dh1 = jvp(partial(self.step_jit, hb=hb, nstep=nstep), (h0,), (dh0,))
-
-        return dh1
-    
-    def step_adj(self,adh0,h0,hb,nstep=1):
-        
-        _, adf = vjp(partial(self.step_jit,hb=hb,nstep=nstep), h0)
-        
-        return adf(adh0)[0]
-
-class QgmWithTiles_2(Qgm):
-    def __init__(self, dx=None, dy=None, dt=None, SSH=None, c=None, Kdiffus=None,
-                 upwind=3, g=9.81, f=1e-4, time_scheme='Euler', 
-                 tile_size=64, tile_overlap=8, **kwargs):
-        """
-        Initialize the QGM model with tiling and overlapping.
-        """
-        super().__init__(dx, dy, dt, SSH, c, Kdiffus, upwind, g, f, time_scheme, **kwargs)
-
-        # Coriolis
-        if hasattr(f, "__len__"):
-            self.f = f.astype('float64')
-        else:
-            self.f = (f * np.ones((self.ny,self.nx))).astype('float64')
-
-
-        # Rossby radius
-        if hasattr(c, "__len__"):
-            self.c = c.astype('float64')
-        else:
-            self.c = c * np.ones((self.ny,self.nx)).astype('float64')
-
-        # Tiling parameters
-        self.tile_size = tile_size
-        self.tile_overlap = tile_overlap
-
-        # Compute tile boundaries
-        self.tiles = self.construct_overlapping_tiles()
-
-        # For Elliptical solver
-        x, y = np.meshgrid(np.arange(1, self.tile_size - 1, dtype='float64'),
-                    np.arange(1, self.tile_size - 1, dtype='float64'))
-        self.laplace_dst_tile = 2 * (np.cos(np.pi / (self.tile_size - 1) * x) - 1) / self.dx ** 2 + \
-                    2 * (np.cos(np.pi / (self.tile_size - 1) * y) - 1) / self.dy ** 2
-        
-        # Spatial window for each tile
-        win = np.ones(tile_size)
-        win[:tile_overlap] = gaspari_cohn(np.arange(0,self.tile_size),tile_overlap)[:tile_overlap][::-1]
-        win[-tile_overlap:] = gaspari_cohn(np.arange(0,self.tile_size),tile_overlap)[:tile_overlap]
-        self.weights_space = win[:,np.newaxis] * win[np.newaxis,:]
-
-        self.weights_space_sum = np.zeros((self.ny, self.nx))
-        for i,j in self.tiles:
-            self.weights_space_sum[i:i+tile_size,j:j+tile_size] += self.weights_space
-
-        # JIT compiling functions
-        self.pv2h_jit = jit(self.pv2h)
-
-    def construct_overlapping_tiles(self):
-        ny, nx = self.ny, self.nx
-        tiles = []
-        
-        for y in range(0, ny, self.tile_size - self.tile_overlap):
-            for x in range(0, nx, self.tile_size - self.tile_overlap):
-                y_start = max(y, 0)
-                if y_start + self.tile_size > ny:
-                    y_start = ny - self.tile_size
-                x_start = max(x, 0)
-                if x_start + self.tile_size > nx:
-                    x_start = nx - self.tile_size
-                tiles.append((y_start, x_start))
-        
-        return tiles
-    
-    def pv2h_tile(self, y_start, x_start, q, qb, hb):
-        """
-        PV to SSH for a single tile.
-        """
-        # Extract tile-specific data
-        q_tile = dynamic_slice_tile(q, y_start, x_start, self.tile_size, self.tile_size)
-        qb_tile = dynamic_slice_tile(qb, y_start, x_start, self.tile_size, self.tile_size)
-        hb_tile = dynamic_slice_tile(hb, y_start, x_start, self.tile_size, self.tile_size)
-        f_tile = jnp.nanmean(dynamic_slice_tile(self.f, y_start, x_start, self.tile_size, self.tile_size))
-        c_tile = jnp.nanmean(dynamic_slice_tile(self.c, y_start, x_start, self.tile_size, self.tile_size))
-
-        # Compute Helmholtz DST over the tile
-        helmholtz_dst_tile = (
-            self.g / f_tile
-            * self.laplace_dst_tile
-            - self.g
-            * f_tile
-            / c_tile ** 2
-        )
-
-        # Initialize h_tile and compute the inversion
-        h_tile = jnp.zeros_like(q_tile, dtype='float64')
-        h_inverted = inverse_elliptic_dst(
-            q_tile[1:-1, 1:-1] - qb_tile[1:-1, 1:-1], helmholtz_dst_tile
-        )
-        h_tile = h_tile.at[1:-1, 1:-1].set(h_inverted)
-        h_tile += hb_tile
-
-        return h_tile
-
-    def compute_updated_h(self, y_start, x_start,  q, qb, hb):
-        """
-        Compute the updated h array for a single tile.
-        """
-        h_tile = self.pv2h_tile(y_start, x_start,  q, qb, hb)
-        # Create an empty array for h updates
-        h_update = jnp.zeros_like(q)
-        h_update = dynamic_update_slice(h_update, self.weights_space * h_tile, (y_start, x_start))
-        return h_update
-    
-    def pv2h(self, q, hb, qb):
-        """
-        PV to SSH with overlapping tiles using parallelization.
-        """
-
-        # Prepare arguments for all tiles
-        tiles_args = jnp.array(self.tiles, dtype=jnp.int32)
-
-        # Compute updates for all tiles in parallel
-        h_updates = jax.vmap(lambda args: partial(self.compute_updated_h, q=q, qb=qb, hb=hb)(*args))(tiles_args)
-
-        # Combine updates from all tiles
-        h = jnp.sum(h_updates, axis=0) / self.weights_space_sum
-
-        return h
-    
-    def h2pv_tile(self, y_start, x_start, h, hb, ind12, ind0):
-
-
-        # Extract tile-specific data
-        h_tile = dynamic_slice_tile(h, y_start, x_start, self.tile_size, self.tile_size)
-        hb_tile = dynamic_slice_tile(hb, y_start, x_start, self.tile_size, self.tile_size)
-        f_tile = jnp.nanmean(dynamic_slice_tile(self.f, y_start, x_start, self.tile_size, self.tile_size))
-        c_tile = jnp.nanmean(dynamic_slice_tile(self.c, y_start, x_start, self.tile_size, self.tile_size))
-
-        ind12_tile = dynamic_slice_tile(ind12, y_start, x_start, self.tile_size, self.tile_size)
-        ind0_tile = dynamic_slice_tile(ind0, y_start, x_start, self.tile_size, self.tile_size)
-
-
-        q_tile = jnp.zeros_like(h_tile,dtype='float64')
-
-        q_tile = q_tile.at[1:-1, 1:-1].set(
-            self.g / f_tile * \
-            ((h_tile[2:, 1:-1] + h_tile[:-2, 1:-1] - 2 * h_tile[1:-1, 1:-1]) / self.dy ** 2 + \
-             (h_tile[1:-1, 2:] + h_tile[1:-1, :-2] - 2 * h_tile[1:-1, 1:-1]) / self.dx ** 2) - \
-            self.g * f_tile / (c_tile ** 2) * h_tile[1:-1, 1:-1])
-
-        q_tile = jnp.where(jnp.isnan(q_tile), 0, q_tile)
-
-        q_tile = jnp.where(ind12_tile, self.g * f_tile / (c_tile ** 2) * hb_tile, q_tile)
-
-        q_tile = jnp.where(ind0_tile, 0, q_tile)
-
-        return q_tile
-    
-    def compute_updated_q(self, y_start, x_start,  h, hb, ind12, ind0):
-        """
-        Compute the updated h array for a single tile.
-        """
-        q_tile = self.h2pv_tile(y_start, x_start,  h, hb, ind12, ind0)
-        # Create an empty array for h updates
-        q_update = jnp.zeros_like(h)
-        q_update = dynamic_update_slice(q_update, self.weights_space * q_tile, (y_start, x_start))
-        return q_update
-
-    def h2pv(self, h, hb):
-
-        # Prepare arguments for all tiles
-        tiles_args = jnp.array(self.tiles, dtype=jnp.int32)
-
-        # Compute updates for all tiles in parallel
-        q_updates = jax.vmap(lambda args: partial(self.compute_updated_q, h=h, hb=hb, ind12=self.ind12, ind0=self.ind0)(*args))(tiles_args)
-
-        # Combine updates from all tiles
-        q = jnp.sum(q_updates, axis=0) / self.weights_space_sum
-
-        return q
-
-
-class Qgm_trac:
-
-    ###########################################################################
-    #                             Initialization                              #
-    ###########################################################################
-    def __init__(self, dx=None, dy=None, dt=None, SSH=None, c=None, upwind=3,
-                 g=9.81, f=1e-4, time_scheme='Euler', Wbc=None, Kdiffus=None, Kdiffus_trac=None,bc_trac='OBC',
-                 mdt=None,
-                 ageo_velocities=False,advect_pv=True,
-                 ** kwargs):
-
-        # Grid shape
-        ny, nx, = np.shape(dx)
-        self.nx = nx
-        self.ny = ny
-
-        # Grid spacing
-        if hasattr(dx, "__len__"):
-            self.dx = dx[int(ny/2),int(nx/2)].astype('float64')
-            self.dy = dy[int(ny/2),int(nx/2)].astype('float64') 
-        else:
-            self.dx = dx
-            self.dy = dy
-
-        # Time step
-        self.dt = dt
-
-        # Gravity
-        self.g = g
-
-        # Coriolis
-        if hasattr(f, "__len__"):
-            self.f = np.nanmean(f).astype('float64')
-            # Beta plane
-            self.beta = (f[2:,:] - f[:-2,:]) / (2*self.dy)
-        else:
-            self.f = f.astype('float64')
-            self.beta = None
-
-        # Rossby radius
-        if hasattr(c, "__len__"):
-            self.c = np.nanmean(c).astype('float64')
-        else:
-            self.c = c.astype('float64')
-
-        # MDT
-        self.mdt = mdt
-
-        # Spatial scheme
-        self.upwind = upwind
-
-        # Time scheme
-        self.time_scheme = time_scheme
-
-        # Elliptical inversion operator
-        x, y = np.meshgrid(np.arange(1, nx - 1, dtype='float64'),
-                           np.arange(1, ny - 1, dtype='float64'))
-        laplace_dst = 2 * (np.cos(np.pi / (nx - 1) * x) - 1) / self.dx ** 2 + \
-                      2 * (np.cos(np.pi / (ny - 1) * y) - 1) / self.dy ** 2
-        self.helmoltz_dst = self.g / self.f * laplace_dst - self.g * self.f / self.c ** 2
-
-        # get land pixels
-        if SSH is not None:
-            isNAN = np.isnan(SSH) 
-        else:
-            isNAN = None
-
-        ################
-        # Mask array
-        ################
-
-        # mask=3 away from the coasts
-        mask = np.zeros((ny,nx),dtype='int64')+3
-
-        # mask=1 for borders of the domain 
-        mask[0,:] = 1
-        mask[:,0] = 1
-        mask[-1,:] = 1
-        mask[:,-1] = 1
-
-        # mask=2 for pixels adjacent to the borders 
-        mask[1,1:-1] = 2
-        mask[1:-1,1] = 2
-        mask[-2,1:-1] = 2
-        mask[-3,1:-1] = 2
-        mask[1:-1,-2] = 2
-        mask[1:-1,-3] = 2
-
-        # mask=0 on land 
-        if isNAN is not None:
-            mask[isNAN] = 0
-            indNan = np.argwhere(isNAN)
-            for i,j in indNan:
-                for p1 in range(-2,3):
-                    for p2 in range(-2,3):
-                        itest=i+p1
-                        jtest=j+p2
-                        if ((itest>=0) & (itest<=ny-1) & (jtest>=0) & (jtest<=nx-1)):
-                            # mask=1 for coast pixels
-                            if (mask[itest,jtest]>=2) and (p1 in [-1,0,1] and p2 in [-1,0,1]):
-                                mask[itest,jtest] = 1   
-                            # mask=1 for pixels adjacent to the coast
-                            elif (mask[itest,jtest]==3):
-                                mask[itest,jtest] = 2     
-        
-        self.mask = mask
-        self.ind0 = mask==0
-        self.ind1 = mask==1
-        self.ind2 = mask==2
-        self.ind12 = self.ind1 + self.ind2
-
-        # Weight map to apply boundary conditions 
-        if Wbc is None or np.all(Wbc==0.):
-            self.Wbc = np.zeros((ny,nx),dtype='float64')
-            self.Wbc[self.ind1] = 1.
-        else:
-            self.Wbc = Wbc.astype('float64')
-
-        # Diffusion coefficient 
-        self.Kdiffus = Kdiffus
-        self.Kdiffus_trac = Kdiffus_trac
-
-        # BC
-        self.bc_trac = bc_trac
-
-        # Adect PV flag
-        self.advect_pv = advect_pv
-
-        # Ageostrophic velocities
-        self.ageo_velocities = ageo_velocities
-
-        # JIT compiling functions
-        self.h2uv_jit = jit(self.h2uv)
-        self.h2pv_jit = jit(self.h2pv)
-        self.cg_jit = jit(cg, static_argnums=(1,2,3))
-        self.pv2h_jit = jit(self.pv2h)
-        self.rhs_jit = jit(self.rhs)
-        self.adv_jit = jit(self.adv)
-        self.euler_jit = jit(self.euler)
-        self.rk2_jit = jit(self.rk2)
-        self.rk4_jit = jit(self.rk4)
-        self.bc_jit = jit(self.bc)
-        self.one_step_jit = jit(self.one_step)
-        self.one_step_for_scan_jit = jit(self.one_step_for_scan)
-        self.step_jit = jit(self.step, static_argnums=3)
-        self.step_tgl_jit = jit(self.step_tgl, static_argnums=4)
-        self.step_adj_jit = jit(self.step_adj, static_argnums=4)
-
-    def h2uv(self, h):
-        """ SSH to U,V
-
-        Args:
-            h (2D array): SSH field.
-
-        Returns:
-            u (2D array): Zonal velocity
-            v (2D array): Meridional velocity
-
-        """
-    
-        u = jnp.zeros((self.ny,self.nx))
-        v = jnp.zeros((self.ny,self.nx))
-
-        u = u.at[1:-1,1:].set(- self.g/self.f*\
-         (h[2:,:-1]+h[2:,1:]-h[:-2,1:]-h[:-2,:-1])/(4*self.dy))
-             
-        v = v.at[1:,1:-1].set(self.g/self.f*\
-            (h[1:,2:]+h[:-1,2:]-h[:-1,:-2]-h[1:,:-2])/(4*self.dx))
-        
-        u = jnp.where(jnp.isnan(u),0,u)
-        v = jnp.where(jnp.isnan(v),0,v)
-            
-        return u,v
-
-    def h2pv(self, h, hb, c=None):
-        """ SSH to Q
-
-        Args:
-            h (2D array): SSH field.
-            c (2D array): Phase speed of first baroclinic radius
-
-        Returns:
-            q: Potential Vorticity field
-        """
-
-        if c is None:
-            c = self.c
-
-        q = jnp.zeros((self.ny, self.nx),dtype='float64')
-
-        q = q.at[1:-1, 1:-1].set(
-            self.g / self.f * \
-            ((h[2:, 1:-1] + h[:-2, 1:-1] - 2 * h[1:-1, 1:-1]) / self.dy ** 2 + \
-             (h[1:-1, 2:] + h[1:-1, :-2] - 2 * h[1:-1, 1:-1]) / self.dx ** 2) - \
-            self.g * self.f / (c ** 2) * h[1:-1, 1:-1])
-
-        q = jnp.where(jnp.isnan(q),0,q)
-
-        q = q.at[self.ind12].set(- \
-            self.g * self.f / (c ** 2) * hb[self.ind12])
-        
-        q = q.at[self.ind0].set(0)
-
-        return q
-    
-    def pv2h(self, q, hb, qb):
-
-        # Interior pv
-        qin = q[1:-1,1:-1] - qb[1:-1,1:-1]
-        
-        # Inverse sine tranfrom to get reconstructed SSH
-        h = jnp.zeros_like(q,dtype='float64')
-        inv = inverse_elliptic_dst(qin, self.helmoltz_dst)
-        h = h.at[1:-1, 1:-1].set(inv)
-
-        # add the boundary value
-        h += hb
-
-        return h
-
-    def rhs(self,u,v,ua,va,var0,way=1):
-
-        """ increment
-
-        Args:
-            u (2D array): Zonal velocity
-            v (2D array): Meridional velocity
-            q : PV start
-            way: forward (+1) or backward (-1)
-
-        Returns:
-            rhs (2D array): advection increment
-
-        """
-
-        if len(var0.shape)==3:
-            q0 = var0[0]
-            c0 = var0[1:]
-        else:
-            q0 = var0
-            c0 = None
-
-        incr = jnp.zeros_like(var0,dtype='float64')
-
-        #######################
-        # Upwind current
-        #######################
-        u_on_T = way*0.5*(u[1:-1,1:-1]+u[1:-1,2:])
-        v_on_T = way*0.5*(v[1:-1,1:-1]+v[2:,1:-1])
-        up = jnp.where(u_on_T < 0, 0, u_on_T)
-        um = jnp.where(u_on_T > 0, 0, u_on_T)
-        vp = jnp.where(v_on_T < 0, 0, v_on_T)
-        vm = jnp.where(v_on_T > 0, 0, v_on_T)
-
-        #######################
-        # PV advection
-        #######################
-        if self.advect_pv:
-            # advection
-            rhs_q = self.adv(up, vp, um, vm, q0)
-            # Beta plane
-            if self.beta is not None:
-                rhs_q = rhs_q.at[2:-2,2:-2].set(
-                        rhs_q[2:-2,2:-2] - way * self.beta[1:-1,2:-2] * (v[2:-2,2:-2]+v[3:-1,2:-2])/2)
-        else:
-            rhs_q = jnp.zeros_like(q0,dtype='float64')
-        # PV Diffusion
-        if self.Kdiffus is not None:
-            rhs_q = rhs_q.at[2:-2,2:-2].set(
-                rhs_q[2:-2,2:-2] +\
-                self.Kdiffus/(self.dx**2)*\
-                    (q0[2:-2,3:-1]+q0[2:-2,1:-3]-2*q0[2:-2,2:-2]) +\
-                self.Kdiffus/(self.dy**2)*\
-                    (q0[3:-1,2:-2]+q0[1:-3,2:-2]-2*q0[2:-2,2:-2])
-            )
-        rhs_q = jnp.where(jnp.isnan(rhs_q), 0, rhs_q)
-        rhs_q = rhs_q.at[self.ind12].set(0)
-        rhs_q = rhs_q.at[self.ind0].set(0)
-
-        
-        #######################
-        # Tracer advection
-        #######################
-        if c0 is not None:
-            incr = incr.at[0].set(rhs_q)
-
-            #######################
-            # Ageostrophic upwind current
-            #######################
-            if self.ageo_velocities:
-                ua_on_T = way*0.5*(ua[1:-1,1:-1]+ua[1:-1,2:])
-                va_on_T = way*0.5*(va[1:-1,1:-1]+va[2:,1:-1])
-                uap = jnp.where(ua_on_T < 0, 0, ua_on_T)
-                uam = jnp.where(ua_on_T > 0, 0, ua_on_T)
-                vap = jnp.where(va_on_T < 0, 0, va_on_T)
-                vam = jnp.where(va_on_T > 0, 0, va_on_T)
-                up += uap
-                um += uam
-                vp += vap
-                vm += vam
-        
-            #######################
-            # Advection
-            #######################
-            for i in range(c0.shape[0]):
-                rhs_c = jnp.zeros((self.ny,self.nx),dtype='float64')
-                # Advection
-                rhs_c = self.adv(up, vp, um, vm, c0[i])
-                # Diffusion
-                if self.Kdiffus_trac is not None:
-                    rhs_c = rhs_c.at[2:-2,2:-2].set(
-                        rhs_c[2:-2,2:-2] +\
-                        self.Kdiffus_trac/(self.dx**2)*\
-                            (c0[i,2:-2,3:-1]+c0[i,2:-2,1:-3]-2*c0[i,2:-2,2:-2]) +\
-                        self.Kdiffus_trac/(self.dy**2)*\
-                            (c0[i,3:-1,2:-2]+c0[i,1:-3,2:-2]-2*c0[i,2:-2,2:-2])
-                    )
-                rhs_c = jnp.where(jnp.isnan(rhs_c), 0, rhs_c)
-                rhs_c = rhs_c.at[self.ind0].set(0)
-                incr = incr.at[i+1].set(rhs_c)
-        else:
-            incr = rhs_q
-            
-        return incr
-    
-    def adv(self, up, vp, um, vm, q0):
-
-        """
-            3rd-order upwind scheme
-        """
-
-        ugradq = jnp.zeros_like(q0,dtype='float64')
-
-        ugradq = ugradq.at[2:-2,2:-2].set(
-            - up[1:-1,1:-1] * 1 / (6 * self.dx) * \
-            (2 * q0[2:-2, 3:-1] + 3 * q0[2:-2, 2:-2] - 6 * q0[2:-2, 1:-3] + q0[2:-2, :-4]) \
-            + um[1:-1,1:-1] * 1 / (6 * self.dx) * \
-            (q0[2:-2, 4:] - 6 * q0[2:-2, 3:-1] + 3 * q0[2:-2, 2:-2] + 2 * q0[2:-2, 1:-3]) \
-            - vp[1:-1,1:-1] * 1 / (6 * self.dy) * \
-            (2 * q0[3:-1, 2:-2] + 3 * q0[2:-2, 2:-2] - 6 * q0[1:-3, 2:-2] + q0[:-4, 2:-2]) \
-            + vm[1:-1,1:-1] * 1 / (6 * self.dy) * \
-            (q0[4:, 2:-2] - 6 * q0[3:-1, 2:-2] + 3 * q0[2:-2, 2:-2] + 2 * q0[1:-3, 2:-2])
-            )
-
-        return ugradq
-
-    def euler(self, var0, incr, way):
-
-        return var0 + way * self.dt * incr
-
-    def rk2(self, var0, incr, ua, va, hb, qb, way):
-
-        # k2
-        var12 = var0 + 0.5*incr*self.dt
-        if len(incr.shape)==3:
-            q12 = var12[0]
-            c12 = var12[1:]
-        else:
-            q12 = +var12
-        h12 = self.pv2h_jit(q12,hb,qb)
-        u12,v12 = self.h2uv_jit(h12)
-        u12 = jnp.where(jnp.isnan(u12),0,u12)
-        v12 = jnp.where(jnp.isnan(v12),0,v12)
-        if len(incr.shape)==3:
-            var12 = jnp.append(q12[jnp.newaxis,:,:],c12,axis=0)
-        else:
-            var12 = +q12
-        incr12 = self.rhs_jit(u12,v12,ua,va,var12,way=way)
-
-        var1 = var0 + self.dt * incr12
-
-        return var1
-
-    def rk4(self, q0, rq, ua, va, hb, qb, way):
-
-        # k1
-        k1 = rq * self.dt
-        # k2
-        q2 = q0 + 0.5*k1
-        h2 = self.pv2h_jit(q2,hb,qb)
-        u2,v2 = self.h2uv_jit(h2)
-        u2 = jnp.where(jnp.isnan(u2),0,u2)
-        v2 = jnp.where(jnp.isnan(v2),0,v2)
-        rq2 = self.qrhs_jit(u2,v2,ua,vaq2,hb,way=way)
-        k2 = rq2*self.dt
-        # k3
-        q3 = q0 + 0.5*k2
-        h3 = self.pv2h_jit(q3,hb,qb)
-        u3,v3 = self.h2uv_jit(h3)
-        u3 = jnp.where(jnp.isnan(u3),0,u3)
-        v3 = jnp.where(jnp.isnan(v3),0,v3)
-        rq3 = self.qrhs_jit(u3,v3,ua,vaq3,hb,way=way)
-        k3 = rq3*self.dt
-        # k4
-        q4 = q0 + k2
-        h4 = self.pv2h_jit(q4,hb,qb)
-        u4,v4 = self.h2uv_jit(h4)
-        u4 = jnp.where(jnp.isnan(u4),0,u4)
-        v4 = jnp.where(jnp.isnan(v4),0,v4)
-        rq4 = self.qrhs_jit(u4,v4,ua,va,q4,hb,way=way)
-        k4 = rq4*self.dt
-        # q increment
-        q1 = q0 + (k1 + 2 * k2 + 2 * k3 + k4) / 6.
-
-        return q1
-    
-    def bc(self,var1,var0,u,v,varb):
+    def bc(self, var1, var0, u, v, varb):
 
         """
         Open Boundary Conditions for tracers, following Mellor (1996)
         """
 
-        if len(varb.shape)==3 and varb.shape[0]>1:
+        if len(varb.shape) == 3 and varb.shape[0] > 1:
 
-            # Compute adimensional coefficients fro OBC
-            r1_S = 1/2 * self.dt/self.dy * (v[1,1:-1]  + jnp.abs(v[1,1:-1] ))
-            r2_S = 1/2 * self.dt/self.dy * (v[1,1:-1]  - jnp.abs(v[1,1:-1] ))
-            r1_N = 1/2 * self.dt/self.dy * (v[-1,1:-1]  + jnp.abs(v[-1,1:-1] ))
-            r2_N = 1/2 * self.dt/self.dy * (v[-1,1:-1]  - jnp.abs(v[-1,1:-1] ))
+            r1_S = 1/2 * self.dt/self.dy * (v[1,1:-1]  + jnp.abs(v[1,1:-1]))
+            r2_S = 1/2 * self.dt/self.dy * (v[1,1:-1]  - jnp.abs(v[1,1:-1]))
+            r1_N = 1/2 * self.dt/self.dy * (v[-1,1:-1] + jnp.abs(v[-1,1:-1]))
+            r2_N = 1/2 * self.dt/self.dy * (v[-1,1:-1] - jnp.abs(v[-1,1:-1]))
             r1_W = 1/2 * self.dt/self.dx * (u[1:-1,1] + jnp.abs(u[1:-1,1]))
             r2_W = 1/2 * self.dt/self.dx * (u[1:-1,1] - jnp.abs(u[1:-1,1]))
             r1_E = 1/2 * self.dt/self.dx * (u[1:-1,-1] + jnp.abs(u[1:-1,-1]))
             r2_E = 1/2 * self.dt/self.dx * (u[1:-1,-1] - jnp.abs(u[1:-1,-1]))
 
             for i in range(1, varb.shape[0]):
-
-                if self.bc_trac=='OBC':
-
-                    #######################
-                    # Tracer Open BC
-                    #######################
-                    # South
+                if self.bc_trac == 'OBC':
                     var1 = var1.at[i,0,1:-1].set(
-                        var0[i,0,1:-1] - (r1_S*(var0[i,0,1:-1]-varb[i,0,1:-1]) + r2_S*(var0[i,1,1:-1]-var0[i,0,1:-1])))
-
-                    # North
+                        var0[i,0,1:-1] - (r1_S * (var0[i,0,1:-1] - varb[i,0,1:-1]) +
+                                          r2_S * (var0[i,1,1:-1] - var0[i,0,1:-1])))
                     var1 = var1.at[i,-1,1:-1].set(
-                        var0[i,-1,1:-1] - (r1_N*(var0[i,-1,1:-1]-var0[i,-2,1:-1]) + r2_N*(varb[i,-1,1:-1]-var0[i,-1,1:-1])))
-                    
-                    # West
+                        var0[i,-1,1:-1] - (r1_N * (var0[i,-1,1:-1] - var0[i,-2,1:-1]) +
+                                           r2_N * (varb[i,-1,1:-1] - var0[i,-1,1:-1])))
                     var1 = var1.at[i,1:-1,0].set(
-                        var0[i,1:-1,0] - (r1_W*(var0[i,1:-1,0]-varb[i,1:-1,0]) + r2_W*(var0[i,1:-1,1]-var0[i,1:-1,0])))
-                    
-                    # East
+                        var0[i,1:-1,0] - (r1_W * (var0[i,1:-1,0] - varb[i,1:-1,0]) +
+                                          r2_W * (var0[i,1:-1,1] - var0[i,1:-1,0])))
                     var1 = var1.at[i,1:-1,-1].set(
-                        var0[i,1:-1,-1] - (r1_E*(var0[i,1:-1,-1]-var0[i,1:-1,-2]) + r2_E*(varb[i,1:-1,-1]-var0[i,1:-1,-1])))
-
+                        var0[i,1:-1,-1] - (r1_E * (var0[i,1:-1,-1] - var0[i,1:-1,-2]) +
+                                           r2_E * (varb[i,1:-1,-1] - var0[i,1:-1,-1])))
                 else:
                     var1 = var1.at[i,self.ind12].set(varb[i,self.ind12])
-            
-                #######################
-                # Tracer Relaxation BC
-                #######################
-                var1 = var1.at[i,1:-1,1:-1].set(self.Wbc[1:-1,1:-1] * varb[i,1:-1,1:-1] + (1-self.Wbc[1:-1,1:-1]) * var1[i,1:-1,1:-1])
-            
+
+                if self.sponge_coef > 0.:
+                    var1 = var1.at[i,1:-1,1:-1].add(
+                        self.sponge_coef * self.Wbc[1:-1,1:-1] *
+                        self.ocean_h[1:-1,1:-1] *
+                        (varb[i,1:-1,1:-1] - var1[i,1:-1,1:-1]))
+
+                var1 = var1.at[i, self.ind0].set(varb[i, self.ind0])
+
         return var1
 
-    def one_step(self, h0, ua, va, var0, hb, varb, way=1):
+    def one_step(self, h0, ua, va, var0, hb, varb, way=1, helmoltz_dst=None):
+
+        """
+            One step forward
+        """
+
+        if helmoltz_dst is None:
+            helmoltz_dst = jnp.asarray(self.helmoltz_dst)
 
         # Compute geostrophic velocities
         u, v = self.h2uv_jit(h0)
 
         # Boundary field for PV
-        if len(varb.shape)==3:
+        if len(varb.shape) == 3:
             qb = +varb[0]
         else:
             qb = +varb
-        
+
         # Compute increment
-        incr = self.rhs_jit(u,v,ua,va,var0,way=way)
+        incr = self.rhs_jit(u, v, ua, va, var0, way=way)
         
         # Time integration 
         if self.time_scheme == 'Euler':
             var1 = self.euler_jit(var0, incr, way)
         elif self.time_scheme == 'rk2':
-            var1 = self.rk2_jit(var0, incr, ua, va, hb, qb, way)
-        elif self.time_scheme == 'rk4':
-            var1 = self.rk4_jit(var0, incr, ua, va, hb, qb, way)
+            var1 = self.rk2_jit(var0, incr, ua, va, hb, qb, way, helmoltz_dst)
+        elif self.time_scheme == 'rk3':
+            var1 = self.rk3_jit(var0, incr, ua, va, hb, qb, way, helmoltz_dst)
+        else:
+            raise ValueError(f"Unsupported time_scheme: {self.time_scheme}")
 
-        # Elliptical inversion 
-        if len(var1.shape)==3:
+        # Elliptical inversion — uses the passed helmoltz_dst so that a
+        # changed self.helmoltz_dst is picked up without JIT re-registration.
+        if len(var1.shape) == 3:
             q1 = +var1[0]
         else:
             q1 = +var1
-        h1 = self.pv2h_jit(q1, hb, qb)
+        h1 = self.pv2h_jit(q1, hb, qb, helmoltz_dst)
 
-        # Tracer boundary conditions
-        if ua is not None and va is not None:
-            ubc = u + ua
-            vbc = v + va
-        else:
-            ubc = u
-            vbc = v 
-        var1 = self.bc_jit(var1,var0,ubc,vbc,varb)
+        var1 = self.bc_jit(var1, var0, u + ua, v + va, varb)
 
         return h1, var1
 
-    def one_step_for_scan(self,X0,X):
+    def one_step_for_scan(self, X0, X):
 
-        h1, ua, va, var1, hb, varb = X0
-        h1, var1 = self.one_step_jit(h1, ua, va, var1, hb, varb)
-        X = (h1, ua, va, var1, hb, varb)
+        """
+            One step forward for scan.  helmoltz_dst is carried as a
+            JAX array so the scan kernel never needs recompilation when
+            self.helmoltz_dst is updated between optimizer iterations.
+        """
 
-        return X,X
+        h1, ua, va, var1, hb, varb, helmoltz_dst = X0
+        h1, var1 = self.one_step_jit(h1, ua, va, var1, hb, varb,
+                                     helmoltz_dst=helmoltz_dst)
+        X = (h1, ua, va, var1, hb, varb, helmoltz_dst)
 
-    
-    def step(self, X0, Xb, way=1, nstep=1):
+        return X, X
+
+    def step(self, X0, Xb, nstep=1, c=None):
 
         """ Propagation
 
         Args:
-            h0 (2D array): initial SSH
-            q0 (2D array, optional): initial PV
-            way: forward (+1) or backward (-1)
+            X0 (2D or 3D array): initial SSH or stacked state
+            Xb (2D or 3D array): boundary SSH or stacked boundaries
+            nstep (int): number of time-step
+            c (2D array or None): effective phase-speed field c_eff(x,y).
+                When None (default) the prior self.c scalar baked at __init__
+                is used — behaviour is bit-for-bit identical to the old code.
+                When provided, an area-weighted ocean-mean scalar c_bar is
+                derived and the DST operator is recomputed from c_bar; the
+                full 2-D c field is passed to h2pv so the stretching term
+                uses the spatially-varying c_eff.
 
         Returns:
-            h1 (2D array): propagated SSH
-            q1 (2D array): propagated PV (if q0 is provided)
+            X1 (2D or 3D array): propagated state
 
         """
-    
-        # Get SSH and tracers
-        if len(X0.shape)==3:
-            h0 = +X0[0] # SSH field
+
+        ua0 = va0 = None
+        if len(X0.shape) == 3:
+            h0 = +X0[0]
             if self.ageo_velocities:
                 ua0 = +X0[1]
                 va0 = +X0[2]
-                c0 = +X0[3:] # Tracer concentrations
+                c0 = +X0[3:]
             else:
-                c0 = +X0[1:] # Tracer concentrations
-            hb = +Xb[0] # Boundary field for SSH
-            cb = +Xb[1:] # Boundary fields for tracers
+                c0 = +X0[1:]
+            hb = +Xb[0]
+            cb = +Xb[1:]
         else:
             h0 = +X0
             c0 = None
             hb = +Xb
             cb = None
 
-        # Tracer mask
         if c0 is not None:
-            c0 = c0.at[:,self.ind0].set(0)
-            cb = cb.at[:,self.ind0].set(0)
-        
-        # Add MDT
+            assert cb is not None
+            c0 = c0.at[:,self.ind0].set(cb[:,self.ind0])
+
         if self.mdt is not None:
             h0 += self.mdt
             hb += self.mdt
 
-        # Compute potential voriticy
-        q0 = self.h2pv_jit(h0, hb)
-        qb = self.h2pv_jit(hb, hb)
+        if c is None:
+            # ---- fast path: prior c scalar, baked DST operator (today's code) ----
+            q0 = self.h2pv_jit(h0, hb)
+            qb = self.h2pv_jit(hb, hb)
 
-        # Init
-        h1 = +h0
-        var1 = +q0
-        varb = +qb
-        if self.ageo_velocities:
-            ua = +ua0
-            va = +va0
+            h1 = +h0
+            var1 = +q0
+            varb = +qb
+            if self.ageo_velocities:
+                assert ua0 is not None and va0 is not None
+                ua = +ua0
+                va = +va0
+            else:
+                ua = jnp.zeros_like(h0)
+                va = jnp.zeros_like(h0)
+            if c0 is not None:
+                var1 = jnp.append(var1[jnp.newaxis,:,:], c0, axis=0)
+                varb = jnp.append(varb[jnp.newaxis,:,:], cb, axis=0)
+
+            helmoltz = jnp.asarray(self.helmoltz_dst)
+            X1, _ = scan(
+                self.one_step_for_scan_jit,
+                init=(h1, ua, va, var1, hb, varb, helmoltz),
+                xs=jnp.zeros(nstep)
+            )
+            h1, ua, va, var1, hb, varb, _ = X1
+
         else:
-            ua = va = None
+            # ---- c-aware path: c_eff(x,y) only enters h2pv ----
+            q0 = self.h2pv_jit(h0, hb, c)
+            qb = self.h2pv_jit(hb, hb, c)
 
-        if c0 is not None:
-            var1 = jnp.append(var1[jnp.newaxis,:,:],c0,axis=0)
-            varb = jnp.append(varb[jnp.newaxis,:,:],cb,axis=0)
+            h1 = +h0
+            var1 = +q0
+            varb = +qb
+            if self.ageo_velocities:
+                assert ua0 is not None and va0 is not None
+                ua = +ua0
+                va = +va0
+            else:
+                ua = jnp.zeros_like(h0)
+                va = jnp.zeros_like(h0)
+            if c0 is not None:
+                var1 = jnp.append(var1[jnp.newaxis,:,:], c0, axis=0)
+                varb = jnp.append(varb[jnp.newaxis,:,:], cb, axis=0)
 
-        # Time propagation
-        for _ in range(nstep):
-            h1, var1 = self.one_step_jit(h1, ua, va, var1, hb, varb)
+            helmoltz = jnp.asarray(self.helmoltz_dst)
+            X1, _ = scan(
+                self.one_step_for_scan_jit,
+                init=(h1, ua, va, var1, hb, varb, helmoltz),
+                xs=jnp.zeros(nstep)
+            )
+            h1, ua, va, var1, hb, varb, _ = X1
 
         # Mask
         h1 = h1.at[self.ind0].set(jnp.nan)
-        if len(var1.shape)==3:
+
+        if len(var1.shape) == 3:
             var1 = var1.at[1:,self.ind0].set(np.nan)
-        
-        # Back to sla
+
         if self.mdt is not None:
             h1 -= self.mdt
 
-        # Concatenate
-        if len(var1.shape)==3:
+        if len(var1.shape) == 3:
             if self.ageo_velocities:
-                X1 = jnp.concatenate((h1[jnp.newaxis,:,:],ua0[jnp.newaxis,:,:],va0[jnp.newaxis,:,:],var1[1:]),axis=0)
+                assert ua0 is not None and va0 is not None
+                X1 = jnp.concatenate(
+                    (h1[jnp.newaxis,:,:], ua0[jnp.newaxis,:,:], va0[jnp.newaxis,:,:], var1[1:]),
+                    axis=0
+                )
             else:
-                X1 = jnp.append(h1[jnp.newaxis,:,:],var1[1:],axis=0)
-        else:
-            X1 = h1
-
-        return X1
-
-    def step_tgl(self, dX0, X0, Xb, way=1, nstep=1):
-
-        _, dX1 = jvp(partial(self.step_jit, Xb=Xb, nstep=nstep, way=way), (X0,), (dX0,))
-
-        return dX1
-    
-    def step_adj(self,adX0,X0,Xb,way=1,nstep=1):
-        
-        _, adf = vjp(partial(self.step_jit,Xb=Xb,nstep=nstep,way=way), X0)
-        
-        return adf(adX0)[0]
-
-class Msqg:
-
-    ###########################################################################
-    #                             Initialization                              #
-    ###########################################################################
-    def __init__(self, dx=None, dy=None, dt=None, SSH=None, c=None, upwind=3,
-                 g=9.81, f=1e-4, time_scheme='Euler', Wbc=None, Kdiffus=None, Kdiffus_trac=None,bc_trac='OBC',
-                 mdt=None):
-
-        # Grid shape
-        ny, nx, = np.shape(dx)
-        self.nx = nx
-        self.ny = ny
-
-        # Grid spacing
-        dx = dy = (np.nanmean(dx) + np.nanmean(dy)) / 2
-        self.dx = dx.astype('float64')
-        self.dy = dy.astype('float64') 
-
-        # Time step
-        self.dt = dt
-
-        # Gravity
-        self.g = g
-
-        # Coriolis
-        if hasattr(f, "__len__"):
-            self.f0 = (np.nanmean(f) * np.ones((self.ny,self.nx))).astype('float64')
-            self.f = f
-        else:
-            self.f0 = f
-            self.f = (f * np.ones((self.ny,self.nx))).astype('float64')
-
-
-        # Rossby radius
-        if hasattr(c, "__len__"):
-            self.c0 = (np.nanmean(c) * np.ones((self.ny,self.nx))).astype('float64')
-            self.c = c
-        else:
-            self.c0 = c
-            self.c = c * np.ones((self.ny,self.nx)).astype('float64')
-
-        # Spatial scheme
-        self.upwind = upwind
-
-        # Time scheme
-        self.time_scheme = time_scheme
-
-        # Elliptical inversion operator
-        x, y = np.meshgrid(np.arange(1, nx - 1, dtype='float64'),
-                           np.arange(1, ny - 1, dtype='float64'))
-        laplace_dst = 2 * (np.cos(np.pi / (nx - 1) * x) - 1) / self.dx ** 2 + \
-                      2 * (np.cos(np.pi / (ny - 1) * y) - 1) / self.dy ** 2
-        self.helmoltz_dst = self.g / self.f[1:ny-1,1:nx-1] * laplace_dst - self.g * self.f[1:ny-1,1:nx-1] / self.c[1:ny-1,1:nx-1] ** 2
-
-        # get land pixels
-        if SSH is not None:
-            isNAN = np.isnan(SSH) 
-        else:
-            isNAN = None
-
-        ################
-        # Mask array
-        ################
-
-        # mask=3 away from the coasts
-        mask = np.zeros((ny,nx),dtype='int64')+3
-
-        # mask=1 for borders of the domain 
-        mask[0,:] = 1
-        mask[:,0] = 1
-        mask[-1,:] = 1
-        mask[:,-1] = 1
-
-        # mask=2 for pixels adjacent to the borders 
-        mask[1,1:-1] = 2
-        mask[1:-1,1] = 2
-        mask[-2,1:-1] = 2
-        mask[-3,1:-1] = 2
-        mask[1:-1,-2] = 2
-        mask[1:-1,-3] = 2
-
-        # mask=0 on land 
-        if isNAN is not None:
-            mask[isNAN] = 0
-            indNan = np.argwhere(isNAN)
-            for i,j in indNan:
-                for p1 in range(-2,3):
-                    for p2 in range(-2,3):
-                        itest=i+p1
-                        jtest=j+p2
-                        if ((itest>=0) & (itest<=ny-1) & (jtest>=0) & (jtest<=nx-1)):
-                            # mask=1 for coast pixels
-                            if (mask[itest,jtest]>=2) and (p1 in [-1,0,1] and p2 in [-1,0,1]):
-                                mask[itest,jtest] = 1   
-                            # mask=1 for pixels adjacent to the coast
-                            elif (mask[itest,jtest]==3):
-                                mask[itest,jtest] = 2     
-        
-        self.mask = mask
-        self.ind0 = mask==0
-        self.ind1 = mask==1
-        self.ind2 = mask==2
-        self.ind12 = self.ind1 + self.ind2
-
-        # Weight map to apply boundary conditions 
-        if Wbc is None or np.all(Wbc==0.):
-            self.Wbc = np.zeros((ny,nx),dtype='float64')
-            self.Wbc[self.ind1] = 1.
-        else:
-            self.Wbc = Wbc.astype('float64')
-
-        # Diffusion coefficient 
-        self.Kdiffus = Kdiffus
-        self.Kdiffus_trac = Kdiffus_trac
-
-        # BC
-        self.bc_trac = bc_trac
-
-        self.ageo_velocities = None
-        self.advect_pv = True
-
-        # JIT compiling functions
-        self.h2uv_jit = jit(self.h2uv)
-        self.h2pv_jit = jit(self.h2pv)
-        self.pv2h_jit = jit(self.pv2h)
-        self.rhs_jit = jit(self.rhs)
-        self._adv_jit = jit(self._adv)
-        self._adv1_jit = jit(self._adv1)
-        self._adv2_jit = jit(self._adv2)
-        self._adv3_jit = jit(self._adv3)
-        self.euler_jit = jit(self.euler)
-        self.rk2_jit = jit(self.rk2)
-        self.rk4_jit = jit(self.rk4)
-        self.bc_jit = jit(self.bc)
-        self.one_step_jit = jit(self.one_step)
-        self.one_step_for_scan_jit = jit(self.one_step_for_scan)
-        self.step_jit = jit(self.step, static_argnums=3)
-        self.step_tgl_jit = jit(self.step_tgl, static_argnums=4)
-        self.step_adj_jit = jit(self.step_adj, static_argnums=4)
-
-
-
-    def h2uv(self, h):
-        """ SSH to U,V
-
-        Args:
-            h (2D array): SSH field.
-
-        Returns:
-            u (2D array): Zonal velocity
-            v (2D array): Meridional velocity
-
-        """
-    
-        u = jnp.zeros((self.ny,self.nx))
-        v = jnp.zeros((self.ny,self.nx))
-
-        u = u.at[1:-1,1:].set(- self.g/self.f[1:-1,1:]*\
-         (h[2:,:-1]+h[2:,1:]-h[:-2,1:]-h[:-2,:-1])/(4*self.dy))
-             
-        v = v.at[1:,1:-1].set(self.g/self.f[1:,1:-1]*\
-            (h[1:,2:]+h[:-1,2:]-h[:-1,:-2]-h[1:,:-2])/(4*self.dx))
-        
-        u = jnp.where(jnp.isnan(u),0,u)
-        v = jnp.where(jnp.isnan(v),0,v)
-            
-        return u,v
-
-    def h2pv(self, h, hbc, c=None):
-        """ SSH to Q
-
-        Args:
-            h (2D array): SSH field.
-            c (2D array): Phase speed of first baroclinic radius
-
-        Returns:
-            q: Potential Vorticity field
-        """
-
-        if c is None:
-            c = self.c
-
-        q = jnp.zeros((self.ny, self.nx),dtype='float64')
-
-        q = q.at[1:-1, 1:-1].set(
-            self.g / self.f[1:-1, 1:-1] * \
-            ((h[2:, 1:-1] + h[:-2, 1:-1] - 2 * h[1:-1, 1:-1]) / self.dy ** 2 + \
-             (h[1:-1, 2:] + h[1:-1, :-2] - 2 * h[1:-1, 1:-1]) / self.dx ** 2) - \
-            self.g * self.f[1:-1, 1:-1] / (c[1:-1, 1:-1] ** 2) * h[1:-1, 1:-1])
-
-        q = jnp.where(jnp.isnan(q),0,q)
-
-        q = q.at[self.ind12].set(- \
-            self.g * self.f[self.ind12] / (c[self.ind12] ** 2) * hbc[self.ind12])
-        
-        q = q.at[self.ind0].set(0)
-
-        return q
-
-    def rhs(self,u,v,ua,va,var0,way=1):
-
-        """ increment
-
-        Args:
-            u (2D array): Zonal velocity
-            v (2D array): Meridional velocity
-            q : PV start
-            way: forward (+1) or backward (-1)
-
-        Returns:
-            rhs (2D array): advection increment
-
-        """
-
-        if len(var0.shape)==3:
-            q0 = var0[0]
-            c0 = var0[1:]
-        else:
-            q0 = var0
-            c0 = None
-
-        incr = jnp.zeros_like(var0,dtype='float64')
-
-
-        #######################
-        # Upwind current
-        #######################
-        u_on_T = way*0.5*(u[1:-1,1:-1]+u[1:-1,2:])
-        v_on_T = way*0.5*(v[1:-1,1:-1]+v[2:,1:-1])
-        up = jnp.where(u_on_T < 0, 0, u_on_T)
-        um = jnp.where(u_on_T > 0, 0, u_on_T)
-        vp = jnp.where(v_on_T < 0, 0, v_on_T)
-        vm = jnp.where(v_on_T > 0, 0, v_on_T)
-
-        #######################
-        # PV advection
-        #######################
-        if self.advect_pv:
-            rhs_q = self._adv_jit(up, vp, um, vm, q0)
-            rhs_q = rhs_q.at[2:-2,2:-2].set(
-                    rhs_q[2:-2,2:-2] - way*\
-                        (self.f[3:-1,2:-2]-self.f[1:-3,2:-2])/(2*self.dy)\
-                            *0.5*(v[2:-2,2:-2]+v[3:-1,2:-2]))
-        else:
-            rhs_q = jnp.zeros_like(q0,dtype='float64')
-        # PV Diffusion
-        if self.Kdiffus is not None:
-            rhs_q = rhs_q.at[2:-2,2:-2].set(
-                rhs_q[2:-2,2:-2] +\
-                self.Kdiffus/(self.dx**2)*\
-                    (q0[2:-2,3:-1]+q0[2:-2,1:-3]-2*q0[2:-2,2:-2]) +\
-                self.Kdiffus/(self.dy**2)*\
-                    (q0[3:-1,2:-2]+q0[1:-3,2:-2]-2*q0[2:-2,2:-2])
-            )
-        rhs_q = jnp.where(jnp.isnan(rhs_q), 0, rhs_q)
-        rhs_q = rhs_q.at[self.ind12].set(0)
-        rhs_q = rhs_q.at[self.ind0].set(0)
-
-        
-        #######################
-        # Tracer advection
-        #######################
-        if c0 is not None:
-            incr = incr.at[0].set(rhs_q)
-
-            #######################
-            # Ageostrophic upwind current
-            #######################
-            ua_on_T = way*0.5*(ua[1:-1,1:-1]+ua[1:-1,2:])
-            va_on_T = way*0.5*(va[1:-1,1:-1]+va[2:,1:-1])
-            uap = jnp.where(ua_on_T < 0, 0, ua_on_T)
-            uam = jnp.where(ua_on_T > 0, 0, ua_on_T)
-            vap = jnp.where(va_on_T < 0, 0, va_on_T)
-            vam = jnp.where(va_on_T > 0, 0, va_on_T)
-            #######################
-            # Advection
-            #######################
-            for i in range(c0.shape[0]):
-                rhs_c = jnp.zeros((self.ny,self.nx),dtype='float64')
-                # Advection
-                rhs_c = self._adv_jit(up+uap, vp+vap, um+uam, vm+vam, c0[i])
-                # Diffusion
-                if self.Kdiffus_trac is not None:
-                    rhs_c = rhs_c.at[2:-2,2:-2].set(
-                        rhs_c[2:-2,2:-2] +\
-                        self.Kdiffus_trac/(self.dx**2)*\
-                            (c0[i,2:-2,3:-1]+c0[i,2:-2,1:-3]-2*c0[i,2:-2,2:-2]) +\
-                        self.Kdiffus_trac/(self.dy**2)*\
-                            (c0[i,3:-1,2:-2]+c0[i,1:-3,2:-2]-2*c0[i,2:-2,2:-2])
-                    )
-                rhs_c = jnp.where(jnp.isnan(rhs_c), 0, rhs_c)
-                rhs_c = rhs_c.at[self.ind0].set(0)
-                incr = incr.at[i+1].set(rhs_c)
-        else:
-            incr = rhs_q
-            
-        return incr
-    
-    def _adv(self,up, vp, um, vm, var0):
-        """
-            main function for upwind schemes
-        """
-        
-        res = jnp.zeros_like(var0,dtype='float64')
-
-        if self.upwind == 1:
-            res = res.at[1:-1,1:-1].set(self._adv1_jit(up, vp, um, vm, var0))
-        elif self.upwind == 2:
-            res = res.at[2:-2,2:-2].set(self._adv2_jit(up, vp, um, vm, var0))
-        elif self.upwind == 3:
-            res = res.at[2:-2,2:-2].set(self._adv3_jit(up, vp, um, vm, var0))
-
-        # Use first order scheme for boundary pixels
-        if self.upwind>1 and self.bc_trac=='OBC':
-            res_tmp = jnp.zeros_like(var0,dtype='float64')
-            res_tmp = res_tmp.at[1:-1, 1:-1].set(self._adv1_jit(up, vp, um, vm, var0))
-            res = res.at[self.ind2].set(res_tmp[self.ind2])
-        
-        return res
-
-    def _adv1(self, up, vp, um, vm, var0):
-
-        """
-            1st-order upwind scheme
-        """
-
-        res = \
-            - up  / self.dx * (var0[1:-1, 1:-1] - var0[1:-1, :-2]) \
-            + um  / self.dx * (var0[1:-1, 1:-1] - var0[1:-1, 2:])  \
-            - vp  / self.dy * (var0[1:-1, 1:-1] - var0[:-2, 1:-1]) \
-            + vm  / self.dy * (var0[1:-1, 1:-1] - var0[2:, 1:-1])
-
-        return res
-
-    def _adv2(self, up, vp, um, vm, var0):
-
-        """
-            2nd-order upwind scheme
-        """
-
-        res = \
-            - up[1:-1,1:-1] * 1 / (2 * self.dx) * \
-                (3 * var0[2:-2, 2:-2] - 4 * var0[2:-2, 1:-3] + var0[2:-2, :-4]) \
-            + um[1:-1,1:-1] * 1 / (2 * self.dx) * \
-                (var0[2:-2, 4:] - 4 * var0[2:-2, 3:-1] + 3 * var0[2:-2, 2:-2]) \
-            - vp[1:-1,1:-1] * 1 / (2 * self.dy) * \
-                (3 * var0[2:-2, 2:-2] - 4 * var0[1:-3, 2:-2] + var0[:-4, 2:-2]) \
-            + vm[1:-1,1:-1] * 1 / (2 * self.dy) * \
-                (var0[4:, 2:-2] - 4 * var0[3:-1, 2:-2] + 3 * var0[2:-2, 2:-2])
-
-        return res
-
-    def _adv3(self, up, vp, um, vm, var0):
-
-        """
-            3rd-order upwind scheme
-        """
-
-        res = \
-            - up[1:-1,1:-1] * 1 / (6 * self.dx) * \
-            (2 * var0[2:-2, 3:-1] + 3 * var0[2:-2, 2:-2] - 6 * var0[2:-2, 1:-3] + var0[2:-2, :-4]) \
-            + um[1:-1,1:-1] * 1 / (6 * self.dx) * \
-            (var0[2:-2, 4:] - 6 * var0[2:-2, 3:-1] + 3 * var0[2:-2, 2:-2] + 2 * var0[2:-2, 1:-3]) \
-            - vp[1:-1,1:-1] * 1 / (6 * self.dy) * \
-            (2 * var0[3:-1, 2:-2] + 3 * var0[2:-2, 2:-2] - 6 * var0[1:-3, 2:-2] + var0[:-4, 2:-2]) \
-            + vm[1:-1,1:-1] * 1 / (6 * self.dy) * \
-            (var0[4:, 2:-2] - 6 * var0[3:-1, 2:-2] + 3 * var0[2:-2, 2:-2] + 2 * var0[1:-3, 2:-2])
-
-        return res
-
-    def pv2h(self, q, hb, qb):
-
-        # Interior pv
-        qin = q[1:-1,1:-1] - qb[1:-1,1:-1]
-        
-        # Inverse sine tranfrom to get reconstructed ssh
-        hrec = jnp.zeros_like(q,dtype='float64')
-        inv = inverse_elliptic_dst(qin, self.helmoltz_dst)
-        hrec = hrec.at[1:-1, 1:-1].set(inv)
-
-        # add the boundary value
-        hrec += hb
-
-        return hrec
-
-    def euler(self, var0, incr, way):
-
-        return var0 + way * self.dt * incr
-
-    def rk2(self, var0, incr, ua, va, hb, qb, way):
-
-        # k2
-        var12 = var0 + 0.5*incr*self.dt
-        if len(incr.shape)==3:
-            q12 = var12[0]
-            c12 = var12[1:]
-        else:
-            q12 = +var12
-        h12 = self.pv2h_jit(q12,hb,qb)
-        u12,v12 = self.h2uv_jit(h12)
-        u12 = jnp.where(jnp.isnan(u12),0,u12)
-        v12 = jnp.where(jnp.isnan(v12),0,v12)
-        if len(incr.shape)==3:
-            var12 = jnp.append(q12[jnp.newaxis,:,:],c12,axis=0)
-        else:
-            var12 = +q12
-        incr12 = self.rhs_jit(u12,v12,ua,va,var12,way=way)
-
-        var1 = var0 + self.dt * incr12
-
-        return var1
-
-    def rk4(self, q0, rq, ua, va, hb, qb, way):
-
-        # k1
-        k1 = rq * self.dt
-        # k2
-        q2 = q0 + 0.5*k1
-        h2 = self.pv2h_jit(q2,hb,qb)
-        u2,v2 = self.h2uv_jit(h2)
-        u2 = jnp.where(jnp.isnan(u2),0,u2)
-        v2 = jnp.where(jnp.isnan(v2),0,v2)
-        rq2 = self.qrhs_jit(u2,v2,ua,vaq2,hb,way=way)
-        k2 = rq2*self.dt
-        # k3
-        q3 = q0 + 0.5*k2
-        h3 = self.pv2h_jit(q3,hb,qb)
-        u3,v3 = self.h2uv_jit(h3)
-        u3 = jnp.where(jnp.isnan(u3),0,u3)
-        v3 = jnp.where(jnp.isnan(v3),0,v3)
-        rq3 = self.qrhs_jit(u3,v3,ua,vaq3,hb,way=way)
-        k3 = rq3*self.dt
-        # k4
-        q4 = q0 + k2
-        h4 = self.pv2h_jit(q4,hb,qb)
-        u4,v4 = self.h2uv_jit(h4)
-        u4 = jnp.where(jnp.isnan(u4),0,u4)
-        v4 = jnp.where(jnp.isnan(v4),0,v4)
-        rq4 = self.qrhs_jit(u4,v4,ua,va,q4,hb,way=way)
-        k4 = rq4*self.dt
-        # q increment
-        q1 = q0 + (k1 + 2 * k2 + 2 * k3 + k4) / 6.
-
-        return q1
-    
-    def bc(self,var1,var0,u,v,varb):
-
-        """
-        Open Boundary Conditions for tracers, following Mellor (1996)
-        """
-
-        if len(varb.shape)==3 and varb.shape[0]>1:
-
-            # Compute adimensional coefficients fro OBC
-            r1_S = 1/2 * self.dt/self.dy * (v[1,1:-1]  + jnp.abs(v[1,1:-1] ))
-            r2_S = 1/2 * self.dt/self.dy * (v[1,1:-1]  - jnp.abs(v[1,1:-1] ))
-            r1_N = 1/2 * self.dt/self.dy * (v[-1,1:-1]  + jnp.abs(v[-1,1:-1] ))
-            r2_N = 1/2 * self.dt/self.dy * (v[-1,1:-1]  - jnp.abs(v[-1,1:-1] ))
-            r1_W = 1/2 * self.dt/self.dx * (u[1:-1,1] + jnp.abs(u[1:-1,1]))
-            r2_W = 1/2 * self.dt/self.dx * (u[1:-1,1] - jnp.abs(u[1:-1,1]))
-            r1_E = 1/2 * self.dt/self.dx * (u[1:-1,-1] + jnp.abs(u[1:-1,-1]))
-            r2_E = 1/2 * self.dt/self.dx * (u[1:-1,-1] - jnp.abs(u[1:-1,-1]))
-
-            for i in range(1, varb.shape[0]):
-
-                if self.bc_trac=='OBC':
-
-                    #######################
-                    # Tracer Open BC
-                    #######################
-                    # South
-                    var1 = var1.at[i,0,1:-1].set(
-                        var0[i,0,1:-1] - (r1_S*(var0[i,0,1:-1]-varb[i,0,1:-1]) + r2_S*(var0[i,1,1:-1]-var0[i,0,1:-1])))
-
-                    # North
-                    var1 = var1.at[i,-1,1:-1].set(
-                        var0[i,-1,1:-1] - (r1_N*(var0[i,-1,1:-1]-var0[i,-2,1:-1]) + r2_N*(varb[i,-1,1:-1]-var0[i,-1,1:-1])))
-                    
-                    # West
-                    var1 = var1.at[i,1:-1,0].set(
-                        var0[i,1:-1,0] - (r1_W*(var0[i,1:-1,0]-varb[i,1:-1,0]) + r2_W*(var0[i,1:-1,1]-var0[i,1:-1,0])))
-                    
-                    # East
-                    var1 = var1.at[i,1:-1,-1].set(
-                        var0[i,1:-1,-1] - (r1_E*(var0[i,1:-1,-1]-var0[i,1:-1,-2]) + r2_E*(varb[i,1:-1,-1]-var0[i,1:-1,-1])))
-
-                else:
-                    var1 = var1.at[i,self.ind12].set(varb[i,self.ind12])
-            
-                #######################
-                # Tracer Relaxation BC
-                #######################
-                var1 = var1.at[i,1:-1,1:-1].set(self.Wbc[1:-1,1:-1] * varb[i,1:-1,1:-1] + (1-self.Wbc[1:-1,1:-1]) * var1[i,1:-1,1:-1])
-            
-        return var1
-
-    def one_step(self, h0, ua, va, var0, hb, varb, way=1):
-
-        # Compute geostrophic velocities
-        u, v = self.h2uv_jit(h0)
-
-        # Boundary field for PV
-        if len(varb.shape)==3:
-            qb = +varb[0]
-        else:
-            qb = +varb
-        
-        # Compute increment
-        incr = self.rhs_jit(u,v,ua,va,var0,way=way)
-        
-        # Time integration 
-        if self.time_scheme == 'Euler':
-            var1 = self.euler_jit(var0, incr, way)
-        elif self.time_scheme == 'rk2':
-            var1 = self.rk2_jit(var0, incr, ua, va, hb, qb, way)
-        elif self.time_scheme == 'rk4':
-            var1 = self.rk4_jit(var0, incr, ua, va, hb, qb, way)
-
-        # Elliptical inversion 
-        if len(var1.shape)==3:
-            q1 = +var1[0]
-        else:
-            q1 = +var1
-        h1 = self.pv2h_jit(q1, hb, qb)
-
-        # Tracer boundary conditions
-        var1 = self.bc_jit(var1,var0,u+ua,v+va,varb)
-
-        return h1, var1
-
-    def one_step_for_scan(self,X0,X):
-
-        h1, ua, va, var1, hb, varb = X0
-        h1, var1 = self.one_step_jit(h1, ua, va, var1, hb, varb)
-        X = (h1, ua, va, var1, hb, varb)
-
-        return X,X
-
-    
-    def step(self, X0, Xb, way=1, nstep=1):
-
-        """ Propagation
-
-        Args:
-            h0 (2D array): initial SSH
-            q0 (2D array, optional): initial PV
-            way: forward (+1) or backward (-1)
-
-        Returns:
-            h1 (2D array): propagated SSH
-            q1 (2D array): propagated PV (if q0 is provided)
-
-        """
-
-        # Get SSH and tracers
-        if len(X0.shape)==3:
-            h0 = +X0[0] # SSH field
-            if self.ageo_velocities:
-                ua0 = +X0[1]
-                va0 = +X0[2]
-                c0 = +X0[3:] # Tracer concentrations
-            else:
-                c0 = +X0[1:] # Tracer concentrations
-            hb = +Xb[0] # Boundary field for SSH
-            cb = +Xb[1:] # Boundary fields for tracers
-        else:
-            h0 = +X0
-            c0 = None
-            hb = +Xb
-            cb = None
-
-        # Tracer mask
-        if c0 is not None:
-            c0 = c0.at[:,self.ind0].set(0)
-            cb = cb.at[:,self.ind0].set(0)
-        # h-->q
-        q0 = self.h2pv_jit(h0, hb)
-        qb = self.h2pv_jit(hb, hb)
-
-        # Init
-        h1 = +h0
-        var1 = +q0
-        varb = +qb
-        if self.ageo_velocities:
-            ua = +ua0
-            va = +va0
-        else:
-            ua = jnp.zeros_like(h0)
-            va = jnp.zeros_like(h0)
-        if c0 is not None:
-            var1 = jnp.append(var1[jnp.newaxis,:,:],c0,axis=0)
-            varb = jnp.append(varb[jnp.newaxis,:,:],cb,axis=0)
-
-        # Time propagation
-        X1, _ = scan(self.one_step_for_scan_jit, init=(h1, ua, va, var1, hb, varb), xs=jnp.zeros(nstep))
-        h1, ua, va, var1, hb, varb = X1
-
-        # Mask
-        h1 = h1.at[self.ind0].set(jnp.nan)
-        if len(var1.shape)==3:
-            var1 = var1.at[1:,self.ind0].set(np.nan)
-
-        # Concatenate
-        if len(var1.shape)==3:
-            if self.ageo_velocities:
-                X1 = jnp.concatenate((h1[jnp.newaxis,:,:],ua0[jnp.newaxis,:,:],va0[jnp.newaxis,:,:],var1[1:]),axis=0)
-            else:
-                X1 = jnp.append(h1[jnp.newaxis,:,:],var1[1:],axis=0)
+                X1 = jnp.append(h1[jnp.newaxis,:,:], var1[1:], axis=0)
         else:
             X1 = +h1
 
         return X1
 
-    def step_tgl(self, dX0, X0, Xb, way=1, nstep=1):
+    def step_tgl(self, dX0, X0, Xb, nstep=1, c=None):
 
-        _, dX1 = jvp(partial(self.step_jit, Xb=Xb, nstep=nstep, way=way), (X0,), (dX0,))
+        _, dX1 = jvp(partial(self.step_jit, Xb=Xb, nstep=nstep, c=c), (X0,), (dX0,))
 
         return dX1
     
-    def step_adj(self,adX0,X0,Xb,way=1,nstep=1):
+    def step_adj(self, adX0, X0, Xb, nstep=1, c=None):
         
-        _, adf = vjp(partial(self.step_jit,Xb=Xb,nstep=nstep,way=way), X0)
+        _, adf = vjp(partial(self.step_jit, Xb=Xb, nstep=nstep, c=c), X0)
         
         return adf(adX0)[0]
 
-class Qgm_old:
 
-    ###########################################################################
-    #                             Initialization                              #
-    ###########################################################################
-    def __init__(self, dx=None, dy=None, dt=None, SSH=None, c=None, Kdiffus=None, upwind=3, g=9.81, f=1e-4, time_scheme='Euler', compile=True, mdt=None, ** kwargs):
-
-        # Grid shape
-        ny, nx, = np.shape(dx)
-        self.nx = nx
-        self.ny = ny
-
-        # Grid spacing
-        dx = dy = (np.nanmean(dx) + np.nanmean(dy)) / 2
-        self.dx = dx.astype('float64')
-        self.dy = dy.astype('float64') 
-
-        # Time step
-        self.dt = dt
-
-        # Gravity
-        self.g = g
-
-        # Coriolis
-        if hasattr(f, "__len__"):
-            self.f = (np.nanmean(f) * np.ones((self.ny,self.nx))).astype('float64')
-        else:
-            self.f = (f * np.ones((self.ny,self.nx))).astype('float64')
-
-
-        # Rossby radius
-        if hasattr(c, "__len__"):
-            self.c = (np.nanmean(c) * np.ones((self.ny,self.nx))).astype('float64')
-        else:
-            self.c = c * np.ones((self.ny,self.nx)).astype('float64')
-
-        # MDT
-        self.mdt = mdt
-
-        # Spatial scheme
-        self.upwind = upwind
-
-        # Time scheme
-        self.time_scheme = time_scheme
-
-        # Elliptical inversion operator
-        x, y = np.meshgrid(np.arange(1, nx - 1, dtype='float64'),
-                        np.arange(1, ny - 1, dtype='float64'))
-        laplace_dst = 2 * (np.cos(np.pi / (nx - 1) * x) - 1) / self.dx ** 2 + \
-                    2 * (np.cos(np.pi / (ny - 1) * y) - 1) / self.dy ** 2
-        self.helmoltz_dst = self.g / self.f[1:ny-1,1:nx-1] * laplace_dst - self.g * self.f[1:ny-1,1:nx-1] / self.c[1:ny-1,1:nx-1] ** 2
-            
-
-        ################
-        # Mask array
-        ################
-        # mask=3 away from the coasts
-        mask = 3 * np.ones((ny,nx),dtype='int64')
-
-        # mask=1 for borders of the domain 
-        mask[0,:] = 1
-        mask[:,0] = 1
-        mask[-1,:] = 1
-        mask[:,-1] = 1
-
-        # mask=2 for pixels adjacent to the borders 
-        mask[1,1:-1] = 2
-        mask[1:-1,1] = 2
-        mask[-2,1:-1] = 2
-        mask[-3,1:-1] = 2
-        mask[1:-1,-2] = 2
-        mask[1:-1,-3] = 2
-
-        # mask=0 on land 
-        if SSH is not None:
-            isNAN = np.isnan(SSH) # get land pixels
-            mask[isNAN] = 0
-            indNan = np.argwhere(isNAN)
-            for i,j in indNan:
-                for p1 in range(-2,3):
-                    for p2 in range(-2,3):
-                        itest=i+p1
-                        jtest=j+p2
-                        if ((itest>=0) & (itest<=ny-1) & (jtest>=0) & (jtest<=nx-1)):
-                            # mask=1 for coast pixels
-                            if (mask[itest,jtest]>=2) and (p1 in [-1,0,1] and p2 in [-1,0,1]):
-                                mask[itest,jtest] = 1   
-                            # mask=1 for pixels adjacent to the coast
-                            elif (mask[itest,jtest]==3):
-                                mask[itest,jtest] = 2     
-        
-        self.mask = mask
-        self.ind0 = mask==0
-        self.ind1 = mask==1
-        self.ind2 = mask==2
-        self.ind12 = self.ind1 + self.ind2
-
-        # Diffusion coefficient 
-        self.Kdiffus = Kdiffus
-
-        # JIT compiling functions
-        if compile:
-            self.h2uv_jit = jit(self.h2uv)
-            self.h2pv_jit = jit(self.h2pv)
-            self.pv2h_jit = jit(self.pv2h)
-            self.rhs_jit = jit(self.rhs)
-            self.adv_jit = jit(self.adv)
-            self.euler_jit = jit(self.euler)
-            self.rk2_jit = jit(self.rk2)
-            self.one_step_jit = jit(self.one_step)
-            self.one_step_for_scan_jit = jit(self.one_step_for_scan)
-            self.step_jit = jit(self.step, static_argnums=2)
-            self.step_tgl_jit = jit(self.step_tgl, static_argnums=3)
-            self.step_adj_jit = jit(self.step_adj, static_argnums=3)
-
-    def h2uv(self, h):
-        """ SSH to U,V
-
-        Args:
-            h (2D array): SSH field.
-
-        Returns:
-            u (2D array): Zonal velocity
-            v (2D array): Meridional velocity
-
-        """
-    
-        u = jnp.zeros((self.ny,self.nx))
-        v = jnp.zeros((self.ny,self.nx))
-
-        u = u.at[1:-1,1:].set(- self.g/self.f[1:-1,1:]*\
-         (h[2:,:-1]+h[2:,1:]-h[:-2,1:]-h[:-2,:-1])/(4*self.dy))
-             
-        v = v.at[1:,1:-1].set(self.g/self.f[1:,1:-1]*\
-            (h[1:,2:]+h[:-1,2:]-h[:-1,:-2]-h[1:,:-2])/(4*self.dx))
-        
-        u = jnp.where(jnp.isnan(u),0,u)
-        v = jnp.where(jnp.isnan(v),0,v)
-            
-        return u,v
-
-    def h2pv(self, h, hb, c=None):
-        """ SSH to PV
-
-        Args:
-            h (2D array): SSH field.
-            hb (2D array): Background SSH field
-
-        Returns:
-            q: Potential Vorticity field
-        """
-
-        if c is None:
-            c = self.c
-
-        q = jnp.zeros((self.ny, self.nx),dtype='float64')
-
-        q = q.at[1:-1, 1:-1].set(
-            self.g / self.f[1:-1, 1:-1] * \
-            ((h[2:, 1:-1] + h[:-2, 1:-1] - 2 * h[1:-1, 1:-1]) / self.dy ** 2 + \
-             (h[1:-1, 2:] + h[1:-1, :-2] - 2 * h[1:-1, 1:-1]) / self.dx ** 2) - \
-            self.g * self.f[1:-1, 1:-1] / (c[1:-1, 1:-1] ** 2) * h[1:-1, 1:-1])
-
-        q = jnp.where(jnp.isnan(q),0,q)
-
-        q = q.at[self.ind12].set(- \
-            self.g * self.f[self.ind12] / (c[self.ind12] ** 2) * hb[self.ind12])
-        
-        q = q.at[self.ind0].set(0)
-
-        return q
-    
-    def pv2h(self, q, hb, qb):
-
-        """ PV to SSH 
-
-        Args:
-            q (2D array): SSH field.
-            hb (2D array): Background SSH field
-            qb (2D array): Background PV field
-
-        Returns:
-            h: SSH field
-        """
-
-        # Interior pv
-        qin = q[1:-1,1:-1] - qb[1:-1,1:-1]
-        
-        # Inverse sine tranfrom to get reconstructed SSH
-        h = jnp.zeros_like(q,dtype='float64')
-        inv = inverse_elliptic_dst(qin, self.helmoltz_dst)
-        h = h.at[1:-1, 1:-1].set(inv)
-
-        # add the boundary value
-        h += hb
-
-        return h
-
-    def rhs(self,u,v,q,way=1):
-
-        """ increment
-
-        Args:
-            u (2D array): Zonal velocity
-            v (2D array): Meridional velocity
-            q : PV start
-            way: forward (+1) or backward (-1)
-
-        Returns:
-            rhs (2D array): advection increment
-
-        """
-
-        q0 = +q
-
-        #######################
-        # Upwind current
-        #######################
-        u_on_T = way*0.5*(u[1:-1,1:-1]+u[1:-1,2:])
-        v_on_T = way*0.5*(v[1:-1,1:-1]+v[2:,1:-1])
-        up = jnp.where(u_on_T < 0, 0, u_on_T)
-        um = jnp.where(u_on_T > 0, 0, u_on_T)
-        vp = jnp.where(v_on_T < 0, 0, v_on_T)
-        vm = jnp.where(v_on_T > 0, 0, v_on_T)
-
-        #######################
-        # PV advection
-        #######################
-        rhs_q = self.adv(up, vp, um, vm, q0)
-        rhs_q = rhs_q.at[2:-2,2:-2].set(
-                rhs_q[2:-2,2:-2] - way*\
-                    (self.f[3:-1,2:-2]-self.f[1:-3,2:-2])/(2*self.dy)\
-                        *0.5*(v[2:-2,2:-2]+v[3:-1,2:-2]))
-        # PV Diffusion
-        if self.Kdiffus is not None:
-            rhs_q = rhs_q.at[2:-2,2:-2].set(
-                rhs_q[2:-2,2:-2] +\
-                self.Kdiffus/(self.dx**2)*\
-                    (q0[2:-2,3:-1]+q0[2:-2,1:-3]-2*q0[2:-2,2:-2]) +\
-                self.Kdiffus/(self.dy**2)*\
-                    (q0[3:-1,2:-2]+q0[1:-3,2:-2]-2*q0[2:-2,2:-2])
-            )
-        rhs_q = jnp.where(jnp.isnan(rhs_q), 0, rhs_q)
-        rhs_q = rhs_q.at[self.ind12].set(0)
-        rhs_q = rhs_q.at[self.ind0].set(0)
-            
-        return rhs_q
-
-    def adv(self, up, vp, um, vm, q0):
-
-        """
-            3rd-order upwind scheme
-        """
-
-        ugradq = jnp.zeros_like(q0,dtype='float64')
-
-        ugradq = ugradq.at[2:-2,2:-2].set(
-            - up[1:-1,1:-1] * 1 / (6 * self.dx) * \
-            (2 * q0[2:-2, 3:-1] + 3 * q0[2:-2, 2:-2] - 6 * q0[2:-2, 1:-3] + q0[2:-2, :-4]) \
-            + um[1:-1,1:-1] * 1 / (6 * self.dx) * \
-            (q0[2:-2, 4:] - 6 * q0[2:-2, 3:-1] + 3 * q0[2:-2, 2:-2] + 2 * q0[2:-2, 1:-3]) \
-            - vp[1:-1,1:-1] * 1 / (6 * self.dy) * \
-            (2 * q0[3:-1, 2:-2] + 3 * q0[2:-2, 2:-2] - 6 * q0[1:-3, 2:-2] + q0[:-4, 2:-2]) \
-            + vm[1:-1,1:-1] * 1 / (6 * self.dy) * \
-            (q0[4:, 2:-2] - 6 * q0[3:-1, 2:-2] + 3 * q0[2:-2, 2:-2] + 2 * q0[1:-3, 2:-2])
-            )
-
-        return ugradq
-    
-    def euler(self, var0, incr, way):
-
-        """
-            Euler time scheme
-        """
-
-        return var0 + way * self.dt * incr
-
-    def rk2(self, var0, incr, hb, qb, way):
-
-        """
-            2rd-order Runge-Kutta time scheme
-        """
-
-        # k2
-        var12 = var0 + 0.5*incr*self.dt
-        if len(incr.shape)==3:
-            q12 = var12[0]
-            c12 = var12[1:]
-        else:
-            q12 = +var12
-        h12 = self.pv2h_jit(q12,hb,qb)
-        u12,v12 = self.h2uv_jit(h12)
-        u12 = jnp.where(jnp.isnan(u12),0,u12)
-        v12 = jnp.where(jnp.isnan(v12),0,v12)
-        if len(incr.shape)==3:
-            var12 = jnp.append(q12[jnp.newaxis,:,:],c12,axis=0)
-        else:
-            var12 = +q12
-        incr12 = self.rhs_jit(u12,v12,var12,way=way)
-
-        var1 = var0 + self.dt * incr12
-
-        return var1
-    
-    def one_step(self, h0, q0, hb, qb, way=1):
-
-        """
-            One step forward
-        """
-
-        # Compute geostrophic velocities
-        u, v = self.h2uv_jit(h0)
-
-        # Compute increment
-        incr = self.rhs_jit(u,v,q0,way=way)
-        
-        # Time integration 
-        if self.time_scheme == 'Euler':
-            q1 = self.euler_jit(q0, incr, way)
-        elif self.time_scheme == 'rk2':
-            q1 = self.rk2_jit(q0, incr, hb, qb, way)
-
-        # Elliptical inversion 
-        h1 = self.pv2h_jit(q1, hb, qb)
-
-        return h1, q1
-
-    def one_step_for_scan(self,X0,X):
-
-        """
-            One step forward for scan
-        """
-
-        h1, q1, hb, qb = X0
-        h1, q1 = self.one_step_jit(h1, q1, hb, qb)
-        X = (h1, q1, hb, qb)
-
-        return X,X
-
-    def step(self, h0, hb, nstep=1):
-
-        """ Propagation
-
-        Args:
-            h0 (2D array): initial SSH
-            hb (2D array): background SSH
-            nstep (int): number of time-step
-
-        Returns:
-            h1 (2D array): propagated SSH
-
-        """
-
-        # Add MDT
-        if self.mdt is not None:
-            h0 += self.mdt
-            hb += self.mdt
-
-        # Compute potential voriticy
-        q0 = self.h2pv_jit(h0, hb)
-        qb = self.h2pv_jit(hb, hb)
-
-        # Init
-        h1 = +h0
-        q1 = +q0
-
-        #####
-        #### Uncomment this section to use scan function 
-        #####
-        # Time propagation
-        #X1, _ = scan(self.one_step_for_scan_jit, init=(h1, q1, hb, qb), xs=jnp.zeros(nstep))
-        #h1, q1, hb, qb = X1
-
-        # Here we do a for loop in order to maximize the performance of the calculation (scan function is not performing well when using JIT-compilation).
-        for _ in range(nstep):
-            h1, q1 = self.one_step_jit(h1, q1, hb, qb)
-
-        # Mask
-        h1 = h1.at[self.ind0].set(jnp.nan)
-
-        # Back to sla
-        if self.mdt is not None:
-            h1 -= self.mdt
-
-        return h1
-
-    def step_tgl(self, dh0, h0, hb, nstep=1):
-
-        _, dh1 = jvp(partial(self.step_jit, hb=hb, nstep=nstep), (h0,), (dh0,))
-
-        return dh1
-    
-    def step_adj(self,adh0,h0,hb,nstep=1):
-        
-        _, adf = vjp(partial(self.step_jit,hb=hb,nstep=nstep), h0)
-        
-        return adf(adh0)[0]
-      
 
 if __name__ == "__main__":
 

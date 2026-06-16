@@ -1,5 +1,8 @@
-"""Finite difference operators in pytorch,
-Louis Thiry, 6 march 2023."""
+"""
+Created by Florian Le Guillou on June 2026.
+
+Provides finite-difference operators for the JAX shallow-water solver.
+"""
 
 import jax.numpy as jnp 
 

@@ -1,23 +1,344 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jan  6 20:15:09 2021
+Created by Florian Le Guillou on June 2026.
 
-@author: leguillou
+Loads, filters, and preprocesses observation datasets.
 """
 import os, sys
+# Disable HDF5 file locking BEFORE importing xarray/netCDF4. On shared
+# filesystems (NFS/Lustre) concurrent reads from sibling subprocesses can
+# raise "NetCDF: Not a valid ID" otherwise.
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 import xarray as xr
 import numpy as np
 
 import datetime 
+import re
 from scipy import signal
-import matplotlib.pylab as plt
 import glob 
 
 from .tools import detrendn, read_auxdata
 from .exp import Config
 
-def Obs(config, State, *args, **kwargs):
+
+# Date patterns recognized in obs file names, in order of preference.
+# Each entry is (regex, "fmt") with named groups y, m, d (d optional).
+_FILENAME_DATE_PATTERNS = [
+    # 8-digit YYYYMMDD (most specific) — accept either standalone or
+    # surrounded by non-digits, but require y >= 1900 to avoid matching
+    # arbitrary 8-digit run numbers.
+    re.compile(r'(?<!\d)(?P<y>(?:19|20)\d{2})(?P<m>\d{2})(?P<d>\d{2})(?!\d)'),
+    # YYYY-MM-DD or YYYY_MM_DD
+    re.compile(r'(?<!\d)(?P<y>(?:19|20)\d{2})[-_](?P<m>\d{2})[-_](?P<d>\d{2})(?!\d)'),
+    # 6-digit YYYYMM (used by some monthly archives)
+    re.compile(r'(?<!\d)(?P<y>(?:19|20)\d{2})(?P<m>\d{2})(?!\d)'),
+]
+
+
+def _extract_file_date_range(fname):
+    """Extract a (start, end) datetime pair from a file basename.
+
+    Looks for a YYYYMMDD / YYYY-MM-DD / YYYYMM pattern in the filename.
+    Returns (None, None) when no recognizable date is present (so the file
+    is *kept* — we never drop a file based on absence of a date).
+    """
+    base = os.path.basename(fname)
+    for pat in _FILENAME_DATE_PATTERNS:
+        m = pat.search(base)
+        if m is None:
+            continue
+        try:
+            y = int(m.group('y'))
+            mo = int(m.group('m'))
+            try:
+                d = int(m.group('d'))
+                start = datetime.datetime(y, mo, d)
+                end = start + datetime.timedelta(days=1)
+            except (IndexError, KeyError):
+                # Monthly pattern: span the whole month
+                start = datetime.datetime(y, mo, 1)
+                if mo == 12:
+                    end = datetime.datetime(y + 1, 1, 1)
+                else:
+                    end = datetime.datetime(y, mo + 1, 1)
+            return start, end
+        except ValueError:
+            continue
+    return None, None
+
+
+def _filter_files_by_date(files, date_start, date_end):
+    """Keep only files whose filename-encoded date overlaps [date_start, date_end].
+
+    Files with no recognizable date in the name are kept (conservative).
+    """
+    if date_start is None and date_end is None:
+        return files
+    t0 = None if date_start is None else (
+        date_start if isinstance(date_start, datetime.datetime)
+        else datetime.datetime.fromisoformat(str(date_start)))
+    t1 = None if date_end is None else (
+        date_end if isinstance(date_end, datetime.datetime)
+        else datetime.datetime.fromisoformat(str(date_end)))
+    out = []
+    for f in files:
+        f_start, f_end = _extract_file_date_range(f)
+        if f_start is None:
+            out.append(f)
+            continue
+        if t1 is not None and f_start > t1:
+            continue
+        if t0 is not None and f_end <= t0:
+            continue
+        out.append(f)
+    return out
+
+
+def _open_obs_dataset(name_obs, OBS, date_start=None, date_end=None):
+    """Open the multi-file dataset for one OBS block.
+
+    Tries the fast path first (combine='nested' + parallel=True with preprocess),
+    then falls back to no-preprocess, and finally to combine='by_coords'.
+    Returns the opened dataset or None if all attempts failed.
+
+    When date_start/date_end are provided, files whose filename contains a
+    date pattern outside that range are skipped before opening.
+    """
+
+    def preprocess(ds):
+        name_var = [OBS.name_time, OBS.name_lon, OBS.name_lat]
+        for key in OBS.name_var:
+            if isinstance(OBS.name_var[key], list):
+                for name in OBS.name_var[key]:
+                    name_var.append(name)
+            else:
+                name_var.append(OBS.name_var[key])
+        ds = ds[name_var]
+        return ds
+
+    if '.nc' in OBS.path and '*' not in OBS.path:
+        try:
+            return xr.open_dataset(OBS.path)
+        except Exception:
+            print(f'[{name_obs}] Error: unable to open {OBS.path}')
+            return None
+
+    if '*' in OBS.path:
+        path = OBS.path
+    else:
+        path = f'{OBS.path}*.nc'
+
+    files = sorted(glob.glob(path))
+    if len(files) == 0:
+        print(f'[{name_obs}] Warning: no files matching {path}')
+        return None
+
+    # Filter by filename date pattern (e.g. "20250603" or "202506") so we
+    # don't open files that fall entirely outside the experiment period.
+    n_total = len(files)
+    files = _filter_files_by_date(files, date_start, date_end)
+    if len(files) == 0:
+        print(f'[{name_obs}] Warning: no files in date range '
+              f'[{date_start}, {date_end}] (out of {n_total} candidates)')
+        return None
+    if len(files) < n_total:
+        print(f'[{name_obs}] Date filter: {len(files)}/{n_total} files kept')
+
+    # Get time dim name from first file (cheap)
+    try:
+        _ds0 = xr.open_dataset(files[0])
+        name_time_dim = _ds0[OBS.name_time].dims[0]
+        _ds0.close()
+    except Exception:
+        name_time_dim = None
+
+    # Try combine='nested' with preprocess (serial open: parallel=True triggers
+    # a libnetcdf assertion `nc4_nc4f_list_add` with non-thread-safe builds).
+    if name_time_dim is not None:
+        try:
+            return xr.open_mfdataset(
+                files, combine='nested', concat_dim=name_time_dim,
+                preprocess=preprocess, compat='override', coords='minimal',
+                parallel=False)
+        except Exception:
+            pass
+
+        # Try combine='nested' without preprocess
+        try:
+            return xr.open_mfdataset(
+                files, combine='nested', concat_dim=name_time_dim,
+                compat='override', coords='minimal', parallel=False)
+        except Exception:
+            pass
+
+    # Last resort: by_coords
+    try:
+        return xr.open_mfdataset(
+            files, preprocess=preprocess, compat='override', coords='minimal')
+    except Exception:
+        try:
+            return xr.open_mfdataset(files, compat='override', coords='minimal')
+        except Exception:
+            print(f'[{name_obs}] Error: unable to open multiple netcdf files')
+            return None
+
+
+def open_obs_datasets(config, date_start=None, date_end=None):
+    """Open all OBS datasets declared in config once, lazily.
+
+    Eagerly loads only the time/lon/lat coordinate arrays so that bbox masks
+    can be built per tile without re-reading them from disk.
+    Returns a dict {name_obs: xarray.Dataset} (or empty dict if config.OBS is None).
+
+    When date_start/date_end are provided, only files whose filename date
+    pattern overlaps that range are opened. This avoids paying the cost of
+    opening (potentially) thousands of out-of-period files for a global archive.
+    """
+    if config.OBS is None:
+        return {}
+    datasets = {}
+    for name_obs, OBS in config.OBS.items():
+        print(f'Opening obs dataset: {name_obs}')
+        ds = _open_obs_dataset(name_obs, OBS,
+                               date_start=date_start, date_end=date_end)
+        if ds is None:
+            continue
+        # Eagerly load 1D coordinate arrays used to build per-tile masks.
+        # Skip 2D coords (e.g. SWOT swath lon/lat) — keeping them as dask
+        # arrays lets the per-tile mask be computed lazily without
+        # materializing the global per-pixel field.
+        for cname in (OBS.name_time, OBS.name_lon, OBS.name_lat):
+            try:
+                if ds[cname].ndim <= 1:
+                    ds[cname].load()
+            except Exception:
+                pass
+        datasets[name_obs] = ds
+    return datasets
+
+
+def select_obs_datasets_time(obs_datasets, config, date_start, date_end):
+    """Restrict each obs dataset to [date_start, date_end] along its time dim.
+
+    Operates on the (already-loaded) 1D time coordinate to build a boolean
+    mask, then uses isel on the underlying time *dimension* — this keeps
+    SWOT swath data lazy (no broadcast against per-pixel arrays).
+    Returns a new dict {name_obs: ds_subset}.
+    """
+    if obs_datasets is None or len(obs_datasets) == 0:
+        return {}
+    t0 = np.datetime64(date_start)
+    t1 = np.datetime64(date_end)
+    out = {}
+    for name_obs, ds in obs_datasets.items():
+        OBS = config.OBS[name_obs]
+        time_arr = ds[OBS.name_time]
+        # Identify the underlying time dimension (handles cases where
+        # name_time is itself a coord on a differently-named dim)
+        time_dim = time_arr.dims[0] if time_arr.ndim >= 1 else OBS.name_time
+        mask = ((time_arr >= t0) & (time_arr <= t1)).values
+        if mask.ndim != 1:
+            # fallback: any() over non-time-dim axes (rare)
+            axes = tuple(i for i, d in enumerate(time_arr.dims) if d != time_dim)
+            mask = mask.any(axis=axes) if axes else mask
+        if not mask.any():
+            continue
+        out[name_obs] = ds.isel({time_dim: mask})
+    return out
+
+
+def _lon_convert_mode(ds, OBS, lon_unit):
+    """Decide whether to convert longitudes to 0..360 or -180..180.
+
+    The lon min/max are computed lazily once per ds and cached on ds.attrs
+    (so SWOT 2D lon is streamed only the first time).
+    Returns one of '0_360', '-180_180', or None.
+    """
+    if '_lon_min_cached' not in ds.attrs:
+        try:
+            ds.attrs['_lon_min_cached'] = float(ds[OBS.name_lon].min().compute())
+            ds.attrs['_lon_max_cached'] = float(ds[OBS.name_lon].max().compute())
+        except Exception:
+            ds.attrs['_lon_min_cached'] = 0.0
+            ds.attrs['_lon_max_cached'] = 0.0
+    lmin = ds.attrs['_lon_min_cached']
+    lmax = ds.attrs['_lon_max_cached']
+    if np.sign(lmin) == -1 and lon_unit == '0_360':
+        return '0_360'
+    if (np.sign(lmin) >= 0 or lmax > 180) and lon_unit == '-180_180':
+        return '-180_180'
+    return None
+
+
+def select_obs_datasets_space(obs_datasets, config, bbox, lon_unit='0_360'):
+    """Restrict each obs dataset to a lon/lat bbox, lazily.
+
+    For 2D coords (e.g. SWOT swath), the bbox mask is reduced to the time
+    dim and applied via isel — this keeps the per-pixel arrays lazy and
+    avoids the where(drop=True) deep-copy that caused 50 GiB OOMs.
+    For 1D coords, the standard where(drop=True) is used.
+    Returns a new dict {name_obs: ds_subset}.
+    """
+    if obs_datasets is None or len(obs_datasets) == 0:
+        return {}
+    out = {}
+    for name_obs, ds in obs_datasets.items():
+        OBS = config.OBS[name_obs]
+        # Pick a lon view that matches the requested unit (lazy, no full read)
+        convert = _lon_convert_mode(ds, OBS, lon_unit)
+        lon_raw = ds[OBS.name_lon]
+        if convert == '0_360':
+            lon_for_mask = lon_raw % 360
+        elif convert == '-180_180':
+            lon_for_mask = (lon_raw + 180) % 360 - 180
+        else:
+            lon_for_mask = lon_raw
+        lat = ds[OBS.name_lat]
+        bbox_mask = ((bbox[0] <= lon_for_mask) & (bbox[1] >= lon_for_mask) &
+                     (bbox[2] <= lat) & (bbox[3] >= lat))
+        # Time dim
+        time_arr = ds[OBS.name_time]
+        time_dim = time_arr.dims[0] if time_arr.ndim >= 1 else OBS.name_time
+        reduce_dims = [d for d in bbox_mask.dims if d != time_dim]
+        if reduce_dims:
+            time_mask = bbox_mask.any(dim=reduce_dims).compute()
+            ds_sel = ds.isel({time_dim: time_mask.values})
+        else:
+            ds_sel = ds.where(bbox_mask.compute(), drop=True)
+        out[name_obs] = ds_sel
+    return out
+
+
+def compute_bbox(config, State):
+    """Replicate the bbox computation done inside Obs() (with 2*d{lon,lat} pad).
+
+    Used by callers that want to pre-select obs datasets over a tile before
+    invoking Obs().
+    """
+    if config.EXP.lon_obs_min is not None:
+        lon_obs_min = config.EXP.lon_obs_min
+    else:
+        lon_obs_min = State.lon_min
+    if config.EXP.lon_obs_max is not None:
+        lon_obs_max = config.EXP.lon_obs_max
+    else:
+        lon_obs_max = State.lon_max
+    if config.EXP.lat_obs_min is not None:
+        lat_obs_min = config.EXP.lat_obs_min
+    else:
+        lat_obs_min = State.lat_min
+    if config.EXP.lat_obs_max is not None:
+        lat_obs_max = config.EXP.lat_obs_max
+    else:
+        lat_obs_max = State.lat_max
+    dlon = np.nanmax(State.lon[:, 1:] - State.lon[:, :-1])
+    dlat = np.nanmax(State.lat[1:, :] - State.lat[:-1, :])
+    return [lon_obs_min - 2 * dlon, lon_obs_max + 2 * dlon,
+            lat_obs_min - 2 * dlat, lat_obs_max + 2 * dlat]
+
+
+def Obs(config, State, obs_datasets=None, *args, **kwargs):
     """
     NAME
         obs
@@ -103,53 +424,23 @@ def Obs(config, State, *args, **kwargs):
     for name_obs, OBS in config.OBS.items():
 
         print(f'\n{name_obs}:\n{OBS}')
-        
-        # Preprocessing function to select only variables of interest
-        def preprocess(ds):
-            name_var = [OBS.name_time, OBS.name_lon, OBS.name_lat]
-            for key in OBS.name_var:
-                if isinstance(OBS.name_var[key], list):
-                    for name in OBS.name_var[key]:
-                        name_var.append(name)
-                else:
-                    name_var.append(OBS.name_var[key])
-            ds = ds[name_var]
-            return ds
-        
-        # Read observation files
-        if '.nc' in OBS.path and '*' not in OBS.path:
-            _ds = xr.open_dataset(OBS.path)
+
+        # Reuse pre-opened dataset if provided, otherwise open here
+        _close_after = False
+        if obs_datasets is not None and name_obs in obs_datasets:
+            _ds = obs_datasets[name_obs]
         else:
-            if '*' in OBS.path:
-                path = OBS.path
-            else:
-                path = f'{OBS.path}*.nc'    
-            try:
-                _ds = xr.open_mfdataset(path,preprocess=preprocess,compat='override',coords='minimal')
-            except:
-                try: 
-                    print('opening without preprocess')
-                    _ds = xr.open_mfdataset(path,compat='override',coords='minimal')
-                except: 
-                    try:
-                        print('opening with combine==nested')
-                        files = glob.glob(path)
-                        # Get time dimension to concatenate
-                        if len(files)==0:
-                            continue
-                        _ds0 = xr.open_dataset(files[0])
-                        name_time_dim = _ds0[OBS.name_time].dims[0]
-                        _ds0.close()
-                        # Open nested files
-                        _ds = xr.open_mfdataset(path,combine='nested',concat_dim=name_time_dim,preprocess=preprocess,compat='override',coords='minimal')
-                    except:
-                        print('Error: unable to open multiple netcdf files')
-                        continue
-        
-        # Copy and close dataset
+            _ds = _open_obs_dataset(name_obs, OBS,
+                                    date_start=time_obs_min,
+                                    date_end=time_obs_max)
+            _close_after = True
+            if _ds is None:
+                continue
+
+        # Shallow copy (do NOT load() — let _obs_alti / _obs_l4 select the bbox first)
         ds = _ds.copy()
-        _ds.close()
-        ds = ds.load()
+        if _close_after:
+            _ds.close()
         
         # Name of obs files
         out_name = f'obs_{box}_{int(config.EXP.assimilation_time_step.total_seconds())}'
@@ -188,17 +479,44 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
     ds = ds.assign_coords({obs_attr.name_time:ds[obs_attr.name_time]})
     ds = ds.swap_dims({ds[obs_attr.name_time].dims[0]:obs_attr.name_time})
 
-    # Convert longitude
-    if np.sign(ds[obs_attr.name_lon].data.min())==-1 and lon_unit=='0_360':
-        ds[obs_attr.name_lon].data = ds[obs_attr.name_lon].data % 360
-    elif (np.sign(ds[obs_attr.name_lon].data.min())>=0 or ds[obs_attr.name_lon].data.max()>180) and lon_unit=='-180_180':
-        ds[obs_attr.name_lon].data = (ds[obs_attr.name_lon].data + 180) % 360 - 180
-    
-    # Select sub area
-    lon_obs = ds[obs_attr.name_lon] 
+    # Determine longitude conversion to apply (deferred until after bbox selection
+    # to avoid materializing global SWOT arrays — e.g. (98M, 69) float64 = 50.9 GiB).
+    lon_min_raw = float(ds[obs_attr.name_lon].min())
+    lon_max_raw = float(ds[obs_attr.name_lon].max())
+    if np.sign(lon_min_raw) == -1 and lon_unit == '0_360':
+        _lon_convert = '0_360'
+    elif (np.sign(lon_min_raw) >= 0 or lon_max_raw > 180) and lon_unit == '-180_180':
+        _lon_convert = '-180_180'
+    else:
+        _lon_convert = None
+
+    # Build a (lazy) lon view in the requested unit for the bbox mask only
+    lon_obs_raw = ds[obs_attr.name_lon]
+    if _lon_convert == '0_360':
+        lon_obs_for_mask = lon_obs_raw % 360
+    elif _lon_convert == '-180_180':
+        lon_obs_for_mask = (lon_obs_raw + 180) % 360 - 180
+    else:
+        lon_obs_for_mask = lon_obs_raw
     lat_obs = ds[obs_attr.name_lat]
-    ds = ds.where(((bbox[0]<=lon_obs) & (bbox[1]>=lon_obs) & 
-                  (bbox[2]<=lat_obs) & (bbox[3]>=lat_obs)).compute(), drop=True)
+    bbox_mask = ((bbox[0] <= lon_obs_for_mask) & (bbox[1] >= lon_obs_for_mask) &
+                 (bbox[2] <= lat_obs) & (bbox[3] >= lat_obs))
+    # For swath data (2D lon/lat), reduce mask to the time dim and use isel,
+    # to avoid xr.where(drop=True) deep-copying the full per-pixel arrays
+    # (which can require tens of GiB for global SWOT).
+    _reduce_dims = [d for d in bbox_mask.dims if d != obs_attr.name_time]
+    if _reduce_dims:
+        time_mask = bbox_mask.any(dim=_reduce_dims).compute()
+        ds = ds.isel({obs_attr.name_time: time_mask.values})
+    else:
+        ds = ds.where(bbox_mask.compute(), drop=True)
+    ds = ds.load()
+
+    # Apply longitude conversion now (on the small per-tile subset)
+    if _lon_convert == '0_360':
+        ds[obs_attr.name_lon].data = ds[obs_attr.name_lon].data % 360
+    elif _lon_convert == '-180_180':
+        ds[obs_attr.name_lon].data = (ds[obs_attr.name_lon].data + 180) % 360 - 180
     # MDT 
     if True in [obs_attr.add_mdt, obs_attr.substract_mdt]:
         finterpmdt = read_auxdata(obs_attr.path_mdt, obs_attr.name_var_mdt, lon_unit)
@@ -307,8 +625,8 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
                     path += '_submdt'
             path += '.nc'
             dsout.to_netcdf(path, encoding={obs_attr.name_time: {'_FillValue': None},
-                                            obs_attr.name_lon: {'_FillValue': None},
-                                            obs_attr.name_lat: {'_FillValue': None}})
+                                            obs_attr.name_lon: {'_FillValue': None, 'dtype': 'float32'},
+                                            obs_attr.name_lat: {'_FillValue': None, 'dtype': 'float32'}})
             dsout.close()
             _ds.close()
             del dsout,_ds
@@ -350,6 +668,7 @@ def _obs_l4(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, ou
     lat_obs = ds[obs_attr.name_lat]
     ds = ds.where(((bbox[0]<=lon_obs) & (bbox[1]>=lon_obs) & 
                   (bbox[2]<=lat_obs) & (bbox[3]>=lat_obs)).compute(), drop=True)
+    ds = ds.load()
 
     lon_obs = ds[obs_attr.name_lon].values
     lat_obs = ds[obs_attr.name_lat].values

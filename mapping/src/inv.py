@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jan  6 16:59:11 2021
+Created by Florian Le Guillou on June 2026.
 
-@author: leguillou
+Runs inversion drivers and assimilation orchestration.
 """
 from .config import USE_FLOAT64
-import sys, os 
-import numpy as np 
+import sys, os
+import time
+import numpy as np
+import pandas as pd
 import os
 import matplotlib.pylab as plt
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta
 import scipy.optimize as opt
 import gc
 import xarray as xr
 
 import glob
-from importlib.machinery import SourceFileLoader 
+from importlib.machinery import SourceFileLoader
 
-import jax 
-import jax.numpy as jnp 
+import jax
+import jax.numpy as jnp
+import jax.lax as lax
+from jax import jit
+from jax.lax import scan
 jax.config.update("jax_enable_x64", USE_FLOAT64)
 
-from . import grid
+from . import tools as grid
 
 
 
@@ -71,11 +76,10 @@ def Inv_forward(config,State,Model,Bc=None):
     present_date = config.EXP.init_date
     nstep = int(config.EXP.saveoutput_time_step.total_seconds()//Model.dt)
 
-    if Bc is not None:
-        time_bc = np.array([np.datetime64(time) for time in Model.timestamps[::nstep]])
-        t_bc = np.array([t for t in Model.T[::nstep]])
-        var_bc = Bc.interp(time_bc)
-        Model.set_bc(t_bc,var_bc)
+    # Set boundary conditions at output times (if configured)
+    time_bc = np.array([np.datetime64(time) for time in Model.timestamps[::nstep]])
+    t_bc = np.array([t for t in Model.T[::nstep]])
+    Model.set_bc(time_bc, t_bc=t_bc)
 
     t = 0
     Model.init(State,t)
@@ -120,10 +124,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         # initialize Model operator 
         from . import mod
         Model = mod.Model(config, State, verbose=verbose)
-    if Bc is None:
-        # initialize Bc 
-        from . import bc
-        Bc = bc.Bc(config, verbose=verbose)
     if dict_obs is None:
         # initialize Obs
         from . import obs
@@ -162,15 +162,12 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     time_checkpoints = np.asarray(time_checkpoints)
     print(f'--> {checkpoints.size} checkpoints to evaluate the cost function')
 
-    # Boundary conditions
-    if Bc is not None:
-        var_bc = Bc.interp(time_checkpoints)
-        Model.set_bc(t_checkpoints,var_bc)
+    # Boundary conditions at checkpoints
+    Model.set_bc(time_checkpoints, t_bc=np.asarray(t_checkpoints))
     
     # Observations operator 
-    if config.INV.anomaly_from_bc: # Remove boundary fields if anomaly mode is chosen
-        time_obs = [np.datetime64(date) for date in Obsop.date_obs]
-        var_bc = Bc.interp(time_obs)
+    if config.INV.anomaly_from_bc and Model._bc_fields is not None:  # Remove boundary fields if anomaly mode is chosen
+        var_bc = Model._bc_fields.interp(np.array([np.datetime64(date) for date in Obsop.date_obs]))
     else:
         var_bc = None
     
@@ -187,7 +184,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         sys.exit('4Dvar only work with reduced basis!!')
     
     # Covariance matrix
-    from .tools_4Dvar import Cov
     if config.INV.sigma_B is not None:     
         print('Warning: sigma_B is prescribed --> ignore Q of the reduced basis')
         # Least squares
@@ -206,20 +202,12 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         ds.close()
 
     # Variational object initialization
-    if config.INV.flag_full_jax:
-        from .tools_4Dvar import Variational_jax as Variational
-    else:
-        from .tools_4Dvar import Variational as Variational
-
     var = Variational(
-        config=config, M=Model, H=Obsop, State=State, B=B, R=R, Basis=Basis, Xb=Xb, checkpoints=checkpoints, nstep=nstep_check, freq_it_plot=config.INV.freq_it_plot)
+        config=config, M=Model, H=Obsop, State=State, B=B, R=R, Basis=Basis, Xb=Xb, checkpoints=checkpoints, freq_it_plot=config.INV.freq_it_plot, print_time=config.INV.print_time)
     
     # Initial Control vector 
     if config.INV.path_init_4Dvar is None:
-        if config.INV.flag_full_jax:
-            Xopt = jnp.zeros((Xb.size,))
-        else:
-            Xopt = np.zeros((Xb.size,))
+        Xopt = np.zeros((Xb.size,))
     else:
         # Read previous minimum 
         print('Read previous minimum:',config.INV.path_init_4Dvar)
@@ -264,11 +252,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         ###################
 
         # Main function
-        if config.INV.flag_full_jax:
-            from jax import jit, value_and_grad
-            fun = jit(value_and_grad(var.cost))
-        else:
-            fun = var.cost_and_grad
+        fun = var.cost_and_grad
 
         # Callback function called at every minimization iterations
         def callback(XX):
@@ -301,7 +285,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             options['ftol'] = 0
             options['gtol'] = 0
 
-        gradient_max_norm = getattr(config.INV, 'gradient_max_norm', 1e6)
+        gradient_max_norm = getattr(config.INV, 'gradient_max_norm', None)
         
         # Run minimization 
         from decimal import Decimal
@@ -352,14 +336,14 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
 
                 # Track best state
                 grad_norm = np.max(np.abs(grad))
-                if np.isfinite(cost) and np.isfinite(grad_norm) and grad_norm < gradient_max_norm:
+                if gradient_max_norm is not None and np.isfinite(cost) and np.isfinite(grad_norm) and grad_norm < gradient_max_norm:
                     if float(cost) < self.best_cost:
                         self.best_cost = float(cost)
                         self.best_x = np.array(x).copy()
                         self.best_grad_norm = grad_norm
 
                 # Check for crazy gradient
-                if (not np.isfinite(cost)) or (not np.isfinite(grad_norm)) or grad_norm > gradient_max_norm:
+                if gradient_max_norm is not None and ((not np.isfinite(cost)) or (not np.isfinite(grad_norm)) or grad_norm > gradient_max_norm):
                     print(f"\nCrazy gradient detected (cost={cost}, grad_norm={grad_norm}). Will restart from best state.")
                     raise CrazyGradient()
 
@@ -469,3 +453,437 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     del State, State0, Xa, dict_obs, B, R, Model, Basis, var, Xopt, Xres, checkpoints, time_checkpoints, t_checkpoints
     gc.collect()
     print()
+
+
+# =============================================================================
+# Merged from tools_4Dvar.py
+# =============================================================================
+
+
+
+class Cov :
+    # case of a simple diagonal covariance matrix
+    def __init__(self,sigma=None):
+        
+        if sigma is None:
+            sigma = 1
+            
+        self.sigma = sigma
+        
+    def inv(self,X):
+        return 1/self.sigma**2 * X    
+    
+    def sqr(self,X):
+        return self.sigma * X
+    
+    def invsqr(self,X):
+        return 1/self.sigma * X
+    
+    
+class Variational:
+    
+    def __init__(self, 
+                 config=None, M=None, H=None, State=None, R=None,B=None, Basis=None, Xb=None, checkpoints=None, nstep=None, freq_it_plot=1, print_time=False):
+        
+        # Objects
+        self.M = M # model
+        self.H = H # observational operator
+        self.State = State # state variables
+    
+        # Covariance matrixes
+        self.B = B
+        self.R = R
+        
+        # Background state
+        self.Xb = Xb
+        
+        # Temporary path where to save model trajectories
+        self.tmp_DA_path = config.EXP.tmp_DA_path
+
+        # checkpoint 
+        self.checkpoints = checkpoints
+        
+        # preconditioning
+        self.prec = config.INV.prec
+        
+        # Wavelet reduced basis
+        self.dtbasis = int(config.INV.timestep_checkpoint.total_seconds()//M.dt)
+        self.basis = Basis 
+        
+        # Save cost function and its gradient at each iteration 
+        self.save_minimization = config.INV.save_minimization
+        if self.save_minimization:
+            self.J = []
+            self.dJ = [] # For incremental 4Dvar only
+            self.G = []
+        
+        # For incremental 4Dvar only
+        self.X0 = self.Xb*0
+
+        self.freq_it_plot = freq_it_plot
+        self.it_plot = 0
+        self.print_time = print_time
+        
+        # Grad test
+        if config.INV.compute_test:
+            print('Gradient test:')
+            np.random.seed(0)
+            if self.prec:
+                X = (np.random.random(self.basis.nbasis)-0.5)
+            else:
+                X = self.B.sqr(np.random.random(self.basis.nbasis)-0.5) + self.Xb
+            
+            def cost(X):
+                return self.cost_and_grad(X)[0]
+            def grad(X):
+                return self.cost_and_grad(X)[1]
+            grad_test(cost,grad,X)
+
+        
+    def cost(self,X0):
+                
+        # Initial state
+        State = self.State.copy()
+        #State.plot(title='State variables at the start of cost function evaluation')
+        # Background cost function evaluation 
+        if self.B is not None:
+            if self.prec :
+                X  = self.B.sqr(X0) + self.Xb
+                Jb = X0.dot(X0) # cost of background term
+            else:
+                X  = X0 + self.Xb
+                Jb = np.dot(X0,self.B.inv(X0)) # cost of background term
+        else:
+            X  = X0 - self.Xb
+            Jb = 0
+    
+        # Observational cost function evaluation
+        Jo = 0.
+
+        time_misfit = 0
+        l = 0
+        time_model = 0
+        j = 0
+        time_basis = 0
+        k = 0
+        
+        for i in range(len(self.checkpoints)-1):
+            
+            timestamp = self.M.timestamps[self.checkpoints[i]]
+            t = self.M.T[self.checkpoints[i]]
+            nstep = self.checkpoints[i+1] - self.checkpoints[i]
+            
+            # 1. Misfit
+            if self.H.is_obs(timestamp):
+                start = time.time()
+                misfit = self.H.misfit(timestamp,State) # d=Hx-xobs   
+                end = time.time()
+                time_misfit += end - start
+                l += 1
+                # Accumulate Jo in float64: model misfit may be float32 (mixed precision)
+                _m = np.asarray(misfit, dtype=np.float64)
+                Jo += _m.dot(np.asarray(self.R.inv(misfit), dtype=np.float64))
+            
+            # 2. Reduced basis
+            if self.checkpoints[i]%self.dtbasis==0:
+                start = time.time()
+                self.basis.operg(t/3600/24, X, State=State.params)
+                end = time.time()
+                time_basis += end - start
+                k += 1
+            
+            State.save(os.path.join(self.tmp_DA_path,
+                        'model_state_' + str(self.checkpoints[i]) + '.nc'))
+
+            # 3. Run forward model
+            start = time.time()
+            self.M.step(t=t,State=State,nstep=nstep)
+            end = time.time()
+            time_model += end - start
+            j += 1
+
+            if i==int(len(self.checkpoints)/2):
+                State.plot(title='State variables at the middle of cost function evaluation')
+
+        timestamp = self.M.timestamps[self.checkpoints[-1]]
+        if self.H.is_obs(timestamp):
+            start = time.time()
+            misfit = self.H.misfit(timestamp,State) # d=Hx-xobsx
+            time_misfit += end - start
+            l += 1
+            _m = np.asarray(misfit, dtype=np.float64)
+            Jo += _m.dot(np.asarray(self.R.inv(misfit), dtype=np.float64))
+        
+        print('misfit', l, time_misfit/l)
+        print('basis', k, time_basis/k)
+        print('model', j, time_model/j)
+        # Cost function (float64 for L-BFGS-B line-search stability)
+        J = np.float64(0.5 * (Jo + Jb))
+        
+        if self.save_minimization:
+            self.J.append(J)
+
+        return J
+    
+    def grad(self,X0): 
+                
+        X = +X0 
+        
+        
+        if self.B is not None:
+            if self.prec :
+                X  = self.B.sqr(X0) + self.Xb
+                gb = X0      # gradient of background term
+            else:
+                X  = X0 + self.Xb
+                gb = self.B.inv(X0) # gradient of background term
+        else:
+            X  = X0 + self.Xb
+            gb = 0
+            
+        # Current trajectory
+        State = self.State.copy()
+        
+        # Ajoint initialization   
+        adState = self.State.copy(free=True)
+        adX = X*0
+
+        # Last timestamp
+        timestamp = self.M.timestamps[self.checkpoints[-1]]
+        if self.H.is_obs(timestamp):
+            self.H.adj(timestamp,adState,self.R)
+
+        # Time loop
+        for i in reversed(range(0,len(self.checkpoints)-1)):
+            
+            nstep = self.checkpoints[i+1] - self.checkpoints[i]
+            timestamp = self.M.timestamps[self.checkpoints[i]]
+            t = self.M.T[self.checkpoints[i]]
+            
+            # Read model state
+            State.load(os.path.join(self.tmp_DA_path,
+                       'model_state_' + str(self.checkpoints[i]) + '.nc'))
+            
+            # 3. Run adjoint model 
+            self.M.step_adj(t=t, adState=adState, State=State, nstep=nstep) # i+1 --> i
+            
+            # 2. Reduced basis
+            if self.checkpoints[i]%self.dtbasis==0:
+                adX += self.basis.operg_transpose(t=t/3600/24,adState=adState.params)
+            
+            # 1. Misfit 
+            if self.H.is_obs(timestamp):
+                self.H.adj(timestamp,adState,self.R)
+
+        if self.prec :
+            adX = np.transpose(self.B.sqr(adX)) 
+        
+        g = adX + gb  # total gradient
+
+        #adState.plot(title='adjoint variables at the end of gradient function evaluation')
+        #State.plot(title='adjoint parameters at the end of gradient function evaluation',params=True)
+        
+        # Cast to float64 for L-BFGS-B line-search stability
+        g = np.asarray(g, dtype=np.float64)
+
+        if self.save_minimization:
+            self.G.append(np.max(np.abs(g)))
+
+        return g  
+
+    def cost_and_grad(self, X0):
+         
+        ########################################
+        # COST FUNCTION
+        ########################################
+
+        # Initial state
+        State = self.State.copy()
+
+        # Background cost function
+        if self.B is not None:
+            if self.prec :
+                X  = self.B.sqr(X0) + self.Xb
+                Jb = X0.dot(X0) # cost of background term
+            else:
+                X  = X0 + self.Xb
+                Jb = np.dot(X0,self.B.inv(X0)) # cost of background term
+        else:
+            X  = X0 - self.Xb
+            Jb = 0
+        
+        cost_misfit = []
+        cost_basis = []
+        cost_model = []
+    
+        # Observational cost function evaluation
+        State_dict = {}
+        misfit_dict = {}
+        Jo = 0.
+
+        for i in range(len(self.checkpoints)-1):
+            
+            t = self.M.T[self.checkpoints[i]]
+            nstep = self.checkpoints[i+1] - self.checkpoints[i]
+            
+            # 1. Misfit
+            if self.H.is_obs_time(t):
+                if self.print_time:
+                    time0 = time.time()
+                misfit = self.H.misfit(t,State) # d=Hx-xobs   
+                misfit_dict[t] = misfit
+                # Accumulate Jo in float64 (model misfit may be float32)
+                _m = np.asarray(misfit, dtype=np.float64)
+                Jo += _m.dot(np.asarray(self.R.inv(misfit), dtype=np.float64))
+                if self.print_time:
+                    cost_misfit.append(time.time()-time0)
+            
+            # 2. Reduced basis
+            if self.checkpoints[i]%self.dtbasis==0:
+                if self.print_time:
+                    time0 = time.time()
+                self.basis.operg(t/3600/24, X, State=State.params)
+                if self.print_time:
+                    cost_basis.append(time.time()-time0)
+            
+            State_dict[t] = State.copy()
+
+            # 3. Run forward model
+            if self.print_time:
+                    time0 = time.time()
+            self.M.step(t=t,State=State,nstep=nstep)
+            if self.print_time:
+                    cost_model.append(time.time()-time0)
+
+            if i==int(len(self.checkpoints)/2):
+                if self.it_plot % self.freq_it_plot == 0:
+                    State.plot(title='State variables at the middle of cost function evaluation', name_save=f'state_cost_it{self.it_plot}')
+                    State.plot(title='State params at the middle of cost function evaluation', params=True, name_save=f'state_params_cost_it{self.it_plot}')
+
+        t = self.M.T[-1]
+        State_dict[t] = State.copy()
+        if self.H.is_obs_time(t):
+            misfit = self.H.misfit(t,State) # d=Hx-xobsx
+            misfit_dict[t] = misfit
+            _m = np.asarray(misfit, dtype=np.float64)
+            Jo += _m.dot(np.asarray(self.R.inv(misfit), dtype=np.float64))
+        
+        # Cost function (float64 for L-BFGS-B line-search stability)
+        J = np.float64(0.5 * (Jo + Jb))
+
+
+        ########################################
+        # GRAD FUNCTION
+        ########################################
+
+        # Gradient of the background term
+        if self.B is not None:
+            if self.prec :
+                gb = X0      # gradient of background term
+            else:
+                gb = self.B.inv(X0) # gradient of background term
+        else:
+            gb = 0
+
+        # Ajoint initialization   
+        adState = self.State.copy(free=True)
+        adX = X*0
+
+        # Last timestamp
+        t = self.M.T[self.checkpoints[-1]]
+        if self.H.is_obs_time(t):
+            self.H.adj(t, adState, State_dict[t], misfit_dict[t])
+    
+        grad_misfit = []
+        grad_basis = []
+        grad_model = []
+
+        # Time loop
+        for i in reversed(range(0,len(self.checkpoints)-1)):
+
+            nstep = self.checkpoints[i+1] - self.checkpoints[i]
+            t = self.M.T[self.checkpoints[i]]
+
+            # 3. Run adjoint model 
+            if self.print_time:
+                time0 = time.time()
+            self.M.step_adj(t=t, adState=adState, State=State_dict[t], nstep=nstep) # i+1 --> i
+            if self.print_time:
+                grad_model.append(time.time()-time0)
+
+            # 2. Reduced basis
+            if self.checkpoints[i]%self.dtbasis==0:
+                if self.print_time:
+                    time0 = time.time()
+                adX += self.basis.operg_transpose(t=t/3600/24,adState=adState.params)
+                if self.print_time:
+                    grad_basis.append(time.time()-time0)
+            
+            # 1. Misfit 
+            if self.H.is_obs_time(t):
+                if self.print_time:
+                    time0 = time.time()
+                self.H.adj(t,adState,State_dict[t],misfit_dict[t])
+                if self.print_time:
+                    grad_misfit.append(time.time()-time0)
+
+            if i==int(len(self.checkpoints)/2):
+                if self.it_plot % self.freq_it_plot == 0:
+                    adState.plot(title='Adjoint State variables at the middle of cost function evaluation', name_save=f'adjoint_state_grad_it{self.it_plot}')
+            
+    
+        if self.print_time:
+            print("[cost] mean computation time [seconds]: misfit: {:.2e}, basis: {:.2e}, model: {:.2e}".format(np.mean(cost_misfit), np.mean(cost_basis), np.mean(cost_model)) )   
+            print("[grad] mean computation time [seconds]: misfit: {:.2e}, basis: {:.2e}, model: {:.2e}".format(np.mean(grad_misfit), np.mean(grad_basis), np.mean(grad_model)) )
+
+        self.it_plot += 1
+
+        if self.prec :
+            adX = np.transpose(self.B.sqr(adX)) 
+
+        G = adX + gb  # total gradient
+
+        # Cast to float64 for L-BFGS-B line-search stability
+        G = np.asarray(G, dtype=np.float64)
+
+        return J, G  
+   
+def grad_test(J, G, X):
+    np.random.seed(0)
+    h = np.random.random(X.size)
+    h /= np.linalg.norm(h)
+    JX = J(X)
+    GX = G(X)
+    Gh = h.dot(np.where(np.isnan(GX),0,GX))
+    for p in range(10):
+        lambd = 10**(-p)
+        test = np.abs(1. - (J(X+lambd*h) - JX)/(lambd*Gh))
+        
+        print(f'{lambd:.1E} , {test:.2E}')
+
+def plot_grad_test(L) :
+    '''
+    plots the result of a gradient test, L is a list containing
+    the test results
+    '''
+    import matplotlib.pyplot as plt
+    
+    fig, ax = plt.subplots()
+    ax.plot(L[0],L[1],'o','red')
+    ax.plot(L[0],L[1],'orange')
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_ylabel('gradient test')
+    ax.set_xlabel('order')
+    ax.invert_xaxis()
+    plt.show()
+
+
+        
+        
+        
+        
+        
+        
+        
+        

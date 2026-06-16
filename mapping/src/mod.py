@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jan  6 22:36:20 2021
+Created by Florian Le Guillou on June 2026.
 
-@author: leguillou
+Implements the model factory and dynamical model classes.
 """
+
 from .config import USE_FLOAT64
 from importlib.machinery import SourceFileLoader 
 import sys
@@ -15,14 +16,10 @@ from math import pi
 from datetime import timedelta
 import matplotlib.pylab as plt 
 import pyinterp
-from copy import deepcopy
-import time
-
 import jax
 import jax.numpy as jnp 
 from jax import jit
-from jax import jvp,vjp
-from jax.lax import scan, fori_loop
+
 
 jax.config.update("jax_enable_x64", USE_FLOAT64)
 
@@ -35,8 +32,281 @@ except ImportError:
 
 
 from . import  grid
-from .tools import gaspari_cohn
 from .exp import Config as Config
+
+
+def _fill_nan_nearest(arr):
+    """Fill NaNs in a 2D or 3D numpy array with the nearest valid value.
+
+    Used for tracer BC fields in Model_qg1l_jax.set_bc: QG tracer advection is
+    not land-mask aware, so a 0 sitting at a NaN-filled (land or coastal
+    no-data) pixel of varb would leak into adjacent ocean cells via advection
+    each step, producing spurious ~0 psu / cold patches at the coast.  This
+    nearest-neighbour fill gives varb a sensible ocean value at land/coastal
+    pixels, mirroring what SW gets for free through its land mask.
+    """
+    from scipy.ndimage import distance_transform_edt
+    out = np.asarray(arr, dtype=float).copy()
+    if out.ndim == 2:
+        slices = [out]
+    elif out.ndim == 3:
+        slices = [out[k] for k in range(out.shape[0])]
+    else:
+        out[np.isnan(out)] = 0.
+        return out
+    for s in slices:
+        nan_mask = np.isnan(s)
+        if not nan_mask.any():
+            continue
+        if nan_mask.all():
+            s[:] = 0.
+            continue
+        ind = distance_transform_edt(
+            nan_mask, return_distances=False, return_indices=True)
+        s[nan_mask] = s[tuple(ind)][nan_mask]
+    return out
+
+
+class _BcFields:
+    """Load and interpolate boundary conditions from an external file."""
+
+    def __init__(self, config_bc, State=None):
+        if State is None:
+            from . import state
+            State = state.State(config_bc._config if hasattr(config_bc, '_config') else {}, verbose=False)
+
+        self.lon = State.lon
+        self.lat = State.lat
+        self.mask = State.mask
+
+        lon_min = np.nanmin(self.lon)
+        lon_max = np.nanmax(self.lon)
+        lat_min = np.nanmin(self.lat)
+        lat_max = np.nanmax(self.lat)
+
+        dlon = np.nanmean(self.lon[:,1:]-self.lon[:,:-1])
+        dlat = np.nanmean(self.lat[1:,:]-self.lat[:-1,:])
+
+        _ds = xr.open_mfdataset(config_bc.file)
+        ds = _ds.copy()
+        _ds.close()
+
+        try:
+            if np.sign(ds[config_bc.name_lon].data.min()) == -1 and State.lon_unit == '0_360':
+                ds = ds.assign_coords({config_bc.name_lon: ((config_bc.name_lon, ds[config_bc.name_lon].data % 360))})
+            elif np.sign(ds[config_bc.name_lon].data.min()) >= 0 and State.lon_unit == '-180_180':
+                ds = ds.assign_coords({config_bc.name_lon: ((config_bc.name_lon, (ds[config_bc.name_lon].data + 180) % 360 - 180))})
+            ds = ds.sortby(ds[config_bc.name_lon])
+        except Exception:
+            print("Warning: can't convert longitude coordinates in " + config_bc.file)
+
+        time_bc = ds[config_bc.name_time].values
+        self.name_time_bc = config_bc.name_time
+        lon_bc = ds[config_bc.name_lon].values
+        lat_bc = ds[config_bc.name_lat].values
+        dlon += np.nanmean(lon_bc[1:] - lon_bc[:-1])
+        dlat += np.nanmean(lat_bc[1:] - lat_bc[:-1])
+        dtime = time_bc[1] - time_bc[0]
+        try:
+            ds = ds.sel({
+                config_bc.name_time: slice(
+                    np.datetime64(config_bc._config.EXP.init_date) - dtime,
+                    np.datetime64(config_bc._config.EXP.final_date) + dtime,
+                ),
+            })
+        except Exception:
+            ds = ds.where(
+                (ds[config_bc.name_time] >= np.datetime64(config_bc._config.EXP.init_date) - dtime)
+                & (ds[config_bc.name_time] <= np.datetime64(config_bc._config.EXP.final_date) + dtime),
+                drop=True,
+            )
+        if len(ds[config_bc.name_lon].shape) == 1 and len(ds[config_bc.name_lat].shape) == 1:
+            ds = ds.sel({
+                config_bc.name_lon: slice(lon_min - 2 * dlon, lon_max + 2 * dlon),
+                config_bc.name_lat: slice(lat_min - 2 * dlat, lat_max + 2 * dlat),
+            })
+
+        self.c_grid = getattr(config_bc, 'c_grid', False)
+        self.lon_bc = ds[config_bc.name_lon].values
+        self.lat_bc = ds[config_bc.name_lat].values
+        self.time_bc = ds[config_bc.name_time].values if config_bc.name_time is not None else None
+
+        self.var = {}
+        for name in config_bc.name_var:
+            self.var[name] = ds[config_bc.name_var[name]].load()
+        ds.close()
+
+    def interp(self, time):
+        if self.time_bc is not None and self.time_bc.size > 1:
+            if len(time.shape) == 0:
+                time = np.array([time])
+            elif len(time.shape) == 1:
+                time = np.ascontiguousarray(time)
+            else:
+                sys.exit('Time dimension must be 1D or 0D')
+
+        if time.size > 1 and type(time[0]) != np.datetime64:
+            time = np.array([np.datetime64(dt) for dt in time])
+        elif time.size == 1 and type(time) != np.datetime64:
+            time = np.array([np.datetime64(time)])
+
+        if len(self.lon_bc.shape) == 1 and len(self.lat_bc.shape) == 1:
+            var_interp = self._interp_3D(time)
+        elif len(self.lon_bc.shape) == 2 and len(self.lat_bc.shape) == 2 and np.all(self.lon_bc == self.lon) and np.all(self.lat_bc == self.lat):
+            var_interp = self._interp_1D(time)
+        else:
+            sys.exit('Boundary conditions coordinates must be 1D, 2D. If 2D, they must match the model grid coordinates')
+
+        return var_interp
+
+    def _interp_3D(self, time):
+        has_time = self.time_bc is not None and self.time_bc.size > 1
+
+        x_source_axis = pyinterp.Axis(self.lon_bc, is_circle=True)
+        y_source_axis = pyinterp.Axis(self.lat_bc)
+
+        if has_time:
+            tbc = self.time_bc
+            i0 = np.clip(np.searchsorted(tbc, time, side='right') - 1, 0, len(tbc) - 2)
+            i1 = i0 + 1
+            t0f = tbc[i0].astype('datetime64[ns]').astype(np.float64)
+            t1f = tbc[i1].astype('datetime64[ns]').astype(np.float64)
+            ttf = time.astype('datetime64[ns]').astype(np.float64)
+            denom = np.where(t1f > t0f, t1f - t0f, 1.0)
+            w1 = (ttf - t0f) / denom
+            below = time < tbc[0]
+            above = time > tbc[-1]
+            w1 = np.where(below, 0.0, w1)
+            w1 = np.where(above, 1.0, w1)
+            w0 = 1.0 - w1
+            needed = np.unique(np.concatenate([i0, i1]))
+            pos = {int(k): n for n, k in enumerate(needed)}
+
+        var_interp = {}
+        for name in self.var:
+            if not self.c_grid or name not in ('U', 'V'):
+                lon_t = self.lon
+                lat_t = self.lat
+                mask_t = self.mask
+            elif name == 'U':
+                lon_t = np.zeros((self.lon.shape[0], self.lon.shape[1] + 1))
+                lat_t = np.zeros((self.lat.shape[0], self.lat.shape[1] + 1))
+                lon_t[:, 1:-1] = (self.lon[:, 1:] + self.lon[:, :-1]) / 2.
+                lon_t[:, 0] = self.lon[:, 0] - (self.lon[:, 1] - self.lon[:, 0]) / 2.
+                lon_t[:, -1] = self.lon[:, -1] + (self.lon[:, -1] - self.lon[:, -2]) / 2.
+                lat_t[:, 1:-1] = (self.lat[:, 1:] + self.lat[:, :-1]) / 2.
+                lat_t[:, 0] = self.lat[:, 0] - (self.lat[:, 1] - self.lat[:, 0]) / 2.
+                lat_t[:, -1] = self.lat[:, -1] + (self.lat[:, -1] - self.lat[:, -2]) / 2.
+                mask_t = np.zeros((self.mask.shape[0], self.mask.shape[1] + 1), dtype=bool)
+                mask_t[:, 1:-1] = self.mask[:, :-1] | self.mask[:, 1:]
+                mask_t[:, 0] = self.mask[:, 0]
+                mask_t[:, -1] = self.mask[:, -1]
+            else:
+                lon_t = np.zeros((self.lat.shape[0] + 1, self.lat.shape[1]))
+                lat_t = np.zeros((self.lat.shape[0] + 1, self.lat.shape[1]))
+                lon_t[1:-1, :] = (self.lon[1:, :] + self.lon[:-1, :]) / 2.
+                lon_t[0, :] = self.lon[0, :] - (self.lon[1, :] - self.lon[0, :]) / 2.
+                lon_t[-1, :] = self.lon[-1, :] + (self.lon[-1, :] - self.lon[-2, :]) / 2.
+                lat_t[1:-1, :] = (self.lat[1:, :] + self.lat[:-1, :]) / 2.
+                lat_t[0, :] = self.lat[0, :] - (self.lat[1, :] - self.lat[0, :]) / 2.
+                lat_t[-1, :] = self.lat[-1, :] + (self.lat[-1, :] - self.lat[-2, :]) / 2.
+                mask_t = np.zeros((self.mask.shape[0] + 1, self.mask.shape[1]), dtype=bool)
+                mask_t[1:-1, :] = self.mask[:-1, :] | self.mask[1:, :]
+                mask_t[0, :] = self.mask[0, :]
+                mask_t[-1, :] = self.mask[-1, :]
+
+            out_shape = lon_t.shape
+            x_flat = lon_t.T.ravel()
+            y_flat = lat_t.T.ravel()
+
+            if not has_time:
+                grid_source = pyinterp.Grid2D(x_source_axis, y_source_axis, np.asarray(self.var[name]).T)
+                _slice = pyinterp.bivariate(grid_source, x_flat, y_flat, bounds_error=False).reshape(out_shape[::-1]).T
+                _slice[mask_t] = np.nan
+                var_interp[name] = np.repeat(_slice[np.newaxis, :, :], len(time), axis=0)
+                continue
+
+            da = self.var[name].squeeze()
+            src = np.asarray(da.isel({self.name_time_bc: needed}).values, dtype=np.float64)
+            if src.ndim == 2:
+                src = src[np.newaxis]
+
+            filled = np.empty_like(src)
+            for k in range(src.shape[0]):
+                sl = src[k]
+                if np.isnan(sl).any():
+                    g2 = pyinterp.Grid2D(x_source_axis, y_source_axis, sl.T.copy())
+                    _, sl_filled = pyinterp.fill.gauss_seidel(g2)
+                    filled[k] = sl_filled.T
+                else:
+                    filled[k] = sl
+
+            nt_out = len(time)
+            n_needed = src.shape[0]
+            result = np.empty((nt_out,) + out_shape, dtype=np.float64)
+
+            if nt_out > n_needed:
+                spatial = np.empty((n_needed,) + out_shape, dtype=np.float64)
+                for k in range(n_needed):
+                    g2 = pyinterp.Grid2D(x_source_axis, y_source_axis, np.ascontiguousarray(filled[k].T))
+                    spatial[k] = pyinterp.bivariate(g2, x_flat, y_flat, bounds_error=False).reshape(out_shape[::-1]).T
+                for t in range(nt_out):
+                    k0 = pos[int(i0[t])]
+                    k1 = pos[int(i1[t])]
+                    if k0 == k1 or w1[t] == 0.0:
+                        result[t] = spatial[k0]
+                    elif w1[t] == 1.0:
+                        result[t] = spatial[k1]
+                    else:
+                        result[t] = w0[t] * spatial[k0] + w1[t] * spatial[k1]
+                    result[t][mask_t] = np.nan
+            else:
+                for t in range(nt_out):
+                    k0 = pos[int(i0[t])]
+                    k1 = pos[int(i1[t])]
+                    if k0 == k1 or w1[t] == 0.0:
+                        blend = filled[k0]
+                    elif w1[t] == 1.0:
+                        blend = filled[k1]
+                    else:
+                        blend = w0[t] * filled[k0] + w1[t] * filled[k1]
+                    g2 = pyinterp.Grid2D(x_source_axis, y_source_axis, np.ascontiguousarray(blend.T))
+                    interp = pyinterp.bivariate(g2, x_flat, y_flat, bounds_error=False).reshape(out_shape[::-1]).T
+                    interp[mask_t] = np.nan
+                    result[t] = interp
+
+            var_interp[name] = result
+
+        return var_interp
+
+    def _interp_1D(self, time):
+        var_interp = {}
+        if len(time.shape) == 0:
+            time = np.array([time])
+        elif len(time.shape) == 1:
+            time = np.ascontiguousarray(time)
+        else:
+            sys.exit('Time dimension must be 1D or 0D')
+
+        for name in self.var:
+            var_data = self.var[name]
+            time_bc = self.time_bc
+            nt = len(time)
+
+            if time_bc is None or np.size(time_bc) <= 1:
+                interp_data = np.repeat(var_data.values[np.newaxis, ...], nt, axis=0)
+            else:
+                interp_result = var_data.interp({self.name_time_bc: xr.DataArray(time, dims=[self.name_time_bc])}, method="linear")
+                interp_data = interp_result.values
+
+            if hasattr(self, 'mask'):
+                mask = self.mask
+                if mask.shape == interp_data.shape[1:]:
+                    interp_data[:, mask] = np.nan
+
+            var_interp[name] = interp_data
+
+        return var_interp
 
 
 def Model(config, State, verbose=True):
@@ -56,12 +326,10 @@ def Model(config, State, verbose=True):
     elif config.MOD.super is not None:
         if verbose:
             print(config.MOD)
-        if config.MOD.super=='MOD_Id':
-            return Model_Id(config,State)
         if config.MOD.super=='MOD_DIFF':
             return Model_diffusion(config,State)
-        elif config.MOD.super=='MOD_QG1L_JAX':
-            return Model_qg1l_jax(config,State)
+        elif config.MOD.super=='MOD_QG1L':
+            return Model_qg1l(config,State)
         elif config.MOD.super=='MOD_CSW1L':
             return Model_csw1l(config,State)
         elif config.MOD.super=='MOD_QGSW':
@@ -112,14 +380,51 @@ class M:
             for name in self.name_var:
                 self.var_to_save.append(self.name_var[name])
 
+        # Load boundary conditions if configured
+        self._bc_fields = None
+        if hasattr(config.MOD, 'bc_file') and config.MOD.bc_file is not None:
+            from . import tools as grid
+            bc_config = type('BC_Config', (), {
+                'file': config.MOD.bc_file,
+                'name_lon': config.MOD.bc_name_lon,
+                'name_lat': config.MOD.bc_name_lat,
+                'name_time': config.MOD.bc_name_time,
+                'name_var': config.MOD.bc_name_var,
+                'c_grid': config.MOD.bc_c_grid,
+                '_config': config
+            })()
+            try:
+                self._bc_fields = _BcFields(bc_config, State)
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Failed to load boundary conditions: {e}")
+                self._bc_fields = None
+
 
     def init(self, State, t0=0):
 
         return
     
-    def set_bc(self,time_bc,var_bc):
-
-        return
+    def set_bc(self,time_bc,var_bc=None,**kwargs):
+        """Set boundary conditions from either direct interpolation or provided data.
+        
+        Parameters
+        ----------
+        time_bc : array-like
+            Timestamps for boundary conditions (np.datetime64 array)
+        var_bc : dict, optional
+            Pre-interpolated BC variables {name: array}. If None and self._bc_fields 
+            is available, will interpolate from loaded BC file automatically.
+        """
+        # If var_bc not provided but we have loaded BC fields, interpolate them
+        if var_bc is None and self._bc_fields is not None:
+            var_bc = self._bc_fields.interp(time_bc)
+        
+        # Store BC data in internal dict for use in model methods
+        if var_bc is not None:
+            self.bc = var_bc
+        else:
+            self.bc = {}
 
     def ano_bc(self,t,State,sign):
 
@@ -143,148 +448,9 @@ class M:
     
 
 ###############################################################################
-#                            Identity Model                                   #
-###############################################################################
-
-class Model_Id(M):
-    
-    def __init__(self,config,State):
-
-        super().__init__(config,State)
-        
-
-        # Initialization 
-        if (config.GRID.super == 'GRID_FROM_FILE') and (config.MOD.name_init_var is not None):
-            dsin = xr.open_dataset(config.GRID.path_init_grid)
-            for name in self.name_var:
-                if name in config.MOD.name_init_var:
-                    var_init = dsin[config.MOD.name_init_var[name]]
-                    if len(var_init.shape)==3:
-                        var_init = var_init[0,:,:]
-                    if config.GRID.subsampling is not None:
-                        var_init = var_init[::config.GRID.subsampling,::config.GRID.subsampling]
-                    dsin.close()
-                    del dsin
-                    State.var[self.name_var[name]] = var_init.values
-                else:
-                    State.var[self.name_var[name]] = np.zeros((State.ny,State.nx))
-        else:
-            for name in self.name_var:  
-                State.var[self.name_var[name]] = np.zeros((State.ny,State.nx))
-        
-        # Model Parameters (Flux)
-        for name in self.name_var:
-            State.params[self.name_var[name]] = np.zeros((State.ny,State.nx))
-
-
-        # Initialize boundary condition dictionnary for each model variable
-        self.bc = {}
-        for _name_var_mod in self.name_var:
-            self.bc[_name_var_mod] = {}
-        self.init_from_bc = config.MOD.init_from_bc
-        
-        # Weight map to apply BC in a smoothed way
-        if config.MOD.dist_sponge_bc is not None:
-            Wbc = grid.compute_weight_map(State.lon, State.lat, +State.mask, config.MOD.dist_sponge_bc)
-        else:
-            Wbc = np.zeros((State.ny,State.nx)) 
-            
-        self.Wbc = Wbc
-        
-        if config.INV is not None and config.INV.super=='INV_4DVAR' and config.INV.compute_test:
-            print('Tangent test:')
-            tangent_test(self,State)
-            print('Adjoint test:')
-            adjoint_test(self,State)
-
-    def init(self, State, t0=0):
-
-        for name in self.name_var: 
-            if t0 in self.bc[name]:
-                if self.init_from_bc:
-                    State.setvar(self.bc[name][t0], self.name_var[name])
-                else:
-                    State.var[self.name_var[name]] = self.Wbc * self.bc[name][t0]
-
-    def set_bc(self,time_bc,var_bc):
-        
-        for _name_var_bc in var_bc:
-            for _name_var_mod in self.name_var:
-                if _name_var_bc==_name_var_mod:
-                    for i,t in enumerate(time_bc):
-                        self.bc[_name_var_mod][t] = var_bc[_name_var_bc][i]
-        
-
-    def _apply_bc(self,State,t0,t):
-
-        for name in self.name_var:
-            if t not in self.bc[name]:
-                State.var[self.name_var[name]] +=\
-                    self.Wbc * (self.bc[name][t]-self.bc[name][t0]) 
-
-    def step(self,State, nstep=1,**kwargs):
-
-        # Loop on model variables
-        for name in self.name_var:
-
-            # Current trajectory
-            var0 = State.getvar(self.name_var[name])
-            var1 = +var0
-            params = State.params[self.name_var[name]]
-            var1 += (1-self.Wbc)*nstep*self.dt/(3600*24) * params
-
-            #var1[var1>4] = 4
-            var1[var1<0] = 0
-
-            State.setvar(var1, self.name_var[name])
-
-        
-    def step_tgl(self,dState,State, nstep=1,**kwargs):
-
-        # Loop on model variables
-        for name in self.name_var:
-
-            # Current trajectory
-            var0 = State.getvar(self.name_var[name])
-            var1 = +var0
-            params = State.params[self.name_var[name]]
-            var1 += params
-
-            # Tangent trajectory
-            dvar0 = dState.getvar(self.name_var[name])
-            dvar1 = +dvar0
-            dparams = dState.params[self.name_var[name]]
-            dvar1 += (1-self.Wbc)*nstep*self.dt/(3600*24) * dparams
-            #dvar1[var1>4] = 0.
-            dvar1[var1<0] = 0.
-            
-            dState.setvar(dvar1, self.name_var[name])
-
-        
-    def step_adj(self,adState,State, nstep=1,**kwargs):
-
-        # Loop on model variables
-        for name in self.name_var:
-
-            # Current trajectory
-            var0 = State.getvar(self.name_var[name])
-            var1 = +var0
-            params = State.params[self.name_var[name]]
-            var1 += params
-
-            # Adjoint trajectory
-            advar0 = adState.getvar(self.name_var[name])
-            advar1 = +advar0
-            #advar1[var1>4] = 0.
-            advar1[var1<0] = 0.
-            adState.params[self.name_var[name]] += (1-self.Wbc)*nstep*self.dt/(3600*24) * advar1
-            
-            adState.setvar(advar1, self.name_var[name])
-
-
-###############################################################################
 #                            Diffusion Models                                 #
 ###############################################################################
+        
         
 class Model_diffusion(M):
     
@@ -367,7 +533,13 @@ class Model_diffusion(M):
         State0 = State.copy()
         State0.save_output(present_date, name_var=self.name_var.values())
 
-    def set_bc(self,time_bc,var_bc):
+    def set_bc(self, time_bc, var_bc=None, **kwargs):
+        # If var_bc not provided but we have loaded BC fields, interpolate them
+        if var_bc is None and self._bc_fields is not None:
+            var_bc = self._bc_fields.interp(time_bc)
+        
+        if var_bc is None:
+            return
         
         for _name_var_bc in var_bc:
             for _name_var_mod in self.name_var:
@@ -397,7 +569,7 @@ class Model_diffusion(M):
             # Update state
             if self.name_var[name] in State.params:
                 params = State.params[self.name_var[name]]
-                var1 += (1-self.Wbc)*nstep*self.dt/(3600*24) * params
+                var1 += nstep*self.dt/(3600*24) * params
 
             State.setvar(var1, self.name_var[name])
         
@@ -425,7 +597,7 @@ class Model_diffusion(M):
             # Update state
             if self.name_var[name] in dState.params:
                 params = dState.params[self.name_var[name]]
-                var1 += (1-self.Wbc)*nstep*self.dt/(3600*24) * params
+                var1 += nstep*self.dt/(3600*24) * params
 
             dState.setvar(var1,self.name_var[name])
         
@@ -457,7 +629,7 @@ class Model_diffusion(M):
 
             # Update state and parameters
             if self.name_var[name] in State.params:
-                adState.params[self.name_var[name]] += (1-self.Wbc)*nstep*self.dt/(3600*24) * advar0 
+                adState.params[self.name_var[name]] += nstep*self.dt/(3600*24) * advar0 
             
             advar1[np.isnan(advar1)] = 0
             adState.setvar(advar1,self.name_var[name])
@@ -467,7 +639,7 @@ class Model_diffusion(M):
 #                       Quasi-Geostrophic Models                              #
 ###############################################################################
     
-class Model_qg1l_jax(M):
+class Model_qg1l(M):
 
     def __init__(self,config,State):
 
@@ -597,8 +769,8 @@ class Model_qg1l_jax(M):
         
         # CFL
         if config.MOD.cfl is not None:
-            grid_spacing = min(np.nanmean(State.DX), np.nanmean(State.DY)) 
-            dt = config.MOD.cfl * grid_spacing / np.nanmean(self.c)
+            grid_spacing = min(np.nanmin(State.DX), np.nanmin(State.DY)) 
+            dt = config.MOD.cfl * grid_spacing / np.nanmax(self.c)
             divisors = [i for i in range(1, 3600 + 1) if 3600 % i == 0]  # Find all divisors of one hour in seconds
             lower_divisors = [d for d in divisors if d <= dt]
             self.dt = max(lower_divisors)  # Get closest
@@ -656,19 +828,27 @@ class Model_qg1l_jax(M):
         self.init_from_bc = config.MOD.init_from_bc
         self.Wbc = np.zeros((State.ny,State.nx))
         if config.MOD.dist_sponge_bc is not None and State.mask is not None:
-            if config.MOD.advect_tracer and config.MOD.bc_trac=='OBC':
-                bc = False # No sponge band for open boundaries
+            # Use the same compute_sponge_components(.) machinery as Model_qgsw so that the
+            # sponge weight is built from independent west/east/north/south + coastal
+            # contributions and behaves consistently across models.
+            if getattr(config.MOD, 'use_sponge_on_coast', True):
+                mask_h = State.mask.copy()
             else:
-                bc = True
-            self.Wbc = grid.compute_weight_map(State.lon, State.lat, deepcopy(State.mask), config.MOD.dist_sponge_bc, bc=bc)
+                mask_h = np.zeros((State.ny, State.nx), dtype=bool)
+
+            wc_h, wNS_h, wWE_h = grid.compute_sponge_components(
+                State.lon, State.lat, mask_h, config.MOD.dist_sponge_bc)
+
+            self.Wbc = 1.0 - (1.0 - wc_h) * (1.0 - wNS_h) * (1.0 - wWE_h)
+
             if config.EXP.flag_plot>1:
                 plt.figure()
                 plt.pcolormesh(self.Wbc)
                 plt.colorbar()
                 plt.title('Wbc')
                 plt.show()
-
-        # Use boundary conditions as mean field (for 4Dvar only)
+        # Sponge Rayleigh-damping coefficient for tracers (like Model_bmit sponge_coef)
+        self.sponge_coef = config.MOD.sponge_coef
         if config.INV is not None and config.INV.super=='INV_4DVAR':
             self.anomaly_from_bc = config.INV.anomaly_from_bc
         else:
@@ -715,22 +895,44 @@ class Model_qg1l_jax(M):
                          tile_size=config.MOD.tile_size,
                          tile_overlap=config.MOD.tile_overlap,
                          mdt=self.mdt,
-                         bathymetry_PV_term=self.bathymetry_PV_term)
+                         sponge_coef=self.sponge_coef,
+                         bathymetry_PV_term=self.bathymetry_PV_term,
+                         formulation=config.MOD.formulation)
+
+        # Control parameters (mirrors Model_qgsw name_params contract)
+        self.name_params = config.MOD.name_params if config.MOD.name_params is not None else []
+        if 'c' in self.name_params:
+            # State.params['c'] holds the c-anomaly dc(x,y); the full effective
+            # phase-speed is c_eff = self.qgm.c (scalar prior) + dc.
+            # For GRID_FROM_FILE, warm-start dc from a previous 'c_anomaly'
+            # variable saved in the init file (same pattern as 'H' in
+            # Model_qgsw). Fall back to dc=0 when the variable is absent.
+            if config.GRID.super == 'GRID_FROM_FILE':
+                dsin = xr.open_dataset(config.GRID.path_init_grid)
+                if 'c_anomaly' in dsin:
+                    _dc_init = dsin['c_anomaly'].values.squeeze()
+                    _dc_init[np.isnan(_dc_init)] = 0.
+                    State.params['c'] = _dc_init
+                else:
+                    State.params['c'] = np.zeros((State.ny, State.nx))
+                dsin.close()
+                del dsin
+            else:
+                State.params['c'] = np.zeros((State.ny, State.nx))
 
         # Model functions initialization
         self.qgm_step = self.qgm.step_jit
         self.qgm_step_tgl = self.qgm.step_tgl_jit
         self.qgm_step_adj = self.qgm.step_adj_jit
 
-        self.step_jax_jit = jit(self.step_jax, static_argnums=[3])
-
         # Tests tgl & adj
         if config.INV is not None and config.INV.super=='INV_4DVAR' and config.INV.compute_test:
+
             print('QG1L_JAX Tangent test:')
             tangent_test(self,State,nstep=10)
             print('QG1L_JAX Adjoint test:')
             adjoint_test(self,State,nstep=10)
-    
+
     def init(self, State, t0=0):
 
         if self.anomaly_from_bc:
@@ -792,30 +994,59 @@ class Model_qg1l_jax(M):
             if name_var is not None:
                 name_var_diag += ['ug', 'vg', 'uc', 'vc', 'Fssh']
 
+        if 'c' in self.name_params:
+            State0.var['c_anomaly'] = State.params['c']
+            name_var_diag += ['c_anomaly']
+
         State0.save_output(present_date, name_var+name_var_diag)#, save_params=self.save_params)
 
-    def set_bc(self,time_bc,var_bc):
+    def set_bc(self,time_bc,var_bc=None,t_bc=None):
+
+        # If var_bc not provided but we have loaded BC fields, interpolate them
+        if var_bc is None and self._bc_fields is not None:
+            var_bc = self._bc_fields.interp(time_bc)
+        
+        if var_bc is None:
+            return
+
+        # Use float model times as dict keys if provided (needed by _apply_bc);
+        # fall back to time_bc keys when called without float times.
+        time_keys = t_bc if t_bc is not None else time_bc
 
         for _name_var_bc in var_bc:
             for _name_var_mod in self.name_var:
                 if _name_var_bc==_name_var_mod:
-                    for i,t in enumerate(time_bc):
+                    for i,t in enumerate(time_keys):
                         var_bc_t = +var_bc[_name_var_bc][i]
-                        # Remove nan
-                        var_bc_t[np.isnan(var_bc_t)] = 0.
+                        # Fill missing values.  For SSH we keep the historical
+                        # NaN->0 behaviour (SSH=0 at land is benign).  For
+                        # tracers we instead fill NaNs with the nearest valid
+                        # ocean value: QG tracer advection is not mask-aware,
+                        # so a 0 sitting at a land / coastal-no-data pixel of
+                        # varb would (i) be copied into the initial state via
+                        # init_from_bc / Wbc*bc, and (ii) leak into adjacent
+                        # ocean cells through advection each step, producing
+                        # the spurious ~0 psu / cold patches observed along
+                        # the coastline.  Nearest-ocean fill mirrors what SW
+                        # gets for free via its land mask.
+                        if _name_var_mod == 'SSH':
+                            var_bc_t[np.isnan(var_bc_t)] = 0.
+                        else:
+                            var_bc_t = _fill_nan_nearest(var_bc_t)
                         # Fill bc dictionnary
                         self.bc[_name_var_mod][t] = var_bc_t
                 elif _name_var_bc==f'{_name_var_mod}_params':
-                    for i,t in enumerate(time_bc):
+                    for i,t in enumerate(time_keys):
                         var_bc[_name_var_bc][i][np.isnan(var_bc[_name_var_bc][i])] = 0.
                         self.forcing[_name_var_mod][t] = var_bc[_name_var_bc][i]
         
-        # For step_jax
-        self.bc_time_jax = jnp.array(list(self.bc['SSH'].keys()))
         self.bc_time = np.array(list(self.bc['SSH'].keys()))
-        self.bc_values = {t: jnp.array(self.bc['SSH'][t]) for t in self.bc['SSH']}
-        for name in var_bc:
-            self.bc_values[name] = jnp.array(list(self.bc['SSH'].values()))
+        self.bc_values = {t: np.array(self.bc['SSH'][t]) for t in self.bc['SSH']}
+        for name in self.name_var:
+            if name in self.bc and len(self.bc[name].keys()) > 0:
+                self.bc_values[name] = np.array(list(self.bc[name].values()))
+            else:
+                self.bc_values[name] = np.array(list(self.bc['SSH'].values()))
             
     def _apply_bc(self,t0,t1):
         
@@ -847,27 +1078,17 @@ class Model_qg1l_jax(M):
                     Xb = np.append(Xb, Cb[np.newaxis,:,:], axis=0)     
         
         return Xb
-
-    def _apply_bc_jax(self,t,t1):
-
-        Xb = jnp.zeros((self.ny,self.nx,))
-
-        idt = jnp.where(self.bc_time_jax==t, size=1)[0]
-        Xb = self.bc_values['SSH'][idt][0]
-
-        if self.advect_tracer:
-            for name in self.name_var:
-                if name!='SSH':
-                    idt = jnp.where(self.bc_time_jax==t1, size=1)[0]
-                    Cb = self.bc_values[name][idt][0]
-                    Xb = jnp.append(Xb[jnp.newaxis,:,:], 
-                                    Cb[jnp.newaxis,:,:], axis=0)     
-        return Xb
     
     def step(self,State,nstep=1,t=0):
 
         # Boundary feld
         Xb = self._apply_bc(t,int(t+nstep*self.dt))
+
+        # c-anomaly: c_eff = prior scalar (fixed throughout 4DVar) + 2-D anomaly dc.
+        # self.qgm.c is never modified here so the forward and adjoint sweeps
+        # see the same operator, keeping the gradient consistent.
+        c_eff = (self.qgm.c + State.params['c'].astype(self.qgm.dtype)
+                 ) if 'c' in self.name_params else None
 
         # Get state variable(s)
         X0 = State.getvar(name_var=self.name_var['SSH'])
@@ -889,7 +1110,7 @@ class Model_qg1l_jax(M):
         X1 = +X0
 
         # Time propagation
-        X1 = self.qgm_step(X1, Xb, nstep=nstep)
+        X1 = self.qgm_step(X1, Xb, nstep=nstep, c=c_eff)
         
         # Update state
         if self.name_var['SSH'] in State.params:
@@ -899,66 +1120,30 @@ class Model_qg1l_jax(M):
                              name_var=self.name_var['SSH'])
                 for i,name in enumerate(self.name_var):
                     if name!='SSH':
+                        # Tracer sponge (Rayleigh damping toward BC) is now applied
+                        # per-substep inside qgm.bc() via sponge_coef; do not double-apply here.
+                        X1_i = X1[i]
                         Fc = State.params[self.name_var[name]] # Forcing term for tracer or ageostrophic velocities
                         # Add Nudging to BC 
                         if self.forcing_tracer_from_bc:
-                            State.setvar(X1[i] + nstep*self.dt/(3600*24) * (1-self.Wbc)  * Fc * (Xb[i] - X0[i]), 
-                                         name_var=self.name_var[name])
+                            X1_i = X1_i + nstep*self.dt/(3600*24) * (1-self.Wbc)  * Fc * (Xb[i] - X0[i])
                         # Only forcing flux
                         else:
-                            State.setvar(X1[i] + nstep*self.dt/(3600*24) * (1-self.Wbc)  * Fc ,
-                                        name_var=self.name_var[name])
+                            X1_i = X1_i + nstep*self.dt/(3600*24) * (1-self.Wbc)  * Fc
+                        State.setvar(X1_i, name_var=self.name_var[name])
             else:
                 X1 += nstep*self.dt/(3600*24) * Fssh
                 State.setvar(X1, name_var=self.name_var['SSH'])
     
-    def step_jax(self,t,State_vars,State_params,nstep=1):
-
-        # Boundary field
-        Xb = self._apply_bc_jax(t,t+nstep*self.dt)
-
-        # Get state variable(s)
-        X0 = State_vars[self.name_var['SSH']]
-        if self.advect_tracer:
-            X0 = X0[jnp.newaxis,:,:]
-            # Tracers
-            for name in self.name_var:
-                if name not in ['SSH', 'U', 'V']:
-                    C0 = State_vars[self.name_var[name]][jnp.newaxis,:,:]
-                    X0 = jnp.append(X0, C0, axis=0)
-        
-        # init
-        X1 = +X0
-
-        # Time propagation
-        X1 = self.qgm_step(X1,Xb,nstep=nstep)
-
-        # Update state
-        if self.name_var['SSH'] in State_params:
-            Fssh = State_params[self.name_var['SSH']] # Forcing term for SSH
-            if self.advect_tracer:
-                X1[0] += nstep*self.dt/(3600*24) * Fssh 
-                State_vars[self.name_var['SSH']] = X1[0]
-                for i,name in enumerate(self.name_var):
-                    if name!='SSH':
-                        Fc = State_params[self.name_var[name]] # Forcing term for tracer or ageostrophic velocities
-                        # Only forcing flux
-                        X1[i] += nstep*self.dt/(3600*24) * (1-self.Wbc)  * Fc 
-                        State_vars[self.name_var[name]] = X1[i]
-            else:
-                X1 += nstep*self.dt/(3600*24) * Fssh
-                State_vars[self.name_var['SSH']] = X1
-        
-        for name in self.name_var:
-            State_vars[self.name_var[name]] = jnp.nan_to_num(State_vars[self.name_var[name]])
-            
-        return State_vars
-
     def step_tgl(self,dState,State,nstep=1,t=0):
 
         # Boundary field
         Xb = self._apply_bc(t,int(t+nstep*self.dt))
-        
+
+        # c-anomaly: c_eff = prior scalar + 2-D anomaly dc
+        c_eff = (self.qgm.c + State.params['c'].astype(self.qgm.dtype)
+                 ) if 'c' in self.name_params else None
+
         # Get state variable
         dX0 = dState.getvar(name_var=self.name_var['SSH']).astype('float64')
         X0 = State.getvar(name_var=self.name_var['SSH']).astype('float64')
@@ -988,7 +1173,15 @@ class Model_qg1l_jax(M):
         X1 = +X0.astype('float64')
 
         # Time propagation
-        dX1 = self.qgm_step_tgl(dX1,X1,Xb,nstep=nstep)
+        if 'c' in self.name_params:
+            # Differentiate jointly w.r.t. (state, c_eff) so that the
+            # linearised effect of dc on h2pv is captured.
+            dc = jnp.asarray(dState.params['c'], dtype=self.qgm.dtype)
+            _, dX1 = jax.jvp(
+                lambda X, c: self.qgm.step_jit(X, Xb, nstep=nstep, c=c),
+                (X1, c_eff), (dX1, dc))
+        else:
+            dX1 = self.qgm_step_tgl(dX1, X1, Xb, nstep=nstep)
 
         # Convert to numpy and reshape
         dX1 = np.array(dX1).astype('float64')
@@ -1020,6 +1213,10 @@ class Model_qg1l_jax(M):
         # Boundary field
         Xb = self._apply_bc(t,int(t+nstep*self.dt))
 
+        # c-anomaly: c_eff = prior scalar + 2-D anomaly dc
+        c_eff = (self.qgm.c + State.params['c'].astype(self.qgm.dtype)
+                 ) if 'c' in self.name_params else None
+
         # Get state variable
         adSSH0 = adState.getvar(name_var=self.name_var['SSH'])#.astype('float64')
         SSH0 = State.getvar(name_var=self.name_var['SSH'])#.astype('float64')
@@ -1048,11 +1245,20 @@ class Model_qg1l_jax(M):
             X0 = SSH0
 
         # Init
-        adX1 = +adX0
         X1 = +X0
 
-        # Time propagation
-        adX1 = self.qgm_step_adj(adX1,X1,Xb,nstep=nstep)
+        # Time propagation — differentiate jointly w.r.t. (state, c_eff).
+        # Using a single vjp call with adX0 (the *incoming* adjoint) is
+        # correct: it avoids the bug of passing the already-propagated adjoint
+        # to the c-gradient vjp.
+        if 'c' in self.name_params:
+            _, vjp_fun = jax.vjp(
+                lambda X, c: self.qgm.step_jit(X, Xb, nstep=nstep, c=c),
+                X1, c_eff)
+            adX1, adc = vjp_fun(adX0)
+            adState.params['c'] = adState.params['c'] + np.array(adc)
+        else:
+            adX1 = self.qgm_step_adj(adX0, X1, Xb, nstep=nstep)
 
         # Update state and parameters
         if self.name_var['SSH'] in adState.params:
@@ -1086,6 +1292,8 @@ class Model_csw1l(M):
 
         super().__init__(config,State)
 
+        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+
         self.config = config
 
         # Model specific libraries
@@ -1105,23 +1313,15 @@ class Model_csw1l(M):
         # grid
         self.ny = State.ny
         self.nx = State.nx
-        if config.MOD.force_constant_km_grid:
-            if config.MOD.dx_km is not None:
-                State.dx = config.MOD.dx_km * 1000
-            if config.MOD.dy_km is not None:
-                State.dy = config.MOD.dy_km * 1000
-            DX = np.ones_like(State.lon)*State.dx
-            DY = np.ones_like(State.lat)*State.dy
-            X, Y = grid.dxdy2xy(DX,DY)
-            self.DX = DX
-            self.DY = DY
-            print('Force constant grid: DX=',State.dx,' DY=',State.dy)
-        else:
-            X = State.X
-            Y = State.Y
-            self.DX = State.DX
-            self.DY = State.DY
-            
+        X = State.X
+        Y = State.Y
+        self.DX = State.DX
+        self.DY = State.DY
+        
+        # Coriolis 
+        self.f = State.f
+        self.f_on_u = (self.f[:, :-1] + self.f[:, 1:]) / 2
+        self.f_on_v = (self.f[:-1, :] + self.f[1:, :]) / 2
 
         # Gravity
         self.g = State.g
@@ -1191,12 +1391,15 @@ class Model_csw1l(M):
                 
         else:
             self.c = config.MOD.c0 * np.ones((State.ny,State.nx))
+            
+        # Equivalent depth
+        self.Heb = self.c**2 / self.g
 
-        # Open Coriolis Frequency if provided
-        if config.MOD.filef_aux is not None and os.path.exists(config.MOD.filef_aux):
+        # Open Bathymetryc if provided
+        if config.MOD.file_H_aux is not None and os.path.exists(config.MOD.file_H_aux):
 
-            ds = xr.open_dataset(config.MOD.filef_aux)
-            name_lon = config.MOD.name_var_f['lon']
+            ds = xr.open_dataset(config.MOD.file_H_aux)
+            name_lon = config.MOD.name_var_H['lon']
             lon = ds[name_lon]
             # Convert longitude 
             if np.sign(lon.data.min())==-1 and State.lon_unit=='0_360':
@@ -1206,34 +1409,42 @@ class Model_csw1l(M):
                 ds = ds.assign_coords({name_lon:((name_lon, (lon.data + 180) % 360 - 180))})
                 ds = ds.sortby(name_lon)    
 
-            self.f = grid.interp2d(ds,
-                                   config.MOD.name_var_f,
+            self.H = grid.interp2d(ds,
+                                   config.MOD.name_var_H,
                                    State.lon,
                                    State.lat)
-        
             
             if config.EXP.flag_plot>0:
                 plt.figure()
-                plt.pcolormesh(self.f)
+                plt.pcolormesh(self.H)
                 plt.colorbar()
-                plt.title('Coriolis Frequency')
+                plt.title('Bathymetry')
                 plt.show()
-                
-        else:
-            self.f = State.f
-        self.f_on_u = (self.f[:, :-1] + self.f[:, 1:]) / 2
-        self.f_on_v = (self.f[:-1, :] + self.f[1:, :]) / 2
-            
-        # Equivalent depth
-        self.Heb = self.c**2 / self.g
 
-        # Mean depth (bathymetry)
-        self.H = config.MOD.H 
+        else:
+            self.H = config.MOD.H 
         
         # Boundary angles
-        if config.MOD.Ntheta>0:
-            theta_p = np.arange(0,pi/2+pi/2/config.MOD.Ntheta,pi/2/config.MOD.Ntheta)
-            self.bc_theta = np.append(theta_p-pi/2,theta_p[1:]) 
+        _ntheta = config.MOD.Ntheta
+        if _ntheta == -1:
+            # Auto: boundary tangential Nyquist criterion.
+            # A wave entering at angle theta has along-boundary wavenumber k_t = k*sin(theta).
+            # At grazing incidence k_t_max = k_max = omega_max/c_min.  With 2*Ntheta+1 angular
+            # samples covering [-k_max, k_max], the Nyquist condition on a boundary of length L
+            # gives:  Ntheta >= k_max * L / (2*pi) = L / lambda_min
+            # where lambda_min = 2*pi*c_min / omega_max and L = max boundary length.
+            _omegas = np.asarray(config.MOD.w_waves)
+            _He_bdy = np.concatenate([
+                self.Heb[0,:], self.Heb[-1,:], self.Heb[:,0], self.Heb[:,-1]])
+            _c_min = np.sqrt(self.g * np.nanmin(_He_bdy[_He_bdy > 0]))
+            _lambda_min = 2*pi * _c_min / np.max(np.abs(_omegas))
+            _L_bdy = max(
+                float(np.asarray(State.X).max() - np.asarray(State.X).min()),
+                float(np.asarray(State.Y).max() - np.asarray(State.Y).min()))
+            _ntheta = int(np.ceil(_L_bdy / _lambda_min))
+        if _ntheta > 0:
+            theta_p = np.arange(0, pi/2 + pi/2/_ntheta, pi/2/_ntheta)
+            self.bc_theta = np.append(theta_p - pi/2, theta_p[1:])
         else:
             self.bc_theta = np.array([0])
         
@@ -1243,7 +1454,6 @@ class Model_csw1l(M):
         # Tide frequencies
         self.omegas = np.asarray(config.MOD.w_waves)
         
-
         # CFL
         if config.MOD.cfl is not None:
             grid_spacing = min(np.nanmean(State.DX), np.nanmean(State.DY)) 
@@ -1267,7 +1477,6 @@ class Model_csw1l(M):
                 self.timestamps = np.array([config.EXP.init_date])
             self.T = np.arange(self.nt) * self.dt
 
-        
         # Initialize model state
         self.name_var = config.MOD.name_var
         self.var_to_save = [self.name_var['SSH']] # ssh
@@ -1335,17 +1544,20 @@ class Model_csw1l(M):
         # Coupling terms from vertical modes
         self.flag_coupling_from_bm = config.MOD.flag_coupling_from_bm
         if self.flag_coupling_from_bm:
-            self._compute_coupling_coefficients(config.MOD.path_vertical_modes)
+            if config.MOD.path_interaction_terms is not None and os.path.exists(config.MOD.path_interaction_terms):
+                self._read_interaction_terms(config, State)
+            else:
+                self._compute_coupling_coefficients(config.MOD.path_vertical_modes)
         if self.flag_coupling_from_bm and config.MOD.path_bm is not None and os.path.exists(config.MOD.path_bm):
             self.is_bm = True
-            self._compute_bm_fields(config.MOD.path_bm, config.MOD.name_var_bm)
+            self._compute_bm_fields(config.MOD.path_bm, config.MOD.name_var_bm, State)
         else:
             self.is_bm = False
 
         # Sponge layer
-        self.flag_bc_sponge = config.MOD.flag_bc_sponge
         self.sponge_width = config.MOD.dist_sponge_bc
         self.sponge_coef = config.MOD.sponge_coef
+        self.flag_bc_sponge = config.MOD.flag_bc_sponge and self.sponge_width is not None and self.sponge_width > 0
         if self.flag_bc_sponge:
             self.Xh = State.X
             self.Yh = State.Y
@@ -1354,31 +1566,61 @@ class Model_csw1l(M):
             self.Xv = 0.5 * (State.X[:-1, :] + State.X[1:, :])
             self.Yv = 0.5 * (State.Y[:-1, :] + State.Y[1:, :])
 
-            if config.MOD.periodic_x and config.MOD.periodic_y:
-                sponge_h = np.zeros_like(self.Xh)
-                sponge_u = np.zeros_like(self.Xu)
-                sponge_v = np.zeros_like(self.Xv)
-            elif config.MOD.periodic_x and not config.MOD.periodic_y:
-                sponge_h = np.maximum.reduce([gaspari_cohn(self.Yh-self.Yh[0,:][None,:], self.sponge_width*1e3), gaspari_cohn(self.Yh[-1,:][None,:]-self.Yh, self.sponge_width*1e3)])
-                sponge_u = np.maximum.reduce([gaspari_cohn(self.Yu-self.Yu[0,:][None,:], self.sponge_width*1e3), gaspari_cohn(self.Yu[-1,:][None,:]-self.Yu, self.sponge_width*1e3)])
-                sponge_v = np.maximum.reduce([gaspari_cohn(self.Yv-self.Yv[0,:][None,:], self.sponge_width*1e3), gaspari_cohn(self.Yv[-1,:][None,:]-self.Yv, self.sponge_width*1e3)])
-            elif not config.MOD.periodic_x and config.MOD.periodic_y:
-                sponge_h = np.maximum.reduce([gaspari_cohn(self.Xh-self.Xh[:,0][:,None], self.sponge_width*1e3), gaspari_cohn(self.Xh[:,-1][:,None]-self.Xh, self.sponge_width*1e3)])
-                sponge_u = np.maximum.reduce([gaspari_cohn(self.Xu-self.Xu[:,0][:,None], self.sponge_width*1e3), gaspari_cohn(self.Xu[:,-1][:,None]-self.Xu, self.sponge_width*1e3)])
-                sponge_v = np.maximum.reduce([gaspari_cohn(self.Xv-self.Xv[:,0][:,None], self.sponge_width*1e3), gaspari_cohn(self.Xv[:,-1][:,None]-self.Xv, self.sponge_width*1e3)])
+            # Sponge profile via grid.compute_sponge_components
+            lon_h = State.lon
+            lat_h = State.lat
+            lon_u = 0.5 * (lon_h[:, :-1] + lon_h[:, 1:])
+            lat_u = 0.5 * (lat_h[:, :-1] + lat_h[:, 1:])
+            lon_v = 0.5 * (lon_h[:-1, :] + lon_h[1:, :])
+            lat_v = 0.5 * (lat_h[:-1, :] + lat_h[1:, :])
+
+            if config.MOD.use_sponge_on_coast:
+                mask_h = State.mask.copy()
+                mask_u = mask_h[:, :-1] & mask_h[:, 1:]
+                mask_v = mask_h[:-1, :] & mask_h[1:, :]
             else:
-                sponge_h = np.maximum.reduce([gaspari_cohn(self.Xh-self.Xh[:,0][:,None], self.sponge_width*1e3), gaspari_cohn(self.Xh[:,-1][:,None]-self.Xh, self.sponge_width*1e3), gaspari_cohn(self.Yh-self.Yh[0,:][None,:], self.sponge_width*1e3), gaspari_cohn(self.Yh[-1,:][None,:]-self.Yh, self.sponge_width*1e3)])
-                sponge_u = np.maximum.reduce([gaspari_cohn(self.Xu-self.Xu[:,0][:,None], self.sponge_width*1e3), gaspari_cohn(self.Xu[:,-1][:,None]-self.Xu, self.sponge_width*1e3), gaspari_cohn(self.Yu-self.Yu[0,:][None,:], self.sponge_width*1e3), gaspari_cohn(self.Yu[-1,:][None,:]-self.Yu, self.sponge_width*1e3)])
-                sponge_v = np.maximum.reduce([gaspari_cohn(self.Xv-self.Xv[:,0][:,None], self.sponge_width*1e3), gaspari_cohn(self.Xv[:,-1][:,None]-self.Xv, self.sponge_width*1e3), gaspari_cohn(self.Yv-self.Yv[0,:][None,:], self.sponge_width*1e3), gaspari_cohn(self.Yv[-1,:][None,:]-self.Yv, self.sponge_width*1e3)])  
+                mask_h = np.zeros_like(lon_h, dtype=bool)
+                mask_u = np.zeros_like(lon_u, dtype=bool)
+                mask_v = np.zeros_like(lon_v, dtype=bool)
 
-            def _normalize_sponge(sponge):
-                sponge_min = jnp.min(sponge)
-                sponge_max = jnp.max(sponge)
-                return (sponge - sponge_min) / (sponge_max - sponge_min)
+            alpha = config.MOD.tangential_sponge_factor
 
-            self.sponge_h = _normalize_sponge(sponge_h)
-            self.sponge_u = _normalize_sponge(sponge_u)
-            self.sponge_v = _normalize_sponge(sponge_v)
+            # h: isotropic sponge
+            wc_h, wNS_h, wWE_h = grid.compute_sponge_components(lon_h, lat_h, mask_h, config.MOD.dist_sponge_bc)
+            if config.MOD.periodic_y:
+                wNS_h[:] = 0.0
+            if config.MOD.periodic_x:
+                wWE_h[:] = 0.0
+            self.sponge_h = 1.0 - (1.0 - wc_h) * (1.0 - wNS_h) * (1.0 - wWE_h)
+
+            # u: normal at W/E (full), tangential at N/S (reduced)
+            wc_u, wNS_u, wWE_u = grid.compute_sponge_components(lon_u, lat_u, mask_u, config.MOD.dist_sponge_bc)
+            if config.MOD.periodic_y:
+                wNS_u[:] = 0.0
+            if config.MOD.periodic_x:
+                wWE_u[:] = 0.0
+            self.sponge_u = 1.0 - (1.0 - wc_u) * (1.0 - alpha * wNS_u) * (1.0 - wWE_u)
+
+            # v: normal at N/S (full), tangential at W/E (reduced)
+            wc_v, wNS_v, wWE_v = grid.compute_sponge_components(lon_v, lat_v, mask_v, config.MOD.dist_sponge_bc)
+            if config.MOD.periodic_y:
+                wNS_v[:] = 0.0
+            if config.MOD.periodic_x:
+                wWE_v[:] = 0.0
+            self.sponge_v = 1.0 - (1.0 - wc_v) * (1.0 - wNS_v) * (1.0 - alpha * wWE_v)
+
+            if config.EXP.flag_plot > 0:
+                _, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
+                im1 = ax1.pcolormesh(self.sponge_h)
+                plt.colorbar(im1, ax=ax1)
+                ax1.set_title('Sponge SSH')
+                im2 = ax2.pcolormesh(self.sponge_u)
+                plt.colorbar(im2, ax=ax2)
+                ax2.set_title('Sponge U')
+                im3 = ax3.pcolormesh(self.sponge_v)
+                plt.colorbar(im3, ax=ax3)
+                ax3.set_title('Sponge V')
+                plt.show()
 
             if not config.MOD.periodic_y:
                 self.sponge_on_h_S = (np.abs(self.Yh-self.Yh[0,:][None,:])<=config.MOD.dist_sponge_bc*1e3) 
@@ -1417,10 +1659,11 @@ class Model_csw1l(M):
             self.weight_sponge_h[self.weight_sponge_h==0] = 1
 
             # Update mask (for avoiding assimilation in sponge regions)
-            State.mask[self.sponge_on_h_S] = True
-            State.mask[self.sponge_on_h_N] = True
-            State.mask[self.sponge_on_h_W] = True
-            State.mask[self.sponge_on_h_E] = True
+            if config.MOD.mask_sponge_bc:
+                State.mask[self.sponge_on_h_S] = True
+                State.mask[self.sponge_on_h_N] = True
+                State.mask[self.sponge_on_h_W] = True
+                State.mask[self.sponge_on_h_E] = True
         
         self.mask = State.mask
 
@@ -1441,10 +1684,36 @@ class Model_csw1l(M):
                          periodic_y=config.MOD.periodic_y,
                          )
     
+        # Set sponge attributes on SW model for compute_IT_2D
+        if self.flag_bc_sponge:
+            self.swm.flag_sponge_bc = True
+            self.swm.sponge_coef = self.sponge_coef
+            self.swm.sponge_u = self.sponge_u
+            self.swm.sponge_v = self.sponge_v
+            self.swm.sponge_h = self.sponge_h
+            self.swm.sponge_on_h_S = self.sponge_on_h_S
+            self.swm.sponge_on_h_N = self.sponge_on_h_N
+            self.swm.sponge_on_h_W = self.sponge_on_h_W
+            self.swm.sponge_on_h_E = self.sponge_on_h_E
+            self.swm.sponge_on_u_S = self.sponge_on_u_S
+            self.swm.sponge_on_u_N = self.sponge_on_u_N
+            self.swm.sponge_on_u_W = self.sponge_on_u_W
+            self.swm.sponge_on_u_E = self.sponge_on_u_E
+            self.swm.sponge_on_v_S = self.sponge_on_v_S
+            self.swm.sponge_on_v_N = self.sponge_on_v_N
+            self.swm.sponge_on_v_W = self.sponge_on_v_W
+            self.swm.sponge_on_v_E = self.sponge_on_v_E
+            self.swm.weight_sponge_u = self.weight_sponge_u
+            self.swm.weight_sponge_v = self.weight_sponge_v
+            self.swm.weight_sponge_h = self.weight_sponge_h
+
+        # IT wave-phase method for sponge BC
+        self.swm.bc_it_method = getattr(config.MOD, 'bc_it_method', 'plane_wave')
+
         # Compile jax-related functions
-        self._jstep_jit = jit(self._jstep)
-        self._jstep_tgl_jit = jit(self._jstep_tgl)
-        self._jstep_adj_jit = jit(self._jstep_adj)
+        self._jstep_jit = jit(self._jstep, static_argnames=['nstep'])
+        self._jstep_tgl_jit = jit(self._jstep_tgl, static_argnames=['nstep'])
+        self._jstep_adj_jit = jit(self._jstep_adj, static_argnames=['nstep'])
         self._compute_advective_terms_from_bm_jit = jit(self._compute_advective_terms_from_bm)
         self._compute_He_from_bm_jit = jit(self._compute_He_from_bm)
         self._compute_w1_IT_jit = jit(self._compute_w1_IT)
@@ -1453,10 +1722,12 @@ class Model_csw1l(M):
         # Functions related to time_scheme
         if self.time_scheme=='Euler':
             self.swm_step = self.swm.step_euler_jit
+            self.swm_step_nstep = self.swm._step_euler_nstep
             self.swm_step_tgl = self.swm.step_euler_tgl_jit
             self.swm_step_adj = self.swm.step_euler_adj_jit
         elif self.time_scheme=='rk4':
             self.swm_step = self.swm.step_rk4_jit
+            self.swm_step_nstep = self.swm._step_rk4_nstep
             self.swm_step_tgl = self.swm.step_rk4_tgl_jit
             self.swm_step_adj = self.swm.step_rk4_adj_jit
         
@@ -1621,33 +1892,133 @@ class Model_csw1l(M):
         plt.colorbar()
         plt.title('dHe')
         plt.show()
-    
-    def _compute_bm_fields(self, path_bm, name_var_bm):
 
-        dsbm = xr.open_mfdataset(path_bm)
-        dsbm_interp = dsbm.interp(time=self.timestamps,
-                                    method='linear').load()
+    def _read_interaction_terms(self, config, State):
+        """Read interaction terms (U11u, U11p, U11z) from a netcdf file
+        instead of computing them from vertical modes."""
+
+        ds = xr.open_dataset(config.MOD.path_interaction_terms)
+        name_lon = config.MOD.name_var_interaction_terms['lon']
+        lon = ds[name_lon]
+        # Convert longitude
+        if np.sign(lon.data.min()) == -1 and State.lon_unit == '0_360':
+            ds = ds.assign_coords({name_lon: ((name_lon, lon.data % 360))})
+            ds = ds.sortby(name_lon)
+        elif np.sign(lon.data.min()) >= 0 and State.lon_unit == '-180_180':
+            ds = ds.assign_coords({name_lon: ((name_lon, (lon.data + 180) % 360 - 180))})
+            ds = ds.sortby(name_lon)
+
+        name_vars = config.MOD.name_var_interaction_terms
+
+        def _read_field(var_key, ds, name_vars, State, divisor):
+            """Read and interpolate a field if variable name is defined and exists in the dataset."""
+            if name_vars.get(var_key) and name_vars[var_key] in ds:
+                return jnp.array(grid.interp2d(
+                    ds, {'lon': name_vars['lon'], 'lat': name_vars['lat'], 'var': name_vars[var_key]},
+                    State.lon, State.lat)) / divisor
+            else:
+                print(f'Warning: {var_key} not found or not defined. Setting to zero.')
+                return jnp.zeros((State.ny, State.nx))
+
+        # Read U11u
+        self.U11u = _read_field('U11_u', ds, name_vars, State, self.H)
+
+        # Read U11p
+        self.U11p = _read_field('U11_p', ds, name_vars, State, self.H)
+
+        # Read U11z
+        self.U11z = _read_field('U11_z', ds, name_vars, State, self.H)
+
+        # Read dc2 (correction to c^2) and convert to dHe = dc2 / g
+        self.dHe = _read_field('dc2', ds, name_vars, State, self.H * self.g)
+
+        if config.EXP.flag_plot > 0:
+            fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+            for ax, data, title in zip(axes,
+                                       [self.U11u, self.U11p, self.U11z, self.dHe],
+                                       ['U11u', 'U11p', 'U11z', 'dHe']):
+                im = ax.pcolormesh(data)
+                plt.colorbar(im, ax=ax)
+                ax.set_title(title)
+            plt.suptitle('Interaction terms (from file)')
+            plt.show()
+
+    def _compute_bm_fields(self, path_bm, name_var_bm, State):
+
+        dsbm = xr.open_mfdataset(path_bm, chunks=None)
+        name_lon_bm = name_var_bm['lon']
+        name_lat_bm = name_var_bm['lat']
+
+        # 0) Select time range covering self.timestamps (with 1-step margin)
+        time_bm = dsbm['time'].values
+        t_min = np.datetime64(self.timestamps.min())
+        t_max = np.datetime64(self.timestamps.max())
+        idx = np.where((time_bm >= t_min) & (time_bm <= t_max))[0]
+        if len(idx) > 0:
+            i0 = max(idx[0] - 1, 0)
+            i1 = min(idx[-1] + 1, len(time_bm) - 1)
+            dsbm = dsbm.isel(time=slice(i0, i1 + 1))
+
+        # 1) Spatial interpolation onto model grid
+        lon_bm = dsbm[name_lon_bm]
+        if len(lon_bm.shape) == 1:
+            # 1D coordinates: select subdomain then use xarray interp (fast)
+            margin = 0.5
+            lon_min, lon_max = float(State.lon.min()) - margin, float(State.lon.max()) + margin
+            lat_min, lat_max = float(State.lat.min()) - margin, float(State.lat.max()) + margin
+            dsbm = dsbm.sel({name_lon_bm: slice(lon_min, lon_max),
+                             name_lat_bm: slice(lat_min, lat_max)})
+            dsbm = dsbm.interp({name_lon_bm: State.lon[0, :],
+                                 name_lat_bm: State.lat[:, 0]},
+                                method='linear')
+            h_all = dsbm[name_var_bm['ssh_bm']].values  # (nt_bm, ny, nx)
+        else:
+            # 2D coordinates: use scipy griddata directly
+            from scipy.interpolate import griddata
+            lon_bm_2d = dsbm[name_lon_bm].values
+            lat_bm_2d = dsbm[name_lat_bm].values
+            if len(lon_bm_2d.shape) == 1:
+                lon_bm_2d, lat_bm_2d = np.meshgrid(lon_bm_2d, lat_bm_2d)
+            nt_bm = dsbm.sizes['time']
+            h_all = np.full((nt_bm, self.ny, self.nx), np.nan)
+            for it in range(nt_bm):
+                var_vals = dsbm[name_var_bm['ssh_bm']].isel(time=it).values
+                valid = ~np.isnan(var_vals) & ~np.isnan(lon_bm_2d) & ~np.isnan(lat_bm_2d)
+                if not valid.any():
+                    continue
+                h_all[it] = griddata(
+                    (lon_bm_2d[valid], lat_bm_2d[valid]),
+                    var_vals[valid],
+                    (State.lon, State.lat),
+                    method='linear').reshape(self.ny, self.nx)
+
+        # 2) Compute geostrophic velocities on all BM timesteps
+        u_all = np.zeros_like(h_all)
+        v_all = np.zeros_like(h_all)
+        u_all[:, 1:-1, 1:] = - self.g / self.f[None, 1:-1, 1:] * \
+            (h_all[:, 2:, :-1] + h_all[:, 2:, 1:] - h_all[:, :-2, 1:] - h_all[:, :-2, :-1]) / (4 * self.DY[None, 1:-1, 1:])
+        v_all[:, 1:, 1:-1] = self.g / self.f[None, 1:, 1:-1] * \
+            (h_all[:, 1:, 2:] + h_all[:, :-1, 2:] - h_all[:, :-1, :-2] - h_all[:, 1:, :-2]) / (4 * self.DX[None, 1:, 1:-1])
+
+        # 3) Build xarray dataset for time interpolation
+        time_bm = dsbm['time'].values
+        ds_bm_uv = xr.Dataset({
+            'ssh': (['time', 'y', 'x'], h_all),
+            'u':   (['time', 'y', 'x'], u_all),
+            'v':   (['time', 'y', 'x'], v_all),
+        }, coords={'time': time_bm})
+        ds_bm_uv = ds_bm_uv.interp(time=self.timestamps, method='linear')
+
+        # 4) Store per-timestep fields
         self.ssh_bm_data = {}
         self.u_bm_data = {}
         self.v_bm_data = {}
         for t, date in zip(self.T, self.timestamps):
-            _h = dsbm_interp[name_var_bm['ssh_bm']].sel(time=date).values
-            _u = np.zeros((self.ny,self.nx))
-            _v = np.zeros((self.ny,self.nx))
-            _u[1:-1,1:] = - self.g/self.f[1:-1,1:]*\
-            (_h[2:,:-1]+_h[2:,1:]-_h[:-2,1:]-_h[:-2,:-1])/(4*self.DY[1:-1,1:])
-                
-            _v[1:,1:-1] = self.g/self.f[1:,1:-1]*\
-                (_h[1:,2:]+_h[:-1,2:]-_h[:-1,:-2]-_h[1:,:-2])/(4*self.DX[1:,1:-1])
-
-            self.ssh_bm_data[t] = _h#jnp.array(_h)
-            self.u_bm_data[t] = _u#jnp.array(_u)
-            self.v_bm_data[t] = _v#jnp.array(_v)
-            
-
-            
-            
-        fig, (ax1,ax2,ax3) = plt.subplots(1,3,figsize=(12,8))
+            self.ssh_bm_data[t] = ds_bm_uv['ssh'].sel(time=date).values
+            self.u_bm_data[t] = ds_bm_uv['u'].sel(time=date).values
+            self.v_bm_data[t] = ds_bm_uv['v'].sel(time=date).values
+        
+        fig, (ax1,ax2,ax3) = plt.subplots(1,3,figsize=(20,5))
         im1 = ax1.pcolormesh(self.ssh_bm_data[0])
         plt.colorbar(im1, ax=ax1)
         ax1.set_title('SSH BM at t=0s')
@@ -2072,6 +2443,28 @@ class Model_csw1l(M):
 
         return u_it, v_it, h_it
     
+    def _jstep(self, t, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm, nstep=1):
+
+        # Compute equivalent depth anomaly from control parameters (once, before scan)
+        He2d = self._compute_He_from_bm(He_mean, alpha_He, h_bm)
+
+        # Compute advective terms from control parameters (once, before scan)
+        u11u, v11u, u11p, v11p, u11z, v11z = self._compute_advective_terms_from_bm(alpha_Uu, alpha_Up, alpha_Uz, u_bm, v_bm)
+        
+        # Compute characteristic variable from external data (once, before scan)
+        if not self.flag_bc_sponge:
+            w1ext = self._compute_w1_IT(t, self.Heb+He2d, h_SN, h_WE)
+        else:
+            w1ext = None
+
+        # Multi-step forward integration (scan + checkpoint inside swm)
+        u1, v1, h1 = self.swm_step_nstep(
+            u, v, h, He2d, w1ext=w1ext,
+            u11u=u11u, v11u=v11u, u11z=u11z, v11z=v11z, u11p=u11p, v11p=v11p,
+            nstep=nstep, t=t, He_total=self.Heb+He2d, h_SN=h_SN, h_WE=h_WE)
+    
+        return u1, v1, h1
+
     def step(self,State,nstep=1,t=0):
 
         # Get state variable
@@ -2125,42 +2518,14 @@ class Model_csw1l(M):
             h_SN = None
             h_WE = None
             
-        # Time stepping
-        for it in range(nstep):
-            # One time step
-            u, v, h = self._jstep_jit(t+it*self.dt, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm)
+        # Time stepping (scan + checkpoint inside swm model)
+        u, v, h = self._jstep_jit(t, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm, nstep=nstep)
         
         # Update state
         State.setvar([u,v,h],[
             self.name_var['U'],
             self.name_var['V'],
             self.name_var['SSH']])
-        
-    def _jstep(self, t, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm):
-
-        # Compute equivalent depth anomaly from control parameters
-        He2d = self._compute_He_from_bm_jit(He_mean, alpha_He, h_bm)
-
-        # Compute advective terms from control parameters
-        u11u, v11u, u11p, v11p, u11z, v11z = self._compute_advective_terms_from_bm_jit(alpha_Uu, alpha_Up, alpha_Uz, u_bm, v_bm)
-        
-        # Compute characteristic variable from external data
-        if not self.flag_bc_sponge:
-            w1ext = self._compute_w1_IT_jit(t, self.Heb+He2d, h_SN, h_WE)
-        else:
-            w1ext = None
-
-        # One forward step
-        u1, v1, h1 = self.swm_step(u, v, h, He2d, w1ext=w1ext, u11u=u11u, v11u=v11u, u11p=u11p, v11p=v11p, u11z=u11z, v11z=v11z)
-
-        # Sponge Boundary conditions
-        if self.flag_bc_sponge:
-            _u_b, _v_b, _h_b = self._compute_IT_2D_jit(t, self.Heb+He2d, h_SN, h_WE)
-            u1 += self.sponge_coef * self.sponge_u * (_u_b - u)
-            v1 += self.sponge_coef * self.sponge_v * (_v_b - v)
-            h1 += self.sponge_coef * self.sponge_h * (_h_b - h)
-    
-        return u1, v1, h1
         
     def step_tgl(self,dState,State,nstep=1,t=0):
         
@@ -2229,13 +2594,10 @@ class Model_csw1l(M):
             dh_SN = dh_WE = None
             h_SN = h_WE = None
             
-        # Time stepping
-        for it in range(nstep):
-            # One time step
-            du, dv, dh = self._jstep_tgl_jit(t+it*self.dt, 
-                                             du, dv, dh, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dalpha_Uz, dh_SN, dh_WE,
-                                             u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm)
-            u, v, h = self._jstep_jit(t+it*self.dt, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm)
+        # Time stepping (JVP through _jstep with scan + checkpoint inside swm model)
+        du, dv, dh = self._jstep_tgl_jit(
+            t, du, dv, dh, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dalpha_Uz, dh_SN, dh_WE,
+            u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm, nstep=nstep)
         
         # Update state
         dState.setvar([du,dv,dh],[
@@ -2245,11 +2607,11 @@ class Model_csw1l(M):
         
     def _jstep_tgl(self, t, 
                    du, dv, dh, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dalpha_Uz, dh_SN, dh_WE,
-                   u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm):
+                   u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm, nstep=1):
         
         def wrapped_jstep(x):
             u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE = x
-            return self._jstep(t, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm)
+            return self._jstep(t, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm, nstep=nstep)
         primals = ((u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE),)
         tangents = ((du, dv, dh, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dalpha_Uz, dh_SN, dh_WE),)
 
@@ -2325,16 +2687,14 @@ class Model_csw1l(M):
             h_SN = h_WE = None
         
 
-        # Current trajectory
+        # Forward trajectory (using JIT'd single-step for fast execution)
         u_list = [u]; v_list = [v]; h_list = [h]
         for it in range(nstep):
-            # One time step
-            u, v, h = self._jstep_jit(t+it*self.dt, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm)
+            u, v, h = self._jstep_jit(t+it*self.dt, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm, nstep=1)
             u_list.append(u); v_list.append(v); h_list.append(h)
             
         # Reverse-time adjoint loop
         for it in reversed(range(nstep)):
-            # Non-linear trajectory at time it
             u = u_list[it]
             v = v_list[it]
             h = h_list[it]
@@ -2374,11 +2734,11 @@ class Model_csw1l(M):
 
     def _jstep_adj(self, t, 
                   adu, adv, adh, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adalpha_Uz, adh_SN, adh_WE,
-                  u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm):
+                  u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm, nstep=1):
 
         def wrapped_jstep(x):
             u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE = x
-            return self._jstep(t, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm)
+            return self._jstep(t, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm, nstep=nstep)
         primals = ((u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE),)
         cotangents = (adu, adv, adh)  
 
@@ -2449,6 +2809,7 @@ class Model_qgsw(M):
             model = model_qg
         else:
             model = model_sw
+        self._is_qg_class = (config.MOD.name_class.lower() == 'qg')
 
         # Coriolis
         if config.MOD.f0 is not None and config.MOD.constant_f:
@@ -2494,9 +2855,79 @@ class Model_qgsw(M):
                                    config.MOD.name_var_mdt,
                                    State.lon,
                                    State.lat)
-            mdt[np.isnan(mdt)] = 0
 
-            mdu, mdv = self.ssh2uv(mdt)
+            # Honour the model mask on the h-grid first: griddata may extrapolate
+            # non-NaN values onto land cells, and near-coast ocean cells can be
+            # contaminated by land-NaN triangles in the Delaunay tessellation.
+            # Force land to NaN, then fill with the nearest valid ocean value so
+            # the coast–ocean transition is smooth.
+            # Convention: State.mask == True → land, False → ocean.
+            mdt[State.mask] = np.nan
+            mdt = _fill_nan_nearest(mdt)
+            # mdt is now smooth everywhere (land filled with nearest ocean value).
+
+            if 'var_u' in config.MOD.name_var_mdt and 'var_v' in config.MOD.name_var_mdt:
+                # Velocities are provided on the h-grid (ny, nx): apply the same
+                # mask/fill treatment, then stagger to the u/v grids using the
+                # same padding convention as f_on_u / f_on_v so that the stored
+                # arrays have shapes (ny, nx+1) and (ny+1, nx) respectively.
+                _name_vars_u = {
+                    'lon': config.MOD.name_var_mdt['lon'],
+                    'lat': config.MOD.name_var_mdt['lat'],
+                    'var': config.MOD.name_var_mdt['var_u'],
+                }
+                _name_vars_v = {
+                    'lon': config.MOD.name_var_mdt['lon'],
+                    'lat': config.MOD.name_var_mdt['lat'],
+                    'var': config.MOD.name_var_mdt['var_v'],
+                }
+                mdu = grid.interp2d(ds,
+                                   _name_vars_u,
+                                   State.lon,
+                                   State.lat)
+                mdv = grid.interp2d(ds,
+                                   _name_vars_v,
+                                   State.lon,
+                                   State.lat)
+                mdu[State.mask] = np.nan
+                mdu = _fill_nan_nearest(mdu)
+                mdv[State.mask] = np.nan
+                mdv = _fill_nan_nearest(mdv)
+                # Stagger h-grid → u-grid (ny, nx+1) and v-grid (ny+1, nx)
+                _pad = ((1, 0), (1, 0))
+                _mdu = np.pad(mdu, pad_width=_pad, mode='edge')
+                mdu = 0.5 * (_mdu[1:, :] + _mdu[:-1, :])   # (ny, nx+1)
+                _mdv = np.pad(mdv, pad_width=_pad, mode='edge')
+                mdv = 0.5 * (_mdv[:, 1:] + _mdv[:, :-1])   # (ny+1, nx)
+            else:
+                # Derive geostrophic velocities from the smooth filled mdt
+                # (before zeroing land) so that no artificial MDT→0 step at the
+                # coast amplifies into huge geostrophic velocities.
+                # ssh2uv returns (ny, nx+1) and (ny+1, nx) directly.
+                mdu, mdv = self.ssh2uv(mdt)
+
+            # Zero land cells in mdt, and zero any staggered u/v face that
+            # borders a land h-cell (same padding convention as ssh2uv).
+            # This removes spurious velocities at coast-facing faces without
+            # affecting the interior ocean signal.
+            mdt[State.mask] = 0.
+            _mask_pad = np.pad(State.mask.astype(bool), pad_width=((1, 0), (1, 0)), mode='edge')
+            mdu[_mask_pad[1:, :] | _mask_pad[:-1, :]] = 0.  # (ny, nx+1)
+            mdv[_mask_pad[:, 1:] | _mask_pad[:, :-1]] = 0.  # (ny+1, nx)
+
+            # Safety: interpolation/extrapolation of external MDT/current files can
+            # still leave non-finite values (NaN/Inf). Enforce finite targets before
+            # they are injected into the model state and sponge relaxation.
+            _nbad_mdt = int(np.size(mdt) - np.count_nonzero(np.isfinite(mdt)))
+            _nbad_mdu = int(np.size(mdu) - np.count_nonzero(np.isfinite(mdu)))
+            _nbad_mdv = int(np.size(mdv) - np.count_nonzero(np.isfinite(mdv)))
+            if (_nbad_mdt + _nbad_mdu + _nbad_mdv) > 0:
+                print('Warning: non-finite MDT background values found '
+                      f'(mdt={_nbad_mdt}, mdu={_nbad_mdu}, mdv={_nbad_mdv}); '
+                      'replacing with 0.')
+            mdt = np.nan_to_num(mdt, nan=0.0, posinf=0.0, neginf=0.0)
+            mdu = np.nan_to_num(mdu, nan=0.0, posinf=0.0, neginf=0.0)
+            mdv = np.nan_to_num(mdv, nan=0.0, posinf=0.0, neginf=0.0)
 
         
             if config.EXP.flag_plot>0:
@@ -2577,6 +3008,16 @@ class Model_qgsw(M):
                     g_prime = np.expand_dims(g_prime, axis=(0,1))
                     
             if config.MOD.H is None:
+                # self.c is interpolated onto State.lon/State.lat, so its shape
+                # must be (State.ny, State.nx). The .T below converts to (nx, ny),
+                # which is then nl-expanded to (1, nx, ny) — the layout sw.py expects.
+                # A silent (nx, ny)-vs-(ny, nx) mismatch here would feed a diagonally
+                # flipped H field to the SW core, degrading forecast skill without
+                # crashing the model. Fail loudly instead.
+                assert self.c.shape == (State.ny, State.nx), \
+                    f'self.c has shape {self.c.shape}, expected (ny, nx)=' \
+                    f'({State.ny}, {State.nx}). The .T applied below assumes ' \
+                    f'(ny, nx); a mismatch will silently transpose H.'
                 H = np.expand_dims(self.c.T**2/g_prime[0,0,0], axis=0) 
                 H0 = np.array([[[np.nanmean(self.c)**2/g_prime[0,0,0]]]])
                 H[np.isnan(H)] = 0.
@@ -2586,8 +3027,9 @@ class Model_qgsw(M):
                     plt.colorbar()
                     plt.title('Equivalent Height')
                     plt.show()
-                if config.MOD.name_class.lower()=='qg':
-                    H = H0 # QG needs constant H
+                if config.MOD.name_class.lower()=='qg' or getattr(config.MOD, 'constant_H', False):
+                    H = H0 # QG needs constant H; constant_H flag forces uniform H for SW too
+                    print(f'H set to constant: H = {H0[0,0,0]:.4f} m')
             else:
                 H = H0 = config.MOD.H
                 if not hasattr(H,'shape'):
@@ -2657,15 +3099,24 @@ class Model_qgsw(M):
                         var_init = var_init[0,:,:]
                     if config.GRID.subsampling is not None:
                         var_init = var_init[::config.GRID.subsampling,::config.GRID.subsampling]
-                    var_init.data[np.isnan(var_init)] = 0.
-                    State.var[self.name_var[name]] = var_init.values
+                    arr = var_init.values.copy()
+                    if name not in ('SSH', 'U', 'V') and np.any(np.isnan(arr)):
+                        # Tracer: extrapolate NaN land cells from nearest ocean value
+                        # (mirrors set_bc treatment in Model_qg1l_jax via _fill_nan_nearest)
+                        arr = _fill_nan_nearest(arr)
+                    else:
+                        arr[np.isnan(arr)] = 0.
+                    State.var[self.name_var[name]] = arr
                 else:
                     if name=='U':
                         State.var[self.name_var[name]] = jnp.zeros((State.ny,State.nx+1), dtype=self.dtype)
                     elif name=='V':
                         State.var[self.name_var[name]] = jnp.zeros((State.ny+1,State.nx), dtype=self.dtype)
-                    elif name=='SSH':
-                        State.var[self.name_var[name]] = jnp.zeros((State.ny,State.nx), dtype=self.dtype)
+                    else:  # SSH or passive tracer — h-grid (ny, nx)
+                        arr = np.zeros((State.ny, State.nx))
+                        if State.mask is not None:
+                            arr[State.mask] = np.nan
+                        State.var[self.name_var[name]] = jnp.asarray(arr, dtype=self.dtype)
             dsin.close()
             del dsin   
         else:
@@ -2674,8 +3125,11 @@ class Model_qgsw(M):
                     State.var[self.name_var[name]] = jnp.zeros((State.ny,State.nx+1), dtype=self.dtype)
                 elif name=='V':
                     State.var[self.name_var[name]] = jnp.zeros((State.ny+1,State.nx), dtype=self.dtype)
-                elif name=='SSH':
-                    State.var[self.name_var[name]] = jnp.zeros((State.ny,State.nx), dtype=self.dtype)
+                else:  # SSH or passive tracer — h-grid (ny, nx)
+                    arr = np.zeros((State.ny, State.nx))
+                    if State.mask is not None:
+                        arr[State.mask] = np.nan
+                    State.var[self.name_var[name]] = jnp.asarray(arr, dtype=self.dtype)
 
         # For nl>1, also initialize per-layer storage in State
         if self.nl > 1:
@@ -2693,7 +3147,7 @@ class Model_qgsw(M):
 
         # Sponge layer
         self.sponge_width = config.MOD.dist_sponge_bc  # km
-        self.sponge_coef = config.MOD.sponge_coef
+        self.sponge_coef = 0.0 if self._is_qg_class else config.MOD.sponge_coef
 
         if self.sponge_width is not None and self.sponge_width>0:
             lon_h = State.lon
@@ -2722,9 +3176,13 @@ class Model_qgsw(M):
             if config.MOD.use_sponge_on_coast:
                 mask_h = State.mask.copy()
                 mask_u = np.zeros((State.ny, State.nx+1), dtype=bool)
-                mask_u[:, 1:State.nx] = mask_h[:, :-1] & mask_h[:, 1:]
+                mask_u[:, 1:State.nx] = mask_h[:, :-1] | mask_h[:, 1:]
+                mask_u[:, 0] = mask_h[:, 0]
+                mask_u[:, State.nx] = mask_h[:, -1]
                 mask_v = np.zeros((State.ny+1, State.nx), dtype=bool)
-                mask_v[1:State.ny, :] = mask_h[:-1, :] & mask_h[1:, :]
+                mask_v[1:State.ny, :] = mask_h[:-1, :] | mask_h[1:, :]
+                mask_v[0, :] = mask_h[0, :]
+                mask_v[State.ny, :] = mask_h[-1, :]
                 
             else:
                 mask_h = np.zeros((State.ny, State.nx), dtype=bool)
@@ -2768,12 +3226,15 @@ class Model_qgsw(M):
 
 
         # Model initialization
+        # QG spectral operators assume uniform spacing scalars; SW keeps full 2-D grids.
+        _dx_param = float(np.nanmean(State.DX)) if config.MOD.name_class.lower() == 'qg' else State.DX.T
+        _dy_param = float(np.nanmean(State.DY)) if config.MOD.name_class.lower() == 'qg' else State.DY.T
         params = {
             "nx": State.nx,
             "ny": State.ny,
             "nl": config.MOD.nl,
-            "dx": State.DX.T,
-            "dy": State.DY.T,
+            "dx": _dx_param,
+            "dy": _dy_param,
             "H": H,
             "g_prime": g_prime,
             "f": np.pad(self.f.T, ((0, 1), (0, 1)), mode='edge'),
@@ -2793,15 +3254,93 @@ class Model_qgsw(M):
             'barotropic_filter_spectral': False,
             'sponge_coef': self.sponge_coef,
             'forcing_momentum': getattr(config.MOD, 'forcing_momentum', 'direct'),
+            'H_min': getattr(config.MOD, 'H_min', None),
+            'H_max': getattr(config.MOD, 'H_max', None),
+            'diff_coef_trac': getattr(config.MOD, 'diff_coef_trac', 0.),
+            'time_scheme':    getattr(config.MOD, 'time_scheme',    'rk3'),
+            'h_adv_scheme':      getattr(config.MOD, 'h_adv_scheme',      'weno'),
+            'mom_adv_scheme':    getattr(config.MOD, 'mom_adv_scheme',    'weno'),
+            'tracer_adv_scheme': getattr(config.MOD, 'tracer_adv_scheme', 'weno'),
+            'solver':            getattr(config.MOD, 'solver',            'dst_cmm'),
         }
 
         self.model = model(params)
 
+        # Build auxiliary QG projector for QG-balanced sponge target (SW mode only)
+        self.model_proj = None
+        self.qg_balanced_sponge_bc = False
+        if not self._is_qg_class and getattr(config.MOD, 'qg_balanced_sponge_bc', False):
+            # Validate preconditions
+            _name_params = config.MOD.name_params if config.MOD.name_params is not None else []
+            if 'bc' in _name_params:
+                raise ValueError(
+                    'qg_balanced_sponge_bc is not compatible with the "bc" control parameter. '
+                    'Use external boundary conditions only when using QG-projected sponge targets.'
+                )
+            if config.MOD.dist_sponge_bc is None or config.MOD.dist_sponge_bc <= 0 or config.MOD.sponge_coef == 0:
+                print('Warning: qg_balanced_sponge_bc=True but sponge is inactive '
+                      '(dist_sponge_bc=None/≤0 or sponge_coef==0); disabling QG-projected sponge targets.')
+            else:
+                # Build auxiliary QG projector by cloning the SW params and
+                # overriding only what the QG elliptic solver needs.
+                qg_projector_params = dict(params)
+                qg_projector_params['H'] = self.H0  # spatially constant H for QG solver
+                # QG spectral solver assumes uniform spacing — collapse 2-D
+                # dx/dy to their domain mean if needed.
+                qg_projector_params['dx'] = float(np.nanmean(State.DX))
+                qg_projector_params['dy'] = float(np.nanmean(State.DY))
+                # The sponge projector only builds a balanced target. In domains
+                # with land, the capacitance-matrix irregular-boundary correction
+                # can become ill-conditioned and seed NaNs into the target, so use
+                # the robust masked DST solve for this auxiliary projection.
+                qg_projector_params['solver'] = 'dst'
+                qg_projector_params['compile'] = False
+                qg_projector_params['sponge_coef'] = 0.0  # projector is not a time-stepper
+                qg_projector_params['visc_coef'] = 0.0
+                qg_projector_params['diff_coef'] = 0.0
+                qg_projector_params['diff_coef_trac'] = 0.0
+                try:
+                    self.model_proj = model_qg(qg_projector_params)
+                    self.qg_balanced_sponge_bc = True
+                    print('Initialized auxiliary QG projector for balanced sponge targets')
+                except Exception as e:
+                    print(f'Warning: failed to initialize QG projector: {e}; '
+                          'falling back to external boundary field sponge targets.')
+                    self.model_proj = None
+                    self.qg_balanced_sponge_bc = False
+
+        if self.mdt is not None:
+            self.mdu = jnp.nan_to_num(self.mdu, nan=0.0, posinf=0.0, neginf=0.0)
+            self.mdv = jnp.nan_to_num(self.mdv, nan=0.0, posinf=0.0, neginf=0.0)
+            self.mdt = jnp.nan_to_num(self.mdt, nan=0.0, posinf=0.0, neginf=0.0)
+            self.mdu = jnp.where(self.model.masks.u > 0.5, self.mdu, 0.0)
+            self.mdv = jnp.where(self.model.masks.v > 0.5, self.mdv, 0.0)
+            self.mdt = jnp.where(self.model.masks.h > 0.5, self.mdt, 0.0)
+
         # Sponge masks: (1, 1, nx, ny) — broadcasts across all layers.
         # Layer 0 is nudged toward surface BC; deep layers toward zero (their BC is 0).
-        self.model.sponge_u = jnp.expand_dims(jnp.asarray(self.sponge_u.T.astype(self.dtype)), axis=(0,1))
-        self.model.sponge_v = jnp.expand_dims(jnp.asarray(self.sponge_v.T.astype(self.dtype)), axis=(0,1))
-        self.model.sponge_h = jnp.expand_dims(jnp.asarray(self.sponge_h.T.astype(self.dtype)), axis=(0,1))
+        self.model.sponge_u = jnp.where(
+            self.model.masks.u > 0.5,
+            jnp.expand_dims(jnp.asarray(self.sponge_u.T.astype(self.dtype)), axis=(0,1)),
+            0.0,
+        )
+        self.model.sponge_v = jnp.where(
+            self.model.masks.v > 0.5,
+            jnp.expand_dims(jnp.asarray(self.sponge_v.T.astype(self.dtype)), axis=(0,1)),
+            0.0,
+        )
+        self.model.sponge_h = jnp.where(
+            self.model.masks.h > 0.5,
+            jnp.expand_dims(jnp.asarray(self.sponge_h.T.astype(self.dtype)), axis=(0,1)),
+            0.0,
+        )
+
+        # Exclude sponge cells from observation assimilation.
+        # Written to State.sponge_mask so that State.mask (land only) is not modified:
+        # other models sharing State (e.g. Model_diffusion) must not zero sponge cells,
+        # but the OBSOP will still exclude them by combining mask + sponge_mask.
+        if getattr(config.MOD, 'mask_sponge_bc', False):
+            State.sponge_mask = (self.sponge_h > 0)
 
         # Maximum number of model steps per JIT call (limits GPU memory)
         self.max_nstep = getattr(config.MOD, 'max_nstep', 240)
@@ -2823,6 +3362,21 @@ class Model_qgsw(M):
             self.jstep_adj_jit = self.jstep_adj
             self.jstep_core_jit = self.jstep_core
 
+        # Tracer detection — config flag takes precedence if explicitly set to False
+        self.tracer_names = [k for k in self.name_var if k not in ('U', 'V', 'SSH')]
+        _cfg_advect = getattr(config.MOD, 'advect_tracer', None)
+        self.advect_tracer = (len(self.tracer_names) > 0) if _cfg_advect is None else bool(_cfg_advect)
+        self.n_trac = len(self.tracer_names)
+
+        if self.advect_tracer:
+            if flag_compile:
+                self.jstep_core_trac_jit = jax.jit(self.jstep_core_trac, static_argnames=['nstep'])
+                self.jstep_tgl_trac_jit  = jax.jit(self.jstep_tgl_trac,  static_argnames=['nstep'])
+                self.jstep_adj_trac_jit  = jax.jit(self.jstep_adj_trac,  static_argnames=['nstep'])
+            else:
+                self.jstep_core_trac_jit = self.jstep_core_trac
+                self.jstep_tgl_trac_jit  = self.jstep_tgl_trac
+                self.jstep_adj_trac_jit  = self.jstep_adj_trac
 
         # Control parameters
         self.name_params = config.MOD.name_params if config.MOD.name_params is not None else []
@@ -2838,12 +3392,39 @@ class Model_qgsw(M):
                 del dsin
             else:
                 State.params['H'] = np.zeros((State.ny,State.nx))
+
         if 'h_wind' in self.name_params:
-            State.params['h_wind'] = np.zeros((State.ny, State.nx))
+            self.h_wind = getattr(config.MOD, 'h_wind', None)
+            if (config.GRID.super == 'GRID_FROM_FILE'):
+                dsin = xr.open_dataset(config.GRID.path_init_grid)
+                if 'h_wind' in dsin:
+                    State.params['h_wind'] = dsin['h_wind'].values.squeeze()
+                    State.params['h_wind'][np.isnan(State.params['h_wind'])] = 0.
+                else:
+                    State.params['h_wind'] = np.zeros((State.ny,State.nx))
+                dsin.close()
+                del dsin
+            else:
+                State.params['h_wind'] = np.zeros((State.ny,State.nx))
+
+        if 'wind_strength' in self.name_params:
+            if (config.GRID.super == 'GRID_FROM_FILE'):
+                dsin = xr.open_dataset(config.GRID.path_init_grid)
+                if 'wind_strength' in dsin:
+                    State.params['wind_strength'] = dsin['wind_strength'].values.squeeze()
+                    State.params['wind_strength'][np.isnan(State.params['wind_strength'])] = 0.
+                else:
+                    State.params['wind_strength'] = np.zeros((State.ny,State.nx))
+                dsin.close()
+                del dsin
+            else:
+                State.params['wind_strength'] = np.zeros((State.ny, State.nx))
+
         if 'bc' in self.name_params:
             State.params['u_b'] = np.zeros((State.ny, State.nx + 1))
             State.params['v_b'] = np.zeros((State.ny + 1, State.nx))
             State.params['h_b'] = np.zeros((State.ny, State.nx))
+
         for name in self.name_var:
             State.params[self.name_var[name]] = np.zeros_like(State.var[self.name_var[name]])
 
@@ -3033,6 +3614,14 @@ class Model_qgsw(M):
                 if t0 in self.bc[name]:
                      State.setvar(self.bc[name][t0], self.name_var[name])
 
+        # In QG mode the velocity field must be geostrophically balanced with SSH.
+        # BC files typically only contain SSH, so u/v would otherwise be zero.
+        if self._is_qg_class:
+            ssh = State.getvar(name_var=self.name_var['SSH'])
+            u0, v0 = self.ssh2uv(ssh)
+            State.setvar(u0, self.name_var['U'])
+            State.setvar(v0, self.name_var['V'])
+
         # For nl>1, project surface fields into per-layer arrays
         if self.nl > 1:
             self._sync_layers_from_surface(State)
@@ -3043,23 +3632,32 @@ class Model_qgsw(M):
 
         _name_var = [self.name_var['U'], self.name_var['V'], self.name_var['SSH']] if name_var is None else name_var
 
-        # Project u,v from staggered grids onto h-grid
-        name_u = self.name_var['U']
-        name_v = self.name_var['V']
-        if name_u in State0.var:
-            u = np.array(State0.var[name_u])
-            State0.var[name_u] = 0.5 * (u[:, :-1] + u[:, 1:])
-        if name_v in State0.var:
-            v = np.array(State0.var[name_v])
-            State0.var[name_v] = 0.5 * (v[:-1, :] + v[1:, :])
+        if name_var is None and self.advect_tracer:
+            for name in self.tracer_names:
+                _name_var.append(self.name_var[name])
 
         if 'H' in self.name_params:
-            State0.var['H'] = +State.params['H']
+            State0.var['H'] = +State.params['H'] 
             _name_var += ['H']
+        
+        if 'h_wind' in self.name_params:
+            State0.var['h_wind'] = +State.params['h_wind']
+            _name_var += ['h_wind']
+        
+        if 'wind_strength' in self.name_params:
+            State0.var['wind_strength'] = State.params['wind_strength']
+            _name_var += ['wind_strength']
     
         State0.save_output(present_date, name_var=_name_var)
     
-    def set_bc(self,time_bc,var_bc):
+    def set_bc(self,time_bc,var_bc=None,**kwargs):
+
+        # If var_bc not provided but we have loaded BC fields, interpolate them
+        if var_bc is None and self._bc_fields is not None:
+            var_bc = self._bc_fields.interp(time_bc)
+        
+        if var_bc is None:
+            return
 
         for i,t in enumerate(time_bc):
             ssh_bc_t = +var_bc['SSH'][i]
@@ -3080,6 +3678,18 @@ class Model_qgsw(M):
             self.bc['U'][t] = u
             self.bc['V'][t] = v
             self.bc['SSH'][t] = ssh_bc_t
+
+        # Tracer BCs
+        for name in self.tracer_names:
+            if name in var_bc:
+                for i, t in enumerate(time_bc):
+                    c_bc_t = +var_bc[name][i]
+                    # Extrapolate NaN land cells from nearest ocean value
+                    # (mirrors Model_qg1l_jax.set_bc — prevents spurious ~0 patches
+                    # from leaking into the ocean via advection/sponge relaxation)
+                    if np.any(np.isnan(c_bc_t)):
+                        c_bc_t = _fill_nan_nearest(c_bc_t)
+                    self.bc[name][t] = c_bc_t
 
         self.bc_time = np.asarray(time_bc)
 
@@ -3104,15 +3714,54 @@ class Model_qgsw(M):
 
         return u_b, v_b, ssh_b
     
+    def _apply_bc_tracer(self, t0, t1):
+        """Return stacked tracer BC array of shape (n_trac, ny, nx)."""
+        if not self.advect_tracer:
+            return None
+        c_b_list = []
+        for name in self.tracer_names:
+            cb_i = np.zeros((self.ny, self.nx), dtype='float32')
+            if name in self.bc and len(self.bc[name]) > 0:
+                if t0 in self.bc[name]:
+                    cb_i = self.bc[name][t0]
+                elif hasattr(self, 'bc_time') and len(self.bc_time) > 0:
+                    idx = np.argmin(np.abs(self.bc_time - t0))
+                    cb_i = self.bc[name][self.bc_time[idx]]
+            c_b_list.append(jnp.asarray(cb_i, dtype=self.dtype))
+        return jnp.stack(c_b_list, axis=0)  # (n_trac, ny, nx)
+    
     def ssh2uv(self, ssh):
-        """Nonlinear SSH → (u, v) model."""
-
-        _ssh = np.pad(ssh, pad_width=((1,0),(1,0)), mode='edge')
-
-        _u = -self.g / self.f_on_u * np.diff(_ssh, axis=0) / self.dy_on_u
-        _v = self.g / self.f_on_v * np.diff(_ssh, axis=1) / self.dx_on_v
-
-        return _u, _v
+        """Geostrophic SSH → (u, v) model."""
+        if self._is_qg_class:
+            # Delegate to the model's G operator so that the same geostrophic
+            # balance formula, f0, dx/dy scalars, and ocean masks are used.
+            # Fill NaN (land), convert to SW (1, 1, nx, ny); g_prime (nl,1,1)
+            # broadcasts to (1, nl, nx, ny).
+            ssh_sw = jnp.array(
+                np.where(np.isnan(ssh), 0.0, ssh).T
+            )[np.newaxis, np.newaxis]
+            p_i = self.model.g_prime.astype(self.model.dtype) * ssh_sw
+            p   = self.model.hgrid_pressure_to_wgrid(p_i)
+            u_sw, v_sw, _ = self.model.G(p, p_i=p_i)
+            # G returns u_stored = u_phys * dx_ugrid, v_stored = v_phys * dy_vgrid
+            # (same internal convention as set_input_uvh / get_physical_uvh).
+            # Divide to recover physical velocities for State convention.
+            u_phys = u_sw / self.model.dx_ugrid
+            v_phys = v_sw / self.model.dy_vgrid
+            # Keep tangential velocities zero on the remaining outer edges.
+            u_phys = u_phys.at[..., :, -1].set(0.0)   # north tangential
+            v_phys = v_phys.at[..., -1, :].set(0.0)   # east  tangential
+            # Convert SW (1, nl, nx+1, ny) → State (ny, nx+1), likewise v.
+            return np.array(u_phys[0, 0].T), np.array(v_phys[0, 0].T)
+        else:
+            # SW mode: finite-difference geostrophy with ocean mask.
+            _ssh = np.where(np.isnan(ssh), 0.0, ssh)
+            _ssh = np.pad(_ssh, pad_width=((1,0),(1,0)), mode='edge')
+            _u = -self.g / self.f_on_u * np.diff(_ssh, axis=0) / self.dy_on_u
+            _v = self.g / self.f_on_v * np.diff(_ssh, axis=1) / self.dx_on_v
+            _u = np.where(self.model.masks.u[0, 0].T, _u, 0.0)
+            _v = np.where(self.model.masks.v[0, 0].T, _v, 0.0)
+            return _u, _v
 
     def ssh2uv_tgl(self, ssh, dssh):
         """Tangent-linear model using JAX forward-mode differentiation."""
@@ -3140,9 +3789,61 @@ class Model_qgsw(M):
         _h = jnp.pad(h, pad_width=pad, mode='edge')
         h_on_v = 0.5*(_h[:,1:] + _h[:,:-1])
         return h_on_v
+
+    def _qg_balanced_sponge_target(self, u, v, h, u_b_sw, v_b_sw, h_b_sw):
+        """Return physical sponge targets from the auxiliary QG projector."""
+        mp = self.model_proj
+
+        if self.nl == 1:
+            u_b_phys = jnp.expand_dims(u_b_sw, axis=(0, 1))
+            v_b_phys = jnp.expand_dims(v_b_sw, axis=(0, 1))
+            h_b_phys = jnp.expand_dims(h_b_sw, axis=(0, 1))
+        else:
+            u_b_phys = jnp.expand_dims(u_b_sw, axis=0)
+            v_b_phys = jnp.expand_dims(v_b_sw, axis=0)
+            h_b_phys = jnp.expand_dims(h_b_sw, axis=0)
+
+        u_clean = jnp.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
+        v_clean = jnp.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+        h_clean = jnp.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
+        u_b_phys = jnp.nan_to_num(u_b_phys, nan=0.0, posinf=0.0, neginf=0.0)
+        v_b_phys = jnp.nan_to_num(v_b_phys, nan=0.0, posinf=0.0, neginf=0.0)
+        h_b_phys = jnp.nan_to_num(h_b_phys, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Use the projector's standard input path so land/coast masks are applied
+        # before Q(u, v, h) forms coastal finite differences.
+        u_in, v_in, h_in = mp.set_input_uvh(u_clean, v_clean, h_clean)
+        _, _, h_b_in = mp.set_input_uvh(u_b_phys, v_b_phys, h_b_phys)
+
+        pb, pb_i, qb = mp._compute_qg_background(h_b_in)
+        u_proj, v_proj, h_proj = mp.project_qg(
+            u_in, v_in, h_in, pb=pb, pb_i=pb_i, qb=qb,
+        )
+        u_proj_phys, v_proj_phys, h_proj_phys = mp.get_physical_uvh(
+            u_proj, v_proj, h_proj, numpy=False,
+        )
+
+        max_factor = 2.0
+        u_scale = jnp.maximum(jnp.maximum(jnp.max(jnp.abs(u_clean)), jnp.max(jnp.abs(u_b_phys))), 1.0)
+        v_scale = jnp.maximum(jnp.maximum(jnp.max(jnp.abs(v_clean)), jnp.max(jnp.abs(v_b_phys))), 1.0)
+        h_scale = jnp.maximum(jnp.maximum(jnp.max(jnp.abs(h_clean)), jnp.max(jnp.abs(h_b_phys))), 1.0)
+
+        u_ok = jnp.isfinite(u_proj_phys) & (jnp.abs(u_proj_phys) <= max_factor * u_scale)
+        v_ok = jnp.isfinite(v_proj_phys) & (jnp.abs(v_proj_phys) <= max_factor * v_scale)
+        h_ok = jnp.isfinite(h_proj_phys) & (jnp.abs(h_proj_phys) <= max_factor * h_scale)
+        u_proj_phys = jnp.nan_to_num(u_proj_phys, nan=0.0, posinf=0.0, neginf=0.0)
+        v_proj_phys = jnp.nan_to_num(v_proj_phys, nan=0.0, posinf=0.0, neginf=0.0)
+        h_proj_phys = jnp.nan_to_num(h_proj_phys, nan=0.0, posinf=0.0, neginf=0.0)
+        u_target = jnp.where(u_ok, u_proj_phys, u_b_phys)
+        v_target = jnp.where(v_ok, v_proj_phys, v_b_phys)
+        h_target = jnp.where(h_ok, h_proj_phys, h_b_phys)
+
+        if self.nl == 1:
+            return u_target[0, 0], v_target[0, 0], h_target[0, 0]
+        return u_target[0], v_target[0], h_target[0]
     
     def jstep_core(self, t, u0, v0, h0, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                taux=None, tauy=None, h_wind=None, nstep=1):
+                taux=None, tauy=None, h_wind=None, wind_strength=None, nstep=1):
         """
         taux: wind stress on u-grid, shape (ny, nx+1) in State convention, or None.
         tauy: wind stress on v-grid, shape (ny+1, nx) in State convention, or None.
@@ -3187,13 +3888,40 @@ class Model_qgsw(M):
             Fv_sw = Fv.T / (3600 * 24)
             Fh_sw = Fh.T / (3600 * 24)
 
+        # Add MDT to sponge BC target: inside model_step the state already has MDT
+        # added, so the sponge must relax toward (anomaly_BC + MDT), not anomaly_BC.
+        if self.mdt is not None:
+            if self.nl > 1:
+                u_b_sw = u_b_sw.at[0].add(self.mdu[0, 0])
+                v_b_sw = v_b_sw.at[0].add(self.mdv[0, 0])
+                h_b_sw = h_b_sw.at[0].add(self.mdt[0, 0])
+            else:
+                u_b_sw = u_b_sw + self.mdu[0, 0]
+                v_b_sw = v_b_sw + self.mdv[0, 0]
+                h_b_sw = h_b_sw + self.mdt[0, 0]
+
+        # QG-balanced sponge target: replace the external sponge target with a
+        # masked, QG-projected field from the current MDT-included state.
+        if self.qg_balanced_sponge_bc and self.model_proj is not None:
+            u_b_sw, v_b_sw, h_b_sw = self._qg_balanced_sponge_target(
+                u, v, h, u_b_sw, v_b_sw, h_b_sw,
+            )
+
         # Step
-        u1, v1, h1 = self.model_step(
+        if self._is_qg_class:
+            u1, v1, h1 = self.model_step(
+                u, v, h, H=H, nstep=nstep,
+                u_b=u_b_sw, v_b=v_b_sw, h_b=h_b_sw,
+                Fu=Fu_sw, Fv=Fv_sw, Fh=Fh_sw,
+            )
+        else:
+            u1, v1, h1 = self.model_step(
                 u, v, h, H=H, nstep=nstep,
                 u_b=u_b_sw, v_b=v_b_sw, h_b=h_b_sw,
                 Fu=Fu_sw, Fv=Fv_sw, Fh=Fh_sw,
                 taux=_taux, tauy=_tauy,
                 h_wind=h_wind,
+                wind_strength=wind_strength,
             )
 
         # Remove MDT (surface only for nl>1)
@@ -3209,13 +3937,109 @@ class Model_qgsw(M):
 
         return u1, v1, h1
     
+    def jstep_core_trac(self, t, u0, v0, h0, c0, H, Fu, Fv, Fh, Fc,
+                        u_b, v_b, h_b, c_b,
+                        taux=None, tauy=None, h_wind=None, wind_strength=None, nstep=1):
+        """
+        Joint single-step for (u, v, h) + passive tracer c.
+
+        c0 : (n_trac, ny, nx)  tracers in State convention (ny, nx per tracer)
+        c_b: (n_trac, ny, nx)  tracer boundary condition
+        Fc : (n_trac, ny, nx)  per-tracer external forcing (same convention as Fh)
+        Returns (u1, v1, h1, c1) where c1 has shape (n_trac, ny, nx).
+        """
+        u, v, h = u0, v0, h0
+
+        # Add MDT (surface only for nl>1)
+        if self.mdt is not None:
+            if self.nl > 1:
+                h = h.at[:, 0:1, :, :].add(self.mdt)
+                u = u.at[:, 0:1, :, :].add(self.mdu)
+                v = v.at[:, 0:1, :, :].add(self.mdv)
+            else:
+                h = h + self.mdt
+                u = u + self.mdu
+                v = v + self.mdv
+
+        # Wind stress: State (ny, nx+1/ny+1) → SW model (nx-1, ny/ny-1)
+        _taux = taux[:, 1:-1].T if taux is not None else None
+        _tauy = tauy[1:-1, :].T if tauy is not None else None
+
+        # Convert BCs and forcing State → SW convention
+        # Tracer: (n_trac, ny, nx) → (1, n_trac, nx, ny)
+        c_sw   = jnp.expand_dims(c0.transpose(0, 2, 1), axis=0)
+        c_b_sw = jnp.expand_dims(c_b.transpose(0, 2, 1), axis=0)
+        Fc_sw  = jnp.expand_dims(Fc.transpose(0, 2, 1), axis=0) / (3600 * 24)
+
+        if self.nl > 1:
+            u_b_sw = jnp.zeros((self.nl, self.nx+1, self.ny), dtype=self.dtype).at[0].set(u_b.T)
+            v_b_sw = jnp.zeros((self.nl, self.nx, self.ny+1), dtype=self.dtype).at[0].set(v_b.T)
+            h_b_sw = jnp.zeros((self.nl, self.nx, self.ny),   dtype=self.dtype).at[0].set(h_b.T)
+            Fu_sw = jnp.zeros((self.nl, self.nx+1, self.ny), dtype=self.dtype).at[0].set(Fu.T) / (3600 * 24)
+            Fv_sw = jnp.zeros((self.nl, self.nx, self.ny+1), dtype=self.dtype).at[0].set(Fv.T) / (3600 * 24)
+            Fh_sw = jnp.zeros((self.nl, self.nx, self.ny),   dtype=self.dtype).at[0].set(Fh.T) / (3600 * 24)
+        else:
+            u_b_sw = u_b.T
+            v_b_sw = v_b.T
+            h_b_sw = h_b.T
+            Fu_sw = Fu.T / (3600 * 24)
+            Fv_sw = Fv.T / (3600 * 24)
+            Fh_sw = Fh.T / (3600 * 24)
+
+        # Add MDT to sponge BC target: inside model.step_with_tracer the state
+        # already has MDT added, so the sponge must relax toward
+        # (anomaly_BC + MDT), not anomaly_BC.
+        if self.mdt is not None:
+            if self.nl > 1:
+                u_b_sw = u_b_sw.at[0].add(self.mdu[0, 0])
+                v_b_sw = v_b_sw.at[0].add(self.mdv[0, 0])
+                h_b_sw = h_b_sw.at[0].add(self.mdt[0, 0])
+            else:
+                u_b_sw = u_b_sw + self.mdu[0, 0]
+                v_b_sw = v_b_sw + self.mdv[0, 0]
+                h_b_sw = h_b_sw + self.mdt[0, 0]
+
+        # QG-balanced sponge target — same logic as in jstep_core.
+        if self.qg_balanced_sponge_bc and self.model_proj is not None:
+            u_b_sw, v_b_sw, h_b_sw = self._qg_balanced_sponge_target(
+                u, v, h, u_b_sw, v_b_sw, h_b_sw,
+            )
+
+        # Joint step (u, v, h, c)
+        u1, v1, h1, c1 = self.model.step_with_tracer(
+            u, v, h, c_sw,
+            H=H, nstep=nstep,
+            u_b=u_b_sw, v_b=v_b_sw, h_b=h_b_sw, c_b=c_b_sw,
+            Fu=Fu_sw, Fv=Fv_sw, Fh=Fh_sw, Fc=Fc_sw,
+            taux=_taux, tauy=_tauy,
+            h_wind=h_wind,
+            wind_strength=wind_strength,
+        )
+
+        # Remove MDT (surface only for nl>1)
+        if self.mdt is not None:
+            if self.nl > 1:
+                h1 = h1.at[:, 0:1, :, :].add(-self.mdt)
+                u1 = u1.at[:, 0:1, :, :].add(-self.mdu)
+                v1 = v1.at[:, 0:1, :, :].add(-self.mdv)
+            else:
+                h1 = h1 - self.mdt
+                u1 = u1 - self.mdu
+                v1 = v1 - self.mdv
+
+        # c1: (1, n_trac, nx, ny) → (n_trac, ny, nx)
+        c1_state = c1[0].transpose(0, 2, 1)
+
+        return u1, v1, h1, c1_state
+    
     def jstep(self, t, u0, v0, h0, H, Fu, Fv, Fh, u_b, v_b, h_b,
-             taux=None, tauy=None, h_wind=None, nstep=1):
+             taux=None, tauy=None, h_wind=None, wind_strength=None, nstep=1):
         return self.jstep_core(
             t, u0, v0, h0, H, Fu, Fv, Fh,
             u_b, v_b, h_b,
             taux=taux, tauy=tauy,
             h_wind=h_wind,
+            wind_strength=wind_strength,
             nstep=nstep,
         )
     
@@ -3223,15 +4047,17 @@ class Model_qgsw(M):
                 u0, v0, h0, H, Fu, Fv, Fh, 
                 u_b, v_b, h_b, taux=None, tauy=None,
                 h_wind=None, dh_wind=None,
+                wind_strength=None, dwind_strength=None,
                 du_b=None, dv_b=None, dh_b=None, nstep=1):
 
         # Define a partial function that fixes constant parameters
         # taux/tauy are prescribed forcings: closed over, not differentiated
         # u_b/v_b/h_b are now in the differentiable tuple
-        f = lambda u, v, h, H, Fu, Fv, Fh, hw, ub, vb, hb: self.jstep_core_jit(
+        f = lambda u, v, h, H, Fu, Fv, Fh, hw, ws, ub, vb, hb: self.jstep_core_jit(
             t, u, v, h, H, Fu, Fv, Fh, ub, vb, hb,
             taux=taux, tauy=tauy,
             h_wind=hw,
+            wind_strength=ws,
             nstep=nstep,
         )
 
@@ -3246,8 +4072,8 @@ class Model_qgsw(M):
         # JVP (forward mode)
         (u1, v1, h1), (du1, dv1, dh1) = jax.jvp(
             f,
-            (u0, v0, h0, H, Fu, Fv, Fh, h_wind, u_b, v_b, h_b),
-            (du0, dv0, dh0, dH, dFu, dFv, dFh, dh_wind, du_b, dv_b, dh_b)
+            (u0, v0, h0, H, Fu, Fv, Fh, h_wind, wind_strength, u_b, v_b, h_b),
+            (du0, dv0, dh0, dH, dFu, dFv, dFh, dh_wind, dwind_strength, du_b, dv_b, dh_b)
         )
 
         return du1, dv1, dh1
@@ -3256,23 +4082,25 @@ class Model_qgsw(M):
                 u0, v0, h0, H, Fu, Fv, Fh, u_b, v_b, h_b,
                 taux=None, tauy=None,
                 h_wind=None, adh_wind=None,
+                wind_strength=None, adwind_strength=None,
                 adu_b=None, adv_b=None, adh_b=None, nstep=1):
 
         # taux/tauy are prescribed forcings: closed over, not differentiated
         # u_b/v_b/h_b are now in the differentiable tuple
-        f = lambda u, v, h, H, Fu, Fv, Fh, hw, ub, vb, hb: self.jstep_core_jit(
+        f = lambda u, v, h, H, Fu, Fv, Fh, hw, ws, ub, vb, hb: self.jstep_core_jit(
             t, u, v, h, H, Fu, Fv, Fh, ub, vb, hb,
             taux=taux, tauy=tauy,
             h_wind=hw,
+            wind_strength=ws,
             nstep=nstep,
         )
 
         # Build the VJP function
-        (u1, v1, h1), vjp_fun = jax.vjp(f, u0, v0, h0, H, Fu, Fv, Fh, h_wind, u_b, v_b, h_b)
+        (u1, v1, h1), vjp_fun = jax.vjp(f, u0, v0, h0, H, Fu, Fv, Fh, h_wind, wind_strength, u_b, v_b, h_b)
 
         # Apply adjoints at output
         (adu0, adv0, adh0, _adH, _adFu, _adFv, _adFh,
-         _adh_wind, _adu_b, _adv_b, _adh_b) = vjp_fun((adu1, adv1, adh1))
+         _adh_wind, _adwind_strength, _adu_b, _adv_b, _adh_b) = vjp_fun((adu1, adv1, adh1))
         if adH is not None:
             adH += _adH
         adFu += _adFu
@@ -3280,6 +4108,8 @@ class Model_qgsw(M):
         adFh += _adFh
         if adh_wind is not None:
             adh_wind += _adh_wind
+        if adwind_strength is not None:
+            adwind_strength += _adwind_strength
         if adu_b is not None:
             adu_b += _adu_b
         if adv_b is not None:
@@ -3287,7 +4117,71 @@ class Model_qgsw(M):
         if adh_b is not None:
             adh_b += _adh_b
         
-        return adu0, adv0, adh0, adH, adFu, adFv, adFh, adh_wind, adu_b, adv_b, adh_b
+        return adu0, adv0, adh0, adH, adFu, adFv, adFh, adh_wind, adwind_strength, adu_b, adv_b, adh_b
+
+    def jstep_tgl_trac(self, t, du0, dv0, dh0, dc0, dH, dFu, dFv, dFh, dFc,
+                       u0, v0, h0, c0, H, Fu, Fv, Fh, Fc,
+                       u_b, v_b, h_b, c_b,
+                       taux=None, tauy=None,
+                       h_wind=None, dh_wind=None,
+                       wind_strength=None, dwind_strength=None,
+                       du_b=None, dv_b=None, dh_b=None, dc_b=None, nstep=1):
+        """TGL for joint (u, v, h, c) step via JAX forward-mode AD."""
+        f = lambda u, v, h, c, H, Fu, Fv, Fh, Fc, hw, ws, ub, vb, hb, cb: \
+            self.jstep_core_trac_jit(
+                t, u, v, h, c, H, Fu, Fv, Fh, Fc, ub, vb, hb, cb,
+                taux=taux, tauy=tauy, h_wind=hw, wind_strength=ws, nstep=nstep)
+
+        if du_b is None: du_b = jnp.zeros_like(u_b)
+        if dv_b is None: dv_b = jnp.zeros_like(v_b)
+        if dh_b is None: dh_b = jnp.zeros_like(h_b)
+        if dc_b is None: dc_b = jnp.zeros_like(c_b)
+        if dFc is None:  dFc  = jnp.zeros_like(Fc)
+
+        (u1, v1, h1, c1), (du1, dv1, dh1, dc1) = jax.jvp(
+            f,
+            (u0, v0, h0, c0, H, Fu, Fv, Fh, Fc, h_wind, wind_strength, u_b, v_b, h_b, c_b),
+            (du0, dv0, dh0, dc0, dH, dFu, dFv, dFh, dFc, dh_wind, dwind_strength, du_b, dv_b, dh_b, dc_b),
+        )
+        return du1, dv1, dh1, dc1
+
+    def jstep_adj_trac(self, t, adu1, adv1, adh1, adc1, adH, adFu, adFv, adFh, adFc,
+                       u0, v0, h0, c0, H, Fu, Fv, Fh, Fc,
+                       u_b, v_b, h_b, c_b,
+                       taux=None, tauy=None,
+                       h_wind=None, adh_wind=None,
+                       wind_strength=None, adwind_strength=None,
+                       adu_b=None, adv_b=None, adh_b=None, adc_b=None, nstep=1):
+        """ADJ for joint (u, v, h, c) step via JAX reverse-mode AD."""
+        f = lambda u, v, h, c, H, Fu, Fv, Fh, Fc, hw, ws, ub, vb, hb, cb: \
+            self.jstep_core_trac_jit(
+                t, u, v, h, c, H, Fu, Fv, Fh, Fc, ub, vb, hb, cb,
+                taux=taux, tauy=tauy, h_wind=hw, wind_strength=ws, nstep=nstep)
+
+        (u1, v1, h1, c1), vjp_fun = jax.vjp(
+            f, u0, v0, h0, c0, H, Fu, Fv, Fh, Fc, h_wind, wind_strength, u_b, v_b, h_b, c_b)
+
+        (adu0, adv0, adh0, adc0,
+         _adH, _adFu, _adFv, _adFh, _adFc,
+         _adh_wind, _adwind_strength,
+         _adu_b, _adv_b, _adh_b, _adc_b) = vjp_fun((adu1, adv1, adh1, adc1))
+
+        if adH is not None:            adH            += _adH
+        if adFc is not None:           adFc           += _adFc
+        if adh_wind is not None:       adh_wind       += _adh_wind
+        if adwind_strength is not None: adwind_strength += _adwind_strength
+        if adu_b is not None:          adu_b          += _adu_b
+        if adv_b is not None:          adv_b          += _adv_b
+        if adh_b is not None:          adh_b          += _adh_b
+        if adc_b is not None:          adc_b          += _adc_b
+        adFu += _adFu
+        adFv += _adFv
+        adFh += _adFh
+
+        return (adu0, adv0, adh0, adc0,
+                adH, adFu, adFv, adFh, adFc,
+                adh_wind, adwind_strength,
+                adu_b, adv_b, adh_b, adc_b)
 
     def step(self,State,nstep=1,t=0):
 
@@ -3297,12 +4191,9 @@ class Model_qgsw(M):
             v = jnp.expand_dims(State.var['v_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
             h = jnp.expand_dims(State.var['h_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
         else:
-            h = State.getvar(name_var=self.name_var['SSH'])
-            u = State.getvar(name_var=self.name_var['U'])
-            v = State.getvar(name_var=self.name_var['V'])
-            u = jnp.expand_dims(u.astype(self.dtype).T, axis=(0,1))
-            v = jnp.expand_dims(v.astype(self.dtype).T, axis=(0,1))
-            h = jnp.expand_dims(h.astype(self.dtype).T, axis=(0,1))
+            h = jnp.expand_dims(jnp.asarray(State.var[self.name_var['SSH']], dtype=self.dtype).T, axis=(0,1))
+            u = jnp.expand_dims(jnp.asarray(State.var[self.name_var['U']], dtype=self.dtype).T, axis=(0,1))
+            v = jnp.expand_dims(jnp.asarray(State.var[self.name_var['V']], dtype=self.dtype).T, axis=(0,1))
         
         # Get parameters (2D forcing from Basis)
         Fu = State.params[self.name_var['U']]
@@ -3318,6 +4209,10 @@ class Model_qgsw(M):
             h_wind = h_wind.astype(self.dtype).T  # (nx, ny)
         else:
             h_wind = None
+        if 'wind_strength' in self.name_params:
+            wind_strength = State.params['wind_strength'].astype(self.dtype).T  # (nx, ny)
+        else:
+            wind_strength = None
 
         # BC perturbation from params
         if 'bc' in self.name_params:
@@ -3326,6 +4221,15 @@ class Model_qgsw(M):
             bc_dh = State.params['h_b'].astype(self.dtype)
         else:
             bc_du = bc_dv = bc_dh = None
+
+        # Tracer setup
+        if self.advect_tracer:
+            c = jnp.stack(
+                [jnp.asarray(State.var[self.name_var[n]], dtype=self.dtype)
+                 for n in self.tracer_names], axis=0)  # (n_trac, ny, nx)
+            Fc = jnp.stack(
+                [jnp.asarray(State.params[self.name_var[n]], dtype=self.dtype)
+                 for n in self.tracer_names], axis=0)  # (n_trac, ny, nx)
 
         # Sub-stepping loop (limits lax.scan length for memory efficiency)
         step_done = 0
@@ -3338,9 +4242,19 @@ class Model_qgsw(M):
                 v_b = v_b + bc_dv
                 h_b = h_b + bc_dh
             taux, tauy = self._get_wind_stress(t_chunk)
-            u, v, h = self.jstep_jit(t_chunk, u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                                      taux=taux, tauy=tauy, h_wind=h_wind, nstep=n_chunk)
+            if self.advect_tracer:
+                c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
+                u, v, h, c = self.jstep_core_trac_jit(
+                    t_chunk, u, v, h, c, H, Fu, Fv, Fh, Fc,
+                    u_b, v_b, h_b, c_b,
+                    taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength,
+                    nstep=n_chunk)
+            else:
+                u, v, h = self.jstep_jit(t_chunk, u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
+                                          taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength, nstep=n_chunk)
             step_done += n_chunk
+
+
 
         if self.nl > 1:
             # Convert back: (1, nl, nx, ny) → (nl, ny, nx)
@@ -3355,7 +4269,12 @@ class Model_qgsw(M):
             h = h[0,0].T
             State.setvar(u, name_var=self.name_var['U'])
             State.setvar(v, name_var=self.name_var['V'])
-            State.setvar(h, name_var=self.name_var['SSH'])   
+            State.setvar(h, name_var=self.name_var['SSH'])
+
+        # Write tracer fields back to State
+        if self.advect_tracer:
+            for i, name in enumerate(self.tracer_names):
+                State.setvar(c[i], name_var=self.name_var[name])
 
     def step_tgl(self,dState,State,nstep=1,t=0):
 
@@ -3401,6 +4320,11 @@ class Model_qgsw(M):
             dh_wind = dState.params['h_wind'].astype(self.dtype).T  # (nx, ny)
         else:
             h_wind = dh_wind = None
+        if 'wind_strength' in self.name_params:
+            wind_strength = State.params['wind_strength'].astype(self.dtype).T    # (nx, ny)
+            dwind_strength = dState.params['wind_strength'].astype(self.dtype).T  # (nx, ny)
+        else:
+            wind_strength = dwind_strength = None
         if 'bc' in self.name_params:
             bc_du = State.params['u_b'].astype(self.dtype)
             bc_dv = State.params['v_b'].astype(self.dtype)
@@ -3412,6 +4336,21 @@ class Model_qgsw(M):
             bc_du = bc_dv = bc_dh = None
             dbc_du = dbc_dv = dbc_dh = None
         
+        # Tracer setup
+        if self.advect_tracer:
+            c = jnp.stack(
+                [jnp.asarray(State.getvar(self.name_var[n]), dtype=self.dtype)
+                 for n in self.tracer_names], axis=0)
+            Fc = jnp.stack(
+                [jnp.asarray(State.params[self.name_var[n]], dtype=self.dtype)
+                 for n in self.tracer_names], axis=0)
+            dc = jnp.stack(
+                [jnp.asarray(dState.getvar(self.name_var[n]), dtype=self.dtype)
+                 for n in self.tracer_names], axis=0)
+            dFc = jnp.stack(
+                [jnp.asarray(dState.params[self.name_var[n]], dtype=self.dtype)
+                 for n in self.tracer_names], axis=0)
+
         # Sub-stepping loop (limits lax.scan length for memory efficiency)
         step_done = 0
         while step_done < nstep:
@@ -3423,16 +4362,36 @@ class Model_qgsw(M):
                 v_b = v_b + bc_dv
                 h_b = h_b + bc_dh
             taux, tauy = self._get_wind_stress(t_chunk)
-            # Propagate tangent (JVP includes forward internally)
-            du, dv, dh = self.jstep_tgl_jit(t_chunk, du, dv, dh, dH, dFu, dFv, dFh,
-                                            u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                                            taux=taux, tauy=tauy,
-                                            h_wind=h_wind, dh_wind=dh_wind,
-                                            du_b=dbc_du, dv_b=dbc_dv, dh_b=dbc_dh,
-                                            nstep=n_chunk)
-            # Propagate forward state for next chunk
-            u, v, h = self.jstep_jit(t_chunk, u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                                      taux=taux, tauy=tauy, h_wind=h_wind, nstep=n_chunk)
+            if self.advect_tracer:
+                c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
+                # Propagate tangent (JVP includes forward internally)
+                du, dv, dh, dc = self.jstep_tgl_trac_jit(
+                    t_chunk, du, dv, dh, dc, dH, dFu, dFv, dFh, dFc,
+                    u, v, h, c, H, Fu, Fv, Fh, Fc,
+                    u_b, v_b, h_b, c_b,
+                    taux=taux, tauy=tauy,
+                    h_wind=h_wind, dh_wind=dh_wind,
+                    wind_strength=wind_strength, dwind_strength=dwind_strength,
+                    du_b=dbc_du, dv_b=dbc_dv, dh_b=dbc_dh,
+                    nstep=n_chunk)
+                # Propagate forward state for next chunk
+                u, v, h, c = self.jstep_core_trac_jit(
+                    t_chunk, u, v, h, c, H, Fu, Fv, Fh, Fc,
+                    u_b, v_b, h_b, c_b,
+                    taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength,
+                    nstep=n_chunk)
+            else:
+                # Propagate tangent (JVP includes forward internally)
+                du, dv, dh = self.jstep_tgl_jit(t_chunk, du, dv, dh, dH, dFu, dFv, dFh,
+                                                u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
+                                                taux=taux, tauy=tauy,
+                                                h_wind=h_wind, dh_wind=dh_wind,
+                                                wind_strength=wind_strength, dwind_strength=dwind_strength,
+                                                du_b=dbc_du, dv_b=dbc_dv, dh_b=dbc_dh,
+                                                nstep=n_chunk)
+                # Propagate forward state for next chunk
+                u, v, h = self.jstep_jit(t_chunk, u, v, h, H, Fu, Fv, Fh, u_b, v_b, h_b,
+                                          taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength, nstep=n_chunk)
             step_done += n_chunk
 
         if self.nl > 1:
@@ -3451,6 +4410,11 @@ class Model_qgsw(M):
             dState.setvar(du, name_var=self.name_var['U'])
             dState.setvar(dv, name_var=self.name_var['V'])
             dState.setvar(dh, name_var=self.name_var['SSH'])
+
+        # Write tracer perturbations back to dState
+        if self.advect_tracer:
+            for i, name in enumerate(self.tracer_names):
+                dState.setvar(dc[i], name_var=self.name_var[name])
 
     def step_adj(self,adState,State,nstep=1,t=0):
 
@@ -3484,18 +4448,12 @@ class Model_qgsw(M):
             v = jnp.expand_dims(State.var['v_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
             h = jnp.expand_dims(State.var['h_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
         else:
-            adh0 = adState.getvar(name_var=self.name_var['SSH'])
-            adu0 = adState.getvar(name_var=self.name_var['U'])
-            adv0 = adState.getvar(name_var=self.name_var['V'])
-            h = State.getvar(name_var=self.name_var['SSH'])
-            u = State.getvar(name_var=self.name_var['U'])
-            v = State.getvar(name_var=self.name_var['V'])
-            adu = jnp.expand_dims((+adu0).astype(self.dtype).T, axis=(0,1))
-            adv = jnp.expand_dims((+adv0).astype(self.dtype).T, axis=(0,1))
-            adh = jnp.expand_dims((+adh0).astype(self.dtype).T, axis=(0,1))
-            u = jnp.expand_dims(u.astype(self.dtype).T, axis=(0,1))
-            v = jnp.expand_dims(v.astype(self.dtype).T, axis=(0,1))
-            h = jnp.expand_dims(h.astype(self.dtype).T, axis=(0,1))
+            adh = jnp.expand_dims(jnp.asarray(adState.var[self.name_var['SSH']], dtype=self.dtype).T, axis=(0,1))
+            adu = jnp.expand_dims(jnp.asarray(adState.var[self.name_var['U']], dtype=self.dtype).T, axis=(0,1))
+            adv = jnp.expand_dims(jnp.asarray(adState.var[self.name_var['V']], dtype=self.dtype).T, axis=(0,1))
+            h = jnp.expand_dims(jnp.asarray(State.var[self.name_var['SSH']], dtype=self.dtype).T, axis=(0,1))
+            u = jnp.expand_dims(jnp.asarray(State.var[self.name_var['U']], dtype=self.dtype).T, axis=(0,1))
+            v = jnp.expand_dims(jnp.asarray(State.var[self.name_var['V']], dtype=self.dtype).T, axis=(0,1))
 
         # Get parameters (2D forcing)
         Fu = State.params[self.name_var['U']]
@@ -3510,6 +4468,10 @@ class Model_qgsw(M):
             h_wind = State.params['h_wind'].astype(self.dtype).T  # (nx, ny)
         else:
             h_wind = None
+        if 'wind_strength' in self.name_params:
+            wind_strength = State.params['wind_strength'].astype(self.dtype).T  # (nx, ny)
+        else:
+            wind_strength = None
         
         # Get adjoint parameters (2D — AD traces per-layer conversion automatically)
         adFu = adState.params[self.name_var['U']]
@@ -3524,6 +4486,10 @@ class Model_qgsw(M):
             adh_wind = adState.params['h_wind'].astype(self.dtype).T  # (nx, ny)
         else:
             adh_wind = None
+        if 'wind_strength' in self.name_params:
+            adwind_strength = adState.params['wind_strength'].astype(self.dtype).T  # (nx, ny)
+        else:
+            adwind_strength = None
         if 'bc' in self.name_params:
             bc_du = State.params['u_b'].astype(self.dtype)
             bc_dv = State.params['v_b'].astype(self.dtype)
@@ -3535,6 +4501,22 @@ class Model_qgsw(M):
             bc_du = bc_dv = bc_dh = None
             adu_b_acc = adv_b_acc = adh_b_acc = None
 
+        # Tracer setup
+        if self.advect_tracer:
+            c = jnp.stack(
+                [jnp.asarray(State.var[self.name_var[n]], dtype=self.dtype)
+                 for n in self.tracer_names], axis=0)
+            Fc = jnp.stack(
+                [jnp.asarray(State.params[self.name_var[n]], dtype=self.dtype)
+                 for n in self.tracer_names], axis=0)
+            adc = jnp.stack(
+                [jnp.asarray(adState.var[self.name_var[n]], dtype=self.dtype)
+                 for n in self.tracer_names], axis=0)
+            adFc = jnp.stack(
+                [jnp.asarray(adState.params[self.name_var[n]], dtype=self.dtype)
+                 for n in self.tracer_names], axis=0)
+            adc_b_acc = None  # Tracer BCs not presently optimised
+
         # Build chunk schedule
         chunks = []
         step_done = 0
@@ -3545,9 +4527,11 @@ class Model_qgsw(M):
             step_done += n_chunk
 
         # Forward pass: store boundary states at chunk boundaries
-        fwd_states = [(u, v, h)]
+        fwd_states = [(u, v, h, c)] if self.advect_tracer else [(u, v, h)]
         if len(chunks) > 1:
             u_fwd, v_fwd, h_fwd = u, v, h
+            if self.advect_tracer:
+                c_fwd = c
             for t_chunk, n_chunk in chunks[:-1]:
                 u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
                 if bc_du is not None:
@@ -3555,30 +4539,56 @@ class Model_qgsw(M):
                     v_b = v_b + bc_dv
                     h_b = h_b + bc_dh
                 taux, tauy = self._get_wind_stress(t_chunk)
-                u_fwd, v_fwd, h_fwd = self.jstep_jit(
-                    t_chunk, u_fwd, v_fwd, h_fwd, H, Fu, Fv, Fh, u_b, v_b, h_b,
-                    taux=taux, tauy=tauy, h_wind=h_wind, nstep=n_chunk)
-                fwd_states.append((u_fwd, v_fwd, h_fwd))
+                if self.advect_tracer:
+                    c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
+                    u_fwd, v_fwd, h_fwd, c_fwd = self.jstep_core_trac_jit(
+                        t_chunk, u_fwd, v_fwd, h_fwd, c_fwd, H, Fu, Fv, Fh, Fc,
+                        u_b, v_b, h_b, c_b,
+                        taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength,
+                        nstep=n_chunk)
+                    fwd_states.append((u_fwd, v_fwd, h_fwd, c_fwd))
+                else:
+                    u_fwd, v_fwd, h_fwd = self.jstep_jit(
+                        t_chunk, u_fwd, v_fwd, h_fwd, H, Fu, Fv, Fh, u_b, v_b, h_b,
+                        taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength, nstep=n_chunk)
+                    fwd_states.append((u_fwd, v_fwd, h_fwd))
 
         # Reverse adjoint through chunks
         for i in range(len(chunks) - 1, -1, -1):
             t_chunk, n_chunk = chunks[i]
-            u_i, v_i, h_i = fwd_states[i]
             u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
             if bc_du is not None:
                 u_b = u_b + bc_du
                 v_b = v_b + bc_dv
                 h_b = h_b + bc_dh
             taux, tauy = self._get_wind_stress(t_chunk)
-            (adu, adv, adh, adH, adFu, adFv, adFh,
-             adh_wind, adu_b_acc, adv_b_acc, adh_b_acc) = self.jstep_adj_jit(
-                t_chunk, adu, adv, adh, adH, adFu, adFv, adFh,
-                u_i, v_i, h_i, H, Fu, Fv, Fh,
-                u_b, v_b, h_b,
-                taux=taux, tauy=tauy,
-                h_wind=h_wind, adh_wind=adh_wind,
-                adu_b=adu_b_acc, adv_b=adv_b_acc, adh_b=adh_b_acc,
-                nstep=n_chunk)
+            if self.advect_tracer:
+                u_i, v_i, h_i, c_i = fwd_states[i]
+                c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
+                (adu, adv, adh, adc,
+                 adH, adFu, adFv, adFh, adFc,
+                 adh_wind, adwind_strength,
+                 adu_b_acc, adv_b_acc, adh_b_acc, adc_b_acc) = self.jstep_adj_trac_jit(
+                    t_chunk, adu, adv, adh, adc, adH, adFu, adFv, adFh, adFc,
+                    u_i, v_i, h_i, c_i, H, Fu, Fv, Fh, Fc,
+                    u_b, v_b, h_b, c_b,
+                    taux=taux, tauy=tauy,
+                    h_wind=h_wind, adh_wind=adh_wind,
+                    wind_strength=wind_strength, adwind_strength=adwind_strength,
+                    adu_b=adu_b_acc, adv_b=adv_b_acc, adh_b=adh_b_acc,
+                    nstep=n_chunk)
+            else:
+                u_i, v_i, h_i = fwd_states[i]
+                (adu, adv, adh, adH, adFu, adFv, adFh,
+                 adh_wind, adwind_strength, adu_b_acc, adv_b_acc, adh_b_acc) = self.jstep_adj_jit(
+                    t_chunk, adu, adv, adh, adH, adFu, adFv, adFh,
+                    u_i, v_i, h_i, H, Fu, Fv, Fh,
+                    u_b, v_b, h_b,
+                    taux=taux, tauy=tauy,
+                    h_wind=h_wind, adh_wind=adh_wind,
+                    wind_strength=wind_strength, adwind_strength=adwind_strength,
+                    adu_b=adu_b_acc, adv_b=adv_b_acc, adh_b=adh_b_acc,
+                    nstep=n_chunk)
 
         if self.nl > 1:
             # Convert back: (1, nl, nx, ny) → (nl, ny, nx)
@@ -3606,6 +4616,8 @@ class Model_qgsw(M):
             adState.params['H'] = adH
         if 'h_wind' in self.name_params:
             adState.params['h_wind'] = adh_wind.T  # back to State convention (ny, nx)
+        if 'wind_strength' in self.name_params:
+            adState.params['wind_strength'] = adwind_strength.T  # back to State convention (ny, nx)
         if 'bc' in self.name_params:
             adState.params['u_b'] = adu_b_acc
             adState.params['v_b'] = adv_b_acc
@@ -3615,6 +4627,13 @@ class Model_qgsw(M):
         adState.params[self.name_var['U']] = adFu 
         adState.params[self.name_var['V']] = adFv 
         adState.params[self.name_var['SSH']] = adFh 
+
+        # Write tracer adjoints back to adState
+        if self.advect_tracer:
+            for i, name in enumerate(self.tracer_names):
+                adState.setvar(adc[i], name_var=self.name_var[name])
+            for i, name in enumerate(self.tracer_names):
+                adState.params[self.name_var[name]] = adFc[i]
 
     def adjoint_test_jstep(self, nstep=1, seed=42):
         """
@@ -3830,6 +4849,9 @@ class Model_bmit(M):
         # Gravity
         self.g = State.g
 
+        # Mask
+        self.mask = State.mask
+
         # Open MDT map if provided
         if config.MOD.path_mdt is not None and os.path.exists(config.MOD.path_mdt):
                       
@@ -3878,6 +4900,18 @@ class Model_bmit(M):
                                    config.MOD.name_var_c,
                                    State.lon,
                                    State.lat)
+        
+            # Remove NaNs (e.g. over land) by nearest-neighbor interpolation
+            # (since c is only used for boundary conditions, this is better than leaving NaNs or filling with a constant.)
+            c_masked = np.ma.masked_invalid(self.c)
+            c_filled = c_masked.filled(np.nan)
+            from scipy import interpolate
+            x = np.arange(self.nx)
+            y = np.arange(self.ny)
+            xx, yy = np.meshgrid(x, y)
+            points = np.array([xx[~c_masked.mask], yy[~c_masked.mask]]).T
+            values = c_filled[~c_masked.mask]
+            self.c = interpolate.griddata(points, values, (xx, yy), method='nearest')
             
             if config.MOD.cmin is not None:
                 self.c[self.c<config.MOD.cmin] = config.MOD.cmin
@@ -3901,13 +4935,70 @@ class Model_bmit(M):
         # Equivalent depth
         self.Heb = self.c**2 / self.g
 
-        # Mean depth (bathymetry)
-        self.H = config.MOD.H 
+        # Open Bathymetry if provided
+        if config.MOD.file_H_aux is not None and os.path.exists(config.MOD.file_H_aux):
+
+            ds = xr.open_dataset(config.MOD.file_H_aux)
+            name_lon = config.MOD.name_var_H['lon']
+            lon = ds[name_lon]
+            # Convert longitude 
+            if np.sign(lon.data.min())==-1 and State.lon_unit=='0_360':
+                ds = ds.assign_coords({name_lon:((name_lon, lon.data % 360))})
+                ds = ds.sortby(name_lon)    
+            elif np.sign(lon.data.min())>=0 and State.lon_unit=='-180_180':
+                ds = ds.assign_coords({name_lon:((name_lon, (lon.data + 180) % 360 - 180))})
+                ds = ds.sortby(name_lon)    
+
+            self.H = grid.interp2d(ds,
+                                   config.MOD.name_var_H,
+                                   State.lon,
+                                   State.lat)
+
+            # Remove NaNs (e.g. over land) by nearest-neighbor interpolation
+            H_masked = np.ma.masked_invalid(self.H)
+            H_filled = H_masked.filled(np.nan)
+            from scipy import interpolate
+            x = np.arange(self.nx)
+            y = np.arange(self.ny)
+            xx, yy = np.meshgrid(x, y)
+            points = np.array([xx[~H_masked.mask], yy[~H_masked.mask]]).T
+            values = H_filled[~H_masked.mask]
+            self.H = interpolate.griddata(points, values, (xx, yy), method='nearest')
+            
+            if config.EXP.flag_plot>0:
+                plt.figure()
+                plt.pcolormesh(self.H)
+                plt.colorbar()
+                plt.title('Bathymetry')
+                plt.show()
+
+        else:
+            self.H = config.MOD.H 
         
         # Boundary angles
-        if config.MOD.Ntheta>0:
-            theta_p = np.arange(0,pi/2+pi/2/config.MOD.Ntheta,pi/2/config.MOD.Ntheta)
-            self.bc_theta = np.append(theta_p-pi/2,theta_p[1:]) 
+        _ntheta = config.MOD.Ntheta
+        if _ntheta == -1:
+            # Auto: boundary tangential Nyquist criterion.
+            # A wave entering at angle theta has along-boundary wavenumber k_t = k*sin(theta).
+            # At grazing incidence k_t_max = k_max = omega_max/c_min.  With 2*Ntheta+1 angular
+            # samples covering [-k_max, k_max], the Nyquist condition on a boundary of length L
+            # gives:  Ntheta >= k_max * L / (2*pi) = L / lambda_min
+            # where lambda_min = 2*pi*c_min / omega_max and L = max boundary length.
+            _omegas = np.asarray(config.MOD.w_waves)
+            _He_bdy = np.concatenate([
+                self.Heb[0,:], self.Heb[-1,:], self.Heb[:,0], self.Heb[:,-1]])
+            _c_min = np.sqrt(self.g * np.nanmin(_He_bdy[_He_bdy > 0]))
+            _lambda_min = 2*pi * _c_min / np.max(np.abs(_omegas))
+            _L_bdy = max(
+                float(np.asarray(State.X).max() - np.asarray(State.X).min()),
+                float(np.asarray(State.Y).max() - np.asarray(State.Y).min()))
+            _ntheta = int(np.ceil(_L_bdy / _lambda_min))
+            print(f'  Auto Ntheta (boundary tangential Nyquist): '
+                    f'lambda_min={_lambda_min/1e3:.1f} km, '
+                    f'L_bdy={_L_bdy/1e3:.1f} km -> Ntheta={_ntheta}')
+        if _ntheta > 0:
+            theta_p = np.arange(0, pi/2 + pi/2/_ntheta, pi/2/_ntheta)
+            self.bc_theta = np.append(theta_p - pi/2, theta_p[1:])
         else:
             self.bc_theta = np.array([0])
         
@@ -3949,7 +5040,6 @@ class Model_bmit(M):
         # Initialize model state
         self.name_var = config.MOD.name_var
         self.var_to_save = [self.name_var['SSH']] # ssh
-
         if (config.GRID.super == 'GRID_FROM_FILE') and (config.MOD.name_init_var is not None):
             dsin = xr.open_dataset(config.GRID.path_init_grid)
             for name in self.name_var:
@@ -3987,6 +5077,12 @@ class Model_bmit(M):
             State.params['He_mean'] = np.zeros((self.ny, self.nx))
         if 'alpha' in self.name_params_it:
             State.params['alpha'] = np.zeros((self.ny, self.nx))
+        if 'alpha_He' in self.name_params_it:
+            State.params['alpha_He'] = np.zeros((self.ny, self.nx))
+        if 'alpha_Uu' in self.name_params_it:
+            State.params['alpha_Uu'] = np.zeros((self.ny, self.nx))
+        if 'alpha_Up' in self.name_params_it:
+            State.params['alpha_Up'] = np.zeros((self.ny, self.nx))
         if 'hbc' in self.name_params_it:
             self.shapehbcx = [len(self.omegas), # tide frequencies
                               2, # North/South
@@ -4004,18 +5100,87 @@ class Model_bmit(M):
             State.params['hbcy'] = np.zeros((self.shapehbcy))
         
 
-        # Coupling terms from vertical modes
-        self.flag_coupling_from_bm = config.MOD.flag_coupling_from_bm
-        if self.flag_coupling_from_bm and os.path.isfile(config.MOD.path_vertical_modes):
-            self._compute_coupling_coefficients(config.MOD.path_vertical_modes)
-        else:
-            self.flag_coupling_from_bm = False
+        # ---- Background IT params (from a previous experiment) ----
+        # If a netcdf file is provided via `config.MOD.path_background_params`,
+        # load `He_mean`, `alpha_He`, `alpha_Uu`, `alpha_Up` background fields.
+        # State.params then represent ANOMALIES around these prescribed values:
+        #     He_mean_total   = State.params['He_mean']  + self.He_mean_bg
+        #     alpha_He_total  = State.params['alpha_He'] + self.alpha_He_bg
+        #     alpha_Uu_total  = State.params['alpha_Uu'] + self.alpha_Uu_bg
+        #     alpha_Up_total  = State.params['alpha_Up'] + self.alpha_Up_bg
+        # Backgrounds default to zero => default behaviour is unchanged.
+        # The combination is applied inside `_compute_He_from_bm` and
+        # `_compute_advective_terms_from_bm`, so the auto-derived TLM/ADJ
+        # treat the backgrounds as constants (no extra term).
+        self.He_mean_bg  = jnp.zeros((self.ny, self.nx))
+        self.alpha_He_bg = jnp.zeros((self.ny, self.nx))
+        self.alpha_Uu_bg = jnp.zeros((self.ny, self.nx))
+        self.alpha_Up_bg = jnp.zeros((self.ny, self.nx))
+        # Python-bool flags so JIT branches can use them as static.
+        self.has_alpha_Uu_bg = False
+        self.has_alpha_Up_bg = False
 
+        path_bg = getattr(config.MOD, 'path_background_params', None)
+        if path_bg is not None and os.path.exists(path_bg):
+            name_var_bg = getattr(config.MOD, 'name_var_background_params', None) or {}
+            ds_bg = xr.open_dataset(path_bg)
+            name_lon = name_var_bg.get('lon', 'lon')
+            name_lat = name_var_bg.get('lat', 'lat')
+            # Optional longitude convention conversion
+            if name_lon in ds_bg.coords or name_lon in ds_bg.variables:
+                lon_arr = ds_bg[name_lon]
+                if np.sign(lon_arr.data.min()) == -1 and State.lon_unit == '0_360':
+                    ds_bg = ds_bg.assign_coords({name_lon: ((name_lon, lon_arr.data % 360))})
+                    ds_bg = ds_bg.sortby(name_lon)
+                elif np.sign(lon_arr.data.min()) >= 0 and State.lon_unit == '-180_180':
+                    ds_bg = ds_bg.assign_coords({name_lon: ((name_lon, (lon_arr.data + 180) % 360 - 180))})
+                    ds_bg = ds_bg.sortby(name_lon)
+
+            def _read_bg(key, default_name):
+                vname = name_var_bg.get(key, default_name)
+                if vname not in ds_bg.variables:
+                    return None
+                arr = grid.interp2d(
+                    ds_bg,
+                    {'lon': name_lon, 'lat': name_lat, key: vname},
+                    State.lon, State.lat)
+                arr = np.asarray(arr, dtype=float)
+                arr[np.isnan(arr)] = 0.
+                return jnp.asarray(arr)
+
+            He_mean_bg  = _read_bg('He_mean',  'He_mean')
+            alpha_He_bg = _read_bg('alpha_He', 'alpha_He')
+            alpha_Uu_bg = _read_bg('alpha_Uu', 'alpha_Uu')
+            alpha_Up_bg = _read_bg('alpha_Up', 'alpha_Up')
+
+            if He_mean_bg  is not None: self.He_mean_bg  = He_mean_bg
+            if alpha_He_bg is not None: self.alpha_He_bg = alpha_He_bg
+            if alpha_Uu_bg is not None: self.alpha_Uu_bg = alpha_Uu_bg
+            if alpha_Up_bg is not None: self.alpha_Up_bg = alpha_Up_bg
+
+            self.has_alpha_Uu_bg = bool(np.any(np.asarray(self.alpha_Uu_bg) != 0))
+            self.has_alpha_Up_bg = bool(np.any(np.asarray(self.alpha_Up_bg) != 0))
+
+            ds_bg.close()
+            print('[Model_bmit] background IT params loaded from', path_bg,
+                  '- State.params now represent anomalies around these values.')
+
+            if config.EXP.flag_plot > 0:
+                _, axes = plt.subplots(1, 4, figsize=(22, 4))
+                for ax, fld, ttl in zip(
+                        axes,
+                        [self.He_mean_bg, self.alpha_He_bg, self.alpha_Uu_bg, self.alpha_Up_bg],
+                        ['He_mean_bg', 'alpha_He_bg', 'alpha_Uu_bg', 'alpha_Up_bg']):
+                    im = ax.pcolormesh(np.asarray(fld))
+                    plt.colorbar(im, ax=ax)
+                    ax.set_title(ttl)
+                plt.suptitle('Background IT params (from previous experiment)')
+                plt.show()
 
         # Sponge layer
-        self.flag_bc_sponge = config.MOD.flag_bc_sponge
         self.sponge_width = config.MOD.dist_sponge_bc
         self.sponge_coef = config.MOD.sponge_coef
+        self.flag_bc_sponge = config.MOD.flag_bc_sponge and self.sponge_width is not None and self.sponge_width > 0
         if self.flag_bc_sponge:
             self.Xh = State.X
             self.Yh = State.Y
@@ -4024,63 +5189,61 @@ class Model_bmit(M):
             self.Xv = 0.5 * (State.X[:-1, :] + State.X[1:, :])
             self.Yv = 0.5 * (State.Y[:-1, :] + State.Y[1:, :])
 
-            if config.MOD.periodic_x and config.MOD.periodic_y:
-                sponge_h = np.zeros_like(self.Xh)
-                sponge_u = np.zeros_like(self.Xu)
-                sponge_v = np.zeros_like(self.Xv)
-            elif config.MOD.periodic_x and not config.MOD.periodic_y:
-                sponge_h = np.maximum.reduce([
-                    gaspari_cohn(self.Yh-self.Yh[0,:], self.sponge_width*1e3), 
-                    gaspari_cohn(self.Yh[-1,:]-self.Yh, self.sponge_width*1e3)])
-                sponge_u = np.maximum.reduce([
-                    gaspari_cohn(self.Yu-self.Yu[0,:], self.sponge_width*1e3), 
-                    gaspari_cohn(self.Yu[-1,:]-self.Yu, self.sponge_width*1e3)
-                    ])
-                sponge_v = np.maximum.reduce([
-                    gaspari_cohn(self.Yv-self.Yv[0,:], self.sponge_width*1e3), 
-                    gaspari_cohn(self.Yv[-1,:]-self.Yv, self.sponge_width*1e3)
-                    ])
-            elif not config.MOD.periodic_x and config.MOD.periodic_y:
-                sponge_h = np.maximum.reduce([
-                    gaspari_cohn(self.Xh.T-self.Xh[:,0].T, self.sponge_width*1e3).T, 
-                    gaspari_cohn(self.Xh[:,-1].T-self.Xh.T, self.sponge_width*1e3).T
-                    ])
-                sponge_u = np.maximum.reduce([
-                    gaspari_cohn(self.Xu.T-self.Xu[:,0].T, self.sponge_width*1e3).T, 
-                    gaspari_cohn(self.Xu[:,-1].T-self.Xu.T, self.sponge_width*1e3).T
-                    ])
-                sponge_v = np.maximum.reduce([
-                    gaspari_cohn(self.Xv.T-self.Xv[:,0].T, self.sponge_width*1e3).T, 
-                    gaspari_cohn(self.Xv[:,-1].T-self.Xv.T, self.sponge_width*1e3).T
-                    ])
+            # Sponge profile via grid.compute_sponge_components
+            lon_h = State.lon
+            lat_h = State.lat
+            lon_u = 0.5 * (lon_h[:, :-1] + lon_h[:, 1:])
+            lat_u = 0.5 * (lat_h[:, :-1] + lat_h[:, 1:])
+            lon_v = 0.5 * (lon_h[:-1, :] + lon_h[1:, :])
+            lat_v = 0.5 * (lat_h[:-1, :] + lat_h[1:, :])
+
+            if config.MOD.use_sponge_on_coast:
+                mask_h = State.mask.copy()
+                mask_u = mask_h[:, :-1] & mask_h[:, 1:]
+                mask_v = mask_h[:-1, :] & mask_h[1:, :]
             else:
-                sponge_h = np.maximum.reduce([
-                    gaspari_cohn(self.Xh.T-self.Xh[:,0].T, self.sponge_width*1e3).T, 
-                    gaspari_cohn(self.Xh[:,-1].T-self.Xh.T, self.sponge_width*1e3).T, 
-                    gaspari_cohn(self.Yh-self.Yh[0,:], self.sponge_width*1e3), 
-                    gaspari_cohn(self.Yh[-1,:]-self.Yh, self.sponge_width*1e3)
-                    ])
-                sponge_u = np.maximum.reduce([
-                    gaspari_cohn(self.Xu.T-self.Xu[:,0].T, self.sponge_width*1e3).T, 
-                    gaspari_cohn(self.Xu[:,-1].T-self.Xu.T, self.sponge_width*1e3).T, 
-                    gaspari_cohn(self.Yu-self.Yu[0,:], self.sponge_width*1e3), 
-                    gaspari_cohn(self.Yu[-1,:]-self.Yu, self.sponge_width*1e3)
-                    ])
-                sponge_v = np.maximum.reduce([
-                    gaspari_cohn(self.Xv.T-self.Xv[:,0].T, self.sponge_width*1e3).T, 
-                    gaspari_cohn(self.Xv[:,-1].T-self.Xv.T, self.sponge_width*1e3).T, 
-                    gaspari_cohn(self.Yv-self.Yv[0,:], self.sponge_width*1e3), 
-                    gaspari_cohn(self.Yv[-1,:]-self.Yv, self.sponge_width*1e3)
-                    ]) 
+                mask_h = np.zeros_like(lon_h, dtype=bool)
+                mask_u = np.zeros_like(lon_u, dtype=bool)
+                mask_v = np.zeros_like(lon_v, dtype=bool)
 
-            def _normalize_sponge(sponge):
-                sponge_min = jnp.min(sponge)
-                sponge_max = jnp.max(sponge)
-                return (sponge - sponge_min) / (sponge_max - sponge_min)
+            alpha = config.MOD.tangential_sponge_factor
 
-            self.sponge_h = _normalize_sponge(sponge_h)
-            self.sponge_u = _normalize_sponge(sponge_u)
-            self.sponge_v = _normalize_sponge(sponge_v)
+            # h: isotropic sponge
+            wc_h, wNS_h, wWE_h = grid.compute_sponge_components(lon_h, lat_h, mask_h, config.MOD.dist_sponge_bc)
+            if config.MOD.periodic_y:
+                wNS_h[:] = 0.0
+            if config.MOD.periodic_x:
+                wWE_h[:] = 0.0
+            self.sponge_h = 1.0 - (1.0 - wc_h) * (1.0 - wNS_h) * (1.0 - wWE_h)
+
+            # u: normal at W/E (full), tangential at N/S (reduced)
+            wc_u, wNS_u, wWE_u = grid.compute_sponge_components(lon_u, lat_u, mask_u, config.MOD.dist_sponge_bc)
+            if config.MOD.periodic_y:
+                wNS_u[:] = 0.0
+            if config.MOD.periodic_x:
+                wWE_u[:] = 0.0
+            self.sponge_u = 1.0 - (1.0 - wc_u) * (1.0 - alpha * wNS_u) * (1.0 - wWE_u)
+
+            # v: normal at N/S (full), tangential at W/E (reduced)
+            wc_v, wNS_v, wWE_v = grid.compute_sponge_components(lon_v, lat_v, mask_v, config.MOD.dist_sponge_bc)
+            if config.MOD.periodic_y:
+                wNS_v[:] = 0.0
+            if config.MOD.periodic_x:
+                wWE_v[:] = 0.0
+            self.sponge_v = 1.0 - (1.0 - wc_v) * (1.0 - wNS_v) * (1.0 - alpha * wWE_v)
+
+            if config.EXP.flag_plot > 0:
+                _, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
+                im1 = ax1.pcolormesh(self.sponge_h)
+                plt.colorbar(im1, ax=ax1)
+                ax1.set_title('Sponge SSH')
+                im2 = ax2.pcolormesh(self.sponge_u)
+                plt.colorbar(im2, ax=ax2)
+                ax2.set_title('Sponge U')
+                im3 = ax3.pcolormesh(self.sponge_v)
+                plt.colorbar(im3, ax=ax3)
+                ax3.set_title('Sponge V')
+                plt.show()
 
             if not config.MOD.periodic_y:
                 self.sponge_on_h_S = (np.abs(self.Yh-self.Yh[0,:][None,:])<=config.MOD.dist_sponge_bc*1e3) 
@@ -4119,13 +5282,20 @@ class Model_bmit(M):
             self.weight_sponge_h[self.weight_sponge_h==0] = 1
 
             # Update mask (for avoiding assimilation in sponge regions)
-            State.mask[self.sponge_on_h_S] = True
-            State.mask[self.sponge_on_h_N] = True
-            State.mask[self.sponge_on_h_W] = True
-            State.mask[self.sponge_on_h_E] = True
+            if config.MOD.mask_sponge_bc:
+                State.mask[self.sponge_on_h_S] = True
+                State.mask[self.sponge_on_h_N] = True
+                State.mask[self.sponge_on_h_W] = True
+                State.mask[self.sponge_on_h_E] = True
         
-        self.mask = State.mask
-        
+        # Coupling terms from vertical modes
+        self.flag_coupling_from_bm = config.MOD.flag_coupling_from_bm
+        if self.flag_coupling_from_bm:
+            if config.MOD.path_interaction_terms is not None and os.path.exists(config.MOD.path_interaction_terms):
+                self._read_interaction_terms(config, State)
+            else:
+                self._compute_coupling_coefficients(config.MOD.path_vertical_modes)
+
         # Model initialization
         self.model_bm = model_bm(
             dx=State.DX,
@@ -4157,11 +5327,45 @@ class Model_bmit(M):
             periodic_y=config.MOD.periodic_y,
             )
     
+        # Set sponge attributes on IT model for compute_IT_2D
+        if self.flag_bc_sponge:
+            self.model_it.flag_sponge_bc = True
+            self.model_it.sponge_coef = self.sponge_coef
+            self.model_it.sponge_u = self.sponge_u
+            self.model_it.sponge_v = self.sponge_v
+            self.model_it.sponge_h = self.sponge_h
+            self.model_it.sponge_on_h_S = self.sponge_on_h_S
+            self.model_it.sponge_on_h_N = self.sponge_on_h_N
+            self.model_it.sponge_on_h_W = self.sponge_on_h_W
+            self.model_it.sponge_on_h_E = self.sponge_on_h_E
+            self.model_it.sponge_on_u_S = self.sponge_on_u_S
+            self.model_it.sponge_on_u_N = self.sponge_on_u_N
+            self.model_it.sponge_on_u_W = self.sponge_on_u_W
+            self.model_it.sponge_on_u_E = self.sponge_on_u_E
+            self.model_it.sponge_on_v_S = self.sponge_on_v_S
+            self.model_it.sponge_on_v_N = self.sponge_on_v_N
+            self.model_it.sponge_on_v_W = self.sponge_on_v_W
+            self.model_it.sponge_on_v_E = self.sponge_on_v_E
+            self.model_it.weight_sponge_u = self.weight_sponge_u
+            self.model_it.weight_sponge_v = self.weight_sponge_v
+            self.model_it.weight_sponge_h = self.weight_sponge_h
+
+        # IT wave-phase method for sponge BC
+        self.model_it.bc_it_method = getattr(config.MOD, 'bc_it_method', 'plane_wave')
+
         # Compile jax-related functions
-        self._jstep_jit = jit(self._jstep)
-        self._jstep_tgl_jit = jit(self._jstep_tgl)
-        self._jstep_adj_jit = jit(self._jstep_adj)
+        self._jstep_jit = jit(self._jstep, static_argnames=['nstep'])
+        self._jstep_tgl_jit = jit(self._jstep_tgl, static_argnames=['nstep'])
+        self._jstep_adj_jit = jit(self._jstep_adj, static_argnames=['nstep'])
         self._compute_w1_IT_jit = jit(self._compute_w1_IT)
+        self._compute_IT_2D_jit = jit(self._compute_IT_2D)
+
+        # Functions related to IT time_scheme
+        self.time_scheme_it = config.MOD.time_scheme_it
+        if self.time_scheme_it == 'Euler':
+            self.model_it_step_nstep = self.model_it._step_euler_nstep
+        elif self.time_scheme_it == 'rk4':
+            self.model_it_step_nstep = self.model_it._step_rk4_nstep
         
         if config.INV is not None and config.INV.super=='INV_4DVAR' and config.INV.compute_test:
             print('BM/IT Tangent test:')
@@ -4184,14 +5388,14 @@ class Model_bmit(M):
     
     def save_output(self,State,present_date,name_var=None,t=None):
 
-        name_var_to_save = [self.name_var['SSH_BM'], 
-                            self.name_var['SSH_IT'], 
-                            self.name_var['SSH'], 
-                            self.name_var['U_IT']+'_interp', 
+        name_var_to_save = [self.name_var['SSH_BM'],
+                            self.name_var['SSH_IT'],
+                            self.name_var['SSH'],
+                            self.name_var['U_IT']+'_interp',
                             self.name_var['V_IT']+'_interp',
                             'He',
                             'He_mean',
-                            'alpha']
+                            'alpha_He']
         
         if self.mdt is not None:
             ssh_bm = State.getvar(name_var=self.name_var['SSH_BM']) + self.mdt
@@ -4214,21 +5418,40 @@ class Model_bmit(M):
             He_mean = +State.params['He_mean'] 
         else:
             He_mean = jnp.zeros((self.ny,self.nx))
-        if 'alpha' in self.name_params_it:
-            alpha = +State.params['alpha'] 
+        if 'alpha_He' in self.name_params_it:
+            alpha_He = +State.params['alpha_He']
+        elif 'alpha' in self.name_params_it:
+            alpha_He = +State.params['alpha']
         else:
-            alpha = jnp.zeros((self.ny,self.nx))
+            alpha_He = jnp.zeros((self.ny,self.nx))
         h_bm = +State.getvar(name_var=self.name_var['SSH_BM'])
-        He2d = self._compute_He_from_bm(He_mean, alpha, h_bm)
+        He2d = self._compute_He_from_bm(He_mean, alpha_He, h_bm)
 
         State.var['He'] = He2d + self.Heb
         State.var['He_mean'] = He_mean
-        State.var['alpha'] = alpha
+        State.var['alpha_He'] = alpha_He
+
+        if 'alpha_Uu' in self.name_params_it: 
+            State.var['alpha_Uu'] = State.params['alpha_Uu']
+            name_var_to_save += ['alpha_Uu']
+        if 'alpha_Up' in self.name_params_it: 
+            State.var['alpha_Up'] = State.params['alpha_Up']
+            name_var_to_save += ['alpha_Up']
+        if 'alpha_Uz' in self.name_params_it: 
+            State.var['alpha_Uz'] = State.params['alpha_Uz']
+            name_var_to_save += ['alpha_Uz']
 
         State.save_output(present_date,
                           name_var=name_var_to_save)
         
-    def set_bc(self,time_bc,var_bc):
+    def set_bc(self,time_bc,var_bc=None,**kwargs):
+
+        # If var_bc not provided but we have loaded BC fields, interpolate them
+        if var_bc is None and self._bc_fields is not None:
+            var_bc = self._bc_fields.interp(time_bc)
+        
+        if var_bc is None:
+            return
 
         for _name_var_bc in var_bc:
             for _name_var_mod in self.name_var:
@@ -4294,7 +5517,8 @@ class Model_bmit(M):
         #########################################################################
         integrand = phi1/phi1[-1] * (phi1**2) * dz_r  # multiply by layer thickness
         U11 = (1/self.H) * integrand.sum(dim="s_rho")   # integral in z
-        self.U11 = jnp.array(U11.values)  
+        self.U11 = jnp.array(U11.values) 
+        self.U11 = jnp.where(self.U11<0, 0, self.U11)
         plt.figure()
         plt.pcolormesh(self.U11)
         plt.colorbar()
@@ -4320,6 +5544,7 @@ class Model_bmit(M):
         dz_w = dz_w.reindex(s_w=s_w, fill_value=np.nan)
         U11p = (1/self.H) * (integrand * dz_w).sum(dim="s_w")   # integral in z
         self.U11p = jnp.array(U11p.values)
+        self.U11p = jnp.where(self.U11p<0, 0, self.U11p)
         plt.figure()
         plt.pcolormesh(self.U11p)
         plt.colorbar()
@@ -4352,44 +5577,121 @@ class Model_bmit(M):
         integrand = phi1pp * A2
         dHe = (1/self.H) * (integrand * dz_r).sum("s_rho")
         self.dHe = jnp.array(dHe.values) 
-
+        self.dHe = jnp.where(self.dHe<0, 0, self.dHe)
         plt.figure()
         plt.pcolormesh(self.dHe)
         plt.colorbar()
         plt.title('dHe')
         plt.show()
 
-    def _compute_He_from_bm(self, He, alpha, h_bm):
+    def _read_interaction_terms(self, config, State):
+        """Read interaction terms (U11, U11p, dHe) from a netcdf file
+        instead of computing them from vertical modes."""
+
+        ds = xr.open_dataset(config.MOD.path_interaction_terms)
+        name_lon = config.MOD.name_var_interaction_terms['lon']
+        lon = ds[name_lon]
+        # Convert longitude
+        if np.sign(lon.data.min()) == -1 and State.lon_unit == '0_360':
+            ds = ds.assign_coords({name_lon: ((name_lon, lon.data % 360))})
+            ds = ds.sortby(name_lon)
+        elif np.sign(lon.data.min()) >= 0 and State.lon_unit == '-180_180':
+            ds = ds.assign_coords({name_lon: ((name_lon, (lon.data + 180) % 360 - 180))})
+            ds = ds.sortby(name_lon)
+
+        name_vars = config.MOD.name_var_interaction_terms
+
+        def _read_field(var_key, ds, name_vars, State, divisor):
+            """Read and interpolate a field if variable name is defined and exists in the dataset."""
+            if name_vars.get(var_key) and name_vars[var_key] in ds:
+                return jnp.array(grid.interp2d(
+                    ds, {'lon': name_vars['lon'], 'lat': name_vars['lat'], 'var': name_vars[var_key]},
+                    State.lon, State.lat)) / divisor
+            else:
+                print(f'Warning: {var_key} not found or not defined. Setting to zero.')
+                return jnp.zeros((State.ny, State.nx))
+
+        # Read U11
+        self.U11 = _read_field('U11_u', ds, name_vars, State, self.H)
+        self.U11 = jnp.where(self.U11<0, 0, self.U11)  # Ensure non-negativity
+        self.U11 = jnp.where(self.mask, 0, self.U11)  # Mask land points
+        self.U11 = jnp.where(jnp.isnan(self.U11), 0, self.U11)  # Ensure no NaNs
         
-        """ Compute equivalent depth with coupling term
+        # Read U11p
+        self.U11p = _read_field('U11_p', ds, name_vars, State, self.H)
+        self.U11p = jnp.where(self.U11p<0, 0, self.U11p)  # Ensure non-negativity
+        self.U11p = jnp.where(self.mask, 0, self.U11p)  # Mask land points
+        self.U11p = jnp.where(jnp.isnan(self.U11p), 0, self.U11p)  # Ensure no NaNs
+        
+        # Read dc2 (correction to c^2) and convert to dHe = dc2 / g
+        self.dHe = _read_field('dc2', ds, name_vars, State, self.H * self.g)
+        self.dHe = jnp.where(self.dHe<0, 0, self.dHe)  # Ensure non-negativity
+        self.dHe = jnp.where(self.mask, 0, self.dHe)  # Mask land points
+        self.dHe = jnp.where(jnp.isnan(self.dHe), 0, self.dHe)  # Ensure no NaNs
+        
+        if config.EXP.flag_plot > 0:
+            fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+            for ax, data, title in zip(axes,
+                                       [self.U11, self.U11p, self.dHe],
+                                       ['U11', 'U11p', 'dHe']):
+                im = ax.pcolormesh(data)
+                plt.colorbar(im, ax=ax)
+                ax.set_title(title)
+            plt.suptitle('Interaction terms (from file)')
+            plt.show()
+
+    def _compute_He_from_bm(self, He, alpha_He, h_bm):
+        
+        """ Compute equivalent depth with coupling term.
+
+        He and alpha_He are interpreted as ANOMALIES around the prescribed
+        background fields `self.He_mean_bg` and `self.alpha_He_bg` (zero by
+        default). The forward primal uses (He + bg); the auto-derived TLM/ADJ
+        treat the backgrounds as constants (zero contribution).
         --------------
         Inputs:
-        He        : IT equivalent depth control parameters (without units)
+        He        : IT equivalent depth anomaly control parameters (without units)
+        alpha_He  : IT He coupling anomaly coefficient (without units)
         h_bm      : BM sea surface height (m) 
         --------------
         Outputs:
         He_tot    : Total equivalent depth with coupling term (m)
         """
 
+        # Add background to He_mean anomaly
         if He is not None:
-            if self.flag_coupling_from_bm and h_bm is not None:
-                He2d =  He + (.5 + alpha) * self.dHe * h_bm 
-            else:
-                He2d = He
+            He_eff = He + self.He_mean_bg
         else:
-            He2d = jnp.zeros((self.ny,self.nx))
-        
+            He_eff = self.He_mean_bg
+
+        if self.flag_coupling_from_bm and h_bm is not None:
+            # Add background to alpha_He anomaly (treat None as zero)
+            alpha_He_eff = self.alpha_He_bg if alpha_He is None else (alpha_He + self.alpha_He_bg)
+            dHe_bm = self.dHe * h_bm
+            if self.flag_bc_sponge:
+                dHe_bm = dHe_bm * (1 - self.sponge_h)
+            He2d = He_eff + (.5 + alpha_He_eff) * dHe_bm
+        else:
+            He2d = He_eff
+
         He2d = jnp.where(self.mask, 0., He2d)
         
         return He2d
 
-    def _compute_advective_terms_from_bm(self, alpha, u_bm, v_bm):
+    def _compute_advective_terms_from_bm(self, alpha_Uu, alpha_Up, u_bm, v_bm):
 
-        """ Compute advective terms with coupling term
+        """ Compute advective terms with coupling term.
+
+        alpha_Uu and alpha_Up are interpreted as ANOMALIES around the prescribed
+        background fields `self.alpha_Uu_bg` and `self.alpha_Up_bg` (zero by
+        default). Forward primal uses (alpha + bg); auto TLM/ADJ treat bg as
+        constants.
         --------------
         Inputs:
-        alpha     : IT advective control parameters (without units)
-        h_bm      : BM sea surface height (m) 
+        alpha_Uu  : IT advective anomaly control parameter for U11 (without units)
+        alpha_Up  : IT advective anomaly control parameter for U11p (without units)
+        u_bm      : BM zonal velocity (m/s)
+        v_bm      : BM meridional velocity (m/s)
         --------------
         Outputs:
         u11, v11  : advective coupling terms for u and v (m/s)
@@ -4397,10 +5699,28 @@ class Model_bmit(M):
         """
 
         if self.flag_coupling_from_bm and u_bm is not None and v_bm is not None:
-            u11 = ((.5 - alpha) + (.5 + alpha) * self.U11) * u_bm 
-            v11 = ((.5 - alpha) + (.5 + alpha) * self.U11) * v_bm 
-            u11p = ((.5 - alpha) + (.5 + alpha) * self.U11p) * u_bm 
-            v11p = ((.5 - alpha) + (.5 + alpha) * self.U11p) * v_bm 
+            # alpha_Uu (anomaly + background)
+            if alpha_Uu is not None or self.has_alpha_Uu_bg:
+                aUu = self.alpha_Uu_bg if alpha_Uu is None else (alpha_Uu + self.alpha_Uu_bg)
+                u11 = ((.5 - aUu) + (.5 + aUu) * self.U11) * u_bm 
+                v11 = ((.5 - aUu) + (.5 + aUu) * self.U11) * v_bm 
+                if self.flag_bc_sponge:
+                    u11 = u11 * (1 - self.sponge_h)
+                    v11 = v11 * (1 - self.sponge_h)
+            else:
+                u11 = None
+                v11 = None
+            # alpha_Up (anomaly + background)
+            if alpha_Up is not None or self.has_alpha_Up_bg:
+                aUp = self.alpha_Up_bg if alpha_Up is None else (alpha_Up + self.alpha_Up_bg)
+                u11p = ((.5 - aUp) + (.5 + aUp) * self.U11p) * u_bm 
+                v11p = ((.5 - aUp) + (.5 + aUp) * self.U11p) * v_bm 
+                if self.flag_bc_sponge:
+                    u11p = u11p * (1 - self.sponge_h)
+                    v11p = v11p * (1 - self.sponge_h)
+            else:
+                u11p = None
+                v11p = None
         else:
             u11 = None
             v11 = None
@@ -4446,7 +5766,7 @@ class Model_bmit(M):
             for i,theta in enumerate(self.bc_theta):
                 kx = jnp.sin(theta) * k
                 ky = jnp.cos(theta) * k
-                kxy = kx*self.swm.Xv[0,:] + ky*self.swm.Yv[0,:]
+                kxy = kx*self.model_it.Xv[0,:] + ky*self.model_it.Yv[0,:]
                 
                 h = h_SN[j,0,0,i]* jnp.cos(w*t-kxy)  +\
                         h_SN[j,0,1,i]* jnp.sin(w*t-kxy) 
@@ -4470,7 +5790,7 @@ class Model_bmit(M):
             for i,theta in enumerate(self.bc_theta):
                 kx = jnp.sin(theta) * k
                 ky = -jnp.cos(theta) * k
-                kxy = kx*self.swm.Xv[-1,:] + ky*self.swm.Yv[-1,:]
+                kxy = kx*self.model_it.Xv[-1,:] + ky*self.model_it.Yv[-1,:]
                 h = h_SN[j,1,0,i]* jnp.cos(w*t-kxy)+\
                         h_SN[j,1,1,i]* jnp.sin(w*t-kxy) 
                 v = self.g/(w**2-fN**2)*(\
@@ -4492,7 +5812,7 @@ class Model_bmit(M):
             for i,theta in enumerate(self.bc_theta):
                 kx = jnp.cos(theta)* k
                 ky = jnp.sin(theta)* k
-                kxy = kx*self.swm.Xu[:,0] + ky*self.swm.Yu[:,0]
+                kxy = kx*self.model_it.Xu[:,0] + ky*self.model_it.Yu[:,0]
                 h = h_WE[j,0,0,i]*jnp.cos(w*t-kxy) +\
                         h_WE[j,0,1,i]*jnp.sin(w*t-kxy)
                 u = self.g/(w**2-fW**2)*(\
@@ -4515,7 +5835,7 @@ class Model_bmit(M):
             for i,theta in enumerate(self.bc_theta):
                 kx = -jnp.cos(theta)* k
                 ky = jnp.sin(theta)* k
-                kxy = kx*self.swm.Xu[:,-1] + ky*self.swm.Yu[:,-1]
+                kxy = kx*self.model_it.Xu[:,-1] + ky*self.model_it.Yu[:,-1]
                 h = h_WE[j,1,0,i]*jnp.cos(w*t-kxy) +\
                         h_WE[j,1,1,i]*jnp.sin(w*t-kxy)
                 u = self.g/(w**2-fE**2)*(\
@@ -4758,125 +6078,72 @@ class Model_bmit(M):
     
     def _jstep(self, t, 
             h_bm, u_it, v_it, h_it, h_tot, 
-            F_bm, He_mean, alpha, h_SN, h_WE,
-            h_bm_bc):
+            F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
+            h_bm_bc, nstep=1):
 
-        """ One time step of the coupled BM/IT model
-        --------------
-        Inputs:
-        t         : time (s)
-        h_bm      : [dynamic] BM sea surface height (m) 
-        u_it      : [dynamic] IT zonal velocity (m/s)
-        v_it      : [dynamic] IT meridional velocity (m/s)
-        h_it      : [dynamic] IT sea surface height (m)
-        h_tot     : [dynamic] Total sea surface height (m)
-        F_bm      : [dynamic] Flux correction BM (m)
-        He_mean   : [dynamic] IT equivalent depth mean (m)
-        alpha     : [dynamic] IT coupling coefficient (m)
-        h_SN      : [dynamic] IT boundary condition North/South (m)
-        h_WE      : [dynamic] IT boundary condition West/East (m)
-        h_bm_bc   : [static] BM sea surface height boundary condition (m)
-        --------------
-        Outputs:
-        h_bm      : updated BM sea surface height (m)
-        u_it      : updated IT zonal velocity (m/s)
-        v_it      : updated IT meridional velocity (m/s)
-        h_it      : updated IT sea surface height (m)
-        h_tot     : updated Total sea surface height (m)
+        """ Multi-step forward integration of the coupled BM/IT model.
+        He and interactive terms are computed once (fixed during nsteps).
+        scan + checkpoint is inside the SWM model.
         """
 
-        # Compute equivalent depth anomaly from control parameters
-        He2d = self._compute_He_from_bm(He_mean, alpha, h_bm)
+        # Compute equivalent depth anomaly from control parameters (once, before scan)
+        He2d = self._compute_He_from_bm(He_mean, alpha_He, h_bm)
         He_tot = self.Heb + He2d
 
-        # Compute advective terms from control parameters
+        # Compute advective terms from control parameters (once, before scan)
         if self.mdt is not None:
             ssh_bm = h_bm + self.mdt
         else:
             ssh_bm = h_bm
         u_bm, v_bm = self.model_bm.h2uv(ssh_bm)
-        u11, v11, u11p, v11p = self._compute_advective_terms_from_bm(alpha, u_bm, v_bm)
+        u11, v11, u11p, v11p = self._compute_advective_terms_from_bm(alpha_Uu, alpha_Up, u_bm, v_bm)
 
-        # Compute characteristic variable from external data
+        # Compute characteristic variable from external data (once, before scan)
         if not self.flag_bc_sponge:
             w1ext = self._compute_w1_IT(t, He_tot, h_SN, h_WE)
         else:
             w1ext = None
 
-        # One BM forward step
-        h_bm = self.model_bm.step(h_bm, h_bm_bc)
+        # BM nstep forward
+        h_bm = self.model_bm.step(h_bm, h_bm_bc, nstep=nstep)
 
-        # One IT forward step
-        u_it, v_it, h_it = self.model_it.step(u_it, v_it, h_it, He2d, w1ext=w1ext, u11=u11, v11=v11, u11p=u11p, v11p=v11p)
-
-        # Sponge Boundary conditions
-        if self.flag_bc_sponge:
-            _u_b, _v_b, _h_b = self._compute_IT_2D(t, He_tot, h_SN, h_WE)
-            u_it += self.sponge_coef * self.sponge_u * (_u_b - u_it)
-            v_it += self.sponge_coef * self.sponge_v * (_v_b - v_it)
-            h_it += self.sponge_coef * self.sponge_h * (_h_b - h_it)
+        # IT nstep forward (scan + checkpoint inside swm)
+        u_it, v_it, h_it = self.model_it_step_nstep(
+            u_it, v_it, h_it, He2d, w1ext=w1ext,
+            u11u=u11, v11u=v11, u11p=u11p, v11p=v11p,
+            nstep=nstep, t=t, He_total=He_tot, h_SN=h_SN, h_WE=h_WE)
 
         # Sum of BM/IT
         h_tot = h_bm + h_it
 
-        # Flux correction BM
+        # Flux correction BM (accumulated over nstep)
         if F_bm is not None:
-            h_bm = h_bm + self.dt/(3600*24) * F_bm
-    
+            h_bm = h_bm + nstep * self.dt/(3600*24) * F_bm
+
         return h_bm, u_it, v_it, h_it, h_tot
      
     def _jstep_tgl(self, t, 
                 dh_bm, du_it, dv_it, dh_it, dh_tot, 
-                dF_bm, dHe_mean, dalpha, dh_SN, dh_WE,
+                dF_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE,
                 h_bm, u_it, v_it, h_it, h_tot, 
-                F_bm, He_mean, alpha, h_SN, h_WE, 
-                h_bm_bc):
-        """ One time step of the coupled BM/IT model tangent linear
-        --------------
-        Inputs:
-        t         : time (s)
-        dh_bm     : [dynamic] perturbation BM sea surface height (m) 
-        du_it     : [dynamic] perturbation IT zonal velocity (m/s)
-        dv_it     : [dynamic] perturbation IT meridional velocity (m/s)
-        dh_it     : [dynamic] perturbation IT sea surface height (m)
-        dh_tot    : [dynamic] perturbation Total sea surface height (m)
-        dF_bm     : [dynamic] perturbation Flux correction BM (m)
-        dHe_mean  : [dynamic] perturbation IT equivalent depth mean (m)
-        dalpha    : [dynamic] perturbation IT equivalent depth anomaly (m)
-        dh_SN     : [dynamic] perturbation IT boundary condition North/South (m)
-        dh_WE     : [dynamic] perturbation IT boundary condition West/East (m)
-        h_bm      : [static] BM sea surface height (m) 
-        u_it      : [static] IT zonal velocity (m/s)
-        v_it      : [static] IT meridional velocity (m/s)
-        h_it      : [static] IT sea surface height (m)
-        h_tot     : [static] Total sea surface height (m)
-        F_bm      : [static] Flux correction BM (m)
-        He_mean   : [static] IT equivalent depth mean (m)
-        alpha     : [static] IT equivalent depth anomaly (m)
-        h_SN      : [static] IT boundary condition North/South (m)
-        h_WE      : [static] IT boundary condition West/East (m)
-        h_bm_bc   : [static] BM sea surface height boundary condition (m)
-        --------------
-        Outputs:
-        du_it     : updated perturbation IT zonal velocity (m/s)
-        dv_it     : updated perturbation IT meridional velocity (m/s)
-        dh_it     : updated perturbation IT sea surface height (m)
-        dh_bm     : updated perturbation BM sea surface height (m)
-        dh_tot    : updated perturbation Total sea surface height (m)
+                F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE, 
+                h_bm_bc, nstep=1):
+        """ Multi-step tangent linear of the coupled BM/IT model
+        using JVP through _jstep (scan + checkpoint inside swm)
         """
         
         def wrapped_jstep(x):
             h_bm, u_it, v_it, h_it, h_tot, \
-                F_bm, He_mean, alpha, h_SN, h_WE = x
+                F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = x
             return self._jstep(t, 
                             h_bm, u_it, v_it, h_it, h_tot, 
-                            F_bm, He_mean, alpha, h_SN, h_WE,
-                            h_bm_bc)
+                            F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
+                            h_bm_bc, nstep=nstep)
 
         primals = ((h_bm, u_it, v_it, h_it, h_tot, 
-                    F_bm, He_mean, alpha, h_SN, h_WE),)
+                    F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE),)
         tangents = ((dh_bm, du_it, dv_it, dh_it, dh_tot, 
-                    dF_bm, dHe_mean, dalpha, dh_SN, dh_WE,),)
+                    dF_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE,),)
 
         _, dy = jax.jvp(wrapped_jstep, primals, tangents)
 
@@ -4884,75 +6151,48 @@ class Model_bmit(M):
 
     def _jstep_adj(self, t, 
                 adh_bm, adu_it, adv_it, adh_it, adh_tot, 
-                adF_bm, adHe_mean, adalpha, adh_SN, adh_WE,
+                adF_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adh_SN, adh_WE,
                 h_bm, u_it, v_it, h_it, h_tot, 
-                F_bm, He_mean, alpha, h_SN, h_WE, 
-                h_bm_bc):
-        """ One time step of the coupled BM/IT model adjoint
-        --------------
-        Inputs:
-        t         : time (s)
-        adh_bm    : [dynamic] adjoint BM sea surface height (m) 
-        adu_it    : [dynamic] adjoint IT zonal velocity (m/s)
-        adv_it    : [dynamic] adjoint IT meridional velocity (m/s)
-        adh_it    : [dynamic] adjoint IT sea surface height (m)
-        adh_tot   : [dynamic] adjoint Total sea surface height (m)
-        adF_bm    : [dynamic] adjoint Flux correction BM (m)
-        adHe      : [dynamic] adjoint IT equivalent depth (m)
-        adh_SN    : [dynamic] adjoint IT boundary condition North/South (m)
-        adh_WE    : [dynamic] adjoint IT boundary condition West/East (m)
-        h_bm      : [static] BM sea surface height (m) 
-        u_it      : [static] IT zonal velocity (m/s)
-        v_it      : [static] IT meridional velocity (m/s)
-        h_it      : [static] IT sea surface height (m)
-        h_tot     : [static] Total sea surface height (m)
-        F_bm      : [static] Flux correction BM (m)
-        He        : [static] IT equivalent depth (m)
-        h_SN      : [static] IT boundary condition North/South (m)
-        h_WE      : [static] IT boundary condition West/East (m)
-        h_bm_bc   : [static] BM sea surface height boundary condition (m)
-        --------------
-        Outputs:
-        adh_bm    : updated adjoint BM sea surface height (m) 
-        adu_it    : updated adjoint IT zonal velocity (m/s)
-        adv_it    : updated adjoint IT meridional velocity (m/s)
-        adh_it    : updated adjoint IT sea surface height (m)
-        adh_tot   : updated adjoint Total sea surface height (m)
-        adHe      : updated adjoint IT equivalent depth (m)
-        adh_SN    : updated adjoint IT boundary condition North/South (m)
-        adh_WE    : updated adjoint IT boundary condition West/East (m)
+                F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE, 
+                h_bm_bc, nstep=1):
+        """ Multi-step adjoint of the coupled BM/IT model
+        using VJP through _jstep (scan + checkpoint inside swm)
         """
 
         def wrapped_jstep(x):
             h_bm, u_it, v_it, h_it, h_tot, \
-                F_bm, He_mean, alpha, h_SN, h_WE = x
+                F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = x
             return self._jstep(t, 
                             h_bm, u_it, v_it, h_it, h_tot, 
-                            F_bm, He_mean, alpha, h_SN, h_WE,
-                            h_bm_bc)
+                            F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
+                            h_bm_bc, nstep=nstep)
 
         primals = ((h_bm, u_it, v_it, h_it, h_tot, 
-                    F_bm, He_mean, alpha, h_SN, h_WE),)
+                    F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE),)
         cotangents = (adh_bm, adu_it, adv_it, adh_it, adh_tot)  
 
         _, vjp_fn = jax.vjp(wrapped_jstep, *primals)
         adjoints = vjp_fn(cotangents)
 
         adh_bm, adu_it, adv_it, adh_it, adh_tot, \
-            _adF_bm, _adHe_mean, _adalpha, _adhSN, _adhWE = adjoints[0]
+            _adF_bm, _adHe_mean, _adalpha_He, _adalpha_Uu, _adalpha_Up, _adhSN, _adhWE = adjoints[0]
         
         if adF_bm is not None:
             adF_bm += _adF_bm
         if adHe_mean is not None:
             adHe_mean += _adHe_mean
-        if adalpha is not None:
-            adalpha += _adalpha
+        if adalpha_He is not None:
+            adalpha_He += _adalpha_He
+        if adalpha_Uu is not None:
+            adalpha_Uu += _adalpha_Uu
+        if adalpha_Up is not None:
+            adalpha_Up += _adalpha_Up
         if adh_SN is not None:
             adh_SN += _adhSN
         if adh_WE is not None:
             adh_WE += _adhWE
 
-        return adh_bm, adu_it, adv_it, adh_it, adh_tot, adF_bm, adHe_mean, adalpha, adh_SN, adh_WE
+        return adh_bm, adu_it, adv_it, adh_it, adh_tot, adF_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adh_SN, adh_WE
     
 
     def step(self,State,nstep=1,t=0):
@@ -4973,12 +6213,24 @@ class Model_bmit(M):
             He_mean = +State.params['He_mean'] 
         else:
             He_mean = jnp.zeros((self.ny,self.nx))
-            
-            alpha = +State.params['alpha'] 
-        if self.flag_coupling_from_bm and 'alpha' in self.name_params_it:
-            alpha = +State.params['alpha']
+        if 'alpha_He' in self.name_params_it:
+            alpha_He = +State.params['alpha_He']
+        elif 'alpha' in self.name_params_it:
+            alpha_He = +State.params['alpha']
         else:
-            alpha = jnp.zeros((self.ny,self.nx))
+            alpha_He = None
+        if 'alpha_Uu' in self.name_params_it:
+            alpha_Uu = +State.params['alpha_Uu']
+        elif 'alpha' in self.name_params_it:
+            alpha_Uu = +State.params['alpha']
+        else:
+            alpha_Uu = None
+        if 'alpha_Up' in self.name_params_it:
+            alpha_Up = +State.params['alpha_Up']
+        elif 'alpha' in self.name_params_it:
+            alpha_Up = +State.params['alpha']
+        else:
+            alpha_Up = None
         if 'hbc' in self.name_params_it:
             h_SN = +State.params['hbcx']
             h_WE = +State.params['hbcy']
@@ -4986,13 +6238,11 @@ class Model_bmit(M):
             h_SN = None
             h_WE = None
             
-        # Time stepping
-        for it in range(nstep):
-            # One time step
-            h_bm, u_it, v_it, h_it, h_tot = self._jstep_jit(t+it*self.dt, 
-                                                            h_bm, u_it, v_it, h_it, h_tot, 
-                                                            F_bm, He_mean, alpha, h_SN, h_WE,
-                                                            h_bm_bc)
+        # Time stepping (scan + checkpoint inside _jstep)
+        h_bm, u_it, v_it, h_it, h_tot = self._jstep_jit(t, 
+                                                        h_bm, u_it, v_it, h_it, h_tot, 
+                                                        F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
+                                                        h_bm_bc, nstep=nstep)
         
         # Update state
         State.setvar([h_bm, u_it,v_it,h_it, h_tot],[
@@ -5028,9 +6278,30 @@ class Model_bmit(M):
             He_mean = +State.params['He_mean'] 
         else:
             He_mean = dHe_mean = jnp.zeros((self.ny,self.nx))
-        if 'alpha' in self.name_params_it:
-            dalpha = +dState.params['alpha']
-            alpha = +State.params['alpha'] 
+        if 'alpha_He' in self.name_params_it:
+            dalpha_He = +dState.params['alpha_He']
+            alpha_He = +State.params['alpha_He']
+        elif 'alpha' in self.name_params_it:
+            dalpha_He = +dState.params['alpha']
+            alpha_He = +State.params['alpha']
+        else:
+            alpha_He = dalpha_He = None
+        if 'alpha_Uu' in self.name_params_it:
+            dalpha_Uu = +dState.params['alpha_Uu']
+            alpha_Uu = +State.params['alpha_Uu']
+        elif 'alpha' in self.name_params_it:
+            dalpha_Uu = +dState.params['alpha']
+            alpha_Uu = +State.params['alpha']
+        else:
+            alpha_Uu = dalpha_Uu = None
+        if 'alpha_Up' in self.name_params_it:
+            dalpha_Up = +dState.params['alpha_Up']
+            alpha_Up = +State.params['alpha_Up']
+        elif 'alpha' in self.name_params_it:
+            dalpha_Up = +dState.params['alpha']
+            alpha_Up = +State.params['alpha']
+        else:
+            alpha_Up = dalpha_Up = None
         if 'hbc' in self.name_params_it:
             dh_SN = dState.params['hbcx']
             dh_WE = dState.params['hbcy']
@@ -5040,22 +6311,14 @@ class Model_bmit(M):
             dh_SN = dh_WE = None
             h_SN = h_WE = None
             
-        # Time stepping
-        for it in range(nstep):
-            # One time step
-            dh_bm, du_it, dv_it, dh_it, dh_tot = self._jstep_tgl_jit(
-                                                        t+it*self.dt, 
-                                                        dh_bm, du_it, dv_it, dh_it, dh_tot, 
-                                                        dF_bm, dHe_mean, dalpha, dh_SN, dh_WE,
-                                                        h_bm, u_it, v_it, h_it, h_tot, 
-                                                        F_bm, He_mean, alpha, h_SN, h_WE,
-                                                        h_bm_bc
-                                                        )
-            h_bm, u_it, v_it, h_it, h_tot = self._jstep_jit(t+it*self.dt, 
-                                                            h_bm, u_it, v_it, h_it, h_tot, 
-                                                            F_bm, He_mean, alpha, h_SN, h_WE,
-                                                            h_bm_bc
-                                                            )
+        # Time stepping (JVP through _jstep with scan + checkpoint)
+        dh_bm, du_it, dv_it, dh_it, dh_tot = self._jstep_tgl_jit(
+                                                    t,
+                                                    dh_bm, du_it, dv_it, dh_it, dh_tot, 
+                                                    dF_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE,
+                                                    h_bm, u_it, v_it, h_it, h_tot, 
+                                                    F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
+                                                    h_bm_bc, nstep=nstep)
 
         # Update state
         dState.setvar([dh_bm, du_it,dv_it,dh_it,dh_tot],[
@@ -5089,11 +6352,30 @@ class Model_bmit(M):
             He_mean = +State.params['He_mean'] 
         else:
             He_mean = adHe_mean = jnp.zeros((self.ny,self.nx))
-        if self.flag_coupling_from_bm and 'alpha' in self.name_params_it:
-            adalpha = +adState.params['alpha']
-            alpha = +State.params['alpha'] 
+        if 'alpha_He' in self.name_params_it:
+            adalpha_He = +adState.params['alpha_He']
+            alpha_He = +State.params['alpha_He']
+        elif 'alpha' in self.name_params_it:
+            adalpha_He = +adState.params['alpha']
+            alpha_He = +State.params['alpha']
         else:
-            alpha = adalpha = jnp.zeros((self.ny,self.nx))
+            alpha_He = adalpha_He = None
+        if 'alpha_Uu' in self.name_params_it:
+            adalpha_Uu = +adState.params['alpha_Uu']
+            alpha_Uu = +State.params['alpha_Uu']
+        elif 'alpha' in self.name_params_it:
+            adalpha_Uu = +adState.params['alpha']
+            alpha_Uu = +State.params['alpha']
+        else:
+            alpha_Uu = adalpha_Uu = None
+        if 'alpha_Up' in self.name_params_it:
+            adalpha_Up = +adState.params['alpha_Up']
+            alpha_Up = +State.params['alpha_Up']
+        elif 'alpha' in self.name_params_it:
+            adalpha_Up = +adState.params['alpha']
+            alpha_Up = +State.params['alpha']
+        else:
+            alpha_Up = adalpha_Up = None
         if 'hbc' in self.name_params_it:
             adh_SN = adState.params['hbcx']
             adh_WE = adState.params['hbcy']
@@ -5106,31 +6388,14 @@ class Model_bmit(M):
         # Static BM Boundary condition
         h_bm_bc = self._apply_bc(t)
 
-        # Current trajectory
-        h_bm_list = [h_bm]; u_it_list = [u_it]; v_it_list = [v_it]; h_it_list = [h_it]; h_tot_list = [h_tot]
-        for it in range(nstep):
-            # One time step
-            h_bm, u_it, v_it, h_it, h_tot = self._jstep_jit(t+it*self.dt, 
-                                               h_bm, u_it, v_it, h_it, h_tot, 
-                                               F_bm, He_mean, alpha, h_SN, h_WE,
-                                               h_bm_bc)
-            h_bm_list.append(h_bm); u_it_list.append(u_it); v_it_list.append(v_it); h_it_list.append(h_it); h_tot_list.append(h_tot)
-            
-        # Reverse-time adjoint loop
-        for it in reversed(range(nstep)):
-            # Non-linear trajectory at time it
-            h_bm = h_bm_list[it]
-            u_it = u_it_list[it]
-            v_it = v_it_list[it]
-            h_it = h_it_list[it]
-            h_tot = h_tot_list[it]
-            adh_bm, adu_it, adv_it, adh_it, adh_tot, \
-                adF_bm, adHe_mean, adalpha, adh_SN, adh_WE = self._jstep_adj_jit(t+it*self.dt, 
-                                                        adh_bm, adu_it, adv_it, adh_it, adh_tot, 
-                                                        adF_bm, adHe_mean, adalpha, adh_SN, adh_WE,
-                                                        h_bm, u_it, v_it, h_it, h_tot, 
-                                                        F_bm, He_mean, alpha, h_SN, h_WE,
-                                                        h_bm_bc)
+        # Adjoint computation (VJP through _jstep with scan + checkpoint)
+        adh_bm, adu_it, adv_it, adh_it, adh_tot, \
+            adF_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adh_SN, adh_WE = self._jstep_adj_jit(t, 
+                                                    adh_bm, adu_it, adv_it, adh_it, adh_tot, 
+                                                    adF_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adh_SN, adh_WE,
+                                                    h_bm, u_it, v_it, h_it, h_tot, 
+                                                    F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
+                                                    h_bm_bc, nstep=nstep)
         
         # Update state and parameters
         adState.setvar([adh_bm, adu_it, adv_it, adh_it, adh_tot],[
@@ -5144,7 +6409,20 @@ class Model_bmit(M):
         adState.params[self.name_var['SSH_BM']] = adF_bm
         if 'He_mean' in self.name_params_it:
             adState.params['He_mean'] = adHe_mean
-        if self.flag_coupling_from_bm and 'alpha' in self.name_params_it:
+        adalpha = 0.
+        if 'alpha_He' in self.name_params_it:
+            adState.params['alpha_He'] = adalpha_He
+        elif 'alpha' in self.name_params_it:
+            adalpha += adalpha_He
+        if 'alpha_Uu' in self.name_params_it:
+            adState.params['alpha_Uu'] = adalpha_Uu
+        elif 'alpha' in self.name_params_it:
+            adalpha += adalpha_Uu
+        if 'alpha_Up' in self.name_params_it:
+            adState.params['alpha_Up'] = adalpha_Up
+        elif 'alpha' in self.name_params_it:
+            adalpha += adalpha_Up
+        if 'alpha' in self.name_params_it:
             adState.params['alpha'] = adalpha
         if 'hbc' in self.name_params_it:
             adState.params['hbcx'] = adh_SN
@@ -5245,10 +6523,10 @@ class Model_multi:
         for name in self.name_var:
             State.var[self.name_var[name]] = var_tot_tmp[name]
 
-    def set_bc(self,time_bc,var_bc):
+    def set_bc(self,time_bc,var_bc=None,**kwargs):
 
         for M in self.Models:
-            M.set_bc(time_bc,var_bc)
+            M.set_bc(time_bc, var_bc, **kwargs)
 
     def save_output(self,State,present_date,name_var=None,t=None):
 

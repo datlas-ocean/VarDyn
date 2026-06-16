@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jan  6 19:35:02 2021
+Created by Florian Le Guillou on June 2026.
 
-@author: leguillou
+Defines the model state container and grid-dependent fields.
 """
-from .config import USE_FLOAT64
+
 import numpy as np
 import xarray as xr
 import sys,os
 import pandas as pd 
 from copy import deepcopy
 import matplotlib.pyplot as plt
-from scipy import interpolate
 import glob
-from datetime import datetime
 import pyinterp 
-import pyinterp.fill
-import pickle 
 
-
-from . import grid
+from . import tools as grid
 
 class State:
     """
@@ -45,7 +40,7 @@ class State:
         self.name_exp_save = config.EXP.name_exp_save
         self.path_save = config.EXP.path_save
         self.tmp_DA_path = config.EXP.tmp_DA_path
-        if not os.path.exists(self.path_save):
+        if first and not os.path.exists(self.path_save):
             os.makedirs(self.path_save)
         self.flag_plot = config.EXP.flag_plot
 
@@ -59,12 +54,11 @@ class State:
         if first:
             self.geo_grid = False
             self.mask = None
+            self.sponge_mask = None  # sponge footprint for obs exclusion (set by Model_qgsw)
             if config.GRID.super == 'GRID_GEO':
                 self.ini_geo_grid(config.GRID)
             elif config.GRID.super == 'GRID_CAR':
                 self.ini_car_grid(config.GRID)
-            elif config.GRID.super == 'GRID_CAR_CENTER':
-                self.ini_car_grid_center(config.GRID)
             elif config.GRID.super == 'GRID_FROM_FILE':
                 self.ini_grid_from_file(config.GRID)
             elif config.GRID.super == 'GRID_RESTART':
@@ -145,8 +139,14 @@ class State:
                 config (module): configuration module
         """
         self.geo_grid = True
-        lon = np.arange(config.lon_min, config.lon_max + config.dlon, config.dlon) 
-        lat = np.arange(config.lat_min, config.lat_max + config.dlat, config.dlat) 
+        # Use linspace instead of arange: float-step arange accumulates rounding
+        # error that can produce an extra point beyond lat_max/lon_max, which
+        # shifts the taper reference used in compute_weights_map and breaks the
+        # smootherstep identity S(t)+S(1-t)=1, causing weight sums != 1.
+        n_lon = round((config.lon_max - config.lon_min) / config.dlon) + 1
+        n_lat = round((config.lat_max - config.lat_min) / config.dlat) + 1
+        lon = np.linspace(config.lon_min, config.lon_max, n_lon)
+        lat = np.linspace(config.lat_min, config.lat_max, n_lat)
         lon,lat = np.meshgrid(lon,lat)
         self.lon = lon
         self.lat = lat
@@ -199,52 +199,6 @@ class State:
         
         self.lon = lon2d
         self.lat = lat2d
-
-    def ini_car_grid_center(self, config):
-        """
-        Creates a 2D geographical grid (lon, lat) with constant spacing in km.
-
-        Parameters:
-        - center_lon, center_lat: Center of the grid (degrees)
-        - spacing_km: Desired spacing between points (km)
-        - shape: Tuple (ny, nx), number of points in lat and lon
-        """
-        
-        ny, nx = config.shape  # Grid size
-
-        ny = int(ny)
-        nx = int(nx)
-
-        lon_center = config.lon_center
-        lat_center = config.lat_center
-
-        spacing_km  = config.spacing_km
-
-        # Compute latitude spacing in degrees (constant)
-        lat_spacing_deg = spacing_km / 111.32  
-
-        # Generate latitude points centered at center_lat
-        lat_points = lat_center + (np.arange(ny) - ny // 2) * lat_spacing_deg
-
-        # Compute longitude spacing dynamically at each latitude
-        lon_grid = np.zeros((ny, nx))
-        lat_grid = np.zeros((ny, nx))
-
-        for i, lat in enumerate(lat_points):
-
-            lat_grid[i, :] = lat
-
-            lon_spacing_deg = spacing_km / (111.32 * np.cos(np.radians(lat)))  # Adjust for latitude
-            lon_points = lon_center + (np.arange(nx) - nx // 2) * lon_spacing_deg
-            
-            lon_grid[i, :] = lon_points
-
-        # Correct lon format
-        if lon_grid.min()<-180:
-            lon_grid = lon_grid%360
-
-        self.lon = lon_grid
-        self.lat = lat_grid
 
     def ini_grid_from_file(self,config):
         """
@@ -342,10 +296,23 @@ class State:
         dlat =  np.nanmax(self.lat[1:,:] - self.lat[:-1,:])
         dlon +=  np.nanmax(ds[name_lon].data[1:] - ds[name_lon].data[:-1])
         dlat +=  np.nanmax(ds[name_lat].data[1:] - ds[name_lat].data[:-1])
-       
-        ds = ds.sel(
-            {name_lon:slice(self.lon_min-dlon,self.lon_max+dlon),
-             name_lat:slice(self.lat_min-dlat,self.lat_max+dlat)})
+
+        # If the tile extends beyond the mask file's native longitude axis
+        # (e.g. GRID_CAR pole-most row overflowing past ±180 because of the
+        # 1/cos(lat) scaling), slicing in longitude would drop the wrap region
+        # and pyinterp would return NaN there -- flagging real ocean as land.
+        # In that case, keep the full periodic axis and rely on is_circle=True.
+        ds_lon_min = float(ds[name_lon].data.min())
+        ds_lon_max = float(ds[name_lon].data.max())
+        tile_overflows_axis = (self.lon.min() < ds_lon_min - 1e-6
+                               or self.lon.max() > ds_lon_max + 1e-6)
+
+        if tile_overflows_axis:
+            ds = ds.sel({name_lat: slice(self.lat_min-dlat, self.lat_max+dlat)})
+        else:
+            ds = ds.sel(
+                {name_lon:slice(self.lon_min-dlon,self.lon_max+dlon),
+                 name_lat:slice(self.lat_min-dlat,self.lat_max+dlat)})
 
         lon = ds[name_lon].values
         lat = ds[name_lat].values
@@ -357,8 +324,10 @@ class State:
         elif len(var.shape)==3:
             mask = var[0,:,:]
         
-        # Interpolate to state grid
-        if self.lon_unit=='-180_180':
+        # Interpolate to state grid. Force a circular longitude axis whenever
+        # the tile overflows the native axis range, so pyinterp wraps queries
+        # by ±360 (otherwise out-of-range points return NaN and get masked).
+        if self.lon_unit=='-180_180' or tile_overflows_axis:
             is_circle = True
         else:
             is_circle = False
@@ -396,29 +365,25 @@ class State:
         coords = {}
         coords[self.name_time] = ((self.name_time), [pd.to_datetime(date)],)
 
-        # Select lon/lat based on grid_type (C-grid staggering)
-        if grid_type == 'u':
-            _lon = self.lon_u
-            _lat = self.lat_u
-            suffix = '_u'
-        elif grid_type == 'v':
-            _lon = self.lon_v
-            _lat = self.lat_v
-            suffix = '_v'
-        else:
-            _lon = self.lon
-            _lat = self.lat
-            suffix = ''
+        # Build coordinate sets for h, u, and v grids
+        # h-grid: (ny, nx)  u-grid: (ny, nx+1)  v-grid: (ny+1, nx)
+        grid_info = {
+            'h': (self.lon,   self.lat,   ''),
+            'u': (self.lon_u, self.lat_u, '_u'),
+            'v': (self.lon_v, self.lat_v, '_v'),
+        }
 
-        lon_name = self.name_lon + suffix
-        lat_name = self.name_lat + suffix
+        def _detect_grid(shape_2d):
+            """Return grid key based on variable shape (ny-dim, nx-dim)."""
+            if grid_type is not None:
+                return grid_type
+            if shape_2d == (self.ny, self.nx + 1):
+                return 'u'
+            elif shape_2d == (self.ny + 1, self.nx):
+                return 'v'
+            return 'h'
 
-        if self.geo_grid:
-                coords[lon_name] = ((lon_name,), _lon[0,:])
-                coords[lat_name] = ((lat_name,), _lat[:,0])
-        else:
-            coords[lon_name] = (('y' + suffix, 'x' + suffix), _lon)
-            coords[lat_name] = (('y' + suffix, 'x' + suffix), _lat)
+        grids_used = set()
 
         if name_var is None:
             name_var = self.var.keys()
@@ -438,16 +403,30 @@ class State:
             if len(var_to_save.shape)==2:
                 var_to_save = var_to_save[np.newaxis,:,:]
             
+            # Detect which grid this variable lives on
+            gkey = _detect_grid(var_to_save.shape[1:])
+            grids_used.add(gkey)
+            _lon, _lat, suffix = grid_info[gkey]
+            lon_name = self.name_lon + suffix
+            lat_name = self.name_lat + suffix
+
             if self.geo_grid:
                 _dims = ['time', lat_name, lon_name]
             else:
                 _dims = ['time', 'y' + suffix, 'x' + suffix]
-            # Rename dims when variable shape differs from lon/lat grid
-            if var_to_save.shape[1] != _lon.shape[0]:
-                _dims[1] += name
-            if var_to_save.shape[2] != _lon.shape[1]:
-                _dims[2] += name
             var[name] = (_dims, var_to_save)
+
+        # Add coordinates for every grid that was used
+        for gkey in grids_used:
+            _lon, _lat, suffix = grid_info[gkey]
+            lon_name = self.name_lon + suffix
+            lat_name = self.name_lat + suffix
+            if self.geo_grid:
+                coords[lon_name] = ((lon_name,), _lon[0,:])
+                coords[lat_name] = ((lat_name,), _lat[:,0])
+            else:
+                coords[lon_name] = (('y' + suffix, 'x' + suffix), _lon)
+                coords[lat_name] = (('y' + suffix, 'x' + suffix), _lat)
 
         if os.path.exists(filename):
             ds = xr.open_dataset(filename)
@@ -534,6 +513,7 @@ class State:
         other.dy = self.dy
         other.f = self.f
         other.mask = self.mask
+        other.sponge_mask = self.sponge_mask
         other.lon = self.lon
         other.lat = self.lat
         other.lon_u = self.lon_u
@@ -542,19 +522,27 @@ class State:
         other.lat_v = self.lat_v
         other.geo_grid = self.geo_grid
 
+        def _copy_array(v):
+            # JAX arrays are immutable: each step() replaces the reference rather than
+            # mutating the buffer, so the existing reference is already a valid snapshot.
+            module = type(v).__module__
+            if module.startswith('jax') or module.startswith('jaxlib'):
+                return v
+            return np.array(v, copy=True)
+
         # (deep)Copy model variables
         for name in self.var.keys():
             if free:
                 other.var[name] = self.var[name]*0
             else:
-                other.var[name] = deepcopy(self.var[name])
+                other.var[name] = _copy_array(self.var[name])
         
         # (deep)Copy model parameters
         for name in self.params.keys():
             if free:
                 other.params[name] = self.params[name]*0
             else:
-                other.params[name] = deepcopy(self.params[name])
+                other.params[name] = _copy_array(self.params[name])
 
         return other
     
@@ -608,24 +596,31 @@ class State:
 
     def setvar(self,var,name_var=None,add=False):
 
+        def _store_value(v):
+            # JAX arrays are immutable; keep reference to avoid costly deepcopy/device copies.
+            module = type(v).__module__
+            if module.startswith('jax') or module.startswith('jaxlib'):
+                return v
+            return np.array(v, copy=True)
+
         if name_var is None:
             for i,name in enumerate(self.var):
                 if add:
                     self.var[name] += var[i]
                 else:
-                    self.var[name] = deepcopy(var[i])
+                    self.var[name] = _store_value(var[i])
         else:
             if type(name_var) in (list,np.ndarray):
                 for i,name in enumerate(name_var):
                     if add:
                         self.var[name] += var[i]
                     else:
-                        self.var[name] = deepcopy(var[i])
+                        self.var[name] = _store_value(var[i])
             else:
                 if add:
                     self.var[name_var] += var
                 else:
-                    self.var[name_var] = deepcopy(var)
+                    self.var[name_var] = _store_value(var)
     
     def scalar(self,coeff,copy=False):
         if copy:

@@ -72,7 +72,7 @@ NAME_MOD = 'myMOD'
 
 myMOD = dict(
 
-    super = 'MOD_QG1L_JAX',
+    super = 'MOD_QG1L',
 
     name_var = {'SSH':'ssh'},
 

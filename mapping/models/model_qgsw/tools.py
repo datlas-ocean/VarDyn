@@ -1,3 +1,9 @@
+"""
+Created by Florian Le Guillou on June 2026.
+
+Provides helper utilities for the QGSW model package.
+"""
+
 import jax 
 import jax.numpy as jnp
 

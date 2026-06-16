@@ -1,3 +1,9 @@
+"""
+Created by Florian Le Guillou on June 2026.
+
+Global precision flag used to configure JAX float64 behavior.
+"""
+
 # config.py
 import os
 import jax
