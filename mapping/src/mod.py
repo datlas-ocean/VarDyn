@@ -16,6 +16,7 @@ from math import pi
 from datetime import timedelta
 import matplotlib.pylab as plt 
 import pyinterp
+import pyinterp.fill
 import jax
 import jax.numpy as jnp 
 from jax import jit
@@ -31,7 +32,7 @@ except ImportError:
     warnings.warn('jaxparrow not installed, some jax functions will not be available')
 
 
-from . import  grid
+from . import  tools as grid 
 from .exp import Config as Config
 
 
