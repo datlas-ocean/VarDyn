@@ -12,11 +12,11 @@ name_experiment = 'VarDyn-SW' # Short experiment name reused in output paths and
 
 myPath = '.' # Root directory for relative outputs, scratch files, and cached operators.
 
-compute_obs = True # Set True to rebuild cached observations and operators.
+compute_obs = False # Set True to rebuild cached observations and operators.
 
 path_mdt = '/data1/data/obs/level4/MDT/mdt_hybrid_cnes_cls22_cmems2020_global.nc' # Mean dynamic topography file used by the grid mask and model.
 
-name_var_mdt = {'lon':'longitude','lat':'latitude','var':'mdt','var_u':'u','var_v':'v'} # Coordinate and variable names used to read MDT and MDT-derived velocities.
+name_var_mdt = {'lon':'longitude','lat':'latitude','var':'mdt'} # Coordinate and variable names used to read MDT and MDT-derived velocities.
 
 #################################################################################################################################
 # Global libraries     
@@ -101,7 +101,7 @@ SW = dict(
 
     dtmodel = 900, # Model timestep before CFL adjustment.
 
-    cfl = .3, # Choose the model time step from a CFL constraint instead of fixed dtmodel.
+    cfl = .1, # Choose the model time step from a CFL constraint instead of fixed dtmodel.
 
     time_scheme = 'rk2', # Time-integration scheme used by the SW model.
 

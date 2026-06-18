@@ -3800,8 +3800,9 @@ class Model_qgsw(M):
             _ssh = np.pad(_ssh, pad_width=((1,0),(1,0)), mode='edge')
             _u = -self.g / self.f_on_u * np.diff(_ssh, axis=0) / self.dy_on_u
             _v = self.g / self.f_on_v * np.diff(_ssh, axis=1) / self.dx_on_v
-            _u = np.where(self.model.masks.u[0, 0].T, _u, 0.0)
-            _v = np.where(self.model.masks.v[0, 0].T, _v, 0.0)
+            if hasattr(self, 'model'):
+                _u = np.where(self.model.masks.u[0, 0].T, _u, 0.0)
+                _v = np.where(self.model.masks.v[0, 0].T, _v, 0.0)
             return _u, _v
 
     def ssh2uv_tgl(self, ssh, dssh):
