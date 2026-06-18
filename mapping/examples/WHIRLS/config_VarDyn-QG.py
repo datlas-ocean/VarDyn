@@ -103,7 +103,7 @@ QG = dict(
 
     init_from_bc = True, # Initialize the model state from the external boundary-condition fields.
 
-    filec_aux = '../../aux/aux_first_baroclinic_speed.nc', # First baroclinic phase-speed field.
+    filec_aux = '../../aux_files/aux_first_baroclinic_speed.nc', # First baroclinic phase-speed field.
 
     name_var_c = {'lon':'lon','lat':'lat','var':'c1'}, # Coordinate and variable names inside filec_aux.
 
@@ -387,7 +387,7 @@ SmallScales_SSH = dict(
     
     wavelet_init = False, # Do not use the wavelet basis to initialize the model state. # Do not use the wavelet basis to initialize the model state.
     
-    file_aux = '../../aux/aux_reduced_basis_BM.nc', # Auxiliary file containing wavelength-dependent std and decorrelation times.
+    file_aux = '../../aux_files/aux_reduced_basis_BM.nc', # Auxiliary file containing wavelength-dependent std and decorrelation times.
 
     lmax = 1000., # Largest wavelength represented by this small-scale basis, in km.
 
@@ -451,7 +451,7 @@ SmallScales_SST = dict(
     
     wavelet_init = False, # Do not use the wavelet basis to initialize the model state. # Do not use the wavelet basis to initialize the model state.
     
-    file_aux = '../../aux/aux_reduced_basis_BM.nc', # Auxiliary file containing wavelength-dependent std and decorrelation times.
+    file_aux = '../../aux_files/aux_reduced_basis_BM.nc', # Auxiliary file containing wavelength-dependent std and decorrelation times.
 
     lmax = 1000., # Largest wavelength represented by this small-scale basis, in km.
 

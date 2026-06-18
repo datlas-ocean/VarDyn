@@ -80,7 +80,7 @@ myMOD = dict(
 
     time_scheme = 'rk2',
 
-    filec_aux = '../../aux/aux_first_baroclinic_speed.nc',
+    filec_aux = '../../aux_files/aux_first_baroclinic_speed.nc',
 
     name_var_c = {'lon':'lon','lat':'lat','var':'c1'},
 
@@ -150,7 +150,7 @@ myBASIS = dict(
 
     facpsp = 1.5, # factor to fix df between wavelets
 
-    file_aux = '../../aux/aux_reduced_basis_BM.nc', # Name of auxilliary file in which are stored the std and tdec for each locations at different wavelengths.
+    file_aux = '../../aux_files/aux_reduced_basis_BM.nc', # Name of auxilliary file in which are stored the std and tdec for each locations at different wavelengths.
 
     lmin = 80, # minimal wavelength (in km)
 
@@ -215,7 +215,7 @@ ALG = dict(
 
     add_mdt = True, 
 
-    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+    path_mdt = '../../aux_files/aux_mdt_cnes_cls18_global.nc',
 
     name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
@@ -237,7 +237,7 @@ H2G = dict(
 
     add_mdt = True, 
 
-    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+    path_mdt = '../../aux_files/aux_mdt_cnes_cls18_global.nc',
 
     name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
@@ -259,7 +259,7 @@ J2G = dict(
 
     add_mdt = True, 
 
-    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+    path_mdt = '../../aux_files/aux_mdt_cnes_cls18_global.nc',
 
     name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
@@ -281,7 +281,7 @@ J2N = dict(
 
     add_mdt = True, 
 
-    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+    path_mdt = '../../aux_files/aux_mdt_cnes_cls18_global.nc',
 
     name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
@@ -303,7 +303,7 @@ J3 = dict(
 
     add_mdt = True, 
 
-    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+    path_mdt = '../../aux_files/aux_mdt_cnes_cls18_global.nc',
 
     name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
@@ -325,7 +325,7 @@ S3A = dict(
 
     add_mdt = True, 
 
-    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+    path_mdt = '../../aux_files/aux_mdt_cnes_cls18_global.nc',
 
     name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 
@@ -361,7 +361,7 @@ myDIAG = dict(
 
     lenght_scale = 1000,
 
-    path_mdt = '../../aux/aux_mdt_cnes_cls18_global.nc',
+    path_mdt = '../../aux_files/aux_mdt_cnes_cls18_global.nc',
 
     name_var_mdt = {'lon':'longitude','lat':'latitude','mdt':'mdt'},
 

@@ -87,7 +87,7 @@ In both configs:
 - `SmallScales_SSH["file_aux"]`: balanced-motion reduced-basis auxiliary file.
 - `SmallScales_SST["file_aux"]`: balanced-motion reduced-basis auxiliary file.
 
-The relative `../../aux/...` files point to the repository auxiliary directory
+The relative `../../aux_files/...` files point to the repository auxiliary directory
 when running from `mapping/examples/WHIRLS`. Change them if you launch from a
 different working directory or keep auxiliary files elsewhere.
 
