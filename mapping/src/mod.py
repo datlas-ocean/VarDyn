@@ -2841,6 +2841,8 @@ class Model_qgsw(M):
             self.dtype = jnp.float32
 
         self.nl = config.MOD.nl
+        self._configured_name_params = config.MOD.name_params if config.MOD.name_params is not None else []
+        self._controls_H = 'H' in self._configured_name_params
 
         if config.MOD.name_class.lower()=='qg':
             model = model_qg
@@ -3090,6 +3092,16 @@ class Model_qgsw(M):
                 H = np.expand_dims(H, axis=0)
         
         self.H0 = H
+        self.H_max_bound = getattr(config.MOD, 'H_max', None)
+        H_floor = getattr(config.MOD, 'H_floor', None)
+        if H_floor is None:
+            if getattr(config.MOD, 'cmin', None) is not None and config.MOD.nl == 1:
+                H_floor = float(config.MOD.cmin)**2 / float(g_prime[0, 0, 0])
+            else:
+                H_floor = 0.
+        self.H_floor = self._as_H_model_array(H_floor, State, 'H_floor')
+        self.H_floor = self._zero_H_floor_on_mask(self.H_floor, State)
+        self._validate_H_floor(self.H0, self.H_floor)
         
         # CFL
         if config.MOD.cfl is not None:
@@ -3291,7 +3303,7 @@ class Model_qgsw(M):
             'barotropic_filter_spectral': False,
             'sponge_coef': self.sponge_coef,
             'forcing_momentum': getattr(config.MOD, 'forcing_momentum', 'direct'),
-            'H_min': getattr(config.MOD, 'H_min', None),
+            'H_min': None if self._controls_H else getattr(config.MOD, 'H_min', None),
             'H_max': getattr(config.MOD, 'H_max', None),
             'diff_coef_trac': getattr(config.MOD, 'diff_coef_trac', 0.),
             'time_scheme':    getattr(config.MOD, 'time_scheme',    'rk3'),
@@ -3416,15 +3428,19 @@ class Model_qgsw(M):
                 self.jstep_adj_trac_jit  = self.jstep_adj_trac
 
         # Control parameters
-        self.name_params = config.MOD.name_params if config.MOD.name_params is not None else []
+        self.name_params = self._configured_name_params
         if 'H' in self.name_params:
             if (config.GRID.super == 'GRID_FROM_FILE'):
                 dsin = xr.open_dataset(config.GRID.path_init_grid)
-                if 'H' in dsin:
-                    State.params['H'] = dsin['H'].values.squeeze()
-                    State.params['H'][np.isnan(State.params['H'])] = 0.
-                else:
-                    State.params['H'] = np.zeros((State.ny,State.nx))
+                if 'H_control' not in dsin:
+                    dsin.close()
+                    raise ValueError(
+                        'Controlled H restarts must provide H_control, the dimensionless '
+                        'equivalent-depth control. Refusing to infer it from H because H '
+                        'now denotes Total Equivalent Depth.'
+                    )
+                State.params['H'] = dsin['H_control'].values.squeeze()
+                State.params['H'][np.isnan(State.params['H'])] = 0.
                 dsin.close()
                 del dsin
             else:
@@ -3476,6 +3492,83 @@ class Model_qgsw(M):
             #self.adjoint_test_jstep(nstep=10)
             adjoint_test(self,State,nstep=10)#, ampl=1e-3)
     
+    def _as_H_model_array(self, value, State, name):
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            return arr.reshape(1, 1, 1)
+        if arr.shape == (State.ny, State.nx):
+            return np.expand_dims(arr.T, axis=0)
+        if arr.ndim == 1:
+            return arr.reshape(-1, 1, 1)
+        if arr.ndim == 2:
+            return np.expand_dims(arr, axis=0)
+        if arr.ndim == 3:
+            return arr
+        raise ValueError(
+            f'{name} must be scalar, 1-D layers, 2-D, or 3-D; got shape {arr.shape}'
+        )
+
+    def _zero_H_floor_on_mask(self, H_floor, State):
+        if State.mask is None:
+            return H_floor
+        mask = np.expand_dims(np.asarray(State.mask, dtype=bool).T, axis=0)
+        shape = np.broadcast_shapes(np.shape(H_floor), np.shape(mask))
+        H_floor_b = np.broadcast_to(H_floor, shape).copy()
+        mask_b = np.broadcast_to(mask, shape)
+        H_floor_b[mask_b] = 0.
+        return H_floor_b
+
+    def _validate_H_floor(self, H_ref, H_floor):
+        if np.nanmin(H_floor) < 0:
+            raise ValueError('H_floor must be non-negative.')
+        try:
+            shape = np.broadcast_shapes(np.shape(H_ref), np.shape(H_floor))
+            H_ref_b = np.broadcast_to(H_ref, shape)
+            H_floor_b = np.broadcast_to(H_floor, shape)
+        except ValueError as exc:
+            raise ValueError(
+                f'H_floor shape {np.shape(H_floor)} is not broadcastable with '
+                f'Reference Equivalent Depth shape {np.shape(H_ref)}.'
+            ) from exc
+        if np.nanmin(H_ref_b - H_floor_b) < -1e-12:
+            raise ValueError(
+                'Reference Equivalent Depth must be greater than or equal to H_floor.'
+            )
+
+    def _H_control_to_sw(self, H_control):
+        H_control = jnp.asarray(H_control, dtype=self.dtype)
+        if H_control.ndim == 2:
+            return jnp.expand_dims(H_control.T, axis=0)
+        if H_control.ndim == 3:
+            return H_control
+        if H_control.ndim == 4 and H_control.shape[0] == 1:
+            return H_control[0]
+        raise ValueError(
+            f'H_control must have shape (ny, nx), (nl, nx, ny), or '
+            f'(1, nl, nx, ny); got {H_control.shape}.'
+        )
+
+    def _H_control_to_total(self, H_control, apply_bounds=True):
+        H_control_sw = self._H_control_to_sw(H_control)
+        H_ref = jnp.asarray(self.H0, dtype=self.dtype)
+        H_floor = jnp.asarray(self.H_floor, dtype=self.dtype)
+        H_total = H_floor + (H_ref - H_floor) * jnp.exp(H_control_sw)
+        if apply_bounds and self.H_max_bound is not None:
+            H_total = jnp.minimum(H_total, self.H_max_bound)
+        return H_total
+
+    def _H_control_to_model_increment(self, H_control):
+        if H_control is None:
+            return None
+        H_ref = jnp.asarray(self.H0, dtype=self.dtype)
+        return self._H_control_to_total(H_control) - H_ref
+
+    def _H_control_to_total_state(self, H_control):
+        H_total = self._H_control_to_total(H_control)
+        if H_total.shape[0] != 1:
+            raise NotImplementedError('Saving controlled H for nl > 1 is not implemented.')
+        return np.array(H_total[0].T)
+
     def _load_wind_forcing(self, config, State):
         """
         Read a NetCDF wind file, convert (u10, v10) to wind stress using the
@@ -3674,8 +3767,9 @@ class Model_qgsw(M):
                 _name_var.append(self.name_var[name])
 
         if 'H' in self.name_params:
-            State0.var['H'] = +State.params['H'] 
-            _name_var += ['H']
+            State0.var['H'] = self._H_control_to_total_state(State.params['H'])
+            State0.var['H_control'] = +State.params['H']
+            _name_var += ['H', 'H_control']
         
         if 'h_wind' in self.name_params:
             State0.var['h_wind'] = +State.params['h_wind']
@@ -3949,16 +4043,18 @@ class Model_qgsw(M):
                 u, v, h, u_b_sw, v_b_sw, h_b_sw,
             )
 
+        H_model = self._H_control_to_model_increment(H)
+
         # Step
         if self._is_qg_class:
             u1, v1, h1 = self.model_step(
-                u, v, h, H=H, nstep=nstep,
+                u, v, h, H=H_model, nstep=nstep,
                 u_b=u_b_sw, v_b=v_b_sw, h_b=h_b_sw,
                 Fu=Fu_sw, Fv=Fv_sw, Fh=Fh_sw,
             )
         else:
             u1, v1, h1 = self.model_step(
-                u, v, h, H=H, nstep=nstep,
+                u, v, h, H=H_model, nstep=nstep,
                 u_b=u_b_sw, v_b=v_b_sw, h_b=h_b_sw,
                 Fu=Fu_sw, Fv=Fv_sw, Fh=Fh_sw,
                 taux=_taux, tauy=_tauy,
@@ -4047,10 +4143,12 @@ class Model_qgsw(M):
                 u, v, h, u_b_sw, v_b_sw, h_b_sw,
             )
 
+        H_model = self._H_control_to_model_increment(H)
+
         # Joint step (u, v, h, c)
         u1, v1, h1, c1 = self.model.step_with_tracer(
             u, v, h, c_sw,
-            H=H, nstep=nstep,
+            H=H_model, nstep=nstep,
             u_b=u_b_sw, v_b=v_b_sw, h_b=h_b_sw, c_b=c_b_sw,
             Fu=Fu_sw, Fv=Fv_sw, Fh=Fh_sw, Fc=Fc_sw,
             taux=_taux, tauy=_tauy,

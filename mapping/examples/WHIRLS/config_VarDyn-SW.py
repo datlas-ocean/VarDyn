@@ -12,7 +12,7 @@ name_experiment = 'VarDyn-SW' # Short experiment name reused in output paths and
 
 myPath = '.' # Root directory for relative outputs, scratch files, and cached operators.
 
-compute_obs = False # Set True to rebuild cached observations and operators.
+compute_obs = True # Set True to rebuild cached observations and operators.
 
 path_mdt = '/data1/data/obs/level4/MDT/mdt_hybrid_cnes_cls22_cmems2020_global.nc' # Mean dynamic topography file used by the grid mask and model.
 
@@ -50,6 +50,8 @@ EXP = dict(
     write_obs = True, # Save preprocessed observations for reuse.
 
     path_obs = f'{myPath}/obs', # Directory used to save/read cached preprocessed observations.
+
+    compute_obs = compute_obs
 
 )
     
@@ -91,7 +93,7 @@ SW = dict(
 
     name_class = 'sw', # Use the Shallow Water core instead of the QG core.
 
-    name_params = ['H'], # Control equivalent-depth corrections in addition to state-variable fluxes.
+    name_params = ['H'], # Control the dimensionless equivalent-depth log-multiplier.
 
     nl = 1, # Number of layers in the model.
 
@@ -111,9 +113,9 @@ SW = dict(
 
     name_var_c = {'lon':'lon','lat':'lat','var':'c1'}, # Coordinate and variable names inside filec_aux.
 
-    cmin = 2., # Lower bound applied to the phase-speed field.
+    #cmin = 2., # Lower bound applied to the phase-speed field.
 
-    constant_H = True, # Use a spatially constant equivalent depth derived from the phase-speed field.
+    constant_H = False, # Use a spatially constant equivalent depth derived from the phase-speed field.
 
     g_prime = None, # Use the default reduced gravity.
 
@@ -134,6 +136,8 @@ SW = dict(
     sponge_coef = .05, # Sponge damping coefficient.
 
     diff_coef = 150, # SSH diffusivity, in m^2/s.
+
+    diff_coef_trac = 150, # SST/passive-tracer diffusivity, in m^2/s.
 
     visc_coef = 150, # Momentum viscosity, in m^2/s.
 
@@ -387,7 +391,7 @@ OBSOP_SST = dict(
 #################################################################################################################################
 # Reduced basis parameters
 #################################################################################################################################
-NAME_BASIS =  ['LargeScales_SSH', 'SmallScales_SSH', 'LargeScales_H', 'Offset_H', 'LargeFastScales_SST', 'LargeSlowScales_SST', 'SmallScales_SST']
+NAME_BASIS =  ['LargeScales_SSH', 'SmallScales_SSH', 'LargeScales_H', 'LargeFastScales_SST', 'LargeSlowScales_SST', 'SmallScales_SST']
 
 
 LargeScales_SSH = dict(
@@ -446,11 +450,11 @@ SmallScales_SSH = dict(
 
 LargeScales_H = dict(
 
-    super = 'BASIS_GAUSS2D', # Use spatial Gaussian basis functions for equivalent-depth corrections.
+    super = 'BASIS_GAUSS2D', # Use spatial Gaussian basis functions for Equivalent-Depth Control.
 
-    name_mod_var = 'H', # Model parameter controlled by this basis block.
+    name_mod_var = 'H', # Dimensionless Equivalent-Depth Control used by this basis block.
     
-    flux = False, # H is a time-independent controlled parameter.
+    flux = False, # H_control is a time-independent controlled parameter.
 
     facns = 2., # Spacing factor between neighboring basis centers in space.
 
@@ -458,17 +462,17 @@ LargeScales_H = dict(
 
     sigma_D = 1000, # Horizontal decorrelation scale, in km.
 
-    sigma_Q = .05, # Prior standard deviation for H corrections.
+    sigma_Q = .05, # Prior standard deviation for H_control; 0.05 is about 5%.
 
 )
 
 Offset_H = dict(
 
-    super = 'BASIS_OFFSET', # Add a domain-wide equivalent-depth offset control.
+    super = 'BASIS_OFFSET', # Add a domain-wide equivalent-depth log-control offset.
 
-    name_mod_var = 'H', # Model parameter controlled by this basis block.
+    name_mod_var = 'H', # Dimensionless Equivalent-Depth Control used by this basis block.
 
-    sigma_B = 0.1, # Prior standard deviation for the offset.
+    sigma_B = 0.1, # Prior standard deviation for H_control offset; 0.1 is about 10%.
     
 )
 

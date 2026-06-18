@@ -404,7 +404,7 @@ MOD_QGSW = dict(
 
     var_to_save = None,
 
-    name_params = None,#['H', 'hbcx', 'hbcy', 'itg'], # list of parameters to control (among 'H', 'hbc', 'hbcy', 'itg')
+    name_params = None,#['H', 'hbcx', 'hbcy', 'itg'], # list of parameters to control. H denotes dimensionless equivalent-depth log-control.
 
     nl = 1, # number of layers in the model (for nl>1, set H and g_prime as lists/arrays)
 
@@ -465,9 +465,11 @@ MOD_QGSW = dict(
 
     visc_coef = 0., # viscosity coefficient (in m^2/s). Typical values 10–30 m²/s, 50–100 m²/s if unstable
 
-    H_min = None, # minimum equivalent depth (in m). None means no clamping
+    H_floor = None, # minimum Total Equivalent Depth for controlled H. If None, use cmin**2/g_prime when cmin is set; otherwise 0.
+
+    H_min = None, # legacy hard minimum equivalent-depth clamp used only when H is not controlled. None means no clamping
     
-    H_max = None, # maximum equivalent depth (in m). None means no clamping
+    H_max = None, # optional hard maximum Total Equivalent Depth safety rail. None means no clamping
 
     diff_coef = 0., # diffusivity coefficient for h (in m^2/s). Typical values 20–50 m²/s, 100–200 m²/s if unstable
 

@@ -111,6 +111,8 @@ QG = dict(
 
     Kdiffus = 150, # Diffusion coefficient applied by the model.
 
+    Kdiffus_trac = 150, # SST/passive-tracer diffusion coefficient applied by the model.
+
     path_mdt = path_mdt, # Mean dynamic topography file used by the QG model.
 
     name_var_mdt = name_var_mdt, # Coordinate and variable names for MDT.
