@@ -165,6 +165,8 @@ MOD_DIFF = dict(
 
     bc_file = None,  # Path to NetCDF file containing boundary conditions
 
+    bc_files = None,  # Optional dict mapping model variable names to BC files or per-variable BC source dicts
+
     bc_name_lon = 'lon',  # Name of longitude coordinate in BC file
 
     bc_name_lat = 'lat',  # Name of latitude coordinate in BC file
@@ -256,6 +258,8 @@ MOD_QG1L = dict(
     name_var_mdt = None, # dictionary of MDT coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
 
     bc_file = None,  # Path to NetCDF file containing boundary conditions
+
+    bc_files = None,  # Optional dict mapping model variable names to BC files or per-variable BC source dicts
 
     bc_name_lon = 'lon',  # Name of longitude coordinate in BC file
 
@@ -374,6 +378,8 @@ MOD_CSW1L = dict(
                                  # 'wkb'            : WKB cumulative-phase integral + He^{-1/4} amplitude correction (best for strongly varying He)
 
     bc_file = None,  # Path to NetCDF file containing boundary conditions
+
+    bc_files = None,  # Optional dict mapping model variable names to BC files or per-variable BC source dicts
 
     bc_name_lon = 'lon',  # Name of longitude coordinate in BC file
 
@@ -513,6 +519,8 @@ MOD_QGSW = dict(
 
     bc_file = None,  # Path to NetCDF file containing boundary conditions
 
+    bc_files = None,  # Optional dict mapping model variable names to BC files or per-variable BC source dicts
+
     bc_name_lon = 'lon',  # Name of longitude coordinate in BC file
 
     bc_name_lat = 'lat',  # Name of latitude coordinate in BC file
@@ -626,6 +634,8 @@ MOD_BMIT = dict(
                                  # 'wkb'            : WKB cumulative-phase integral + He^{-1/4} amplitude correction (best for strongly varying He)
 
     bc_file = None,  # Path to NetCDF file containing boundary conditions
+
+    bc_files = None,  # Optional dict mapping model variable names to BC files or per-variable BC source dicts
 
     bc_name_lon = 'lon',  # Name of longitude coordinate in BC file
 

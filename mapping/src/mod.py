@@ -68,6 +68,19 @@ def _fill_nan_nearest(arr):
     return out
 
 
+class _MultiBcFields:
+    """Merge several per-variable boundary-condition sources."""
+
+    def __init__(self, bc_fields):
+        self.bc_fields = bc_fields
+
+    def interp(self, time):
+        out = {}
+        for bc_field in self.bc_fields:
+            out.update(bc_field.interp(time))
+        return out
+
+
 class _BcFields:
     """Load and interpolate boundary conditions from an external file."""
 
@@ -381,11 +394,13 @@ class M:
             for name in self.name_var:
                 self.var_to_save.append(self.name_var[name])
 
-        # Load boundary conditions if configured
+        # Load boundary conditions if configured.  `bc_file` is the legacy
+        # single-source form; `bc_files` lets each model variable come from its
+        # own product with its own coordinate/variable names.
         self._bc_fields = None
+        bc_sources = []
         if hasattr(config.MOD, 'bc_file') and config.MOD.bc_file is not None:
-            from . import tools as grid
-            bc_config = type('BC_Config', (), {
+            bc_sources.append(type('BC_Config', (), {
                 'file': config.MOD.bc_file,
                 'name_lon': config.MOD.bc_name_lon,
                 'name_lat': config.MOD.bc_name_lat,
@@ -393,13 +408,35 @@ class M:
                 'name_var': config.MOD.bc_name_var,
                 'c_grid': config.MOD.bc_c_grid,
                 '_config': config
-            })()
+            })())
+        if hasattr(config.MOD, 'bc_files') and config.MOD.bc_files is not None:
+            for name, bc_src in config.MOD.bc_files.items():
+                if isinstance(bc_src, str):
+                    bc_src = {'file': bc_src}
+                name_var = bc_src.get('name_var', name)
+                if isinstance(name_var, str):
+                    name_var = {name: name_var}
+                bc_sources.append(type('BC_Config', (), {
+                    'file': bc_src.get('file'),
+                    'name_lon': bc_src.get('name_lon', config.MOD.bc_name_lon),
+                    'name_lat': bc_src.get('name_lat', config.MOD.bc_name_lat),
+                    'name_time': bc_src.get('name_time', config.MOD.bc_name_time),
+                    'name_var': name_var,
+                    'c_grid': bc_src.get('c_grid', config.MOD.bc_c_grid),
+                    '_config': config
+                })())
+
+        bc_fields = []
+        for bc_config in bc_sources:
             try:
-                self._bc_fields = _BcFields(bc_config, State)
+                bc_fields.append(_BcFields(bc_config, State))
             except Exception as e:
                 import warnings
-                warnings.warn(f"Failed to load boundary conditions: {e}")
-                self._bc_fields = None
+                warnings.warn(f"Failed to load boundary conditions from {bc_config.file}: {e}")
+        if len(bc_fields) == 1:
+            self._bc_fields = bc_fields[0]
+        elif len(bc_fields) > 1:
+            self._bc_fields = _MultiBcFields(bc_fields)
 
 
     def init(self, State, t0=0):
@@ -451,8 +488,7 @@ class M:
 ###############################################################################
 #                            Diffusion Models                                 #
 ###############################################################################
-        
-        
+         
 class Model_diffusion(M):
     
     def __init__(self,config,State):
@@ -3651,7 +3687,7 @@ class Model_qgsw(M):
     
         State0.save_output(present_date, name_var=_name_var)
     
-    def set_bc(self,time_bc,var_bc=None,**kwargs):
+    def set_bc(self,time_bc,var_bc=None,t_bc=None,**kwargs):
 
         # If var_bc not provided but we have loaded BC fields, interpolate them
         if var_bc is None and self._bc_fields is not None:
@@ -3660,7 +3696,11 @@ class Model_qgsw(M):
         if var_bc is None:
             return
 
-        for i,t in enumerate(time_bc):
+        # Use float model times as dict keys if provided (needed by init and
+        # _apply_bc); fall back to datetime keys when called directly.
+        time_keys = t_bc if t_bc is not None else time_bc
+
+        for i,t in enumerate(time_keys):
             ssh_bc_t = +var_bc['SSH'][i]
             # Remove nan
             ssh_bc_t[np.isnan(ssh_bc_t)] = 0.
@@ -3683,7 +3723,7 @@ class Model_qgsw(M):
         # Tracer BCs
         for name in self.tracer_names:
             if name in var_bc:
-                for i, t in enumerate(time_bc):
+                for i, t in enumerate(time_keys):
                     c_bc_t = +var_bc[name][i]
                     # Extrapolate NaN land cells from nearest ocean value
                     # (mirrors Model_qg1l_jax.set_bc — prevents spurious ~0 patches
@@ -3692,7 +3732,7 @@ class Model_qgsw(M):
                         c_bc_t = _fill_nan_nearest(c_bc_t)
                     self.bc[name][t] = c_bc_t
 
-        self.bc_time = np.asarray(time_bc)
+        self.bc_time = np.asarray(time_keys)
 
     def _apply_bc(self,t0,t1):
         
