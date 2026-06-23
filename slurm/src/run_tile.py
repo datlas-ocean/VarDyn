@@ -17,6 +17,13 @@ _MASSH_PATH = os.environ.get('MASSH_PATH', str(Path(__file__).parent.parent / 'm
 sys.path.append(_MASSH_PATH)
 from src import inv
 
+TILE_SUCCESS_MARKER = "outputs_saved.ok"
+
+
+def marker_path(config) -> Path:
+    """File written when a tile completed through output saving."""
+    return Path(config.EXP.path_save) / TILE_SUCCESS_MARKER
+
 
 def run_tile(tile_dir: Path, restart:bool):
     """
@@ -55,15 +62,31 @@ def run_tile(tile_dir: Path, restart:bool):
 
     print(f"Running inversion, output path: {config.EXP.path_save}")
 
+    success_marker = marker_path(config)
+
     # --------------------------------------------------
     # Run algorithm
     # --------------------------------------------------
-    if restart or not os.path.exists(f'{config.INV.path_save_control_vectors}/Xres.nc'):
+    if restart and success_marker.exists():
+        success_marker.unlink()
+
+    if restart or not success_marker.exists():
         inv.Inv_4Dvar(config=config, State=State, verbose=0)
+
+        success_marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp_marker = success_marker.with_suffix(success_marker.suffix + ".tmp")
+        tmp_marker.write_text(
+            f"Tile completed successfully through output saving.\n"
+            f"timestamp: {datetime.now().isoformat()}\n"
+            f"tile_dir: {tile_dir}\n",
+            encoding="utf-8",
+        )
+        tmp_marker.replace(success_marker)
+
         print(f"[{datetime.now()}] Finished tile: {tile_dir}")
     else:
         print(f"[{datetime.now()}] Non-processed tile: {tile_dir}")
-        print(f'Because you did not ask for restart and {f'{config.INV.path_save_control_vectors}/Xres.nc'} exists.')
+        print(f"Because you did not ask for restart and {success_marker} exists.")
 
 
 def main():
