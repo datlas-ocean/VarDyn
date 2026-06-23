@@ -37,8 +37,15 @@ class ConvergenceReached(Exception):
 class CrazyGradient(Exception):
     pass
 
+def _block_until_ready(obj):
+    """Wait for pending JAX work before reporting wall-clock timings."""
+    return jax.tree_util.tree_map(
+        lambda x: x.block_until_ready() if hasattr(x, 'block_until_ready') else x,
+        obj,
+    )
 
-def Inv(config, State=None, Model=None, dict_obs=None, Obsop=None, Basis=None, Bc=None, *args, **kwargs):
+
+def Inv(config, State=None, Model=None, dict_obs=None, Obsop=None, Basis=None, *args, **kwargs):
 
     """
     NAME
@@ -49,17 +56,17 @@ def Inv(config, State=None, Model=None, dict_obs=None, Obsop=None, Basis=None, B
     """
     
     if config.INV is None:
-        return Inv_forward(config, State=State, Model=Model, Bc=Bc)
+        return Inv_forward(config, State=State, Model=Model)
     
     print(config.INV)
     
     if config.INV.super=='INV_4DVAR':
-        return Inv_4Dvar(config, State=State, Model=Model, dict_obs=dict_obs, Obsop=Obsop, Basis=Basis, Bc=Bc)
+        return Inv_4Dvar(config, State=State, Model=Model, dict_obs=dict_obs, Obsop=Obsop, Basis=Basis)
     
     else:
         sys.exit(config.INV.super + ' not implemented yet')
         
-def Inv_forward(config,State,Model,Bc=None):
+def Inv_forward(config,State,Model):
     
     """
     NAME
@@ -98,15 +105,12 @@ def Inv_forward(config,State,Model,Bc=None):
         # Save
         if config.EXP.saveoutputs:
             Model.save_output(State,present_date,name_var=Model.var_to_save,t=t)    
-        State.plot(present_date)
     
     State.plot(title='End of forward integration')
         
     return
        
-
-
-def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=None,Bc=None,verbose=True,gpu_device=None) :
+def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=None,verbose=True,gpu_device=None) :
 
     
     '''
@@ -252,7 +256,21 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         ###################
 
         # Main function
-        fun = var.cost_and_grad
+        raw_fun = var.cost_and_grad
+        first_cost_eval = True
+
+        def fun(XX):
+            nonlocal first_cost_eval
+
+            if not first_cost_eval:
+                return raw_fun(XX)
+
+            first_cost_eval = False
+            time0 = time.time()
+            J, G = raw_fun(XX)
+            _block_until_ready((J, G))
+            print("[cost] first evaluation compile+run time: {:.2f} seconds".format(time.time() - time0))
+            return J, G
 
         # Callback function called at every minimization iterations
         def callback(XX):
@@ -731,6 +749,8 @@ class Variational:
                 if self.print_time:
                     time0 = time.time()
                 misfit = self.H.misfit(t,State) # d=Hx-xobs   
+                if self.print_time:
+                    _block_until_ready(misfit)
                 misfit_dict[t] = misfit
                 # Accumulate Jo in float64 (model misfit may be float32)
                 _m = np.asarray(misfit, dtype=np.float64)
@@ -744,6 +764,7 @@ class Variational:
                     time0 = time.time()
                 self.basis.operg(t/3600/24, X, State=State.params)
                 if self.print_time:
+                    _block_until_ready(State.params)
                     cost_basis.append(time.time()-time0)
             
             State_dict[t] = State.copy()
@@ -753,6 +774,7 @@ class Variational:
                     time0 = time.time()
             self.M.step(t=t,State=State,nstep=nstep)
             if self.print_time:
+                    _block_until_ready(State.var)
                     cost_model.append(time.time()-time0)
 
             if i==int(len(self.checkpoints)/2):
@@ -764,6 +786,8 @@ class Variational:
         State_dict[t] = State.copy()
         if self.H.is_obs_time(t):
             misfit = self.H.misfit(t,State) # d=Hx-xobsx
+            if self.print_time:
+                _block_until_ready(misfit)
             misfit_dict[t] = misfit
             _m = np.asarray(misfit, dtype=np.float64)
             Jo += _m.dot(np.asarray(self.R.inv(misfit), dtype=np.float64))
@@ -793,6 +817,8 @@ class Variational:
         t = self.M.T[self.checkpoints[-1]]
         if self.H.is_obs_time(t):
             self.H.adj(t, adState, State_dict[t], misfit_dict[t])
+            if self.print_time:
+                _block_until_ready((adState.var, adState.params))
     
         grad_misfit = []
         grad_basis = []
@@ -809,14 +835,17 @@ class Variational:
                 time0 = time.time()
             self.M.step_adj(t=t, adState=adState, State=State_dict[t], nstep=nstep) # i+1 --> i
             if self.print_time:
+                _block_until_ready((adState.var, adState.params))
                 grad_model.append(time.time()-time0)
 
             # 2. Reduced basis
             if self.checkpoints[i]%self.dtbasis==0:
                 if self.print_time:
                     time0 = time.time()
-                adX += self.basis.operg_transpose(t=t/3600/24,adState=adState.params)
+                _adX = self.basis.operg_transpose(t=t/3600/24,adState=adState.params)
+                adX += _adX
                 if self.print_time:
+                    _block_until_ready(adX)
                     grad_basis.append(time.time()-time0)
             
             # 1. Misfit 
@@ -825,6 +854,7 @@ class Variational:
                     time0 = time.time()
                 self.H.adj(t,adState,State_dict[t],misfit_dict[t])
                 if self.print_time:
+                    _block_until_ready((adState.var, adState.params))
                     grad_misfit.append(time.time()-time0)
 
             if i==int(len(self.checkpoints)/2):
@@ -833,8 +863,25 @@ class Variational:
             
     
         if self.print_time:
-            print("[cost] mean computation time [seconds]: misfit: {:.2e}, basis: {:.2e}, model: {:.2e}".format(np.mean(cost_misfit), np.mean(cost_basis), np.mean(cost_model)) )   
-            print("[grad] mean computation time [seconds]: misfit: {:.2e}, basis: {:.2e}, model: {:.2e}".format(np.mean(grad_misfit), np.mean(grad_basis), np.mean(grad_model)) )
+            def _time_stats(name, values):
+                values = np.asarray(values, dtype=float)
+                if values.size == 0:
+                    return f"{name}: n=0"
+                return (
+                    f"{name}: mean={values.mean():.2e}, "
+                    f"total={values.sum():.2e}, n={values.size}"
+                )
+
+            print("[cost] computation time [seconds]: " + ", ".join([
+                _time_stats('misfit', cost_misfit),
+                _time_stats('basis', cost_basis),
+                _time_stats('model', cost_model),
+            ]))
+            print("[grad] computation time [seconds]: " + ", ".join([
+                _time_stats('misfit', grad_misfit),
+                _time_stats('basis', grad_basis),
+                _time_stats('model', grad_model),
+            ]))
 
         self.it_plot += 1
 

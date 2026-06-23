@@ -114,26 +114,31 @@ class _BcFields:
         except Exception:
             print("Warning: can't convert longitude coordinates in " + config_bc.file)
 
-        time_bc = ds[config_bc.name_time].values
         self.name_time_bc = config_bc.name_time
+        has_time = (
+            config_bc.name_time is not None
+            and config_bc.name_time in ds
+        )
+        time_bc = ds[config_bc.name_time].values if has_time else None
         lon_bc = ds[config_bc.name_lon].values
         lat_bc = ds[config_bc.name_lat].values
         dlon += np.nanmean(lon_bc[1:] - lon_bc[:-1])
         dlat += np.nanmean(lat_bc[1:] - lat_bc[:-1])
-        dtime = time_bc[1] - time_bc[0]
-        try:
-            ds = ds.sel({
-                config_bc.name_time: slice(
-                    np.datetime64(config_bc._config.EXP.init_date) - dtime,
-                    np.datetime64(config_bc._config.EXP.final_date) + dtime,
-                ),
-            })
-        except Exception:
-            ds = ds.where(
-                (ds[config_bc.name_time] >= np.datetime64(config_bc._config.EXP.init_date) - dtime)
-                & (ds[config_bc.name_time] <= np.datetime64(config_bc._config.EXP.final_date) + dtime),
-                drop=True,
-            )
+        if has_time and np.size(time_bc) > 1:
+            dtime = time_bc[1] - time_bc[0]
+            try:
+                ds = ds.sel({
+                    config_bc.name_time: slice(
+                        np.datetime64(config_bc._config.EXP.init_date) - dtime,
+                        np.datetime64(config_bc._config.EXP.final_date) + dtime,
+                    ),
+                })
+            except Exception:
+                ds = ds.where(
+                    (ds[config_bc.name_time] >= np.datetime64(config_bc._config.EXP.init_date) - dtime)
+                    & (ds[config_bc.name_time] <= np.datetime64(config_bc._config.EXP.final_date) + dtime),
+                    drop=True,
+                )
         if len(ds[config_bc.name_lon].shape) == 1 and len(ds[config_bc.name_lat].shape) == 1:
             ds = ds.sel({
                 config_bc.name_lon: slice(lon_min - 2 * dlon, lon_max + 2 * dlon),
@@ -141,9 +146,11 @@ class _BcFields:
             })
 
         self.c_grid = getattr(config_bc, 'c_grid', False)
+        self.name_lon_bc = config_bc.name_lon
+        self.name_lat_bc = config_bc.name_lat
         self.lon_bc = ds[config_bc.name_lon].values
         self.lat_bc = ds[config_bc.name_lat].values
-        self.time_bc = ds[config_bc.name_time].values if config_bc.name_time is not None else None
+        self.time_bc = ds[config_bc.name_time].values if has_time else None
 
         self.var = {}
         for name in config_bc.name_var:
@@ -173,11 +180,88 @@ class _BcFields:
 
         return var_interp
 
+    def _prepare_source_2D(self, name, da):
+        if self.name_time_bc is not None and self.name_time_bc in da.dims:
+            da = da.isel({self.name_time_bc: 0})
+        da = da.squeeze(drop=True)
+
+        if self.name_lat_bc in da.dims and self.name_lon_bc in da.dims:
+            da = da.transpose(self.name_lat_bc, self.name_lon_bc)
+
+        src = np.asarray(da.values, dtype=np.float64)
+        if src.ndim != 2:
+            raise ValueError(
+                f"Boundary condition variable {name} must be 2D after "
+                f"removing singleton dimensions; got shape {src.shape}"
+            )
+
+        x_source, y_source = self._source_axes(name, da, src.shape)
+        return src, x_source, y_source
+
+    def _prepare_source_3D(self, name, da, needed):
+        if da.ndim > 3:
+            da = da.squeeze(drop=True)
+        if self.name_time_bc is not None and self.name_time_bc in da.dims:
+            da = da.isel({self.name_time_bc: needed})
+            if self.name_lat_bc in da.dims and self.name_lon_bc in da.dims:
+                da = da.transpose(self.name_time_bc, self.name_lat_bc, self.name_lon_bc)
+
+        src = np.asarray(da.values, dtype=np.float64)
+        if src.ndim == 2:
+            src = src[np.newaxis]
+        if src.ndim != 3:
+            raise ValueError(
+                f"Boundary condition variable {name} must be 3D after "
+                f"time selection; got shape {src.shape}"
+            )
+
+        x_source, y_source = self._source_axes(name, da, src.shape[-2:])
+        return src, x_source, y_source
+
+    def _axis_to_faces(self, axis):
+        axis = np.asarray(axis, dtype=np.float64)
+        if axis.size < 2:
+            raise ValueError('At least two coordinates are needed to infer C-grid faces')
+        faces = np.empty(axis.size + 1, dtype=axis.dtype)
+        faces[1:-1] = 0.5 * (axis[:-1] + axis[1:])
+        faces[0] = axis[0] - 0.5 * (axis[1] - axis[0])
+        faces[-1] = axis[-1] + 0.5 * (axis[-1] - axis[-2])
+        return faces
+
+    def _source_axes(self, name, da, spatial_shape):
+        if self.name_lon_bc in da.coords:
+            lon_bc = np.asarray(da[self.name_lon_bc].values)
+        else:
+            lon_bc = np.asarray(self.lon_bc)
+        if self.name_lat_bc in da.coords:
+            lat_bc = np.asarray(da[self.name_lat_bc].values)
+        else:
+            lat_bc = np.asarray(self.lat_bc)
+
+        if lon_bc.ndim != 1 or lat_bc.ndim != 1:
+            raise ValueError(
+                f"Boundary condition variable {name} requires 1D source "
+                f"coordinates for 3D interpolation; got lon {lon_bc.shape}, "
+                f"lat {lat_bc.shape}"
+            )
+
+        ny, nx = spatial_shape
+        if self.c_grid and name == 'U' and len(lon_bc) + 1 == nx and len(lat_bc) == ny:
+            lon_bc = self._axis_to_faces(lon_bc)
+        elif self.c_grid and name == 'V' and len(lon_bc) == nx and len(lat_bc) + 1 == ny:
+            lat_bc = self._axis_to_faces(lat_bc)
+
+        if len(lon_bc) != nx or len(lat_bc) != ny:
+            raise ValueError(
+                f"Boundary condition variable {name} shape {(ny, nx)} does "
+                f"not match source coordinates lon {lon_bc.shape}, "
+                f"lat {lat_bc.shape}"
+            )
+
+        return pyinterp.Axis(lon_bc, is_circle=True), pyinterp.Axis(lat_bc)
+
     def _interp_3D(self, time):
         has_time = self.time_bc is not None and self.time_bc.size > 1
-
-        x_source_axis = pyinterp.Axis(self.lon_bc, is_circle=True)
-        y_source_axis = pyinterp.Axis(self.lat_bc)
 
         if has_time:
             tbc = self.time_bc
@@ -234,16 +318,16 @@ class _BcFields:
             y_flat = lat_t.T.ravel()
 
             if not has_time:
-                grid_source = pyinterp.Grid2D(x_source_axis, y_source_axis, np.asarray(self.var[name]).T)
+                da = self.var[name]
+                src, x_source_axis, y_source_axis = self._prepare_source_2D(name, da)
+                grid_source = pyinterp.Grid2D(x_source_axis, y_source_axis, src.T)
                 _slice = pyinterp.bivariate(grid_source, x_flat, y_flat, bounds_error=False).reshape(out_shape[::-1]).T
                 _slice[mask_t] = np.nan
                 var_interp[name] = np.repeat(_slice[np.newaxis, :, :], len(time), axis=0)
                 continue
-
-            da = self.var[name].squeeze()
-            src = np.asarray(da.isel({self.name_time_bc: needed}).values, dtype=np.float64)
-            if src.ndim == 2:
-                src = src[np.newaxis]
+            
+            da = self.var[name]
+            src, x_source_axis, y_source_axis = self._prepare_source_3D(name, da, needed)
 
             filled = np.empty_like(src)
             for k in range(src.shape[0]):
@@ -308,6 +392,8 @@ class _BcFields:
             nt = len(time)
 
             if time_bc is None or np.size(time_bc) <= 1:
+                if self.name_time_bc is not None and self.name_time_bc in var_data.dims:
+                    var_data = var_data.isel({self.name_time_bc: 0})
                 interp_data = np.repeat(var_data.values[np.newaxis, ...], nt, axis=0)
             else:
                 interp_result = var_data.interp({self.name_time_bc: xr.DataArray(time, dims=[self.name_time_bc])}, method="linear")
@@ -439,8 +525,53 @@ class M:
             self._bc_fields = _MultiBcFields(bc_fields)
 
 
+    def _land_mask_for_shape(self, State, shape):
+        if State.mask is None or len(shape) < 2:
+            return None
+        h_shape = State.mask.shape
+        var_shape = tuple(shape[-2:])
+        if var_shape == h_shape:
+            return State.mask
+        if var_shape == (h_shape[0], h_shape[1] + 1):
+            mask = np.zeros(var_shape, dtype=bool)
+            mask[:, 1:-1] = State.mask[:, :-1] | State.mask[:, 1:]
+            mask[:, 0] = State.mask[:, 0]
+            mask[:, -1] = State.mask[:, -1]
+            return mask
+        if var_shape == (h_shape[0] + 1, h_shape[1]):
+            mask = np.zeros(var_shape, dtype=bool)
+            mask[1:-1, :] = State.mask[:-1, :] | State.mask[1:, :]
+            mask[0, :] = State.mask[0, :]
+            mask[-1, :] = State.mask[-1, :]
+            return mask
+        return None
+
+    def _set_land_nan(self, State, name_var=None):
+        if State.mask is None:
+            return
+        if name_var is None:
+            name_var = self.name_var.values()
+        for name in name_var:
+            if name not in State.var:
+                continue
+            arr = np.asarray(State.var[name])
+            mask = self._land_mask_for_shape(State, arr.shape)
+            if mask is None:
+                continue
+            arr = arr.astype(float, copy=True)
+            arr[..., mask] = np.nan
+            State.var[name] = arr
+
+    def _finite_model_array(self, State, name, fill_land='zero'):
+        arr = np.asarray(State.var[name], dtype=float)
+        arr = np.where(np.isfinite(arr), arr, np.nan)
+        if fill_land == 'nearest':
+            return _fill_nan_nearest(arr)
+        return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
     def init(self, State, t0=0):
 
+        self._set_land_nan(State)
         return
     
     def set_bc(self,time_bc,var_bc=None,**kwargs):
@@ -564,6 +695,7 @@ class Model_diffusion(M):
             for name in self.name_var: 
                 if t0 in self.bc[name]:
                      State.setvar(self.bc[name][t0], self.name_var[name])
+        self._set_land_nan(State)
 
     def save_output(self,State,present_date,name_var=None,t=None):
 
@@ -973,6 +1105,7 @@ class Model_qg1l(M):
     def init(self, State, t0=0):
 
         if self.anomaly_from_bc:
+            self._set_land_nan(State)
             return
         elif type(self.init_from_bc)==dict:
             for name in self.init_from_bc:
@@ -982,6 +1115,7 @@ class Model_qg1l(M):
             for name in self.name_var: 
                 if t0 in self.bc[name]:
                      State.setvar(self.bc[name][t0], self.name_var[name])
+        self._set_land_nan(State)
     
     def save_output(self,State,present_date,name_var=None,t=None):
 
@@ -1485,9 +1619,6 @@ class Model_csw1l(M):
         else:
             self.bc_theta = np.array([0])
         
-        # Open Boundary condition kind
-        self.bc_kind = config.MOD.bc_kind
-        
         # Tide frequencies
         self.omegas = np.asarray(config.MOD.w_waves)
         
@@ -1547,7 +1678,7 @@ class Model_csw1l(M):
                     State.var[self.name_var[name]] = np.zeros((State.ny,State.nx))
 
         
-        # Model Parameters (OBC, He and alpha coefficient)
+        # Model Parameters (sponge, He and alpha coefficient)
         self.name_params = config.MOD.name_params
         if 'He_mean' in self.name_params:
             State.params['He_mean'] = np.zeros((self.ny, self.nx))
@@ -1695,12 +1826,15 @@ class Model_csw1l(M):
             self.weight_sponge_v[self.weight_sponge_v==0] = 1
             self.weight_sponge_h[self.weight_sponge_h==0] = 1
 
-            # Update mask (for avoiding assimilation in sponge regions)
+            # Keep sponge exclusion separate from State.mask so model and basis
+            # still include sponge cells.
             if config.MOD.mask_sponge_bc:
-                State.mask[self.sponge_on_h_S] = True
-                State.mask[self.sponge_on_h_N] = True
-                State.mask[self.sponge_on_h_W] = True
-                State.mask[self.sponge_on_h_E] = True
+                sponge_mask = (self.sponge_on_h_S | self.sponge_on_h_N |
+                               self.sponge_on_h_W | self.sponge_on_h_E)
+                if getattr(State, 'sponge_mask', None) is None:
+                    State.sponge_mask = sponge_mask.copy()
+                else:
+                    State.sponge_mask = np.asarray(State.sponge_mask, dtype=bool) | sponge_mask
         
         self.mask = State.mask
 
@@ -1708,15 +1842,10 @@ class Model_csw1l(M):
         self.swm = model(X=X,
                          Y=Y,
                          dt=self.dt,
-                         bc=self.bc_kind,
                          omegas=self.omegas,
                          bc_theta=self.bc_theta,
                          f=self.f,
                          Heb=self.Heb,
-                         obc_north=config.MOD.obc_north,
-                         obc_west=config.MOD.obc_west,
-                         obc_south=config.MOD.obc_south,
-                         obc_east=config.MOD.obc_east,
                          periodic_x=config.MOD.periodic_x,
                          periodic_y=config.MOD.periodic_y,
                          )
@@ -1745,7 +1874,8 @@ class Model_csw1l(M):
             self.swm.weight_sponge_h = self.weight_sponge_h
 
         # IT wave-phase method for sponge BC
-        self.swm.bc_it_method = getattr(config.MOD, 'bc_it_method', 'plane_wave')
+        self.swm.bc_it_method = getattr(config.MOD, 'bc_it_method', 'plane_wave_bdy')
+        self.swm.bc_it_corner_weight_power = getattr(config.MOD, 'bc_it_corner_weight_power', self.swm.bc_it_corner_weight_power)
 
         # Compile jax-related functions
         self._jstep_jit = jit(self._jstep, static_argnames=['nstep'])
@@ -1753,8 +1883,6 @@ class Model_csw1l(M):
         self._jstep_adj_jit = jit(self._jstep_adj, static_argnames=['nstep'])
         self._compute_advective_terms_from_bm_jit = jit(self._compute_advective_terms_from_bm)
         self._compute_He_from_bm_jit = jit(self._compute_He_from_bm)
-        self._compute_w1_IT_jit = jit(self._compute_w1_IT)
-        self._compute_IT_2D_jit = jit(self._compute_IT_2D)
 
         # Functions related to time_scheme
         if self.time_scheme=='Euler':
@@ -2133,353 +2261,6 @@ class Model_csw1l(M):
         
         return u11u, v11u, u11p, v11p, u11z, v11z
 
-    def _compute_w1_IT(self,t,He,h_SN,h_WE):
-        """
-        Compute first characteristic variable w1 for internal tides from external 
-        data
-
-        Parameters
-        ----------
-        t : float 
-            time in seconds
-        He : 2D array
-        h_SN : ND array
-            amplitude of SSH for southern/northern borders
-        h_WE : ND array
-            amplitude of SSH for western/eastern borders
-
-        Returns
-        -------
-        w1ext: 1D array
-            flattened  first characteristic variable (South/North/West/East)
-        """
-
-        if h_SN is None or h_WE is None:
-            return None 
-        
-        # Adjust time for 1d bc
-        if self.bc_kind=='1d':
-            t += self.dt
-        
-        # South
-        HeS = (He[0,:]+He[1,:])/2
-        fS = (self.f[0,:]+self.f[1,:])/2
-        w1S = jnp.zeros(self.nx)
-        for j,w in enumerate(self.omegas):
-            k = jnp.sqrt((w**2-fS**2)/(self.g*HeS))
-            for i,theta in enumerate(self.bc_theta):
-                kx = jnp.sin(theta) * k
-                ky = jnp.cos(theta) * k
-                kxy = kx*self.swm.Xv[0,:] + ky*self.swm.Yv[0,:]
-                
-                h = h_SN[j,0,0,i]* jnp.cos(w*t-kxy)  +\
-                        h_SN[j,0,1,i]* jnp.sin(w*t-kxy) 
-                v = self.g/(w**2-fS**2)*( \
-                    h_SN[j,0,0,i]* (w*ky*jnp.cos(w*t-kxy) \
-                                - fS*kx*jnp.sin(w*t-kxy)
-                                    ) +\
-                    h_SN[j,0,1,i]* (w*ky*jnp.sin(w*t-kxy) \
-                                + fS*kx*jnp.cos(w*t-kxy)
-                                    )
-                        )
-                
-                w1S += v + jnp.sqrt(self.g/HeS) * h
-         
-        # North
-        fN = (self.f[-1,:]+self.f[-2,:])/2
-        HeN = (He[-1,:]+He[-2,:])/2
-        w1N = jnp.zeros(self.nx)
-        for j,w in enumerate(self.omegas):
-            k = jnp.sqrt((w**2-fN**2)/(self.g*HeN))
-            for i,theta in enumerate(self.bc_theta):
-                kx = jnp.sin(theta) * k
-                ky = -jnp.cos(theta) * k
-                kxy = kx*self.swm.Xv[-1,:] + ky*self.swm.Yv[-1,:]
-                h = h_SN[j,1,0,i]* jnp.cos(w*t-kxy)+\
-                        h_SN[j,1,1,i]* jnp.sin(w*t-kxy) 
-                v = self.g/(w**2-fN**2)*(\
-                    h_SN[j,1,0,i]* (w*ky*jnp.cos(w*t-kxy) \
-                                - fN*kx*jnp.sin(w*t-kxy)
-                                    ) +\
-                    h_SN[j,1,1,i]* (w*ky*jnp.sin(w*t-kxy) \
-                                + fN*kx*jnp.cos(w*t-kxy)
-                                    )
-                        )
-                w1N += v - jnp.sqrt(self.g/HeN) * h
-
-        # West
-        fW = (self.f[:,0]+self.f[:,1])/2
-        HeW = (He[:,0]+He[:,1])/2
-        w1W = jnp.zeros(self.ny)
-        for j,w in enumerate(self.omegas):
-            k = jnp.sqrt((w**2-fW**2)/(self.g*HeW))
-            for i,theta in enumerate(self.bc_theta):
-                kx = jnp.cos(theta)* k
-                ky = jnp.sin(theta)* k
-                kxy = kx*self.swm.Xu[:,0] + ky*self.swm.Yu[:,0]
-                h = h_WE[j,0,0,i]*jnp.cos(w*t-kxy) +\
-                        h_WE[j,0,1,i]*jnp.sin(w*t-kxy)
-                u = self.g/(w**2-fW**2)*(\
-                    h_WE[j,0,0,i]*(w*kx*jnp.cos(w*t-kxy) \
-                              + fW*ky*jnp.sin(w*t-kxy)
-                                  ) +\
-                    h_WE[j,0,1,i]*(w*kx*jnp.sin(w*t-kxy) \
-                              - fW*ky*jnp.cos(w*t-kxy)
-                                  )
-                        )
-                w1W += u + jnp.sqrt(self.g/HeW) * h
-
-        
-        # East
-        HeE = (He[:,-1]+He[:,-2])/2
-        fE = (self.f[:,-1]+self.f[:,-2])/2
-        w1E = jnp.zeros(self.ny)
-        for j,w in enumerate(self.omegas):
-            k = jnp.sqrt((w**2-fE**2)/(self.g*HeE))
-            for i,theta in enumerate(self.bc_theta):
-                kx = -jnp.cos(theta)* k
-                ky = jnp.sin(theta)* k
-                kxy = kx*self.swm.Xu[:,-1] + ky*self.swm.Yu[:,-1]
-                h = h_WE[j,1,0,i]*jnp.cos(w*t-kxy) +\
-                        h_WE[j,1,1,i]*jnp.sin(w*t-kxy)
-                u = self.g/(w**2-fE**2)*(\
-                    h_WE[j,1,0,i]* (w*kx*jnp.cos(w*t-kxy) \
-                                + fE*ky*jnp.sin(w*t-kxy)
-                                    ) +\
-                    h_WE[j,1,1,i]*(w*kx*jnp.sin(w*t-kxy) \
-                              - fE*ky*jnp.cos(w*t-kxy)
-                                  )
-                        )
-                w1E += u - jnp.sqrt(self.g/HeE) * h
-        
-        w1ext = (w1S,w1N,w1W,w1E)    
-        
-        return w1ext
-
-    def _compute_IT_2D(self,t,He,h_SN,h_WE,flag_tangent=True):
-        """
-        Compute 2D plane wave IT fields 
-
-        Parameters
-        ----------
-        t : float 
-            time in seconds
-        He : 2D array
-        h_SN : ND array
-            amplitude of SSH for southern/northern borders
-        h_WE : ND array
-            amplitude of SSH for western/eastern borders
-
-        Returns
-        -------
-        u,v,h: 2D arrays
-            
-        """
-
-        u_S = jnp.zeros((self.ny,self.nx-1))
-        v_S = jnp.zeros((self.ny-1,self.nx))
-        h_S = jnp.zeros((self.ny,self.nx))
-        u_N = jnp.zeros((self.ny,self.nx-1))
-        v_N = jnp.zeros((self.ny-1,self.nx))
-        h_N = jnp.zeros((self.ny,self.nx))
-        u_W = jnp.zeros((self.ny,self.nx-1))
-        v_W = jnp.zeros((self.ny-1,self.nx))
-        h_W = jnp.zeros((self.ny,self.nx))
-        u_E = jnp.zeros((self.ny,self.nx-1))
-        v_E = jnp.zeros((self.ny-1,self.nx))
-        h_E = jnp.zeros((self.ny,self.nx))
-
-        He_on_u = (He[:,1:] + He[:,:-1]) /2
-        He_on_v = (He[1:,:] + He[:-1,:]) /2
-
-        for j,w in enumerate(self.omegas):
-            k_on_h = jnp.sqrt((w**2-self.f**2)/(self.g*He))
-            k_on_u = jnp.sqrt((w**2-self.f_on_u**2)/(self.g*(He_on_u)))
-            k_on_v = jnp.sqrt((w**2-self.f_on_v**2)/(self.g*(He_on_v)))
-
-            for i,theta in enumerate(self.bc_theta):
-
-                ####################################
-                # South
-                ####################################
-                kx_on_h = jnp.sin(theta) * k_on_h
-                ky_on_h = jnp.cos(theta) * k_on_h
-                kx_on_u = jnp.sin(theta) * k_on_u
-                ky_on_u = jnp.cos(theta) * k_on_u
-                kx_on_v = jnp.sin(theta) * k_on_v
-                ky_on_v = jnp.cos(theta) * k_on_v
-                kxy_on_h = kx_on_h*self.Xh + ky_on_h*self.Yh
-                kxy_on_u = kx_on_u*self.Xu + ky_on_u*self.Yu
-                kxy_on_v = kx_on_v*self.Xv + ky_on_v*self.Yv
-
-                # h
-                h_S += self.sponge_on_h_S *(\
-                    h_SN[j,0,0,i]* jnp.cos(w*t-kxy_on_h)  +\
-                    h_SN[j,0,1,i]* jnp.sin(w*t-kxy_on_h)) 
-                
-                # v
-                h_cos_theta_on_v_S = h_SN[j,0,0,i]
-                h_sin_theta_on_v_S = h_SN[j,0,1,i]
-                v_S += self.sponge_on_v_S * (self.g/(w**2-self.f_on_v**2)*( \
-                    h_cos_theta_on_v_S * (w*ky_on_v*jnp.cos(w*t-kxy_on_v) \
-                                - self.f_on_v*kx_on_v*jnp.sin(w*t-kxy_on_v)
-                                    ) +\
-                    h_sin_theta_on_v_S * (w*ky_on_v*jnp.sin(w*t-kxy_on_v) \
-                                + self.f_on_v*kx_on_v*jnp.cos(w*t-kxy_on_v)
-                                    )
-                        ))
-                
-                # u
-                if flag_tangent:
-                    h_cos_theta_on_u_S = (h_cos_theta_on_v_S[1:] + h_cos_theta_on_v_S[:-1]) * 0.5
-                    h_sin_theta_on_u_S = (h_sin_theta_on_v_S[1:] + h_sin_theta_on_v_S[:-1]) * 0.5
-                    u_S += self.sponge_on_u_S * (self.g/(w**2-self.f_on_u**2)*( \
-                        h_cos_theta_on_u_S * (w*kx_on_u*jnp.cos(w*t-kxy_on_u) \
-                                    + self.f_on_u*ky_on_u*jnp.sin(w*t-kxy_on_u)
-                                        ) +\
-                        h_sin_theta_on_u_S * (w*kx_on_u*jnp.sin(w*t-kxy_on_u) \
-                                    - self.f_on_u*ky_on_u*jnp.cos(w*t-kxy_on_u)
-                                        )
-                            ))
-                
-                ####################################
-                # North
-                ####################################
-                kx_on_h = +jnp.sin(theta) * k_on_h
-                ky_on_h = -jnp.cos(theta) * k_on_h
-                kx_on_u = +jnp.sin(theta) * k_on_u
-                ky_on_u = -jnp.cos(theta) * k_on_u
-                kx_on_v = +jnp.sin(theta) * k_on_v
-                ky_on_v = -jnp.cos(theta) * k_on_v
-                kxy_on_h = kx_on_h*self.Xh + ky_on_h*self.Yh
-                kxy_on_u = kx_on_u*self.Xu + ky_on_u*self.Yu
-                kxy_on_v = kx_on_v*self.Xv + ky_on_v*self.Yv
-
-                # h
-                h_N += self.sponge_on_h_N *(\
-                    h_SN[j,1,0,i]* jnp.cos(w*t-kxy_on_h)  +\
-                    h_SN[j,1,1,i]* jnp.sin(w*t-kxy_on_h)) 
-                
-                # v
-                h_cos_theta_on_v_N = h_SN[j,1,0,i]
-                h_sin_theta_on_v_N = h_SN[j,1,1,i]
-                v_N += self.sponge_on_v_N * (self.g/(w**2-self.f_on_v**2)*( \
-                    h_cos_theta_on_v_N * (w*ky_on_v*jnp.cos(w*t-kxy_on_v) \
-                                - self.f_on_v*kx_on_v*jnp.sin(w*t-kxy_on_v)
-                                    ) +\
-                    h_sin_theta_on_v_N * (w*ky_on_v*jnp.sin(w*t-kxy_on_v) \
-                                + self.f_on_v*kx_on_v*jnp.cos(w*t-kxy_on_v)
-                                    )
-                        ))  
-                
-                # u
-                if flag_tangent:
-                    h_cos_theta_on_u_N = (h_cos_theta_on_v_N[1:] + h_cos_theta_on_v_N[:-1]) * 0.5
-                    h_sin_theta_on_u_N = (h_sin_theta_on_v_N[1:] + h_sin_theta_on_v_N[:-1]) * 0.5
-                    u_N += self.sponge_on_u_N * (self.g/(w**2-self.f_on_u**2)*( \
-                        h_cos_theta_on_u_N * (w*kx_on_u*jnp.cos(w*t-kxy_on_u) \
-                                    + self.f_on_u*ky_on_u*jnp.sin(w*t-kxy_on_u)
-                                        ) +\
-                        h_sin_theta_on_u_N * (w*kx_on_u*jnp.sin(w*t-kxy_on_u) \
-                                    - self.f_on_u*ky_on_u*jnp.cos(w*t-kxy_on_u)
-                                        )
-                            ))
-                
-                ####################################
-                # West
-                ####################################
-                kx_on_h = jnp.cos(theta) * k_on_h
-                ky_on_h = jnp.sin(theta) * k_on_h
-                kx_on_u = jnp.cos(theta) * k_on_u
-                ky_on_u = jnp.sin(theta) * k_on_u
-                kx_on_v = jnp.cos(theta) * k_on_v
-                ky_on_v = jnp.sin(theta) * k_on_v
-                kxy_on_h = kx_on_h*self.Xh + ky_on_h*self.Yh
-                kxy_on_u = kx_on_u*self.Xu + ky_on_u*self.Yu
-                kxy_on_v = kx_on_v*self.Xv + ky_on_v*self.Yv
-
-                # h
-                h_W += self.sponge_on_h_W *(\
-                    h_WE[j,0,0,i][:,None]* jnp.cos(w*t-kxy_on_h)  +\
-                    h_WE[j,0,1,i][:,None]* jnp.sin(w*t-kxy_on_h)) 
-                
-                # u
-                h_cos_theta_on_u_W = h_WE[j,0,0,i][:,None]
-                h_sin_theta_on_u_W = h_WE[j,0,1,i][:,None]
-                u_W += self.sponge_on_u_W * (self.g/(w**2-self.f_on_u**2)*( \
-                    h_cos_theta_on_u_W * (w*kx_on_u*jnp.cos(w*t-kxy_on_u) \
-                                + self.f_on_u*ky_on_u*jnp.sin(w*t-kxy_on_u)
-                                    ) +\
-                    h_sin_theta_on_u_W * (w*kx_on_u*jnp.sin(w*t-kxy_on_u) \
-                                - self.f_on_u*ky_on_u*jnp.cos(w*t-kxy_on_u)
-                                    )
-                        ))
-
-                # v
-                if flag_tangent:
-                    h_cos_theta_on_v_W = (h_cos_theta_on_u_W[1:] + h_cos_theta_on_u_W[:-1]) * 0.5
-                    h_sin_theta_on_v_W = (h_sin_theta_on_u_W[1:] + h_sin_theta_on_u_W[:-1]) * 0.5
-                    v_W += self.sponge_on_v_W * (self.g/(w**2-self.f_on_v**2)*( \
-                        h_cos_theta_on_v_W * (w*ky_on_v*jnp.cos(w*t-kxy_on_v) \
-                                    - self.f_on_v*kx_on_v*jnp.sin(w*t-kxy_on_v)
-                                        ) +\
-                        h_sin_theta_on_v_W * (w*ky_on_v*jnp.sin(w*t-kxy_on_v) \
-                                    + self.f_on_v*kx_on_v*jnp.cos(w*t-kxy_on_v)
-                                        )
-                            ))  
-                
-                
-                
-                ####################################
-                # East
-                ####################################
-                kx_on_h = -jnp.cos(theta) * k_on_h
-                ky_on_h = jnp.sin(theta) * k_on_h
-                kx_on_u = -jnp.cos(theta) * k_on_u
-                ky_on_u = jnp.sin(theta) * k_on_u
-                kx_on_v = -jnp.cos(theta) * k_on_v
-                ky_on_v = jnp.sin(theta) * k_on_v
-                kxy_on_h = kx_on_h*self.Xh + ky_on_h*self.Yh
-                kxy_on_u = kx_on_u*self.Xu + ky_on_u*self.Yu
-                kxy_on_v = kx_on_v*self.Xv + ky_on_v*self.Yv
-
-                # h
-                h_E += self.sponge_on_h_E *(\
-                    h_WE[j,1,0,i][:,None]* jnp.cos(w*t-kxy_on_h)  +\
-                    h_WE[j,1,1,i][:,None]* jnp.sin(w*t-kxy_on_h))
-                
-                # u
-                h_cos_theta_on_u_E = h_WE[j,1,0,i][:,None]
-                h_sin_theta_on_u_E = h_WE[j,1,1,i][:,None]
-                u_E += self.sponge_on_u_E * (self.g/(w**2-self.f_on_u**2)*( \
-                    h_cos_theta_on_u_E * (w*kx_on_u*jnp.cos(w*t-kxy_on_u) \
-                                + self.f_on_u*ky_on_u*jnp.sin(w*t-kxy_on_u)
-                                    ) +\
-                    h_sin_theta_on_u_E * (w*kx_on_u*jnp.sin(w*t-kxy_on_u) \
-                                - self.f_on_u*ky_on_u*jnp.cos(w*t-kxy_on_u)
-                                    )
-                        ))
-                
-                # v
-                if flag_tangent:
-                    h_cos_theta_on_v_E = (h_cos_theta_on_u_E[1:] + h_cos_theta_on_u_E[:-1]) * 0.5
-                    h_sin_theta_on_v_E = (h_sin_theta_on_u_E[1:] + h_sin_theta_on_u_E[:-1]) * 0.5
-                    v_E += self.sponge_on_v_E * (self.g/(w**2-self.f_on_v**2)*( \
-                        h_cos_theta_on_v_E * (w*ky_on_v*jnp.cos(w*t-kxy_on_v) \
-                                    - self.f_on_v*kx_on_v*jnp.sin(w*t-kxy_on_v)
-                                        ) +\
-                        h_sin_theta_on_v_E * (w*ky_on_v*jnp.sin(w*t-kxy_on_v) \
-                                    + self.f_on_v*kx_on_v*jnp.cos(w*t-kxy_on_v)
-                                        )
-                            ))
-        
-        u_it = (u_S + u_N + u_W + u_E) / self.weight_sponge_u
-        v_it = (v_S + v_N + v_W + v_E) / self.weight_sponge_v
-        h_it = (h_S + h_N + h_W + h_E) / self.weight_sponge_h
-
-
-        return u_it, v_it, h_it
-    
     def _jstep(self, t, u, v, h, He_mean, alpha_He, alpha_Uu, alpha_Up, alpha_Uz, h_SN, h_WE, h_bm, u_bm, v_bm, nstep=1):
 
         # Compute equivalent depth anomaly from control parameters (once, before scan)
@@ -2487,16 +2268,10 @@ class Model_csw1l(M):
 
         # Compute advective terms from control parameters (once, before scan)
         u11u, v11u, u11p, v11p, u11z, v11z = self._compute_advective_terms_from_bm(alpha_Uu, alpha_Up, alpha_Uz, u_bm, v_bm)
-        
-        # Compute characteristic variable from external data (once, before scan)
-        if not self.flag_bc_sponge:
-            w1ext = self._compute_w1_IT(t, self.Heb+He2d, h_SN, h_WE)
-        else:
-            w1ext = None
 
         # Multi-step forward integration (scan + checkpoint inside swm)
         u1, v1, h1 = self.swm_step_nstep(
-            u, v, h, He2d, w1ext=w1ext,
+            u, v, h, He2d,
             u11u=u11u, v11u=v11u, u11z=u11z, v11z=v11z, u11p=u11p, v11p=v11p,
             nstep=nstep, t=t, He_total=self.Heb+He2d, h_SN=h_SN, h_WE=h_WE)
     
@@ -3091,7 +2866,12 @@ class Model_qgsw(M):
             elif len(H.shape) == 2:
                 H = np.expand_dims(H, axis=0)
         
+        H_from_init = self._H_from_init_file(config, State)
+        if H_from_init is not None:
+            H = H_from_init
+
         self.H0 = H
+        self._H_from_init_file_used = H_from_init is not None
         self.H_max_bound = getattr(config.MOD, 'H_max', None)
         H_floor = getattr(config.MOD, 'H_floor', None)
         if H_floor is None:
@@ -3384,12 +3164,14 @@ class Model_qgsw(M):
             0.0,
         )
 
-        # Exclude sponge cells from observation assimilation.
-        # Written to State.sponge_mask so that State.mask (land only) is not modified:
-        # other models sharing State (e.g. Model_diffusion) must not zero sponge cells,
-        # but the OBSOP will still exclude them by combining mask + sponge_mask.
+        # Exclude sponge cells from observation assimilation without changing
+        # State.mask, which is also used by model masks and basis support.
         if getattr(config.MOD, 'mask_sponge_bc', False):
-            State.sponge_mask = (self.sponge_h > 0)
+            sponge_mask = (self.sponge_h > 0)
+            if getattr(State, 'sponge_mask', None) is None:
+                State.sponge_mask = sponge_mask.copy()
+            else:
+                State.sponge_mask = np.asarray(State.sponge_mask, dtype=bool) | sponge_mask
 
         # Maximum number of model steps per JIT call (limits GPU memory)
         self.max_nstep = getattr(config.MOD, 'max_nstep', 240)
@@ -3432,15 +3214,20 @@ class Model_qgsw(M):
         if 'H' in self.name_params:
             if (config.GRID.super == 'GRID_FROM_FILE'):
                 dsin = xr.open_dataset(config.GRID.path_init_grid)
-                if 'H_control' not in dsin:
+                if self._H_from_init_file_used:
+                    # Saved H is already the total equivalent depth from the
+                    # previous run. Start new increments from zero around it.
+                    State.params['H'] = np.zeros((State.ny,State.nx))
+                elif 'H_control' in dsin:
+                    State.params['H'] = dsin['H_control'].values.squeeze()
+                    State.params['H'][np.isnan(State.params['H'])] = 0.
+                else:
                     dsin.close()
                     raise ValueError(
-                        'Controlled H restarts must provide H_control, the dimensionless '
-                        'equivalent-depth control. Refusing to infer it from H because H '
-                        'now denotes Total Equivalent Depth.'
+                        'Controlled H restarts must provide either H, the total '
+                        'equivalent depth, or H_control, the dimensionless equivalent-depth '
+                        'control.'
                     )
-                State.params['H'] = dsin['H_control'].values.squeeze()
-                State.params['H'][np.isnan(State.params['H'])] = 0.
                 dsin.close()
                 del dsin
             else:
@@ -3492,6 +3279,41 @@ class Model_qgsw(M):
             #self.adjoint_test_jstep(nstep=10)
             adjoint_test(self,State,nstep=10)#, ampl=1e-3)
     
+    def _H_from_init_file(self, config, State):
+        if config.GRID.super != 'GRID_FROM_FILE':
+            return None
+        path_init = getattr(config.GRID, 'path_init_grid', None)
+        if path_init is None or not os.path.exists(path_init):
+            return None
+
+        candidate_names = []
+        if config.MOD.name_init_var is not None and 'H' in config.MOD.name_init_var:
+            candidate_names.append(config.MOD.name_init_var['H'])
+        candidate_names.append('H')
+
+        dsin = xr.open_dataset(path_init)
+        try:
+            for name in candidate_names:
+                if name not in dsin:
+                    continue
+                da = dsin[name].squeeze(drop=True)
+                if config.EXP.name_time in da.dims:
+                    da = da.isel({config.EXP.name_time: 0})
+                if getattr(config.GRID, 'subsampling', None) is not None and da.ndim >= 2:
+                    da = da[..., ::config.GRID.subsampling, ::config.GRID.subsampling]
+                arr = np.asarray(da.values, dtype=float)
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                H = self._as_H_model_array(arr, State, name)
+                if self._is_qg_class and not (H.shape == (1, 1, 1) or np.nanstd(H) == 0.):
+                    H = np.array([[[np.nanmean(H)]]])
+                    print(f'H read from {path_init}:{name} and averaged for QG: H = {H[0,0,0]:.4f} m')
+                else:
+                    print(f'H read from {path_init}:{name}')
+                return H
+        finally:
+            dsin.close()
+        return None
+
     def _as_H_model_array(self, value, State, name):
         arr = np.asarray(value)
         if arr.ndim == 0:
@@ -3501,8 +3323,12 @@ class Model_qgsw(M):
         if arr.ndim == 1:
             return arr.reshape(-1, 1, 1)
         if arr.ndim == 2:
+            if arr.shape == (State.nx, State.ny):
+                return np.expand_dims(arr, axis=0)
             return np.expand_dims(arr, axis=0)
         if arr.ndim == 3:
+            if arr.shape[-2:] == (State.ny, State.nx):
+                return np.swapaxes(arr, -1, -2)
             return arr
         raise ValueError(
             f'{name} must be scalar, 1-D layers, 2-D, or 3-D; got shape {arr.shape}'
@@ -3756,6 +3582,8 @@ class Model_qgsw(M):
         if self.nl > 1:
             self._sync_layers_from_surface(State)
 
+        self._set_land_nan(State)
+
     def save_output(self,State,present_date,name_var=None,t=None):
 
         State0 = State.copy()
@@ -3799,15 +3627,20 @@ class Model_qgsw(M):
             # Remove nan
             ssh_bc_t[np.isnan(ssh_bc_t)] = 0.
 
-            if 'U' not in var_bc or 'V' not in var_bc:
-                u = np.zeros((self.ny, self.nx+1))
-                v = np.zeros((self.ny+1, self.nx))
-            else:
+            if 'U' in var_bc and 'V' in var_bc:
                 u = +var_bc['U'][i]
                 v = +var_bc['V'][i]
                 # Remove nan
                 u[np.isnan(u)] = 0.
                 v[np.isnan(v)] = 0.
+            else:
+                u, v = self.ssh2uv(ssh_bc_t)
+                if 'U' in var_bc:
+                    u = +var_bc['U'][i]
+                    u[np.isnan(u)] = 0.
+                if 'V' in var_bc:
+                    v = +var_bc['V'][i]
+                    v[np.isnan(v)] = 0.
 
             # Fill bc dictionnary
             self.bc['U'][t] = u
@@ -4327,13 +4160,19 @@ class Model_qgsw(M):
 
         if self.nl > 1:
             # Read per-layer state and convert to SW convention (1, nl, nx, ny)
-            u = jnp.expand_dims(State.var['u_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
-            v = jnp.expand_dims(State.var['v_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
-            h = jnp.expand_dims(State.var['h_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
+            u_layers = np.nan_to_num(np.asarray(State.var['u_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            v_layers = np.nan_to_num(np.asarray(State.var['v_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            h_layers = np.nan_to_num(np.asarray(State.var['h_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            u = jnp.expand_dims(u_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
+            v = jnp.expand_dims(v_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
+            h = jnp.expand_dims(h_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
         else:
-            h = jnp.expand_dims(jnp.asarray(State.var[self.name_var['SSH']], dtype=self.dtype).T, axis=(0,1))
-            u = jnp.expand_dims(jnp.asarray(State.var[self.name_var['U']], dtype=self.dtype).T, axis=(0,1))
-            v = jnp.expand_dims(jnp.asarray(State.var[self.name_var['V']], dtype=self.dtype).T, axis=(0,1))
+            h0 = self._finite_model_array(State, self.name_var['SSH'])
+            u0 = self._finite_model_array(State, self.name_var['U'])
+            v0 = self._finite_model_array(State, self.name_var['V'])
+            h = jnp.expand_dims(jnp.asarray(h0, dtype=self.dtype).T, axis=(0,1))
+            u = jnp.expand_dims(jnp.asarray(u0, dtype=self.dtype).T, axis=(0,1))
+            v = jnp.expand_dims(jnp.asarray(v0, dtype=self.dtype).T, axis=(0,1))
         
         # Get parameters (2D forcing from Basis)
         Fu = State.params[self.name_var['U']]
@@ -4365,7 +4204,7 @@ class Model_qgsw(M):
         # Tracer setup
         if self.advect_tracer:
             c = jnp.stack(
-                [jnp.asarray(State.var[self.name_var[n]], dtype=self.dtype)
+                [jnp.asarray(self._finite_model_array(State, self.name_var[n], fill_land='nearest'), dtype=self.dtype)
                  for n in self.tracer_names], axis=0)  # (n_trac, ny, nx)
             Fc = jnp.stack(
                 [jnp.asarray(State.params[self.name_var[n]], dtype=self.dtype)
@@ -4416,24 +4255,32 @@ class Model_qgsw(M):
             for i, name in enumerate(self.tracer_names):
                 State.setvar(c[i], name_var=self.name_var[name])
 
+        self._set_land_nan(State)
+
     def step_tgl(self,dState,State,nstep=1,t=0):
 
         if self.nl > 1:
             # Per-layer perturbation
-            du = jnp.expand_dims(dState.var['u_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
-            dv = jnp.expand_dims(dState.var['v_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
-            dh = jnp.expand_dims(dState.var['h_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
+            du_layers = np.nan_to_num(np.asarray(dState.var['u_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            dv_layers = np.nan_to_num(np.asarray(dState.var['v_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            dh_layers = np.nan_to_num(np.asarray(dState.var['h_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            du = jnp.expand_dims(du_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
+            dv = jnp.expand_dims(dv_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
+            dh = jnp.expand_dims(dh_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
             # Per-layer forward trajectory
-            u = jnp.expand_dims(State.var['u_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
-            v = jnp.expand_dims(State.var['v_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
-            h = jnp.expand_dims(State.var['h_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
+            u_layers = np.nan_to_num(np.asarray(State.var['u_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            v_layers = np.nan_to_num(np.asarray(State.var['v_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            h_layers = np.nan_to_num(np.asarray(State.var['h_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            u = jnp.expand_dims(u_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
+            v = jnp.expand_dims(v_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
+            h = jnp.expand_dims(h_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
         else:
-            dh = dState.getvar(name_var=self.name_var['SSH'])
-            du = dState.getvar(name_var=self.name_var['U'])
-            dv = dState.getvar(name_var=self.name_var['V'])
-            h = State.getvar(name_var=self.name_var['SSH'])
-            u = State.getvar(name_var=self.name_var['U'])
-            v = State.getvar(name_var=self.name_var['V'])
+            dh = self._finite_model_array(dState, self.name_var['SSH'])
+            du = self._finite_model_array(dState, self.name_var['U'])
+            dv = self._finite_model_array(dState, self.name_var['V'])
+            h = self._finite_model_array(State, self.name_var['SSH'])
+            u = self._finite_model_array(State, self.name_var['U'])
+            v = self._finite_model_array(State, self.name_var['V'])
             du = jnp.expand_dims(du.astype(self.dtype).T, axis=(0,1))
             dv = jnp.expand_dims(dv.astype(self.dtype).T, axis=(0,1))
             dh = jnp.expand_dims(dh.astype(self.dtype).T, axis=(0,1))
@@ -4479,13 +4326,13 @@ class Model_qgsw(M):
         # Tracer setup
         if self.advect_tracer:
             c = jnp.stack(
-                [jnp.asarray(State.getvar(self.name_var[n]), dtype=self.dtype)
+                [jnp.asarray(self._finite_model_array(State, self.name_var[n], fill_land='nearest'), dtype=self.dtype)
                  for n in self.tracer_names], axis=0)
             Fc = jnp.stack(
                 [jnp.asarray(State.params[self.name_var[n]], dtype=self.dtype)
                  for n in self.tracer_names], axis=0)
             dc = jnp.stack(
-                [jnp.asarray(dState.getvar(self.name_var[n]), dtype=self.dtype)
+                [jnp.asarray(self._finite_model_array(dState, self.name_var[n]), dtype=self.dtype)
                  for n in self.tracer_names], axis=0)
             dFc = jnp.stack(
                 [jnp.asarray(dState.params[self.name_var[n]], dtype=self.dtype)
@@ -4561,16 +4408,22 @@ class Model_qgsw(M):
         if self.nl > 1:
             # --- Combine surface adjoint (from obs) with per-layer adjoint ---
             # Adjoint of ssh = h_layers.sum(axis=0): broadcast ad_ssh to all layers
-            adh_surface = jnp.asarray(adState.getvar(name_var=self.name_var['SSH']), dtype=self.dtype)
-            adu_surface = jnp.asarray(adState.getvar(name_var=self.name_var['U']),   dtype=self.dtype)
-            adv_surface = jnp.asarray(adState.getvar(name_var=self.name_var['V']),   dtype=self.dtype)
+            adh_surface = jnp.asarray(self._finite_model_array(adState, self.name_var['SSH']), dtype=self.dtype)
+            adu_surface = jnp.asarray(self._finite_model_array(adState, self.name_var['U']),   dtype=self.dtype)
+            adv_surface = jnp.asarray(self._finite_model_array(adState, self.name_var['V']),   dtype=self.dtype)
 
-            adh_layers = jnp.asarray(adState.var.get('h_layers',
-                            jnp.zeros((self.nl, self.ny, self.nx), dtype=self.dtype)), dtype=self.dtype)
-            adu_layers = jnp.asarray(adState.var.get('u_layers',
-                            jnp.zeros((self.nl, self.ny, self.nx+1), dtype=self.dtype)), dtype=self.dtype)
-            adv_layers = jnp.asarray(adState.var.get('v_layers',
-                            jnp.zeros((self.nl, self.ny+1, self.nx), dtype=self.dtype)), dtype=self.dtype)
+            adh_layers = jnp.asarray(np.nan_to_num(
+                            np.asarray(adState.var.get('h_layers',
+                            jnp.zeros((self.nl, self.ny, self.nx), dtype=self.dtype)), dtype=float),
+                            nan=0.0, posinf=0.0, neginf=0.0), dtype=self.dtype)
+            adu_layers = jnp.asarray(np.nan_to_num(
+                            np.asarray(adState.var.get('u_layers',
+                            jnp.zeros((self.nl, self.ny, self.nx+1), dtype=self.dtype)), dtype=float),
+                            nan=0.0, posinf=0.0, neginf=0.0), dtype=self.dtype)
+            adv_layers = jnp.asarray(np.nan_to_num(
+                            np.asarray(adState.var.get('v_layers',
+                            jnp.zeros((self.nl, self.ny+1, self.nx), dtype=self.dtype)), dtype=float),
+                            nan=0.0, posinf=0.0, neginf=0.0), dtype=self.dtype)
 
             # Adjoint of sum: each layer receives the surface SSH adjoint
             adh_layers = adh_layers + adh_surface[None, :, :]
@@ -4584,16 +4437,19 @@ class Model_qgsw(M):
             adh = jnp.expand_dims(adh_layers.transpose(0, 2, 1), axis=0)
 
             # Forward trajectory from State (per-layer)
-            u = jnp.expand_dims(State.var['u_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
-            v = jnp.expand_dims(State.var['v_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
-            h = jnp.expand_dims(State.var['h_layers'].astype(self.dtype).transpose(0, 2, 1), axis=0)
+            u_layers = np.nan_to_num(np.asarray(State.var['u_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            v_layers = np.nan_to_num(np.asarray(State.var['v_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            h_layers = np.nan_to_num(np.asarray(State.var['h_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            u = jnp.expand_dims(u_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
+            v = jnp.expand_dims(v_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
+            h = jnp.expand_dims(h_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
         else:
-            adh = jnp.expand_dims(jnp.asarray(adState.var[self.name_var['SSH']], dtype=self.dtype).T, axis=(0,1))
-            adu = jnp.expand_dims(jnp.asarray(adState.var[self.name_var['U']], dtype=self.dtype).T, axis=(0,1))
-            adv = jnp.expand_dims(jnp.asarray(adState.var[self.name_var['V']], dtype=self.dtype).T, axis=(0,1))
-            h = jnp.expand_dims(jnp.asarray(State.var[self.name_var['SSH']], dtype=self.dtype).T, axis=(0,1))
-            u = jnp.expand_dims(jnp.asarray(State.var[self.name_var['U']], dtype=self.dtype).T, axis=(0,1))
-            v = jnp.expand_dims(jnp.asarray(State.var[self.name_var['V']], dtype=self.dtype).T, axis=(0,1))
+            adh = jnp.expand_dims(jnp.asarray(self._finite_model_array(adState, self.name_var['SSH']), dtype=self.dtype).T, axis=(0,1))
+            adu = jnp.expand_dims(jnp.asarray(self._finite_model_array(adState, self.name_var['U']), dtype=self.dtype).T, axis=(0,1))
+            adv = jnp.expand_dims(jnp.asarray(self._finite_model_array(adState, self.name_var['V']), dtype=self.dtype).T, axis=(0,1))
+            h = jnp.expand_dims(jnp.asarray(self._finite_model_array(State, self.name_var['SSH']), dtype=self.dtype).T, axis=(0,1))
+            u = jnp.expand_dims(jnp.asarray(self._finite_model_array(State, self.name_var['U']), dtype=self.dtype).T, axis=(0,1))
+            v = jnp.expand_dims(jnp.asarray(self._finite_model_array(State, self.name_var['V']), dtype=self.dtype).T, axis=(0,1))
 
         # Get parameters (2D forcing)
         Fu = State.params[self.name_var['U']]
@@ -4644,13 +4500,13 @@ class Model_qgsw(M):
         # Tracer setup
         if self.advect_tracer:
             c = jnp.stack(
-                [jnp.asarray(State.var[self.name_var[n]], dtype=self.dtype)
+                [jnp.asarray(self._finite_model_array(State, self.name_var[n], fill_land='nearest'), dtype=self.dtype)
                  for n in self.tracer_names], axis=0)
             Fc = jnp.stack(
                 [jnp.asarray(State.params[self.name_var[n]], dtype=self.dtype)
                  for n in self.tracer_names], axis=0)
             adc = jnp.stack(
-                [jnp.asarray(adState.var[self.name_var[n]], dtype=self.dtype)
+                [jnp.asarray(self._finite_model_array(adState, self.name_var[n]), dtype=self.dtype)
                  for n in self.tracer_names], axis=0)
             adFc = jnp.stack(
                 [jnp.asarray(adState.params[self.name_var[n]], dtype=self.dtype)
@@ -4941,7 +4797,92 @@ class Model_qgsw(M):
               f'<Mdx,y>/<dx,M*y> = {ratio}')
         
 
+
 class Model_bmit(M):
+
+    def _load_component_bc_fields(self, component_config, config, State):
+        bc_sources = []
+        if getattr(component_config, 'bc_file', None) is not None:
+            bc_sources.append(type('BC_Config', (), {
+                'file': component_config.bc_file,
+                'name_lon': getattr(component_config, 'bc_name_lon', 'lon'),
+                'name_lat': getattr(component_config, 'bc_name_lat', 'lat'),
+                'name_time': getattr(component_config, 'bc_name_time', None),
+                'name_var': getattr(component_config, 'bc_name_var', {}),
+                'c_grid': getattr(component_config, 'bc_c_grid', False),
+                '_config': config,
+            })())
+        if getattr(component_config, 'bc_files', None) is not None:
+            for name, bc_src in component_config.bc_files.items():
+                if isinstance(bc_src, str):
+                    bc_src = {'file': bc_src}
+                name_var = bc_src.get('name_var', name)
+                if isinstance(name_var, str):
+                    name_var = {name: name_var}
+                bc_sources.append(type('BC_Config', (), {
+                    'file': bc_src.get('file'),
+                    'name_lon': bc_src.get('name_lon', getattr(component_config, 'bc_name_lon', 'lon')),
+                    'name_lat': bc_src.get('name_lat', getattr(component_config, 'bc_name_lat', 'lat')),
+                    'name_time': bc_src.get('name_time', getattr(component_config, 'bc_name_time', None)),
+                    'name_var': name_var,
+                    'c_grid': bc_src.get('c_grid', getattr(component_config, 'bc_c_grid', False)),
+                    '_config': config,
+                })())
+
+        bc_fields = []
+        for bc_config in bc_sources:
+            try:
+                bc_fields.append(_BcFields(bc_config, State))
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Failed to load BM boundary conditions from {bc_config.file}: {e}")
+        if len(bc_fields) == 1:
+            return bc_fields[0]
+        if len(bc_fields) > 1:
+            return _MultiBcFields(bc_fields)
+        return None
+
+    def _read_component_c(self, component_config, State, title='Rossby phase velocity'):
+        if getattr(component_config, 'filec_aux', None) is not None and os.path.exists(component_config.filec_aux):
+
+            ds = xr.open_dataset(component_config.filec_aux)
+            name_lon = component_config.name_var_c['lon']
+            lon = ds[name_lon]
+            if np.sign(lon.data.min()) == -1 and State.lon_unit == '0_360':
+                ds = ds.assign_coords({name_lon: ((name_lon, lon.data % 360))})
+                ds = ds.sortby(name_lon)
+            elif np.sign(lon.data.min()) >= 0 and State.lon_unit == '-180_180':
+                ds = ds.assign_coords({name_lon: ((name_lon, (lon.data + 180) % 360 - 180))})
+                ds = ds.sortby(name_lon)
+
+            c = grid.interp2d(ds, component_config.name_var_c, State.lon, State.lat)
+
+            c_masked = np.ma.masked_invalid(c)
+            c_filled = c_masked.filled(np.nan)
+            from scipy import interpolate
+            x = np.arange(self.nx)
+            y = np.arange(self.ny)
+            xx, yy = np.meshgrid(x, y)
+            points = np.array([xx[~c_masked.mask], yy[~c_masked.mask]]).T
+            values = c_filled[~c_masked.mask]
+            c = interpolate.griddata(points, values, (xx, yy), method='nearest')
+
+            if getattr(component_config, 'cmin', None) is not None:
+                c[c < component_config.cmin] = component_config.cmin
+
+            if getattr(component_config, 'cmax', None) is not None:
+                c[c > component_config.cmax] = component_config.cmax
+
+            if self.config.EXP.flag_plot > 0:
+                plt.figure()
+                plt.pcolormesh(c)
+                plt.colorbar()
+                plt.title(title)
+                plt.show()
+
+            return c
+
+        return getattr(component_config, 'c0', 2.7) * np.ones((State.ny, State.nx))
 
     def __init__(self,config,State):
 
@@ -4950,27 +4891,84 @@ class Model_bmit(M):
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
         self.config = config
+        self.name_var = config.MOD.name_var
+        self.bm_config = Config(config.MOD.bm_model)
+        self.it_config = Config(config.MOD.it_model)
+        self.bm_config.dtmodel = self.dt
+        self.it_config.dtmodel = self.dt
+        self._bc_fields = None
+        if self.bm_config.super == 'MOD_QGSW':
+            self.bm_config.name_var = {
+                'U': self.name_var['U_BM'],
+                'V': self.name_var['V_BM'],
+                'SSH': self.name_var['SSH_BM'],
+            }
+            self.bm_config.name_init_var = {
+                'U': self.name_var['U_BM'],
+                'V': self.name_var['V_BM'],
+                'SSH': self.name_var['SSH_BM'],
+            }
+        elif self.bm_config.super == 'MOD_QG1L':
+            self.bm_config.name_var = {'SSH': self.name_var['SSH_BM']}
+            self.bm_config.name_init_var = {'SSH': self.name_var['SSH_BM']}
+        self.it_config.name_var = {
+            'U': self.name_var['U_IT'],
+            'V': self.name_var['V_IT'],
+            'SSH': self.name_var['SSH_IT'],
+        }
+        self.it_config.name_params = getattr(self.it_config, 'name_params', ['He_mean', 'hbc'])
+        self.bm_height_for_He = getattr(config.MOD, 'bm_height_for_He', 'anomaly')
+        if self.bm_height_for_He not in ('anomaly', 'full'):
+            raise ValueError("MOD_BMIT.bm_height_for_He must be 'anomaly' or 'full'.")
+        self.mask_sponge_bc = getattr(config.MOD, 'mask_sponge_bc', True)
+        self.bm_config.mask_sponge_bc = self.mask_sponge_bc
 
-        # BM model specific libraries
-        if config.MOD.dir_model is None:
-            dir_model = os.path.realpath(
-                os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                             '..','models','model_qg1l'))
-        else:
-            dir_model = config.MOD.dir_model  
-        qgm = SourceFileLoader("qgm",f'{dir_model}/jqgm.py').load_module() 
-        model_bm = qgm.Qgm
+        # Feed the existing IT setup code from the selected IT component block.
+        # These are internal aliases only; the public MOD_BMIT surface remains
+        # componentized through bm_model and it_model.
+        for key in [
+                'filec_aux', 'name_var_c', 'c0', 'cmin', 'cmax', 'file_H_aux',
+                'name_var_H', 'H', 'Ntheta', 'w_waves', 'g',
+                'periodic_x', 'periodic_y', 'flag_bc_sponge', 'dist_sponge_bc',
+                'sponge_coef', 'use_sponge_on_coast', 'tangential_sponge_factor',
+                'bc_it_method', 'bc_it_corner_weight_power']:
+            config.MOD[key] = getattr(self.it_config, key)
+        config.MOD.mask_sponge_bc = self.mask_sponge_bc
+        config.MOD.name_params_it = getattr(self.it_config, 'name_params', [])
+        config.MOD.time_scheme_it = getattr(self.it_config, 'time_scheme', 'rk4')
 
-        # IT model specific libraries
-        if config.MOD.dir_model is None:
+        if self.bm_config.super == 'MOD_QG1L':
+            self._bc_fields = self._load_component_bc_fields(self.bm_config, config, State)
+
+        # BM aliases used by the legacy QG1L BM path. QGSW owns its own setup.
+        config.MOD.path_mdt = getattr(self.bm_config, 'path_mdt', None)
+        config.MOD.name_var_mdt = getattr(self.bm_config, 'name_var_mdt', None)
+        config.MOD.time_scheme_bm = getattr(self.bm_config, 'time_scheme', 'Euler')
+        config.MOD.Kdiffus = getattr(self.bm_config, 'Kdiffus', 0)
+
+        self.bm_kind = self.bm_config.super
+        model_bm = None
+        if self.bm_kind == 'MOD_QG1L':
+            if getattr(self.bm_config, 'dir_model', None) is None:
+                dir_model = os.path.realpath(
+                    os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                 '..','models','model_qg1l'))
+            else:
+                dir_model = self.bm_config.dir_model
+            qgm = SourceFileLoader("qgm_bmit", f'{dir_model}/jqgm.py').load_module()
+            model_bm = qgm.Qgm
+        elif self.bm_kind != 'MOD_QGSW':
+            raise ValueError(f"Unsupported MOD_BMIT bm_model.super={self.bm_kind!r}")
+
+        if self.it_config.super != 'MOD_CSW1L':
+            raise ValueError(f"Unsupported MOD_BMIT it_model.super={self.it_config.super!r}")
+        if getattr(self.it_config, 'dir_model', None) is None:
             dir_model = os.path.realpath(
                 os.path.join(os.path.dirname(os.path.realpath(__file__)),
                              '..','models','model_sw1l'))
         else:
-            dir_model = config.MOD.dir_model
-        
-        swm = SourceFileLoader("swm", 
-                                dir_model + "/jswm.py").load_module()
+            dir_model = self.it_config.dir_model
+        swm = SourceFileLoader("swm_bmit", dir_model + "/jswm.py").load_module()
         model_it = swm.CSWm
 
         # grid
@@ -5074,6 +5072,10 @@ class Model_bmit(M):
 
         # Equivalent depth
         self.Heb = self.c**2 / self.g
+        self.c_bm = self.c
+        if self.bm_kind == 'MOD_QG1L':
+            self.c_bm = self._read_component_c(
+                self.bm_config, State, title='BM Rossby phase velocity')
 
         # Open Bathymetry if provided
         if config.MOD.file_H_aux is not None and os.path.exists(config.MOD.file_H_aux):
@@ -5142,14 +5144,11 @@ class Model_bmit(M):
         else:
             self.bc_theta = np.array([0])
         
-        # Open Boundary condition kind
-        self.bc_kind = config.MOD.bc_kind
-
         # External boundary conditions
         self.bc = {}
         for _name_var_mod in self.name_var:
             self.bc[_name_var_mod] = {}
-        self.init_from_bc = config.MOD.init_from_bc
+        self.init_from_bc_bm = getattr(self.bm_config, 'init_from_bc', False)
         
         # Tide frequencies
         self.omegas = np.asarray(config.MOD.w_waves)
@@ -5211,7 +5210,7 @@ class Model_bmit(M):
         # BM Model Parameters (Flux)
         State.params[self.name_var['SSH_BM']] = np.zeros((State.ny,State.nx))
 
-        # IT Model Parameters (OBC, He and alpha coefficient)
+        # IT Model Parameters (sponge, He and alpha coefficient)
         self.name_params_it = config.MOD.name_params_it
         if 'He_mean' in self.name_params_it:
             State.params['He_mean'] = np.zeros((self.ny, self.nx))
@@ -5242,23 +5241,21 @@ class Model_bmit(M):
 
         # ---- Background IT params (from a previous experiment) ----
         # If a netcdf file is provided via `config.MOD.path_background_params`,
-        # load `He_mean`, `alpha_He`, `alpha_Uu`, `alpha_Up` background fields.
-        # State.params then represent ANOMALIES around these prescribed values:
-        #     He_mean_total   = State.params['He_mean']  + self.He_mean_bg
-        #     alpha_He_total  = State.params['alpha_He'] + self.alpha_He_bg
-        #     alpha_Uu_total  = State.params['alpha_Uu'] + self.alpha_Uu_bg
-        #     alpha_Up_total  = State.params['alpha_Up'] + self.alpha_Up_bg
-        # Backgrounds default to zero => default behaviour is unchanged.
-        # The combination is applied inside `_compute_He_from_bm` and
-        # `_compute_advective_terms_from_bm`, so the auto-derived TLM/ADJ
-        # treat the backgrounds as constants (no extra term).
+        # load `He_mean` anomaly background and physical alpha references.
+        # Alpha controls are dimensionless logit increments:
+        #     alpha_total = sigmoid(logit(alpha_ref) + alpha_control)
+        # with neutral alpha_ref=0.5 by default. The dynamics below still uses
+        # the centered coefficient alpha_total - 0.5, preserving the former
+        # zero-control neutral behaviour while bounding physical alpha in (0, 1).
         self.He_mean_bg  = jnp.zeros((self.ny, self.nx))
-        self.alpha_He_bg = jnp.zeros((self.ny, self.nx))
-        self.alpha_Uu_bg = jnp.zeros((self.ny, self.nx))
-        self.alpha_Up_bg = jnp.zeros((self.ny, self.nx))
+        self.alpha_eps = float(getattr(config.MOD, 'alpha_eps', 1e-6))
+        self.alpha_background_physical = getattr(config.MOD, 'alpha_background_physical', None)
+        self.alpha_He_ref = 0.5 * jnp.ones((self.ny, self.nx))
+        self.alpha_Uu_ref = 0.5 * jnp.ones((self.ny, self.nx))
+        self.alpha_Up_ref = 0.5 * jnp.ones((self.ny, self.nx))
         # Python-bool flags so JIT branches can use them as static.
-        self.has_alpha_Uu_bg = False
-        self.has_alpha_Up_bg = False
+        self.has_alpha_Uu_ref = False
+        self.has_alpha_Up_ref = False
 
         path_bg = getattr(config.MOD, 'path_background_params', None)
         if path_bg is not None and os.path.exists(path_bg):
@@ -5276,7 +5273,7 @@ class Model_bmit(M):
                     ds_bg = ds_bg.assign_coords({name_lon: ((name_lon, (lon_arr.data + 180) % 360 - 180))})
                     ds_bg = ds_bg.sortby(name_lon)
 
-            def _read_bg(key, default_name):
+            def _read_bg(key, default_name, fill_value=0.):
                 vname = name_var_bg.get(key, default_name)
                 if vname not in ds_bg.variables:
                     return None
@@ -5285,36 +5282,58 @@ class Model_bmit(M):
                     {'lon': name_lon, 'lat': name_lat, key: vname},
                     State.lon, State.lat)
                 arr = np.asarray(arr, dtype=float)
-                arr[np.isnan(arr)] = 0.
+                arr[np.isnan(arr)] = fill_value
                 return jnp.asarray(arr)
 
+            def _read_alpha_ref(key, default_name):
+                vname = name_var_bg.get(key, default_name)
+                if vname not in ds_bg.variables:
+                    return None
+                is_physical = self.alpha_background_physical
+                if is_physical is None:
+                    is_physical = (
+                        f'{vname}_control' in ds_bg.variables
+                        or f'{key}_control' in ds_bg.variables
+                    )
+                arr = _read_bg(key, default_name, fill_value=0.5 if is_physical else 0.)
+                arr_np = np.asarray(arr, dtype=float)
+                if not is_physical:
+                    arr_np = arr_np + 0.5
+                if np.nanmin(arr_np) < 0. or np.nanmax(arr_np) > 1.:
+                    kind = 'physical alpha' if is_physical else 'legacy centered alpha anomaly'
+                    raise ValueError(
+                        f'Background {key} interpreted as {kind} gives physical range '
+                        f'[{np.nanmin(arr_np)}, {np.nanmax(arr_np)}], outside [0, 1].'
+                    )
+                return jnp.asarray(np.clip(arr_np, self.alpha_eps, 1. - self.alpha_eps))
+
             He_mean_bg  = _read_bg('He_mean',  'He_mean')
-            alpha_He_bg = _read_bg('alpha_He', 'alpha_He')
-            alpha_Uu_bg = _read_bg('alpha_Uu', 'alpha_Uu')
-            alpha_Up_bg = _read_bg('alpha_Up', 'alpha_Up')
+            alpha_He_ref = _read_alpha_ref('alpha_He', 'alpha_He')
+            alpha_Uu_ref = _read_alpha_ref('alpha_Uu', 'alpha_Uu')
+            alpha_Up_ref = _read_alpha_ref('alpha_Up', 'alpha_Up')
 
             if He_mean_bg  is not None: self.He_mean_bg  = He_mean_bg
-            if alpha_He_bg is not None: self.alpha_He_bg = alpha_He_bg
-            if alpha_Uu_bg is not None: self.alpha_Uu_bg = alpha_Uu_bg
-            if alpha_Up_bg is not None: self.alpha_Up_bg = alpha_Up_bg
+            if alpha_He_ref is not None: self.alpha_He_ref = alpha_He_ref
+            if alpha_Uu_ref is not None: self.alpha_Uu_ref = alpha_Uu_ref
+            if alpha_Up_ref is not None: self.alpha_Up_ref = alpha_Up_ref
 
-            self.has_alpha_Uu_bg = bool(np.any(np.asarray(self.alpha_Uu_bg) != 0))
-            self.has_alpha_Up_bg = bool(np.any(np.asarray(self.alpha_Up_bg) != 0))
+            self.has_alpha_Uu_ref = bool(np.any(np.abs(np.asarray(self.alpha_Uu_ref) - 0.5) > 1e-12))
+            self.has_alpha_Up_ref = bool(np.any(np.abs(np.asarray(self.alpha_Up_ref) - 0.5) > 1e-12))
 
             ds_bg.close()
             print('[Model_bmit] background IT params loaded from', path_bg,
-                  '- State.params now represent anomalies around these values.')
+                  '- alpha params are now dimensionless logit controls around physical references.')
 
             if config.EXP.flag_plot > 0:
                 _, axes = plt.subplots(1, 4, figsize=(22, 4))
                 for ax, fld, ttl in zip(
                         axes,
-                        [self.He_mean_bg, self.alpha_He_bg, self.alpha_Uu_bg, self.alpha_Up_bg],
-                        ['He_mean_bg', 'alpha_He_bg', 'alpha_Uu_bg', 'alpha_Up_bg']):
+                        [self.He_mean_bg, self.alpha_He_ref, self.alpha_Uu_ref, self.alpha_Up_ref],
+                        ['He_mean_bg', 'alpha_He_ref', 'alpha_Uu_ref', 'alpha_Up_ref']):
                     im = ax.pcolormesh(np.asarray(fld))
                     plt.colorbar(im, ax=ax)
                     ax.set_title(ttl)
-                plt.suptitle('Background IT params (from previous experiment)')
+                plt.suptitle('Background IT params / alpha references')
                 plt.show()
 
         # Sponge layer
@@ -5421,12 +5440,15 @@ class Model_bmit(M):
             self.weight_sponge_v[self.weight_sponge_v==0] = 1
             self.weight_sponge_h[self.weight_sponge_h==0] = 1
 
-            # Update mask (for avoiding assimilation in sponge regions)
+            # Keep sponge exclusion separate from State.mask so model and basis
+            # still include sponge cells.
             if config.MOD.mask_sponge_bc:
-                State.mask[self.sponge_on_h_S] = True
-                State.mask[self.sponge_on_h_N] = True
-                State.mask[self.sponge_on_h_W] = True
-                State.mask[self.sponge_on_h_E] = True
+                sponge_mask = (self.sponge_on_h_S | self.sponge_on_h_N |
+                               self.sponge_on_h_W | self.sponge_on_h_E)
+                if getattr(State, 'sponge_mask', None) is None:
+                    State.sponge_mask = sponge_mask.copy()
+                else:
+                    State.sponge_mask = np.asarray(State.sponge_mask, dtype=bool) | sponge_mask
         
         # Coupling terms from vertical modes
         self.flag_coupling_from_bm = config.MOD.flag_coupling_from_bm
@@ -5437,32 +5459,49 @@ class Model_bmit(M):
                 self._compute_coupling_coefficients(config.MOD.path_vertical_modes)
 
         # Model initialization
-        self.model_bm = model_bm(
-            dx=State.DX,
-            dy=State.DY,
-            dt=self.dt,
-            SSH=State.getvar(name_var=self.name_var['SSH_BM']),
-            c=self.c,
-            time_scheme=config.MOD.time_scheme_bm,
-            g=config.MOD.g,
-            f=self.f,
-            Kdiffus=config.MOD.Kdiffus,
-            mdt=self.mdt
-            )
+        if self.bm_kind == 'MOD_QGSW':
+            config_bm = Config({
+                'EXP': config.EXP,
+                'GRID': config.GRID,
+                'MOD': self.bm_config,
+                'INV': config.INV,
+            })
+            self.model_bm = Model_qgsw(config_bm, State)
+            if getattr(self.model_bm, 'nl', 1) != 1:
+                raise NotImplementedError(
+                    'MOD_BMIT with a QGSW Balanced Motion component currently '
+                    'supports nl=1 only; multi-layer BM needs per-layer BM '
+                    'state variables in the coupled model.')
+        else:
+            self.model_bm = model_bm(
+                dx=State.DX,
+                dy=State.DY,
+                dt=self.dt,
+                SSH=State.getvar(name_var=self.name_var['SSH_BM']),
+                c=self.c_bm,
+                time_scheme=config.MOD.time_scheme_bm,
+                g=config.MOD.g,
+                f=self.f,
+                Kdiffus=config.MOD.Kdiffus,
+                mdt=self.mdt
+                )
+            # QG1L BM exposes diagnosed velocity fields on the h-grid.
+            ssh_bm = State.getvar(name_var=self.name_var['SSH_BM'])
+            ssh_full = ssh_bm + self.mdt if self.mdt is not None else ssh_bm
+            u_bm, v_bm = self.model_bm.h2uv(ssh_full)
+            State.setvar([u_bm, v_bm], [self.name_var['U_BM'], self.name_var['V_BM']])
+            State.params[self.name_var['SSH_BM']] = np.zeros((State.ny, State.nx))
+            State.params[self.name_var['U_BM']] = np.zeros_like(State.var[self.name_var['U_BM']])
+            State.params[self.name_var['V_BM']] = np.zeros_like(State.var[self.name_var['V_BM']])
         
         self.model_it = model_it(
             X=State.X,
             Y=State.Y,
             dt=self.dt,
-            bc=self.bc_kind,
             omegas=self.omegas,
             bc_theta=self.bc_theta,
             f=self.f,
             Heb=self.Heb,
-            obc_north=config.MOD.obc_north,
-            obc_west=config.MOD.obc_west,
-            obc_south=config.MOD.obc_south,
-            obc_east=config.MOD.obc_east,
             periodic_x=config.MOD.periodic_x,
             periodic_y=config.MOD.periodic_y,
             )
@@ -5491,14 +5530,14 @@ class Model_bmit(M):
             self.model_it.weight_sponge_h = self.weight_sponge_h
 
         # IT wave-phase method for sponge BC
-        self.model_it.bc_it_method = getattr(config.MOD, 'bc_it_method', 'plane_wave')
+        self.model_it.bc_it_method = getattr(config.MOD, 'bc_it_method', 'plane_wave_bdy')
+        self.model_it.bc_it_corner_weight_power = getattr(config.MOD, 'bc_it_corner_weight_power', self.model_it.bc_it_corner_weight_power)
+        self.max_nstep = getattr(config.MOD, 'max_nstep', 240)
 
         # Compile jax-related functions
         self._jstep_jit = jit(self._jstep, static_argnames=['nstep'])
         self._jstep_tgl_jit = jit(self._jstep_tgl, static_argnames=['nstep'])
         self._jstep_adj_jit = jit(self._jstep_adj, static_argnames=['nstep'])
-        self._compute_w1_IT_jit = jit(self._compute_w1_IT)
-        self._compute_IT_2D_jit = jit(self._compute_IT_2D)
 
         # Functions related to IT time_scheme
         self.time_scheme_it = config.MOD.time_scheme_it
@@ -5515,36 +5554,71 @@ class Model_bmit(M):
     
     def init(self, State, t0=0):
 
-        if type(self.init_from_bc)==dict:
-            for name in self.init_from_bc:
-                if self.init_from_bc[name] and t0 in self.bc[name]:
-                    State.setvar(self.bc[name][t0], self.name_var[name])
-        elif self.init_from_bc:
-            for name in self.name_var: 
-                if t0 in self.bc[name]:
-                     State.setvar(self.bc[name][t0], self.name_var[name])
-        
+        if self.bm_kind == 'MOD_QGSW':
+            self.model_bm.init(State, t0=t0)
+            has_u_bc = hasattr(self.model_bm, 'bc') and t0 in self.model_bm.bc.get('U', {})
+            has_v_bc = hasattr(self.model_bm, 'bc') and t0 in self.model_bm.bc.get('V', {})
+            if (not getattr(self.model_bm, '_is_qg_class', False)) and (not has_u_bc or not has_v_bc):
+                h_bm = State.getvar(name_var=self.name_var['SSH_BM'])
+                u_bm, v_bm = self.model_bm.ssh2uv(h_bm)
+                values = []
+                names = []
+                if not has_u_bc:
+                    values.append(u_bm)
+                    names.append(self.name_var['U_BM'])
+                if not has_v_bc:
+                    values.append(v_bm)
+                    names.append(self.name_var['V_BM'])
+                State.setvar(values, names)
+
+        if self.bm_kind == 'MOD_QG1L':
+            if type(self.init_from_bc_bm)==dict:
+                for name in self.init_from_bc_bm:
+                    bmit_name = {'U': 'U_BM', 'V': 'V_BM', 'SSH': 'SSH_BM'}.get(name, name)
+                    if self.init_from_bc_bm[name] and t0 in self.bc[bmit_name]:
+                        State.setvar(self.bc[bmit_name][t0], self.name_var[bmit_name])
+            elif self.init_from_bc_bm:
+                for name in ('U_BM', 'V_BM', 'SSH_BM'):
+                    if t0 in self.bc[name]:
+                         State.setvar(self.bc[name][t0], self.name_var[name])
+
+        if self.bm_kind == 'MOD_QG1L':
+            h_bm = State.getvar(name_var=self.name_var['SSH_BM'])
+            u_bm, v_bm = self._bm_velocity_on_h(
+                State.getvar(name_var=self.name_var['U_BM']),
+                State.getvar(name_var=self.name_var['V_BM']),
+                h_bm)
+            State.setvar([u_bm, v_bm], [self.name_var['U_BM'], self.name_var['V_BM']])
+
         State.var[self.name_var['SSH']] = State.var[self.name_var['SSH_BM']] + State.var[self.name_var['SSH_IT']]
-    
+        self._set_land_nan(State)
+
     def save_output(self,State,present_date,name_var=None,t=None):
 
-        name_var_to_save = [self.name_var['SSH_BM'],
+        name_var_to_save = [self.name_var['U_BM'],
+                            self.name_var['V_BM'],
+                            self.name_var['SSH_BM'],
                             self.name_var['SSH_IT'],
                             self.name_var['SSH'],
                             self.name_var['U_IT']+'_interp',
                             self.name_var['V_IT']+'_interp',
+                            self.name_var['U_BM']+'_interp',
+                            self.name_var['V_BM']+'_interp',
                             'He',
-                            'He_mean',
-                            'alpha_He']
-        
-        if self.mdt is not None:
-            ssh_bm = State.getvar(name_var=self.name_var['SSH_BM']) + self.mdt
-            ssh = State.getvar(name_var=self.name_var['SSH']) + self.mdt
-            State.setvar(ssh_bm, name_var='ssh_bm')
-            State.setvar(ssh, name_var='ssh')
-            if name_var is not None:
-                name_var_to_save += ['ssh_bm','ssh']
-        
+                            'He_mean']
+        if 'alpha' in self.name_params_it:
+            name_var_to_save += ['alpha', 'alpha_control']
+        else:
+            name_var_to_save += ['alpha_He']
+            if 'alpha_He' in self.name_params_it:
+                name_var_to_save += ['alpha_He_control']
+
+        mdt = self._bm_mdt_h()
+        if mdt is not None:
+            State.var[self.name_var['SSH_BM']+'_full'] = State.getvar(name_var=self.name_var['SSH_BM']) + mdt
+            State.var[self.name_var['SSH']+'_full'] = State.getvar(name_var=self.name_var['SSH']) + mdt
+            name_var_to_save += [self.name_var['SSH_BM']+'_full', self.name_var['SSH']+'_full']
+
         u = +State.getvar(name_var=self.name_var['U_IT'])
         v = +State.getvar(name_var=self.name_var['V_IT'])
         u_to_save = np.zeros((State.ny,State.nx))
@@ -5554,56 +5628,92 @@ class Model_bmit(M):
         State.var[self.name_var['U_IT']+'_interp'] = u_to_save
         State.var[self.name_var['V_IT']+'_interp'] = v_to_save
 
+        u_bm_h, v_bm_h = self._bm_velocity_on_h(
+            State.getvar(name_var=self.name_var['U_BM']),
+            State.getvar(name_var=self.name_var['V_BM']),
+            State.getvar(name_var=self.name_var['SSH_BM']))
+        State.var[self.name_var['U_BM']+'_interp'] = np.asarray(u_bm_h)
+        State.var[self.name_var['V_BM']+'_interp'] = np.asarray(v_bm_h)
+
         if 'He_mean' in self.name_params_it:
-            He_mean = +State.params['He_mean'] 
+            He_mean = +State.params['He_mean']
         else:
             He_mean = jnp.zeros((self.ny,self.nx))
         if 'alpha_He' in self.name_params_it:
-            alpha_He = +State.params['alpha_He']
+            alpha_He_control = +State.params['alpha_He']
         elif 'alpha' in self.name_params_it:
-            alpha_He = +State.params['alpha']
+            alpha_He_control = +State.params['alpha']
         else:
-            alpha_He = jnp.zeros((self.ny,self.nx))
-        h_bm = +State.getvar(name_var=self.name_var['SSH_BM'])
-        He2d = self._compute_He_from_bm(He_mean, alpha_He, h_bm)
+            alpha_He_control = None
+        h_for_He = self._bm_height_for_He(+State.getvar(name_var=self.name_var['SSH_BM']))
+        He2d = self._compute_He_from_bm(He_mean, alpha_He_control, h_for_He)
+        alpha_He = self._alpha_control_to_physical_state(alpha_He_control, self.alpha_He_ref)
 
         State.var['He'] = He2d + self.Heb
         State.var['He_mean'] = He_mean
         State.var['alpha_He'] = alpha_He
+        if 'alpha' in self.name_params_it:
+            State.var['alpha'] = alpha_He
+            State.var['alpha_control'] = State.params['alpha']
+        elif 'alpha_He' in self.name_params_it:
+            State.var['alpha_He_control'] = State.params['alpha_He']
 
-        if 'alpha_Uu' in self.name_params_it: 
-            State.var['alpha_Uu'] = State.params['alpha_Uu']
-            name_var_to_save += ['alpha_Uu']
-        if 'alpha_Up' in self.name_params_it: 
-            State.var['alpha_Up'] = State.params['alpha_Up']
-            name_var_to_save += ['alpha_Up']
-        if 'alpha_Uz' in self.name_params_it: 
-            State.var['alpha_Uz'] = State.params['alpha_Uz']
-            name_var_to_save += ['alpha_Uz']
+        if 'alpha_Uu' in self.name_params_it:
+            State.var['alpha_Uu'] = self._alpha_control_to_physical_state(
+                State.params['alpha_Uu'], self.alpha_Uu_ref)
+            State.var['alpha_Uu_control'] = State.params['alpha_Uu']
+            name_var_to_save += ['alpha_Uu', 'alpha_Uu_control']
+        if 'alpha_Up' in self.name_params_it:
+            State.var['alpha_Up'] = self._alpha_control_to_physical_state(
+                State.params['alpha_Up'], self.alpha_Up_ref)
+            State.var['alpha_Up_control'] = State.params['alpha_Up']
+            name_var_to_save += ['alpha_Up', 'alpha_Up_control']
 
         State.save_output(present_date,
                           name_var=name_var_to_save)
-        
-    def set_bc(self,time_bc,var_bc=None,**kwargs):
 
-        # If var_bc not provided but we have loaded BC fields, interpolate them
+    def set_bc(self,time_bc,var_bc=None,t_bc=None,**kwargs):
+
+        time_keys = t_bc if t_bc is not None else time_bc
+
+        # A QGSW BM component owns its own boundary source and storage.
+        if self.bm_kind == 'MOD_QGSW' and var_bc is None:
+            self.model_bm.set_bc(time_bc, t_bc=time_keys)
+            return
+
+        # QG1L BM boundary conditions are loaded from bm_model and stored by BMIT.
         if var_bc is None and self._bc_fields is not None:
             var_bc = self._bc_fields.interp(time_bc)
         
         if var_bc is None:
             return
 
+        for bm_role, bmit_role in {'U': 'U_BM', 'V': 'V_BM', 'SSH': 'SSH_BM'}.items():
+            if bm_role in var_bc and bmit_role not in var_bc:
+                var_bc[bmit_role] = var_bc[bm_role]
+
+        if self.bm_kind == 'MOD_QGSW':
+            bm_var_bc = {}
+            if 'U_BM' in var_bc:
+                bm_var_bc['U'] = var_bc['U_BM']
+            if 'V_BM' in var_bc:
+                bm_var_bc['V'] = var_bc['V_BM']
+            if 'SSH_BM' in var_bc:
+                bm_var_bc['SSH'] = var_bc['SSH_BM']
+            if bm_var_bc:
+                self.model_bm.set_bc(time_bc, bm_var_bc, t_bc=time_keys)
+
         for _name_var_bc in var_bc:
             for _name_var_mod in self.name_var:
                 if _name_var_bc==_name_var_mod:
-                    for i,t in enumerate(time_bc):
+                    for i,t in enumerate(time_keys):
                         var_bc_t = +var_bc[_name_var_bc][i]
                         # Remove nan
                         var_bc_t[np.isnan(var_bc_t)] = 0.
                         # Fill bc dictionnary
                         self.bc[_name_var_mod][t] = var_bc_t
                 elif _name_var_bc==f'{_name_var_mod}_params':
-                    for i,t in enumerate(time_bc):
+                    for i,t in enumerate(time_keys):
                         var_bc[_name_var_bc][i][np.isnan(var_bc[_name_var_bc][i])] = 0.
         
         # For step_jax
@@ -5780,14 +5890,29 @@ class Model_bmit(M):
             plt.suptitle('Interaction terms (from file)')
             plt.show()
 
+    def _alpha_control_to_physical(self, alpha_control, alpha_ref):
+
+        alpha_ref = jnp.clip(jnp.asarray(alpha_ref), self.alpha_eps, 1. - self.alpha_eps)
+        logit_ref = jnp.log(alpha_ref) - jnp.log1p(-alpha_ref)
+        if alpha_control is None:
+            alpha_control = 0.
+        return jax.nn.sigmoid(logit_ref + jnp.asarray(alpha_control))
+
+    def _alpha_control_to_centered(self, alpha_control, alpha_ref):
+
+        return self._alpha_control_to_physical(alpha_control, alpha_ref) - 0.5
+
+    def _alpha_control_to_physical_state(self, alpha_control, alpha_ref):
+
+        return np.asarray(self._alpha_control_to_physical(alpha_control, alpha_ref))
+
     def _compute_He_from_bm(self, He, alpha_He, h_bm):
         
         """ Compute equivalent depth with coupling term.
 
-        He and alpha_He are interpreted as ANOMALIES around the prescribed
-        background fields `self.He_mean_bg` and `self.alpha_He_bg` (zero by
-        default). The forward primal uses (He + bg); the auto-derived TLM/ADJ
-        treat the backgrounds as constants (zero contribution).
+        He is interpreted as an anomaly around `self.He_mean_bg`.
+        alpha_He is a dimensionless logit-control around the physical
+        reference `self.alpha_He_ref`; the dynamics uses alpha - 0.5.
         --------------
         Inputs:
         He        : IT equivalent depth anomaly control parameters (without units)
@@ -5805,8 +5930,7 @@ class Model_bmit(M):
             He_eff = self.He_mean_bg
 
         if self.flag_coupling_from_bm and h_bm is not None:
-            # Add background to alpha_He anomaly (treat None as zero)
-            alpha_He_eff = self.alpha_He_bg if alpha_He is None else (alpha_He + self.alpha_He_bg)
+            alpha_He_eff = self._alpha_control_to_centered(alpha_He, self.alpha_He_ref)
             dHe_bm = self.dHe * h_bm
             if self.flag_bc_sponge:
                 dHe_bm = dHe_bm * (1 - self.sponge_h)
@@ -5822,10 +5946,9 @@ class Model_bmit(M):
 
         """ Compute advective terms with coupling term.
 
-        alpha_Uu and alpha_Up are interpreted as ANOMALIES around the prescribed
-        background fields `self.alpha_Uu_bg` and `self.alpha_Up_bg` (zero by
-        default). Forward primal uses (alpha + bg); auto TLM/ADJ treat bg as
-        constants.
+        alpha_Uu and alpha_Up are dimensionless logit-controls around the
+        physical references `self.alpha_Uu_ref` and `self.alpha_Up_ref`; the
+        dynamics uses alpha - 0.5.
         --------------
         Inputs:
         alpha_Uu  : IT advective anomaly control parameter for U11 (without units)
@@ -5839,9 +5962,9 @@ class Model_bmit(M):
         """
 
         if self.flag_coupling_from_bm and u_bm is not None and v_bm is not None:
-            # alpha_Uu (anomaly + background)
-            if alpha_Uu is not None or self.has_alpha_Uu_bg:
-                aUu = self.alpha_Uu_bg if alpha_Uu is None else (alpha_Uu + self.alpha_Uu_bg)
+            # alpha_Uu physical value is bounded in (0, 1); aUu is centered.
+            if alpha_Uu is not None or self.has_alpha_Uu_ref:
+                aUu = self._alpha_control_to_centered(alpha_Uu, self.alpha_Uu_ref)
                 u11 = ((.5 - aUu) + (.5 + aUu) * self.U11) * u_bm 
                 v11 = ((.5 - aUu) + (.5 + aUu) * self.U11) * v_bm 
                 if self.flag_bc_sponge:
@@ -5850,9 +5973,9 @@ class Model_bmit(M):
             else:
                 u11 = None
                 v11 = None
-            # alpha_Up (anomaly + background)
-            if alpha_Up is not None or self.has_alpha_Up_bg:
-                aUp = self.alpha_Up_bg if alpha_Up is None else (alpha_Up + self.alpha_Up_bg)
+            # alpha_Up physical value is bounded in (0, 1); aUp is centered.
+            if alpha_Up is not None or self.has_alpha_Up_ref:
+                aUp = self._alpha_control_to_centered(alpha_Up, self.alpha_Up_ref)
                 u11p = ((.5 - aUp) + (.5 + aUp) * self.U11p) * u_bm 
                 v11p = ((.5 - aUp) + (.5 + aUp) * self.U11p) * v_bm 
                 if self.flag_bc_sponge:
@@ -5869,456 +5992,155 @@ class Model_bmit(M):
         
         return u11, v11, u11p, v11p
 
-    def _compute_w1_IT(self,t,He,h_SN,h_WE):
-        """
-        Compute first characteristic variable w1 for internal tides from external 
-        data
+    def _bm_mdt_h(self):
+        if self.bm_kind == 'MOD_QGSW' and getattr(self.model_bm, 'mdt', None) is not None:
+            return self.model_bm.mdt[0, 0].T
+        if getattr(self, 'mdt', None) is not None:
+            return self.mdt
+        return None
 
-        Parameters
-        ----------
-        t : float 
-            time in seconds
-        He : 2D array
-        h_SN : ND array
-            amplitude of SSH for southern/northern borders
-        h_WE : ND array
-            amplitude of SSH for western/eastern borders
+    def _bm_mduv(self):
+        if self.bm_kind == 'MOD_QGSW' and getattr(self.model_bm, 'mdu', None) is not None:
+            return self.model_bm.mdu[0, 0].T, self.model_bm.mdv[0, 0].T
+        return None, None
 
-        Returns
-        -------
-        w1ext: 1D array
-            flattened  first characteristic variable (South/North/West/East)
-        """
+    def _bm_height_for_He(self, h_bm):
+        if self.bm_height_for_He == 'full':
+            mdt = self._bm_mdt_h()
+            if mdt is not None:
+                return h_bm + mdt
+        return h_bm
 
-        if h_SN is None or h_WE is None:
-            return None 
-        
-        # Adjust time for 1d bc
-        if self.bc_kind=='1d':
-            t += self.dt
-        
-        # South
-        HeS = (He[0,:]+He[1,:])/2
-        fS = (self.f[0,:]+self.f[1,:])/2
-        w1S = jnp.zeros(self.nx)
-        for j,w in enumerate(self.omegas):
-            k = jnp.sqrt((w**2-fS**2)/(self.g*HeS))
-            for i,theta in enumerate(self.bc_theta):
-                kx = jnp.sin(theta) * k
-                ky = jnp.cos(theta) * k
-                kxy = kx*self.model_it.Xv[0,:] + ky*self.model_it.Yv[0,:]
-                
-                h = h_SN[j,0,0,i]* jnp.cos(w*t-kxy)  +\
-                        h_SN[j,0,1,i]* jnp.sin(w*t-kxy) 
-                v = self.g/(w**2-fS**2)*( \
-                    h_SN[j,0,0,i]* (w*ky*jnp.cos(w*t-kxy) \
-                                - fS*kx*jnp.sin(w*t-kxy)
-                                    ) +\
-                    h_SN[j,0,1,i]* (w*ky*jnp.sin(w*t-kxy) \
-                                + fS*kx*jnp.cos(w*t-kxy)
-                                    )
-                        )
-                
-                w1S += v + jnp.sqrt(self.g/HeS) * h
-         
-        # North
-        fN = (self.f[-1,:]+self.f[-2,:])/2
-        HeN = (He[-1,:]+He[-2,:])/2
-        w1N = jnp.zeros(self.nx)
-        for j,w in enumerate(self.omegas):
-            k = jnp.sqrt((w**2-fN**2)/(self.g*HeN))
-            for i,theta in enumerate(self.bc_theta):
-                kx = jnp.sin(theta) * k
-                ky = -jnp.cos(theta) * k
-                kxy = kx*self.model_it.Xv[-1,:] + ky*self.model_it.Yv[-1,:]
-                h = h_SN[j,1,0,i]* jnp.cos(w*t-kxy)+\
-                        h_SN[j,1,1,i]* jnp.sin(w*t-kxy) 
-                v = self.g/(w**2-fN**2)*(\
-                    h_SN[j,1,0,i]* (w*ky*jnp.cos(w*t-kxy) \
-                                - fN*kx*jnp.sin(w*t-kxy)
-                                    ) +\
-                    h_SN[j,1,1,i]* (w*ky*jnp.sin(w*t-kxy) \
-                                + fN*kx*jnp.cos(w*t-kxy)
-                                    )
-                        )
-                w1N += v - jnp.sqrt(self.g/HeN) * h
+    def _bm_velocity_on_h(self, u_bm, v_bm, h_bm):
+        if self.bm_kind == 'MOD_QGSW':
+            u_full = u_bm
+            v_full = v_bm
+            mdu, mdv = self._bm_mduv()
+            if mdu is not None:
+                u_full = u_full + mdu
+                v_full = v_full + mdv
+            u_h = 0.5 * (u_full[:, :-1] + u_full[:, 1:])
+            v_h = 0.5 * (v_full[:-1, :] + v_full[1:, :])
+            return u_h, v_h
 
-        # West
-        fW = (self.f[:,0]+self.f[:,1])/2
-        HeW = (He[:,0]+He[:,1])/2
-        w1W = jnp.zeros(self.ny)
-        for j,w in enumerate(self.omegas):
-            k = jnp.sqrt((w**2-fW**2)/(self.g*HeW))
-            for i,theta in enumerate(self.bc_theta):
-                kx = jnp.cos(theta)* k
-                ky = jnp.sin(theta)* k
-                kxy = kx*self.model_it.Xu[:,0] + ky*self.model_it.Yu[:,0]
-                h = h_WE[j,0,0,i]*jnp.cos(w*t-kxy) +\
-                        h_WE[j,0,1,i]*jnp.sin(w*t-kxy)
-                u = self.g/(w**2-fW**2)*(\
-                    h_WE[j,0,0,i]*(w*kx*jnp.cos(w*t-kxy) \
-                              + fW*ky*jnp.sin(w*t-kxy)
-                                  ) +\
-                    h_WE[j,0,1,i]*(w*kx*jnp.sin(w*t-kxy) \
-                              - fW*ky*jnp.cos(w*t-kxy)
-                                  )
-                        )
-                w1W += u + jnp.sqrt(self.g/HeW) * h
+        mdt = self._bm_mdt_h()
+        ssh_full = h_bm + mdt if mdt is not None else h_bm
+        return self.model_bm.h2uv(ssh_full)
 
-        
-        # East
-        HeE = (He[:,-1]+He[:,-2])/2
-        fE = (self.f[:,-1]+self.f[:,-2])/2
-        w1E = jnp.zeros(self.ny)
-        for j,w in enumerate(self.omegas):
-            k = jnp.sqrt((w**2-fE**2)/(self.g*HeE))
-            for i,theta in enumerate(self.bc_theta):
-                kx = -jnp.cos(theta)* k
-                ky = jnp.sin(theta)* k
-                kxy = kx*self.model_it.Xu[:,-1] + ky*self.model_it.Yu[:,-1]
-                h = h_WE[j,1,0,i]*jnp.cos(w*t-kxy) +\
-                        h_WE[j,1,1,i]*jnp.sin(w*t-kxy)
-                u = self.g/(w**2-fE**2)*(\
-                    h_WE[j,1,0,i]* (w*kx*jnp.cos(w*t-kxy) \
-                                + fE*ky*jnp.sin(w*t-kxy)
-                                    ) +\
-                    h_WE[j,1,1,i]*(w*kx*jnp.sin(w*t-kxy) \
-                              - fE*ky*jnp.cos(w*t-kxy)
-                                  )
-                        )
-                w1E += u - jnp.sqrt(self.g/HeE) * h
-        
-        w1ext = (w1S,w1N,w1W,w1E)    
-        
-        return w1ext
+    def _bm_step_qgsw(self, t, u_bm, v_bm, h_bm,
+                      Fu_bm, Fv_bm, Fh_bm,
+                      u_bm_bc, v_bm_bc, h_bm_bc,
+                      taux_bm=None, tauy_bm=None, nstep=1):
+        dtype = self.model_bm.dtype
+        u0 = jnp.expand_dims(jnp.asarray(u_bm, dtype=dtype).T, axis=(0, 1))
+        v0 = jnp.expand_dims(jnp.asarray(v_bm, dtype=dtype).T, axis=(0, 1))
+        h0 = jnp.expand_dims(jnp.asarray(h_bm, dtype=dtype).T, axis=(0, 1))
+        u1, v1, h1 = self.model_bm.jstep_jit(
+            t, u0, v0, h0, None, Fu_bm, Fv_bm, Fh_bm,
+            u_bm_bc, v_bm_bc, h_bm_bc,
+            taux=taux_bm, tauy=tauy_bm,
+            h_wind=None, wind_strength=None, nstep=nstep)
+        return u1[0, 0].T, v1[0, 0].T, h1[0, 0].T
 
-    def _compute_IT_2D(self,t,He,h_SN,h_WE,flag_tangent=True):
-        """
-        Compute 2D plane wave IT fields 
+    def _jstep(self, t,
+            u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
+            Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+            h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
+            taux_bm=None, tauy_bm=None, nstep=1):
 
-        Parameters
-        ----------
-        t : float 
-            time in seconds
-        He : 2D array
-        h_SN : ND array
-            amplitude of SSH for southern/northern borders
-        h_WE : ND array
-            amplitude of SSH for western/eastern borders
+        """Multi-step forward integration of the coupled BM/IT model."""
 
-        Returns
-        -------
-        u,v,h: 2D arrays
-            
-        """
-
-        u_S = jnp.zeros((self.ny,self.nx-1))
-        v_S = jnp.zeros((self.ny-1,self.nx))
-        h_S = jnp.zeros((self.ny,self.nx))
-        u_N = jnp.zeros((self.ny,self.nx-1))
-        v_N = jnp.zeros((self.ny-1,self.nx))
-        h_N = jnp.zeros((self.ny,self.nx))
-        u_W = jnp.zeros((self.ny,self.nx-1))
-        v_W = jnp.zeros((self.ny-1,self.nx))
-        h_W = jnp.zeros((self.ny,self.nx))
-        u_E = jnp.zeros((self.ny,self.nx-1))
-        v_E = jnp.zeros((self.ny-1,self.nx))
-        h_E = jnp.zeros((self.ny,self.nx))
-
-        He_on_u = (He[:,1:] + He[:,:-1]) /2
-        He_on_v = (He[1:,:] + He[:-1,:]) /2
-
-        for j,w in enumerate(self.omegas):
-            k_on_h = jnp.sqrt((w**2-self.f**2)/(self.g*He))
-            k_on_u = jnp.sqrt((w**2-self.f_on_u**2)/(self.g*(He_on_u)))
-            k_on_v = jnp.sqrt((w**2-self.f_on_v**2)/(self.g*(He_on_v)))
-
-            for i,theta in enumerate(self.bc_theta):
-
-                ####################################
-                # South
-                ####################################
-                kx_on_h = jnp.sin(theta) * k_on_h
-                ky_on_h = jnp.cos(theta) * k_on_h
-                kx_on_u = jnp.sin(theta) * k_on_u
-                ky_on_u = jnp.cos(theta) * k_on_u
-                kx_on_v = jnp.sin(theta) * k_on_v
-                ky_on_v = jnp.cos(theta) * k_on_v
-                kxy_on_h = kx_on_h*self.Xh + ky_on_h*self.Yh
-                kxy_on_u = kx_on_u*self.Xu + ky_on_u*self.Yu
-                kxy_on_v = kx_on_v*self.Xv + ky_on_v*self.Yv
-
-                # h
-                h_S += self.sponge_on_h_S *(\
-                    h_SN[j,0,0,i]* jnp.cos(w*t-kxy_on_h)  +\
-                    h_SN[j,0,1,i]* jnp.sin(w*t-kxy_on_h)) 
-                
-                # v
-                h_cos_theta_on_v_S = h_SN[j,0,0,i]
-                h_sin_theta_on_v_S = h_SN[j,0,1,i]
-                v_S += self.sponge_on_v_S * (self.g/(w**2-self.f_on_v**2)*( \
-                    h_cos_theta_on_v_S * (w*ky_on_v*jnp.cos(w*t-kxy_on_v) \
-                                - self.f_on_v*kx_on_v*jnp.sin(w*t-kxy_on_v)
-                                    ) +\
-                    h_sin_theta_on_v_S * (w*ky_on_v*jnp.sin(w*t-kxy_on_v) \
-                                + self.f_on_v*kx_on_v*jnp.cos(w*t-kxy_on_v)
-                                    )
-                        ))
-                
-                # u
-                if flag_tangent:
-                    h_cos_theta_on_u_S = (h_cos_theta_on_v_S[1:] + h_cos_theta_on_v_S[:-1]) * 0.5
-                    h_sin_theta_on_u_S = (h_sin_theta_on_v_S[1:] + h_sin_theta_on_v_S[:-1]) * 0.5
-                    u_S += self.sponge_on_u_S * (self.g/(w**2-self.f_on_u**2)*( \
-                        h_cos_theta_on_u_S * (w*kx_on_u*jnp.cos(w*t-kxy_on_u) \
-                                    + self.f_on_u*ky_on_u*jnp.sin(w*t-kxy_on_u)
-                                        ) +\
-                        h_sin_theta_on_u_S * (w*kx_on_u*jnp.sin(w*t-kxy_on_u) \
-                                    - self.f_on_u*ky_on_u*jnp.cos(w*t-kxy_on_u)
-                                        )
-                            ))
-                
-                ####################################
-                # North
-                ####################################
-                kx_on_h = +jnp.sin(theta) * k_on_h
-                ky_on_h = -jnp.cos(theta) * k_on_h
-                kx_on_u = +jnp.sin(theta) * k_on_u
-                ky_on_u = -jnp.cos(theta) * k_on_u
-                kx_on_v = +jnp.sin(theta) * k_on_v
-                ky_on_v = -jnp.cos(theta) * k_on_v
-                kxy_on_h = kx_on_h*self.Xh + ky_on_h*self.Yh
-                kxy_on_u = kx_on_u*self.Xu + ky_on_u*self.Yu
-                kxy_on_v = kx_on_v*self.Xv + ky_on_v*self.Yv
-
-                # h
-                h_N += self.sponge_on_h_N *(\
-                    h_SN[j,1,0,i]* jnp.cos(w*t-kxy_on_h)  +\
-                    h_SN[j,1,1,i]* jnp.sin(w*t-kxy_on_h)) 
-                
-                # v
-                h_cos_theta_on_v_N = h_SN[j,1,0,i]
-                h_sin_theta_on_v_N = h_SN[j,1,1,i]
-                v_N += self.sponge_on_v_N * (self.g/(w**2-self.f_on_v**2)*( \
-                    h_cos_theta_on_v_N * (w*ky_on_v*jnp.cos(w*t-kxy_on_v) \
-                                - self.f_on_v*kx_on_v*jnp.sin(w*t-kxy_on_v)
-                                    ) +\
-                    h_sin_theta_on_v_N * (w*ky_on_v*jnp.sin(w*t-kxy_on_v) \
-                                + self.f_on_v*kx_on_v*jnp.cos(w*t-kxy_on_v)
-                                    )
-                        ))  
-                
-                # u
-                if flag_tangent:
-                    h_cos_theta_on_u_N = (h_cos_theta_on_v_N[1:] + h_cos_theta_on_v_N[:-1]) * 0.5
-                    h_sin_theta_on_u_N = (h_sin_theta_on_v_N[1:] + h_sin_theta_on_v_N[:-1]) * 0.5
-                    u_N += self.sponge_on_u_N * (self.g/(w**2-self.f_on_u**2)*( \
-                        h_cos_theta_on_u_N * (w*kx_on_u*jnp.cos(w*t-kxy_on_u) \
-                                    + self.f_on_u*ky_on_u*jnp.sin(w*t-kxy_on_u)
-                                        ) +\
-                        h_sin_theta_on_u_N * (w*kx_on_u*jnp.sin(w*t-kxy_on_u) \
-                                    - self.f_on_u*ky_on_u*jnp.cos(w*t-kxy_on_u)
-                                        )
-                            ))
-                
-                ####################################
-                # West
-                ####################################
-                kx_on_h = jnp.cos(theta) * k_on_h
-                ky_on_h = jnp.sin(theta) * k_on_h
-                kx_on_u = jnp.cos(theta) * k_on_u
-                ky_on_u = jnp.sin(theta) * k_on_u
-                kx_on_v = jnp.cos(theta) * k_on_v
-                ky_on_v = jnp.sin(theta) * k_on_v
-                kxy_on_h = kx_on_h*self.Xh + ky_on_h*self.Yh
-                kxy_on_u = kx_on_u*self.Xu + ky_on_u*self.Yu
-                kxy_on_v = kx_on_v*self.Xv + ky_on_v*self.Yv
-
-                # h
-                h_W += self.sponge_on_h_W *(\
-                    h_WE[j,0,0,i][:,None]* jnp.cos(w*t-kxy_on_h)  +\
-                    h_WE[j,0,1,i][:,None]* jnp.sin(w*t-kxy_on_h)) 
-                
-                # u
-                h_cos_theta_on_u_W = h_WE[j,0,0,i][:,None]
-                h_sin_theta_on_u_W = h_WE[j,0,1,i][:,None]
-                u_W += self.sponge_on_u_W * (self.g/(w**2-self.f_on_u**2)*( \
-                    h_cos_theta_on_u_W * (w*kx_on_u*jnp.cos(w*t-kxy_on_u) \
-                                + self.f_on_u*ky_on_u*jnp.sin(w*t-kxy_on_u)
-                                    ) +\
-                    h_sin_theta_on_u_W * (w*kx_on_u*jnp.sin(w*t-kxy_on_u) \
-                                - self.f_on_u*ky_on_u*jnp.cos(w*t-kxy_on_u)
-                                    )
-                        ))
-
-                # v
-                if flag_tangent:
-                    h_cos_theta_on_v_W = (h_cos_theta_on_u_W[1:] + h_cos_theta_on_u_W[:-1]) * 0.5
-                    h_sin_theta_on_v_W = (h_sin_theta_on_u_W[1:] + h_sin_theta_on_u_W[:-1]) * 0.5
-                    v_W += self.sponge_on_v_W * (self.g/(w**2-self.f_on_v**2)*( \
-                        h_cos_theta_on_v_W * (w*ky_on_v*jnp.cos(w*t-kxy_on_v) \
-                                    - self.f_on_v*kx_on_v*jnp.sin(w*t-kxy_on_v)
-                                        ) +\
-                        h_sin_theta_on_v_W * (w*ky_on_v*jnp.sin(w*t-kxy_on_v) \
-                                    + self.f_on_v*kx_on_v*jnp.cos(w*t-kxy_on_v)
-                                        )
-                            ))  
-                
-                
-                
-                ####################################
-                # East
-                ####################################
-                kx_on_h = -jnp.cos(theta) * k_on_h
-                ky_on_h = jnp.sin(theta) * k_on_h
-                kx_on_u = -jnp.cos(theta) * k_on_u
-                ky_on_u = jnp.sin(theta) * k_on_u
-                kx_on_v = -jnp.cos(theta) * k_on_v
-                ky_on_v = jnp.sin(theta) * k_on_v
-                kxy_on_h = kx_on_h*self.Xh + ky_on_h*self.Yh
-                kxy_on_u = kx_on_u*self.Xu + ky_on_u*self.Yu
-                kxy_on_v = kx_on_v*self.Xv + ky_on_v*self.Yv
-
-                # h
-                h_E += self.sponge_on_h_E *(\
-                    h_WE[j,1,0,i][:,None]* jnp.cos(w*t-kxy_on_h)  +\
-                    h_WE[j,1,1,i][:,None]* jnp.sin(w*t-kxy_on_h))
-                
-                # u
-                h_cos_theta_on_u_E = h_WE[j,1,0,i][:,None]
-                h_sin_theta_on_u_E = h_WE[j,1,1,i][:,None]
-                u_E += self.sponge_on_u_E * (self.g/(w**2-self.f_on_u**2)*( \
-                    h_cos_theta_on_u_E * (w*kx_on_u*jnp.cos(w*t-kxy_on_u) \
-                                + self.f_on_u*ky_on_u*jnp.sin(w*t-kxy_on_u)
-                                    ) +\
-                    h_sin_theta_on_u_E * (w*kx_on_u*jnp.sin(w*t-kxy_on_u) \
-                                - self.f_on_u*ky_on_u*jnp.cos(w*t-kxy_on_u)
-                                    )
-                        ))
-                
-                # v
-                if flag_tangent:
-                    h_cos_theta_on_v_E = (h_cos_theta_on_u_E[1:] + h_cos_theta_on_u_E[:-1]) * 0.5
-                    h_sin_theta_on_v_E = (h_sin_theta_on_u_E[1:] + h_sin_theta_on_u_E[:-1]) * 0.5
-                    v_E += self.sponge_on_v_E * (self.g/(w**2-self.f_on_v**2)*( \
-                        h_cos_theta_on_v_E * (w*ky_on_v*jnp.cos(w*t-kxy_on_v) \
-                                    - self.f_on_v*kx_on_v*jnp.sin(w*t-kxy_on_v)
-                                        ) +\
-                        h_sin_theta_on_v_E * (w*ky_on_v*jnp.sin(w*t-kxy_on_v) \
-                                    + self.f_on_v*kx_on_v*jnp.cos(w*t-kxy_on_v)
-                                        )
-                            ))
-        
-        u_it = (u_S + u_N + u_W + u_E) / self.weight_sponge_u
-        v_it = (v_S + v_N + v_W + v_E) / self.weight_sponge_v
-        h_it = (h_S + h_N + h_W + h_E) / self.weight_sponge_h
-
-
-        return u_it, v_it, h_it
-    
-    def _jstep(self, t, 
-            h_bm, u_it, v_it, h_it, h_tot, 
-            F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
-            h_bm_bc, nstep=1):
-
-        """ Multi-step forward integration of the coupled BM/IT model.
-        He and interactive terms are computed once (fixed during nsteps).
-        scan + checkpoint is inside the SWM model.
-        """
-
-        # Compute equivalent depth anomaly from control parameters (once, before scan)
-        He2d = self._compute_He_from_bm(He_mean, alpha_He, h_bm)
+        h_for_He = self._bm_height_for_He(h_bm)
+        He2d = self._compute_He_from_bm(He_mean, alpha_He, h_for_He)
         He_tot = self.Heb + He2d
 
-        # Compute advective terms from control parameters (once, before scan)
-        if self.mdt is not None:
-            ssh_bm = h_bm + self.mdt
-        else:
-            ssh_bm = h_bm
-        u_bm, v_bm = self.model_bm.h2uv(ssh_bm)
-        u11, v11, u11p, v11p = self._compute_advective_terms_from_bm(alpha_Uu, alpha_Up, u_bm, v_bm)
-
-        # Compute characteristic variable from external data (once, before scan)
-        if not self.flag_bc_sponge:
-            w1ext = self._compute_w1_IT(t, He_tot, h_SN, h_WE)
-        else:
-            w1ext = None
+        u_bm_h, v_bm_h = self._bm_velocity_on_h(u_bm, v_bm, h_bm)
+        u11, v11, u11p, v11p = self._compute_advective_terms_from_bm(
+            alpha_Uu, alpha_Up, u_bm_h, v_bm_h)
 
         # BM nstep forward
-        h_bm = self.model_bm.step(h_bm, h_bm_bc, nstep=nstep)
+        if self.bm_kind == 'MOD_QGSW':
+            u_bm, v_bm, h_bm = self._bm_step_qgsw(
+                t, u_bm, v_bm, h_bm,
+                Fu_bm, Fv_bm, Fh_bm,
+                u_bm_bc, v_bm_bc, h_bm_bc,
+                taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=nstep)
+        else:
+            h_bm = self.model_bm.step(h_bm, h_bm_bc, nstep=nstep)
+            if Fh_bm is not None:
+                h_bm = h_bm + nstep * self.dt/(3600*24) * Fh_bm
+            u_bm, v_bm = self._bm_velocity_on_h(u_bm, v_bm, h_bm)
 
         # IT nstep forward (scan + checkpoint inside swm)
         u_it, v_it, h_it = self.model_it_step_nstep(
-            u_it, v_it, h_it, He2d, w1ext=w1ext,
+            u_it, v_it, h_it, He2d,
             u11u=u11, v11u=v11, u11p=u11p, v11p=v11p,
             nstep=nstep, t=t, He_total=He_tot, h_SN=h_SN, h_WE=h_WE)
 
-        # Sum of BM/IT
         h_tot = h_bm + h_it
 
-        # Flux correction BM (accumulated over nstep)
-        if F_bm is not None:
-            h_bm = h_bm + nstep * self.dt/(3600*24) * F_bm
+        return u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot
 
-        return h_bm, u_it, v_it, h_it, h_tot
-     
-    def _jstep_tgl(self, t, 
-                dh_bm, du_it, dv_it, dh_it, dh_tot, 
-                dF_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE,
-                h_bm, u_it, v_it, h_it, h_tot, 
-                F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE, 
-                h_bm_bc, nstep=1):
-        """ Multi-step tangent linear of the coupled BM/IT model
-        using JVP through _jstep (scan + checkpoint inside swm)
-        """
-        
+    def _jstep_tgl(self, t,
+                du_bm, dv_bm, dh_bm, du_it, dv_it, dh_it, dh_tot,
+                dFu_bm, dFv_bm, dFh_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up,
+                dh_SN, dh_WE,
+                u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
+                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
+                taux_bm=None, tauy_bm=None, nstep=1):
+        """Multi-step tangent linear of the coupled BM/IT model using JVP."""
+
         def wrapped_jstep(x):
-            h_bm, u_it, v_it, h_it, h_tot, \
-                F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = x
-            return self._jstep(t, 
-                            h_bm, u_it, v_it, h_it, h_tot, 
-                            F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
-                            h_bm_bc, nstep=nstep)
+            u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot, \
+                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = x
+            return self._jstep(
+                t, u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
+                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
+                taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=nstep)
 
-        primals = ((h_bm, u_it, v_it, h_it, h_tot, 
-                    F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE),)
-        tangents = ((dh_bm, du_it, dv_it, dh_it, dh_tot, 
-                    dF_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE,),)
+        primals = ((u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
+                    Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE),)
+        tangents = ((du_bm, dv_bm, dh_bm, du_it, dv_it, dh_it, dh_tot,
+                     dFu_bm, dFv_bm, dFh_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE),)
 
         _, dy = jax.jvp(wrapped_jstep, primals, tangents)
+        return dy
 
-        return dy  # returns (dh_bm, du_it, dv_it, dh_it, dh_tot)
-
-    def _jstep_adj(self, t, 
-                adh_bm, adu_it, adv_it, adh_it, adh_tot, 
-                adF_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adh_SN, adh_WE,
-                h_bm, u_it, v_it, h_it, h_tot, 
-                F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE, 
-                h_bm_bc, nstep=1):
-        """ Multi-step adjoint of the coupled BM/IT model
-        using VJP through _jstep (scan + checkpoint inside swm)
-        """
+    def _jstep_adj(self, t,
+                adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot,
+                adFu_bm, adFv_bm, adFh_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up,
+                adh_SN, adh_WE,
+                u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
+                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
+                taux_bm=None, tauy_bm=None, nstep=1):
+        """Multi-step adjoint of the coupled BM/IT model using VJP."""
 
         def wrapped_jstep(x):
-            h_bm, u_it, v_it, h_it, h_tot, \
-                F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = x
-            return self._jstep(t, 
-                            h_bm, u_it, v_it, h_it, h_tot, 
-                            F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
-                            h_bm_bc, nstep=nstep)
+            u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot, \
+                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = x
+            return self._jstep(
+                t, u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
+                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
+                taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=nstep)
 
-        primals = ((h_bm, u_it, v_it, h_it, h_tot, 
-                    F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE),)
-        cotangents = (adh_bm, adu_it, adv_it, adh_it, adh_tot)  
+        primals = ((u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
+                    Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE),)
+        cotangents = (adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot)
 
         _, vjp_fn = jax.vjp(wrapped_jstep, *primals)
         adjoints = vjp_fn(cotangents)
 
-        adh_bm, adu_it, adv_it, adh_it, adh_tot, \
-            _adF_bm, _adHe_mean, _adalpha_He, _adalpha_Uu, _adalpha_Up, _adhSN, _adhWE = adjoints[0]
-        
-        if adF_bm is not None:
-            adF_bm += _adF_bm
+        adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot, \
+            _adFu_bm, _adFv_bm, _adFh_bm, _adHe_mean, _adalpha_He, \
+            _adalpha_Uu, _adalpha_Up, _adhSN, _adhWE = adjoints[0]
+
+        adFu_bm += _adFu_bm
+        adFv_bm += _adFv_bm
+        adFh_bm += _adFh_bm
         if adHe_mean is not None:
             adHe_mean += _adHe_mean
         if adalpha_He is not None:
@@ -6332,25 +6154,35 @@ class Model_bmit(M):
         if adh_WE is not None:
             adh_WE += _adhWE
 
-        return adh_bm, adu_it, adv_it, adh_it, adh_tot, adF_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adh_SN, adh_WE
-    
+        return (adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot,
+                adFu_bm, adFv_bm, adFh_bm, adHe_mean, adalpha_He,
+                adalpha_Uu, adalpha_Up, adh_SN, adh_WE)
 
-    def step(self,State,nstep=1,t=0):
+    def _bm_bc_for_chunk(self, t_chunk, n_chunk):
+        if self.bm_kind == 'MOD_QGSW':
+            return self.model_bm._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+        h_b = self._apply_bc(t_chunk)
+        u_b = jnp.zeros((self.ny, self.nx))
+        v_b = jnp.zeros((self.ny, self.nx))
+        return u_b, v_b, h_b
 
-        # Get state variable
-        h_bm = +State.getvar(name_var=self.name_var['SSH_BM'])
-        u_it = +State.getvar(name_var=self.name_var['U_IT'])
-        v_it = +State.getvar(name_var=self.name_var['V_IT'])
-        h_it = +State.getvar(name_var=self.name_var['SSH_IT'])
-        h_tot = +State.getvar(name_var=self.name_var['SSH'])
+    def _bm_wind_for_chunk(self, t_chunk):
+        if self.bm_kind == 'MOD_QGSW':
+            return self.model_bm._get_wind_stress(t_chunk)
+        return None, None
 
-        # Static BM Boundary condition
-        h_bm_bc = self._apply_bc(t)
+    def _bm_controls(self, State):
+        u_name = self.name_var['U_BM']
+        v_name = self.name_var['V_BM']
+        h_name = self.name_var['SSH_BM']
+        Fu = State.params.get(u_name, np.zeros_like(State.var[u_name]))
+        Fv = State.params.get(v_name, np.zeros_like(State.var[v_name]))
+        Fh = State.params.get(h_name, np.zeros_like(State.var[h_name]))
+        return Fu, Fv, Fh
 
-        # Get control (dynamic) parameters
-        F_bm = State.params[self.name_var['SSH_BM']] # Flux correction BM
+    def _it_controls(self, State):
         if 'He_mean' in self.name_params_it:
-            He_mean = +State.params['He_mean'] 
+            He_mean = +State.params['He_mean']
         else:
             He_mean = jnp.zeros((self.ny,self.nx))
         if 'alpha_He' in self.name_params_it:
@@ -6377,168 +6209,163 @@ class Model_bmit(M):
         else:
             h_SN = None
             h_WE = None
-            
-        # Time stepping (scan + checkpoint inside _jstep)
-        h_bm, u_it, v_it, h_it, h_tot = self._jstep_jit(t, 
-                                                        h_bm, u_it, v_it, h_it, h_tot, 
-                                                        F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
-                                                        h_bm_bc, nstep=nstep)
-        
-        # Update state
-        State.setvar([h_bm, u_it,v_it,h_it, h_tot],[
+        return He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE
+
+    def step(self,State,nstep=1,t=0):
+
+        u_bm = +State.getvar(name_var=self.name_var['U_BM'])
+        v_bm = +State.getvar(name_var=self.name_var['V_BM'])
+        h_bm = +State.getvar(name_var=self.name_var['SSH_BM'])
+        u_it = +State.getvar(name_var=self.name_var['U_IT'])
+        v_it = +State.getvar(name_var=self.name_var['V_IT'])
+        h_it = +State.getvar(name_var=self.name_var['SSH_IT'])
+        h_tot = +State.getvar(name_var=self.name_var['SSH'])
+
+        Fu_bm, Fv_bm, Fh_bm = self._bm_controls(State)
+        He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = self._it_controls(State)
+
+        step_done = 0
+        while step_done < nstep:
+            n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
+            t_chunk = t + step_done * self.dt
+            u_bm_bc, v_bm_bc, h_bm_bc = self._bm_bc_for_chunk(t_chunk, n_chunk)
+            taux_bm, tauy_bm = self._bm_wind_for_chunk(t_chunk)
+            u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot = self._jstep_jit(
+                t_chunk,
+                u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
+                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
+                taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=n_chunk)
+            step_done += n_chunk
+
+        State.setvar([u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot],[
+            self.name_var['U_BM'],
+            self.name_var['V_BM'],
             self.name_var['SSH_BM'],
             self.name_var['U_IT'],
             self.name_var['V_IT'],
             self.name_var['SSH_IT'],
             self.name_var['SSH']]
             )
-    
+
     def step_tgl(self,dState,State,nstep=1,t=0):
-        
-        # Get state variable
+
+        du_bm = +dState.getvar(name_var=self.name_var['U_BM'])
+        dv_bm = +dState.getvar(name_var=self.name_var['V_BM'])
         dh_bm = +dState.getvar(name_var=self.name_var['SSH_BM'])
         du_it = +dState.getvar(name_var=self.name_var['U_IT'])
         dv_it = +dState.getvar(name_var=self.name_var['V_IT'])
         dh_it = +dState.getvar(name_var=self.name_var['SSH_IT'])
         dh_tot = +dState.getvar(name_var=self.name_var['SSH'])
+        u_bm = +State.getvar(name_var=self.name_var['U_BM'])
+        v_bm = +State.getvar(name_var=self.name_var['V_BM'])
         h_bm = +State.getvar(name_var=self.name_var['SSH_BM'])
         u_it = +State.getvar(name_var=self.name_var['U_IT'])
         v_it = +State.getvar(name_var=self.name_var['V_IT'])
         h_it = +State.getvar(name_var=self.name_var['SSH_IT'])
         h_tot = +State.getvar(name_var=self.name_var['SSH'])
 
-        # Static BM Boundary condition
-        h_bm_bc = self._apply_bc(t)
-        
-        # Get control (dynamic) parameters
-        dF_bm = dState.params[self.name_var['SSH_BM']] # Flux correction BM
-        F_bm = State.params[self.name_var['SSH_BM']] # Flux correction BM
-        if 'He_mean' in self.name_params_it:
-            dHe_mean = +dState.params['He_mean'] 
-            He_mean = +State.params['He_mean'] 
-        else:
-            He_mean = dHe_mean = jnp.zeros((self.ny,self.nx))
-        if 'alpha_He' in self.name_params_it:
-            dalpha_He = +dState.params['alpha_He']
-            alpha_He = +State.params['alpha_He']
-        elif 'alpha' in self.name_params_it:
-            dalpha_He = +dState.params['alpha']
-            alpha_He = +State.params['alpha']
-        else:
-            alpha_He = dalpha_He = None
-        if 'alpha_Uu' in self.name_params_it:
-            dalpha_Uu = +dState.params['alpha_Uu']
-            alpha_Uu = +State.params['alpha_Uu']
-        elif 'alpha' in self.name_params_it:
-            dalpha_Uu = +dState.params['alpha']
-            alpha_Uu = +State.params['alpha']
-        else:
-            alpha_Uu = dalpha_Uu = None
-        if 'alpha_Up' in self.name_params_it:
-            dalpha_Up = +dState.params['alpha_Up']
-            alpha_Up = +State.params['alpha_Up']
-        elif 'alpha' in self.name_params_it:
-            dalpha_Up = +dState.params['alpha']
-            alpha_Up = +State.params['alpha']
-        else:
-            alpha_Up = dalpha_Up = None
-        if 'hbc' in self.name_params_it:
-            dh_SN = dState.params['hbcx']
-            dh_WE = dState.params['hbcy']
-            h_SN = State.params['hbcx']
-            h_WE = State.params['hbcy']
-        else:
-            dh_SN = dh_WE = None
-            h_SN = h_WE = None
-            
-        # Time stepping (JVP through _jstep with scan + checkpoint)
-        dh_bm, du_it, dv_it, dh_it, dh_tot = self._jstep_tgl_jit(
-                                                    t,
-                                                    dh_bm, du_it, dv_it, dh_it, dh_tot, 
-                                                    dF_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE,
-                                                    h_bm, u_it, v_it, h_it, h_tot, 
-                                                    F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
-                                                    h_bm_bc, nstep=nstep)
+        Fu_bm, Fv_bm, Fh_bm = self._bm_controls(State)
+        dFu_bm, dFv_bm, dFh_bm = self._bm_controls(dState)
+        He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = self._it_controls(State)
+        dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE = self._it_controls(dState)
 
-        # Update state
-        dState.setvar([dh_bm, du_it,dv_it,dh_it,dh_tot],[
+        step_done = 0
+        while step_done < nstep:
+            n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
+            t_chunk = t + step_done * self.dt
+            u_bm_bc, v_bm_bc, h_bm_bc = self._bm_bc_for_chunk(t_chunk, n_chunk)
+            taux_bm, tauy_bm = self._bm_wind_for_chunk(t_chunk)
+            du_bm, dv_bm, dh_bm, du_it, dv_it, dh_it, dh_tot = self._jstep_tgl_jit(
+                t_chunk,
+                du_bm, dv_bm, dh_bm, du_it, dv_it, dh_it, dh_tot,
+                dFu_bm, dFv_bm, dFh_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE,
+                u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
+                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
+                u_bm_bc, v_bm_bc, h_bm_bc,
+                taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=n_chunk)
+            step_done += n_chunk
+            if step_done < nstep:
+                u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot = self._jstep_jit(
+                    t_chunk,
+                    u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
+                    Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                    h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
+                    taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=n_chunk)
+
+        dState.setvar([du_bm, dv_bm, dh_bm, du_it, dv_it, dh_it, dh_tot],[
+            self.name_var['U_BM'],
+            self.name_var['V_BM'],
             self.name_var['SSH_BM'],
             self.name_var['U_IT'],
             self.name_var['V_IT'],
             self.name_var['SSH_IT'],
             self.name_var['SSH']]
             )
-       
+
     def step_adj(self, adState, State, nstep=1, t=0):
-        
-        # Get state variable
+
+        adu_bm = +adState.getvar(name_var=self.name_var['U_BM'])
+        adv_bm = +adState.getvar(name_var=self.name_var['V_BM'])
         adh_bm = +adState.getvar(name_var=self.name_var['SSH_BM'])
         adu_it = +adState.getvar(name_var=self.name_var['U_IT'])
         adv_it = +adState.getvar(name_var=self.name_var['V_IT'])
         adh_it = +adState.getvar(name_var=self.name_var['SSH_IT'])
         adh_tot = +adState.getvar(name_var=self.name_var['SSH'])
+        u_bm = +State.getvar(name_var=self.name_var['U_BM'])
+        v_bm = +State.getvar(name_var=self.name_var['V_BM'])
+        h_bm = +State.getvar(name_var=self.name_var['SSH_BM'])
         u_it = +State.getvar(name_var=self.name_var['U_IT'])
         v_it = +State.getvar(name_var=self.name_var['V_IT'])
         h_it = +State.getvar(name_var=self.name_var['SSH_IT'])
-        h_bm = +State.getvar(name_var=self.name_var['SSH_BM'])
         h_tot = +State.getvar(name_var=self.name_var['SSH'])
-        
-        # Get control (dynamic) parameters
-        adF_bm = adState.params[self.name_var['SSH_BM']] # Flux correction BM
-        F_bm = State.params[self.name_var['SSH_BM']] # Flux correction BM
-        # Get parameters
-        if 'He_mean' in self.name_params_it:
-            adHe_mean = +adState.params['He_mean'] 
-            He_mean = +State.params['He_mean'] 
-        else:
-            He_mean = adHe_mean = jnp.zeros((self.ny,self.nx))
-        if 'alpha_He' in self.name_params_it:
-            adalpha_He = +adState.params['alpha_He']
-            alpha_He = +State.params['alpha_He']
-        elif 'alpha' in self.name_params_it:
-            adalpha_He = +adState.params['alpha']
-            alpha_He = +State.params['alpha']
-        else:
-            alpha_He = adalpha_He = None
-        if 'alpha_Uu' in self.name_params_it:
-            adalpha_Uu = +adState.params['alpha_Uu']
-            alpha_Uu = +State.params['alpha_Uu']
-        elif 'alpha' in self.name_params_it:
-            adalpha_Uu = +adState.params['alpha']
-            alpha_Uu = +State.params['alpha']
-        else:
-            alpha_Uu = adalpha_Uu = None
-        if 'alpha_Up' in self.name_params_it:
-            adalpha_Up = +adState.params['alpha_Up']
-            alpha_Up = +State.params['alpha_Up']
-        elif 'alpha' in self.name_params_it:
-            adalpha_Up = +adState.params['alpha']
-            alpha_Up = +State.params['alpha']
-        else:
-            alpha_Up = adalpha_Up = None
-        if 'hbc' in self.name_params_it:
-            adh_SN = adState.params['hbcx']
-            adh_WE = adState.params['hbcy']
-            h_SN = State.params['hbcx']
-            h_WE = State.params['hbcy']
-        else:
-            adh_SN = adh_WE = None
-            h_SN = h_WE = None
-        
-        # Static BM Boundary condition
-        h_bm_bc = self._apply_bc(t)
 
-        # Adjoint computation (VJP through _jstep with scan + checkpoint)
-        adh_bm, adu_it, adv_it, adh_it, adh_tot, \
-            adF_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adh_SN, adh_WE = self._jstep_adj_jit(t, 
-                                                    adh_bm, adu_it, adv_it, adh_it, adh_tot, 
-                                                    adF_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adh_SN, adh_WE,
-                                                    h_bm, u_it, v_it, h_it, h_tot, 
-                                                    F_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
-                                                    h_bm_bc, nstep=nstep)
-        
-        # Update state and parameters
-        adState.setvar([adh_bm, adu_it, adv_it, adh_it, adh_tot],[
+        Fu_bm, Fv_bm, Fh_bm = self._bm_controls(State)
+        adFu_bm, adFv_bm, adFh_bm = self._bm_controls(adState)
+        He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = self._it_controls(State)
+        adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adh_SN, adh_WE = self._it_controls(adState)
+
+        chunks = []
+        step_done = 0
+        while step_done < nstep:
+            n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
+            t_chunk = t + step_done * self.dt
+            chunks.append((t_chunk, n_chunk))
+            step_done += n_chunk
+
+        fwd_states = [(u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot)]
+        u_fwd, v_fwd, h_fwd, uit_fwd, vit_fwd, hit_fwd, htot_fwd = fwd_states[0]
+        for t_chunk, n_chunk in chunks[:-1]:
+            u_bm_bc, v_bm_bc, h_bm_bc = self._bm_bc_for_chunk(t_chunk, n_chunk)
+            taux_bm, tauy_bm = self._bm_wind_for_chunk(t_chunk)
+            u_fwd, v_fwd, h_fwd, uit_fwd, vit_fwd, hit_fwd, htot_fwd = self._jstep_jit(
+                t_chunk,
+                u_fwd, v_fwd, h_fwd, uit_fwd, vit_fwd, hit_fwd, htot_fwd,
+                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
+                taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=n_chunk)
+            fwd_states.append((u_fwd, v_fwd, h_fwd, uit_fwd, vit_fwd, hit_fwd, htot_fwd))
+
+        for i in range(len(chunks) - 1, -1, -1):
+            t_chunk, n_chunk = chunks[i]
+            u_i, v_i, h_i, uit_i, vit_i, hit_i, htot_i = fwd_states[i]
+            u_bm_bc, v_bm_bc, h_bm_bc = self._bm_bc_for_chunk(t_chunk, n_chunk)
+            taux_bm, tauy_bm = self._bm_wind_for_chunk(t_chunk)
+            (adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot,
+             adFu_bm, adFv_bm, adFh_bm, adHe_mean, adalpha_He,
+             adalpha_Uu, adalpha_Up, adh_SN, adh_WE) = self._jstep_adj_jit(
+                t_chunk,
+                adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot,
+                adFu_bm, adFv_bm, adFh_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up,
+                adh_SN, adh_WE,
+                u_i, v_i, h_i, uit_i, vit_i, hit_i, htot_i,
+                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
+                taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=n_chunk)
+
+        adState.setvar([adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot],[
+            self.name_var['U_BM'],
+            self.name_var['V_BM'],
             self.name_var['SSH_BM'],
             self.name_var['U_IT'],
             self.name_var['V_IT'],
@@ -6546,7 +6373,9 @@ class Model_bmit(M):
             self.name_var['SSH']]
             )
 
-        adState.params[self.name_var['SSH_BM']] = adF_bm
+        adState.params[self.name_var['U_BM']] = adFu_bm
+        adState.params[self.name_var['V_BM']] = adFv_bm
+        adState.params[self.name_var['SSH_BM']] = adFh_bm
         if 'He_mean' in self.name_params_it:
             adState.params['He_mean'] = adHe_mean
         adalpha = 0.
@@ -6567,8 +6396,8 @@ class Model_bmit(M):
         if 'hbc' in self.name_params_it:
             adState.params['hbcx'] = adh_SN
             adState.params['hbcy'] = adh_WE
-    
-    
+
+
 ###############################################################################
 #                             Multi-models                                    #
 ###############################################################################      
@@ -6662,6 +6491,8 @@ class Model_multi:
         # Update state
         for name in self.name_var:
             State.var[self.name_var[name]] = var_tot_tmp[name]
+        for M in self.Models:
+            M._set_land_nan(State)
 
     def set_bc(self,time_bc,var_bc=None,**kwargs):
 

@@ -344,21 +344,11 @@ MOD_CSW1L = dict(
 
     name_var_bm = {'time':'','lon':'','lat':'','ssh_bm':''}, # Variable names for the balanced motion netcdf file
 
-    # Boundary conditions parameters
+    # Sponge-layer boundary relaxation parameters
 
-    bc_kind = '1d', # Either 1d or 2d (only for open boundaries conditions)
+    periodic_x = False, # Whether to apply periodic boundary conditions in the zonal direction
 
-    obc_north = False, # Whether to apply open boundary conditions on the north border
-
-    obc_west = False, # Whether to apply open boundary conditions on the west border
-
-    obc_south = False, # Whether to apply open boundary conditions on the south border
-
-    obc_east = False, # Whether to apply open boundary conditions on the east border
-
-    periodic_x = False, # Whether to apply periodic boundary conditions in the zonal direction (overrides obc_west and obc_east)
-
-    periodic_y = False, # Whether to apply periodic boundary conditions in the meridional direction (overrides obc_north and obc_south)
+    periodic_y = False, # Whether to apply periodic boundary conditions in the meridional direction
 
     flag_bc_sponge = True, # Whether to apply a sponge boundary condition (i.e. a damping term nudging the solution towards the boundary conditions) close to the borders and coastal areas (if *dist_sponge_bc* is not None)
 
@@ -372,10 +362,12 @@ MOD_CSW1L = dict(
 
     mask_sponge_bc = True, # Whether to set the mask to True in the sponge boundary areas (i.e. to avoid assimilating observations in these areas)
 
-    bc_it_method = 'plane_wave', # Wave phase method for the sponge IT boundary conditions.
-                                 # 'plane_wave'     : original method — k(x,y)*coords (inconsistent with spatially varying He, kept for backward compatibility)
-                                 # 'plane_wave_bdy' : k evaluated at the boundary edge (true 1D plane wave, recommended for smoothly varying He)
-                                 # 'wkb'            : WKB cumulative-phase integral + He^{-1/4} amplitude correction (best for strongly varying He)
+    bc_it_method = 'plane_wave_bdy', # Wave phase method for the sponge IT boundary conditions.
+                                     # 'plane_wave'     : original method, kept for backward compatibility
+                                     # 'plane_wave_bdy' : k evaluated at the boundary edge (recommended default)
+                                     # 'wkb'            : WKB cumulative-phase integral + He^{-1/4} amplitude correction
+
+    bc_it_corner_weight_power = 1.0, # Power applied to smooth S/N/W/E corner partition weights
 
     bc_file = None,  # Path to NetCDF file containing boundary conditions
 
@@ -385,7 +377,7 @@ MOD_CSW1L = dict(
 
     bc_name_lat = 'lat',  # Name of latitude coordinate in BC file
 
-    bc_name_time = None,  # Name of time coordinate in BC file
+    bc_name_time = 'time',  # Name of time coordinate in BC file
 
     bc_name_var = {},  # Dict mapping variable names to names in BC file
 
@@ -404,7 +396,7 @@ MOD_QGSW = dict(
 
     var_to_save = None,
 
-    name_params = None,#['H', 'hbcx', 'hbcy', 'itg'], # list of parameters to control. H denotes dimensionless equivalent-depth log-control.
+    name_params = None, #['H', 'hbcx', 'hbcy', 'itg'], # list of parameters to control. H denotes dimensionless equivalent-depth log-control.
 
     nl = 1, # number of layers in the model (for nl>1, set H and g_prime as lists/arrays)
 
@@ -527,7 +519,7 @@ MOD_QGSW = dict(
 
     bc_name_lat = 'lat',  # Name of latitude coordinate in BC file
 
-    bc_name_time = None,  # Name of time coordinate in BC file
+    bc_name_time = 'time',  # Name of time coordinate in BC file
 
     bc_name_var = {},  # Dict mapping variable names to names in BC file
 
@@ -538,63 +530,88 @@ MOD_QGSW = dict(
 # Balanced Motion + Internal Tide model
 MOD_BMIT = dict(
 
-    # Common parameters for BM and IT components
+    # Coupled BM/IT state variables. BM velocity variables are prognostic when
+    # bm_model uses a shallow-water core and diagnosed when bm_model is SSH-only.
+    name_var = {
+        'U_IT':'u_it', 'V_IT':'v_it', 'SSH_IT':'ssh_it',
+        'U_BM':'u_bm', 'V_BM':'v_bm', 'SSH_BM':'ssh_bm',
+        'SSH':'ssh'
+    },
 
-    name_var = {'U_IT':'u_it','V_IT':'v_it','SSH_IT':'ssh_it', 'SSH_BM':'ssh_bm', 'SSH':'ssh'},
-
-    name_init_var = [],
-
-    dir_model = None,
+    name_init_var = {},
 
     var_to_save = None,
 
-    dtmodel = 300, # model timestep
+    dtmodel = 300, # coupled model timestep; component models are run on this timestep
 
-    filec_aux = None, # auxilliary file to be used as phase velocity field (the spatial interpolation is handled inline)
+    # Balanced Motion component. Component-specific BM options live here.
+    bm_model = dict(
+        super = 'MOD_QG1L',
+        name_var = {'SSH':'ssh_bm'},
+        name_params = None,
+        name_init_var = {'SSH':'ssh_bm'},
+        dtmodel = 300,
+        init_from_bc = False,
+        time_scheme = 'Euler',
+        Kdiffus = 0,
+        c0 = 2.7,
+        filec_aux = None,
+        name_var_c = {'lon':'','lat':'','var':''},
+        cmin = None,
+        cmax = None,
+        path_mdt = None,
+        name_var_mdt = None,
+        bc_file = None,
+        bc_files = None,
+        bc_name_lon = 'lon',
+        bc_name_lat = 'lat',
+        bc_name_time = 'time',
+        bc_name_var = {},
+        bc_c_grid = False,
+    ),
 
-    name_var_c = {'lon':'','lat':'','var':''}, # Variable names for the phase velocity auxilliary file 
+    # Height used by BM->IT equivalent-depth coupling: 'anomaly' uses SSH_BM,
+    # 'full' uses SSH_BM plus MDT when available. Advective coupling always uses
+    # full BM velocities.
+    bm_height_for_He = 'anomaly',
 
-    c0 = 2.7, # If filec_aux is None, fixed value for phase velocity (m/s)
+    mask_sponge_bc = True, # Whether to set the mask to True in sponge boundary areas for the coupled BM/IT model.
 
-    cfl = None, # If not None, dtmodel is set such as dtmodel=cfl*dx/sqrt(gHe)
+    # Internal Tide component. Component-specific IT options live here.
+    it_model = dict(
+        super = 'MOD_CSW1L',
+        name_var = {'U':'u_it','V':'v_it','SSH':'ssh_it'},
+        name_params = ['He_mean', 'hbc'],
+        name_init_var = {'U':'u_it', 'V':'v_it', 'SSH':'ssh_it'},
+        dtmodel = 300,
+        time_scheme = 'rk4',
+        c0 = 2.7,
+        filec_aux = None,
+        name_var_c = {'lon':'','lat':'','var':''},
+        cmin = None,
+        cmax = None,
+        H = 4e3,
+        file_H_aux = None,
+        name_var_H = {'lon':'','lat':'','var':''},
+        w_waves = [2*3.14/12/3600],
+        Ntheta = 1,
+        g = 9.81,
+        periodic_x = False,
+        periodic_y = False,
+        flag_bc_sponge = False,
+        dist_sponge_bc = None,
+        sponge_coef = 0.05,
+        use_sponge_on_coast = True,
+        tangential_sponge_factor = 1.,
+        bc_it_method = 'plane_wave_bdy',
+        bc_it_corner_weight_power = 1.0,
+    ),
 
-    init_from_bc = False,
+    alpha_eps = 1e-6, # safety margin for alpha logit references loaded from background files
 
-    # BM parameters
+    alpha_background_physical = None, # If None, auto-detect new physical alpha backgrounds via *_control companions; False reads legacy centered alpha anomalies.
 
-    time_scheme_bm = 'Euler', # Time scheme of the model (e.g. Euler,rk2,rk4)
-
-    Kdiffus = 0, # Coefficient of diffusion for the BM component
-
-    path_mdt = None, # path of MDT 
-
-    name_var_mdt = None, # dictionary of MDT coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
-
-    # IT parameters
-
-    time_scheme_it = 'rk4', # Time scheme of the model (e.g. Euler,rk4)
-
-    name_params_it = ['He', 'hbc'], # list of parameters to control (among 'He', 'hbc')
-
-    H = 4e3, # Mean depth (in m)
-
-    file_H_aux = None, # if H is None, netcdf file for spatially varying depth field
-
-    name_var_H = {'lon':'','lat':'','var':''}, # Variable names for the depth netcdf file
-
-    bc_kind = '1d', # Either 1d or 2d
-
-    w_waves = [2*3.14/12/3600], # igw frequencies (in seconds)
-
-    Ntheta = 1, # Number of angles (computed from the normal of the border) of incoming waves.
-               # Set to -1 to auto-compute the minimum Ntheta from the boundary tangential Nyquist:
-               #   Ntheta >= L_bdy / lambda_min, where L_bdy = max boundary length and
-               #   lambda_min = 2*pi*c_min/omega_max  (c_min on the boundary).
-               # Set to 0 for normal incidence only (theta=0).
-
-    g = 9.81,
-
-    flag_coupling_from_bm = False, # Whether to compute He corrections from the balanced motion field
+    flag_coupling_from_bm = False, # Whether to compute He and advective corrections from Balanced Motion
 
     path_vertical_modes = None, # Path of the vertical modes netcdf file
 
@@ -602,52 +619,7 @@ MOD_BMIT = dict(
 
     name_var_interaction_terms = {'lon':'lon','lat':'lat','U11_u':None,'U11_p':None,'dc2':None}, # Variable names for the interaction terms
 
-    cmin = None, # Minimum phase velocity (m/s)
-
-    cmax = None, # Maximum phase velocity (m/s)
-
-    obc_north = True,
-
-    obc_west = True,
-
-    obc_south = True,
-
-    obc_east = True,
-
-    periodic_x = False,
-
-    periodic_y = False,
-
-    flag_bc_sponge = False,
-
-    dist_sponge_bc = None,
-
-    sponge_coef = 0.05,
-
-    use_sponge_on_coast = True,
-
-    tangential_sponge_factor = 1.,
-
-    mask_sponge_bc = True, # Whether to set the mask to True in the sponge boundary areas (i.e. to avoid assimilating observations in these areas)
-
-    bc_it_method = 'plane_wave', # Wave phase method for the sponge IT boundary conditions.
-                                 # 'plane_wave'     : original method — k(x,y)*coords (inconsistent with spatially varying He, kept for backward compatibility)
-                                 # 'plane_wave_bdy' : k evaluated at the boundary edge (true 1D plane wave, recommended for smoothly varying He)
-                                 # 'wkb'            : WKB cumulative-phase integral + He^{-1/4} amplitude correction (best for strongly varying He)
-
-    bc_file = None,  # Path to NetCDF file containing boundary conditions
-
-    bc_files = None,  # Optional dict mapping model variable names to BC files or per-variable BC source dicts
-
-    bc_name_lon = 'lon',  # Name of longitude coordinate in BC file
-
-    bc_name_lat = 'lat',  # Name of latitude coordinate in BC file
-
-    bc_name_time = None,  # Name of time coordinate in BC file
-
-    bc_name_var = {},  # Dict mapping variable names to names in BC file
-
-    bc_c_grid = False,  # Whether BC grid is C-grid (True) or A-grid (False)
+    max_nstep = 240, # maximum number of coupled model steps per JIT call.
 
 )
 
@@ -1168,7 +1140,6 @@ DIAG_OSE = dict(
     name_bas_var = None
 
 )
-
 
 
 

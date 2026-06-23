@@ -511,6 +511,7 @@ class Basis_gauss3d(_Basis_gauss3d):
                 yy = yy[~indmask]
             Gauss_2d[i,indphys] = mywindow(xx / self.sigma_D) * mywindow(yy / self.sigma_D)
         Gauss_2d = jnp.array(Gauss_2d)
+        self.Gauss_xy_T = sparse.CSR.fromdense(Gauss_2d)
         return sparse.CSR.fromdense(Gauss_2d.T)  
 
     def _compute_component_time(self, time):
@@ -579,28 +580,13 @@ class Basis_gauss3d(_Basis_gauss3d):
         return phi
 
     def _operg_reduced(self, t, phi_2d):
-        """
-        Project a 2D physical space field back to the reduced space.
+        """Project a 2D physical adjoint field back to reduced space."""
 
-        Parameters:
-            t: Current time
-            phi_2d: 2D physical space field to project back.
+        Gt = self.get_Gt_value(t)
+        ad_space = self.Gauss_xy_T @ phi_2d.ravel()
+        adX = Gt.reshape((-1, self.Nx)) * ad_space[None, :]
 
-        Returns:
-            Reduced space representation (1D vector).
-        """
-
-        # Define a wrapper function for _operg that computes the forward projection
-        def operg_func(X):
-            return self._operg_jit(t, X)
-
-        # Compute the vector-Jacobian product (vjp) for the forward projection
-        _, vjp_func = jax.vjp(operg_func, self.zero_basis)  # Provide a zero vector matching the reduced space shape
-
-        # Use the vjp_func to compute the reduced space projection
-        X_reduced, = vjp_func(phi_2d)
-
-        return X_reduced
+        return adX.ravel()
 
     def operg(self, t, X, State=None):
         
@@ -993,7 +979,9 @@ class Basis_gauss2d(_Basis_gauss2d):
                 xx = xx[~indmask]
                 yy = yy[~indmask]
             Gauss_2d[i, indphys] = mywindow(xx / self.sigma_D) * mywindow(yy / self.sigma_D)
-        return sparse.CSR.fromdense(jnp.array(Gauss_2d).T)
+        Gauss_2d = jnp.array(Gauss_2d)
+        self.Gauss_xy_T = sparse.CSR.fromdense(Gauss_2d)
+        return sparse.CSR.fromdense(Gauss_2d.T)
 
     def _ssh2uv(self, ssh):
         _ssh = jnp.pad(ssh, pad_width=((1, 0), (1, 0)), mode='edge')
@@ -1009,10 +997,8 @@ class Basis_gauss2d(_Basis_gauss2d):
         return (self.Gauss_xy @ X).reshape(self.shape_phys)
 
     def _operg_reduced(self, phi_2d):
-        """Reverse-mode projection via VJP (JAX traceable)."""
-        _, vjp_func = jax.vjp(self._operg_jit, self.zero_basis)
-        X_reduced, = vjp_func(phi_2d)
-        return X_reduced
+        """Project a 2D physical adjoint field back to reduced space."""
+        return self.Gauss_xy_T @ phi_2d.ravel()
 
     def operg(self, t, X, State=None):
         """Project control vector to physical space."""
@@ -1812,6 +1798,7 @@ class Basis_bmaux(_Basis_bmaux):
     def _compute_component_space(self):
 
         Gx = [None,]*self.nf
+        GxT = [None,]*self.nf
         Nx = [None,]*self.nf
 
         for iff in range(self.nf):
@@ -1877,8 +1864,10 @@ class Basis_bmaux(_Basis_bmaux):
             indptr[1:] = np.cumsum(sizes)
 
             Gx[iff] = sparse.CSC((data, indices, indptr), shape=(self.nphys, nwaves))
+            GxT[iff] = sparse.CSR((data, indices, indptr), shape=(nwaves, self.nphys))
                         
 
+        self.GxT = GxT
         return Gx, Nx
 
     def _compute_component_time(self, time):
@@ -1954,28 +1943,19 @@ class Basis_bmaux(_Basis_bmaux):
         return phi
 
     def _operg_reduced(self, t, phi_2d):
-        """
-        Project a 2D physical space field back to the reduced space.
+        """Project a 2D physical adjoint field back to reduced space."""
 
-        Parameters:
-            t: Current time
-            phi_2d: 2D physical space field to project back.
+        adX = self.zero_basis
+        phi_1d = phi_2d.ravel()
 
-        Returns:
-            Reduced space representation (1D vector).
-        """
+        for iff in range(self.nf):
+            Gt = self.get_Gt_value(t, iff)
+            Nx_val = self.Nx[iff]
+            ad_space = self.GxT[iff] @ phi_1d
+            adX_f = Gt.reshape((-1, Nx_val)) * ad_space[None, :]
+            adX = adX.at[self.iff_wavebounds[iff]:self.iff_wavebounds[iff+1]].set(adX_f.ravel())
 
-        # Define a wrapper function for _operg that computes the forward projection
-        def operg_func(X):
-            return self._operg_jit(t, X)
-
-        # Compute the vector-Jacobian product (vjp) for the forward projection
-        _, vjp_func = jax.vjp(operg_func, self.zero_basis)  # Provide a zero vector matching the reduced space shape
-
-        # Use the vjp_func to compute the reduced space projection
-        X_reduced, = vjp_func(phi_2d)
-
-        return X_reduced
+        return adX
 
     def operg(self, t, X, State=None):
         
@@ -2129,6 +2109,7 @@ class Basis_hbc:
         self.vect_time = jnp.eye(time.size)
 
         self.Gxy = {} # Dictionary containing gaussian basis elements for each parameters. 
+        self.GxyT = {} # Transpose operators for explicit adjoint projection.
         self.shape_params = {} # Dictionary containing the shapes in the reduced space of each of the parameters.
         self.shape_params_phys = {} # Dictionary containing the shapes in the physical space of each of the parameters.
         
@@ -2297,6 +2278,8 @@ class Basis_hbc:
         # Saving gaussian reduced basis elements 
         self.Gxy["hbcS"] = sparse.CSR.fromdense(jnp.array(bc_S_gauss.T)) # For South boundary 
         self.Gxy["hbcN"] = sparse.CSR.fromdense(jnp.array(bc_N_gauss.T)) # For North boundary
+        self.GxyT["hbcS"] = sparse.CSR.fromdense(jnp.array(bc_S_gauss))
+        self.GxyT["hbcN"] = sparse.CSR.fromdense(jnp.array(bc_N_gauss))
 
         ####################################
         ###   - BASIS ELEMENT SHAPES -   ###
@@ -2410,6 +2393,8 @@ class Basis_hbc:
         # Gaussian reduced basis elements
         self.Gxy["hbcE"] = sparse.CSR.fromdense(jnp.array(bc_E_gauss.T)) # For East boundary 
         self.Gxy["hbcW"] = sparse.CSR.fromdense(jnp.array(bc_W_gauss.T)) # For West boundary 
+        self.GxyT["hbcE"] = sparse.CSR.fromdense(jnp.array(bc_E_gauss))
+        self.GxyT["hbcW"] = sparse.CSR.fromdense(jnp.array(bc_W_gauss))
 
         ####################################
         ###   - BASIS ELEMENT SHAPES -   ###
@@ -2543,28 +2528,29 @@ class Basis_hbc:
         return phi
 
     def _operg_reduced(self, t, phi_2d):
-        """
-        Project a 2D physical space field back to the reduced space.
+        """Project HBC physical adjoints explicitly back to reduced space."""
 
-        Parameters:
-            t: Current time
-            phi_2d: 2D physical space field to project back.
+        if self.time_dependant:
+            _Gt = self.get_bc_t_gauss_value(t)
 
-        Returns:
-            Reduced space representation (1D vector).
-        """
+        adX = jnp.zeros((self.nbasis,))
 
-        # Define a wrapper function for _operg that computes the forward projection
-        def operg_func(X):
-            return self._operg_jit(t, X)
+        for name in self.slice_params_phys.keys():
+            ad_phi = phi_2d[self.slice_params_phys[name]].reshape(self.shape_params_phys[name])
+            ad_phi_t = ad_phi.T
 
-        # Compute the vector-Jacobian product (vjp) for the forward projection
-        _, vjp_func = jax.vjp(operg_func, jnp.zeros(self.nbasis))  # Provide a zero vector matching the reduced space shape
+            Gt_ad_phi_t = sparse.csr_matmat(
+                self.GxyT[name],
+                ad_phi_t.reshape(ad_phi_t.shape[0], -1),
+            )
+            ad_reduced = Gt_ad_phi_t.reshape((Gt_ad_phi_t.shape[0],) + ad_phi_t.shape[1:]).T
 
-        # Use the vjp_func to compute the reduced space projection
-        X_reduced, = vjp_func(phi_2d)
+            if self.time_dependant:
+                ad_reduced = _Gt[None, None, None, :, None] * ad_reduced[:, :, :, None, :]
 
-        return X_reduced
+            adX = adX.at[self.slice_params[name]].set(ad_reduced.flatten())
+
+        return adX
 
     def operg(self, t, X, State=None):
         
@@ -2816,15 +2802,11 @@ class Basis_multi:
             Project to reduced space
         """
         
-        for i,B in enumerate(self.Basis):
-            _adX = B.operg_transpose(t, adState=adState)
-            if i==0:
-                adX = +_adX
-            else:
-                if self.jax:
-                    adX = jnp.concatenate((adX, _adX))
-                else:
-                    adX = np.concatenate((adX, _adX))
+        adX_parts = [B.operg_transpose(t, adState=adState) for B in self.Basis]
+        if self.jax:
+            adX = jnp.concatenate(adX_parts)
+        else:
+            adX = np.concatenate(adX_parts)
         
         for name_mod_var in self.name_mod_var:
             adState[name_mod_var] *= 0.

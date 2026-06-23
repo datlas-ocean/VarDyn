@@ -113,9 +113,7 @@ SW = dict(
 
     name_var_c = {'lon':'lon','lat':'lat','var':'c1'}, # Coordinate and variable names inside filec_aux.
 
-    #cmin = 2., # Lower bound applied to the phase-speed field.
-
-    constant_H = False, # Use a spatially constant equivalent depth derived from the phase-speed field.
+    constant_H = True, # Use a spatially constant equivalent depth derived from the phase-speed field.
 
     g_prime = None, # Use the default reduced gravity.
 

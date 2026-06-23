@@ -27,7 +27,7 @@ class CSWm:
     #                             Initialization                              #
     ###########################################################################
     
-    def __init__(self,X=None,Y=None,dt=None,time_scheme='rk4',bc_kind='1d',g=9.81,f=1e-4,Heb=0.7,obc_south=True, obc_north=True, obc_west=True, obc_east=True, periodic_x=False, periodic_y=False, omegas=None, bc_theta=None, **arr_kwargs):
+    def __init__(self,X=None,Y=None,dt=None,time_scheme='rk4',g=9.81,f=1e-4,Heb=0.7,periodic_x=False, periodic_y=False, omegas=None, bc_theta=None, **arr_kwargs):
         
         self.X = X
         self.Y = Y
@@ -36,7 +36,6 @@ class CSWm:
         self.Xv = self.rho_on_v(X)
         self.Yv = self.rho_on_v(Y)
         self.dt = dt
-        self.bc_kind = bc_kind
         self.g = g
         if hasattr(f, "__len__") and f.shape==self.X.shape:
             self.f = f
@@ -82,12 +81,6 @@ class CSWm:
         self.shapeh = self.X.shape
         self.shapeHe = self.X.shape
         
-        # Open Boundary Conditions
-        self.obc_south = obc_south
-        self.obc_north = obc_north
-        self.obc_west = obc_west
-        self.obc_east = obc_east
-        
         # Periodic Boundary Conditions
         self.periodic_x = periodic_x
         self.periodic_y = periodic_y
@@ -131,7 +124,8 @@ class CSWm:
         # 'plane_wave'     : local k(x,y) * coords  (original, phase inconsistent with varying He)
         # 'plane_wave_bdy' : k from boundary row/col -> true 1D plane wave (recommended)
         # 'wkb'            : cumulative-path-integral phase + He^{-1/4} amplitude correction
-        self.bc_it_method = 'plane_wave'
+        self.bc_it_method = arr_kwargs.get('bc_it_method', 'plane_wave_bdy')
+        self.bc_it_corner_weight_power = float(arr_kwargs.get('bc_it_corner_weight_power', 1.0))
         
         # JAX compiling — always-needed utilities
         self.u_on_v_jit = jit(self.u_on_v)
@@ -139,7 +133,6 @@ class CSWm:
         self.rhs_u_jit = jit(self.rhs_u)
         self.rhs_v_jit = jit(self.rhs_v)
         self.rhs_h_jit = jit(self.rhs_h)
-        self.obcs_jit = jit(self.obcs)
 
         # Only JIT the active time scheme to avoid unnecessary compile overhead.
         # Leapfrog and the unused scheme are still available as plain methods;
@@ -348,270 +341,10 @@ class CSWm:
     
     
     ###########################################################################
-    #                      Open Boundary Conditions                           #
+    #                         Boundary Handling                               #
     ###########################################################################
-    
-    def obcs(self,u,v,h,u0,v0,h0,He,w1ext):
-        
-        g = self.g
-                
-        #######################################################################
-        # South
-        #######################################################################
-        if self.obc_south:
-            HeS = (He[0,:]+He[1,:])/2
-            cS = jnp.sqrt(g*HeS)
-            if self.bc_kind=='1d':
-                cS *= self.dt/(self.Y[1,:]-self.Y[0,:])
-            fS = (self.f[0,:] + self.f[1,:])/2
-            aS = jnp.sqrt(HeS/g)
-        
-            # 1. w1
-            w1extS = +w1ext[0]
-            
-            if self.bc_kind=='1d':
-                w1S = w1extS
-            elif self.bc_kind=='2d':
-                # dw1dy0
-                w10  = v0[0,:] + (1/aS)* (h0[0,:]+h0[1,:])/2
-                w10_ = (v0[0,:]+v0[1,:])/2 + (1/aS)* h0[1,:]
-                _w10 = w1extS
-                dw1dy0 = (w10_ - _w10)/(self.Y[1,:]-self.Y[0,:])
-                # dudx0
-                dudx0 = jnp.zeros(self.nx)
-                dudx0 = dudx0.at[1:-1].set(((u0[0,1:] + u0[1,1:] - u0[0,:-1] - u0[1,:-1])/2)/(self.Xu[0,1:]-self.Xu[0,:-1]))
-                dudx0 = dudx0.at[0].set(dudx0[1])
-                dudx0 = dudx0.at[-1].set(dudx0[-2])
-                # w1S
-                w1S = w10 - self.dt*cS* (dw1dy0 + dudx0)
-            
-            # 2. w2
-            w20 = (u0[0,:] + u0[1,:])/2
-            if self.bc_kind=='1d':
-                w2S = w20
-            elif self.bc_kind=='2d':
-                dhdx0 = ((h0[0,1:]+h0[1,1:]-h0[0,:-1]-h0[1,:-1])/2)/(self.X[0,1:]-self.X[0,:-1])
-                w2S = w20 - self.dt*g* dhdx0 
-                    
-            # 3. w3
-            if self.bc_kind=='1d':
-                _vS = (1-3/2*cS)* v0[0,:] + cS/2* (4*v0[1,:] - v0[2,:])
-                _hS = (1/2+cS)* h0[1,:] + (1/2-cS)* h0[0,:]
-                w3S = _vS - (1/aS) * _hS
-            elif self.bc_kind=='2d':
-                w30   = v0[0,:] - (1/aS) * (h0[0,:]+h0[1,:])/2
-                w30_  = (v0[0,:]+v0[1,:])/2  - (1/aS) * h0[1,:]
-                w30__ = v0[1,:] - (1/aS) * (h0[1,:]+h0[2,:])/2
-                dw3dy0 =  -(3*w30 - 4*w30_ + w30__)/((self.Y[1,:]-self.Y[0,:])/2)
-                w3S = w30 + self.dt*cS* (dw3dy0 + dudx0) 
 
-            # 4. Values on BC
-            uS = w2S
-            vS = (w1S + w3S)/2 
-            hS = aS * (w1S - w3S)/2
-            
-        #######################################################################
-        # North
-        #######################################################################
-        if self.obc_north:
-            HeN = (He[-1,:]+He[-2,:])/2
-            cN = jnp.sqrt(g*HeN)
-            if self.bc_kind=='1d':
-                cN *= self.dt/(self.Y[-1,:]-self.Y[-2,:])
-            aN = jnp.sqrt(HeN/g)
-
-            # 1. w1
-            w1extN = +w1ext[1]
-            
-            if self.bc_kind=='1d':
-                w1N = w1extN
-            elif self.bc_kind=='2d':
-                w10  = v0[-1,:] - (1/aN) * (h0[-1,:]+h0[-2,:])/2
-                w10_ = (v0[-1,:]+v0[-2,:])/2 - (1/aN) * h0[-2,:]
-                _w10 = w1extN
-                dw1dy0 = (_w10 - w10_)/(self.Y[-1,:]-self.Y[-2,:])
-                dudx0 = jnp.zeros(self.nx)
-                dudx0 = dudx0.at[1:-1].set(((u0[-1,1:] + u0[-2,1:] - u0[-1,:-1] - u0[-2,:-1])/2)/(self.Xu[-1,1:]-self.Xu[-1,:-1]))
-                dudx0 = dudx0.at[0].set(dudx0[1])
-                dudx0 = dudx0.at[-1].set(dudx0[-2])
-                w1N = w10 + self.dt*cN* (dw1dy0 + dudx0)
-
-            # 2. w2
-            w20 = (u0[-1,:] + u0[-2,:])/2
-            if self.bc_kind=='1d':   
-                w2N = w20
-            elif self.bc_kind=='2d':
-                dhdx0 = ((h0[-1,1:]+h0[-2,1:]-h0[-1,:-1]-h0[-2,:-1])/2)/(self.X[-1,1:]-self.X[-1,:-1])
-                w2N = w20 - self.dt*g*dhdx0 
-            # 3. w3
-            if self.bc_kind=='1d':   
-                _vN = (1-3/2*cN)* v0[-1,:] + cN/2* (4*v0[-2,:] - v0[-3,:])
-                _hN = (1/2+cN)* h0[-2,:] + (1/2-cN)* h0[-1,:]
-                w3N = _vN + (1/aN) * _hN
-            elif self.bc_kind=='2d':
-                w30   = v0[-1,:] + (1/aN) * (h0[-1,:]+h0[-2,:])/2
-                w30_  = (v0[-1,:]+v0[-2,:])/2 + (1/aN) * h0[-2,:]
-                w30__ = v0[-2,:] + (1/aN) * (h0[-2,:]+h0[-3,:])/2
-                dw3dy0 = (3*w30 - 4*w30_ + w30__)/((self.Y[1,:]-self.Y[0,:])/2)
-                w3N = w30 - self.dt*cN* (dw3dy0 + dudx0) 
-            
-            # 4. Values on BC
-            uN = w2N
-            vN = (w1N + w3N)/2 
-            hN = aN * (w3N - w1N)/2
-        
-        #######################################################################
-        # West
-        #######################################################################
-        if self.obc_west:
-            HeW = (He[:,0]+He[:,1])/2
-            cW = jnp.sqrt(g*HeW)
-            if self.bc_kind=='1d':
-                cW *= self.dt/(self.X[:,1]-self.X[:,0])
-            aW = jnp.sqrt(HeW/g)
-            
-            # 1. w1
-            w1extW = +w1ext[2]
-            
-            if self.bc_kind=='1d':   
-                w1W = w1extW
-            elif self.bc_kind=='2d':
-                w10  = u0[:,0] + (1/aW) * (h0[:,0]+h0[:,1])/2
-                w10_ = (u0[:,0]+u0[:,1])/2 + (1/aW) * h0[:,1]
-                _w10 = w1extW
-                dw1dx0 = (w10_ - _w10)/(self.X[:,1]-self.X[:,0])
-                dvdy0 = jnp.zeros(self.ny)
-                dvdy0 = dvdy0.at[1:-1].set(((v0[1:,0] + v0[1:,1] - v0[:-1,0] - v0[:-1,1])/2)/(self.Yv[1:,0]-self.Yv[:-1,0]))
-                dvdy0 = dvdy0.at[0].set(dvdy0[1])
-                dvdy0 = dvdy0.at[-1].set(dvdy0[-2])
-                w1W = w10 - self.dt*cW* (dw1dx0 + dvdy0) 
-                
-            # 2. w2
-            w20 = (v0[:,0] + v0[:,1])/2
-            if self.bc_kind=='1d':   
-                w2W = w20
-            elif self.bc_kind=='2d':
-                dhdy0 = ((h0[1:,0]+h0[1:,1]-h0[:-1,0]-h0[:-1,1])/2)/(self.Y[1:,0]-self.Y[:-1,0])
-                w2W = w20 - self.dt*g * dhdy0 
-                    
-            # 3. w3
-            if self.bc_kind=='1d':   
-                _uW = (1-3/2*cW)* u0[:,0] + cW/2* (4*u0[:,1]-u0[:,2]) 
-                _hW = (1/2+cW)*h0[:,1] + (1/2-cW)*h0[:,0]
-                w3W = _uW - (1/aW) * _hW
-            elif self.bc_kind=='2d':
-                w30   = u0[:,0] - (1/aW) * (h0[:,0]+h0[:,1])/2
-                w30_  = (u0[:,0]+u0[:,1])/2 - (1/aW) * h0[:,1]
-                w30__ = u0[:,1] - (1/aW) * (h0[:,1]+h0[:,2])/2
-                dw3dx0 = -(3*w30 - 4*w30_ + w30__)/((self.Xu[:,1]-self.Xu[:,0])/2)
-                w3W = w30 + self.dt*cW* (dw3dx0 + dvdy0)
-                
-            # 4. Values on BC
-            uW = (w1W + w3W)/2 
-            vW = w2W
-            hW = aW * (w1W - w3W)/2
-        
-        #######################################################################
-        # East
-        #######################################################################
-        if self.obc_east:
-            HeE = (He[:,-1]+He[:,-2])/2
-            cE = jnp.sqrt(g*HeE)
-            if self.bc_kind=='1d':
-                cE *= self.dt/(self.X[:,-1]-self.X[:,-2])
-            aE = jnp.sqrt(HeE/g)
-            
-            # 1. w1
-            w1extE = +w1ext[3]
-            
-            if self.bc_kind=='1d':   
-                w1E = w1extE
-            elif self.bc_kind=='2d':
-                w10  = u0[:,-1] - (1/aE) * (h0[:,-1]+h0[:,-2])/2
-                w10_ = (u0[:,-1]+u0[:,-2])/2 - (1/aE) * h0[:,-2]
-                _w10 = w1extE
-                dw1dx0 = (_w10 - w10_)/(self.X[:,-1]-self.X[:,-2])
-                dvdy0 = jnp.zeros(self.ny)
-                dvdy0 = dvdy0.at[1:-1].set(((v0[1:,-1] + v0[1:,-2] - v0[:-1,-1] - v0[:-1,-2])/2)/(self.Yv[1:,-1]-self.Yv[:-1,-1]))
-                dvdy0 = dvdy0.at[0].set(dvdy0[1])
-                dvdy0 = dvdy0.at[-1].set(dvdy0[-2])
-                w1E = w10 + self.dt*cE* (dw1dx0 + dvdy0) 
-            # 2. w2
-            w20 = (v0[:,-1] + v0[:,-2])/2
-            if  self.bc_kind=='1d':   
-                w2E = w20
-            elif self.bc_kind=='2d':
-                w20 = (v0[:,-1] + v0[:,-2])/2
-                dhdy0 = ((h0[1:,-1]+h0[1:,-2]-h0[:-1,-1]-h0[:-1,-2])/2)/(self.Y[1:,-1]-self.Y[:-1,-1])
-                w2E = w20 - self.dt*g * dhdy0 
-            # 3. w3
-            if self.bc_kind=='1d':   
-                _uE = (1-3/2*cE)* u0[:,-1] + cE/2* (4*u0[:,-2]-u0[:,-3])
-                _hE = ((1/2+cE)*h0[:,-2] + (1/2-cE)*h0[:,-1])
-                w3E = _uE + (1/aE) * _hE 
-            elif self.bc_kind=='2d':
-                w30   = u0[:,-1] + (1/aE) * (h0[:,-1]+h0[:,-2])/2
-                w30_  = (u0[:,-1]+u0[:,-2])/2 + (1/aE) * h0[:,-2]
-                w30__ = u0[:,-2] + (1/aE) * (h0[:,-2]+h0[:,-3])/2
-                dw3dx0 =  (3*w30 - 4*w30_ + w30__)/((self.Xu[:,-1]-self.Xu[:,-2])/2)
-                w3E = w30 - self.dt*cE* (dw3dx0 + dvdy0) 
-                
-            # 4. Values on BC
-            uE = (w1E + w3E)/2 
-            vE = w2E
-            hE = aE * (w3E - w1E)/2
-        
-        #######################################################################
-        # Update border pixels 
-        #######################################################################
-        # South
-        if self.obc_south:
-            u = u.at[0,:].set(uS)
-            v = v.at[0,:].set(vS)
-            h = h.at[0,:].set(hS)
-        # North
-        if self.obc_north:
-            u = u.at[-1,:].set(uN)
-            v = v.at[-1,:].set(vN)
-            h = h.at[-1,:].set(hN)
-        # West
-        if self.obc_west:
-            u = u.at[:,0].set(uW)
-            v = v.at[:,0].set(vW)
-            h = h.at[:,0].set(hW)   
-        # East
-        if self.obc_east:
-            u = u.at[:,-1].set(uE)
-            v = v.at[:,-1].set(vE)
-            h = h.at[:,-1].set(hE)
-        # South-West
-        if self.obc_south and self.obc_west:
-            u = u.at[0,0].set((uS[0] + uW[0])/2)
-            v = v.at[0,0].set((vS[0] + vW[0])/2)
-            h = h.at[0,0].set((hS[0] + hW[0])/2)
-        # South-East
-        if self.obc_south and self.obc_east:
-            u = u.at[0,-1].set((uS[-1] + uE[0])/2)
-            v = v.at[0,-1].set((vS[-1] + vE[0])/2)
-            h = h.at[0,-1].set((hS[-1] + hE[0])/2)
-        # North-West
-        if self.obc_north and self.obc_west:
-            u = u.at[-1,0].set((uN[0] + uW[-1])/2)
-            v = v.at[-1,0].set((vN[0] + vW[-1])/2)
-            h = h.at[-1,0].set((hN[0] + hW[-1])/2)
-        # North-East
-        if self.obc_north and self.obc_east:
-            u = u.at[-1,-1].set((uN[-1] + uE[-1])/2)
-            v = v.at[-1,-1].set((vN[-1] + vE[-1])/2)
-            h = h.at[-1,-1].set((hN[-1] + hE[-1])/2)
-    
-        return u,v,h
-    
     def boundary_conditions(self,u,v,h,u0,v0,h0,w1ext):
-
-        if w1ext is not None:
-            u,v,h = self.obcs_jit(u,v,h,u0,v0,h0,self.Heb,w1ext)
-        
         return u,v,h
     
     def periodic_boundary_conditions(self, u, v, h):
@@ -849,12 +582,31 @@ class CSWm:
             # default amplitude: 1.0 (no correction)
             amp_ones = jnp.ones((len(thetas), ny_g, nx_g))
 
+            # Local boundary coordinates.  Tangential phase is a path
+            # integral along the boundary; using k(s) * s would add an artificial
+            # s * dk/ds term and creates stripes perpendicular to the boundary.
+            y_S = Y_g - Y_g[0:1, :]
+            y_N = Y_g[-1:, :] - Y_g
+            x_W = X_g - X_g[:, 0:1]
+            x_E = X_g[:, -1:] - X_g
+
+            def _cumtrapz_last(coord, kval):
+                ds = coord[..., 1:] - coord[..., :-1]
+                dphi = 0.5 * (kval[..., :-1] + kval[..., 1:]) * ds
+                return jnp.concatenate([jnp.zeros_like(kval[..., :1]),
+                                        jnp.cumsum(dphi, axis=-1)], axis=-1)
+
+            def _cumtrapz_first(coord, kval):
+                return jnp.swapaxes(_cumtrapz_last(jnp.swapaxes(coord, -1, -2),
+                                                   jnp.swapaxes(kval, -1, -2)), -1, -2)
+
             if self.bc_it_method == 'plane_wave':
-                # phase = k(x,y) · (x, y)  [original, kept for back-compat]
-                phi_S =  sin_t3*k_g*X_g + cos_t3*k_g*Y_g
-                phi_N =  sin_t3*k_g*X_g - cos_t3*k_g*Y_g
-                phi_W =  cos_t3*k_g*X_g + sin_t3*k_g*Y_g
-                phi_E = -cos_t3*k_g*X_g + sin_t3*k_g*Y_g
+                phi_x = _cumtrapz_last(X_g, k_g)
+                phi_y = _cumtrapz_first(Y_g, k_g)
+                phi_S = sin_t3 * phi_x + cos_t3 * k_g * y_S
+                phi_N = sin_t3 * phi_x + cos_t3 * k_g * y_N
+                phi_W = cos_t3 * k_g * x_W + sin_t3 * phi_y
+                phi_E = cos_t3 * k_g * x_E + sin_t3 * phi_y
                 amp_S = amp_N = amp_W = amp_E = amp_ones
 
             elif self.bc_it_method == 'plane_wave_bdy':
@@ -863,10 +615,14 @@ class CSWm:
                 k_N_bdy = jnp.sqrt((w**2 - f_g[-1,:]**2) / (self.g * He_g[-1,:]))
                 k_W_bdy = jnp.sqrt((w**2 - f_g[:,0 ]**2) / (self.g * He_g[:,0 ]))   # (ny_g,)
                 k_E_bdy = jnp.sqrt((w**2 - f_g[:,-1]**2) / (self.g * He_g[:,-1]))
-                phi_S =  sin_t3*k_S_bdy[None,:]*X_g + cos_t3*k_S_bdy[None,:]*Y_g
-                phi_N =  sin_t3*k_N_bdy[None,:]*X_g - cos_t3*k_N_bdy[None,:]*Y_g
-                phi_W =  cos_t3*k_W_bdy[:,None]*X_g + sin_t3*k_W_bdy[:,None]*Y_g
-                phi_E = -cos_t3*k_E_bdy[:,None]*X_g + sin_t3*k_E_bdy[:,None]*Y_g
+                phi_S_t = _cumtrapz_last(X_g[0, :], k_S_bdy)[None, :]
+                phi_N_t = _cumtrapz_last(X_g[-1, :], k_N_bdy)[None, :]
+                phi_W_t = _cumtrapz_last(Y_g[:, 0], k_W_bdy)[:, None]
+                phi_E_t = _cumtrapz_last(Y_g[:, -1], k_E_bdy)[:, None]
+                phi_S = sin_t3 * phi_S_t + cos_t3 * k_S_bdy[None, :] * y_S
+                phi_N = sin_t3 * phi_N_t + cos_t3 * k_N_bdy[None, :] * y_N
+                phi_W = cos_t3 * k_W_bdy[:, None] * x_W + sin_t3 * phi_W_t
+                phi_E = cos_t3 * k_E_bdy[:, None] * x_E + sin_t3 * phi_E_t
                 amp_S = amp_N = amp_W = amp_E = amp_ones
 
             else:  # 'wkb'
@@ -917,12 +673,61 @@ class CSWm:
 
         return out  # out[dir][grid] = (phase, amp, kx, ky)  all (n_theta, ny_g, nx_g)
 
+    def _smootherstep(self, x):
+        return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+
+    def _edge_weight(self, dist, mask):
+        mask = jnp.asarray(mask, dtype=bool)
+        dist = jnp.asarray(dist)
+        width = jnp.max(jnp.where(mask, dist, 0.0))
+        width = jnp.maximum(width, 1e-12)
+        r = jnp.clip(dist / width, 0.0, 1.0)
+        weight = 1.0 - self._smootherstep(r)
+        if self.bc_it_corner_weight_power != 1.0:
+            weight = weight ** self.bc_it_corner_weight_power
+        return jnp.where(mask, weight, 0.0)
+
+    def _it_boundary_weights(self, grid):
+        """Smooth partition of unity for S/N/W/E sponge fields on one grid."""
+        if grid == 'h':
+            X, Y = self.X, self.Y
+            names = ('sponge_on_h_S', 'sponge_on_h_N', 'sponge_on_h_W', 'sponge_on_h_E')
+        elif grid == 'u':
+            X, Y = self.Xu, self.Yu
+            names = ('sponge_on_u_S', 'sponge_on_u_N', 'sponge_on_u_W', 'sponge_on_u_E')
+        else:
+            X, Y = self.Xv, self.Yv
+            names = ('sponge_on_v_S', 'sponge_on_v_N', 'sponge_on_v_W', 'sponge_on_v_E')
+
+        if not all(hasattr(self, name) for name in names):
+            weight = 0.25 * jnp.ones_like(X)
+            return weight, weight, weight, weight
+
+        X = jnp.asarray(X)
+        Y = jnp.asarray(Y)
+        mask_S = getattr(self, names[0])
+        mask_N = getattr(self, names[1])
+        mask_W = getattr(self, names[2])
+        mask_E = getattr(self, names[3])
+
+        w_S = self._edge_weight(jnp.abs(Y - Y[0:1, :]), mask_S)
+        w_N = self._edge_weight(jnp.abs(Y[-1:, :] - Y), mask_N)
+        w_W = self._edge_weight(jnp.abs(X - X[:, 0:1]), mask_W)
+        w_E = self._edge_weight(jnp.abs(X[:, -1:] - X), mask_E)
+
+        weight_sum = w_S + w_N + w_W + w_E
+        active = weight_sum > 0.0
+        weight_sum = jnp.where(active, weight_sum, 1.0)
+        return tuple(jnp.where(active, w / weight_sum, 0.0)
+                     for w in (w_S, w_N, w_W, w_E))
+
     def compute_IT_2D(self, t, He, h_SN, h_WE, flag_tangent=True):
         """
         Compute 2D IT wave fields for sponge boundary conditions.
 
-        Vectorised over both omega and theta: no Python loops are unrolled in the
-        XLA graph, which dramatically reduces compile time and memory.
+        Each S/N/W/E wave field is blended with a smooth partition of unity.
+        This avoids the hard corner jumps produced by boolean sponge-mask
+        averaging while leaving the HBC amplitudes untouched.
 
         Parameters
         ----------
@@ -938,6 +743,10 @@ class CSWm:
         """
         He_on_u = (He[:,1:] + He[:,:-1]) / 2
         He_on_v = (He[1:,:] + He[:-1,:]) / 2
+
+        wh_S, wh_N, wh_W, wh_E = self._it_boundary_weights('h')
+        wu_S, wu_N, wu_W, wu_E = self._it_boundary_weights('u')
+        wv_S, wv_N, wv_W, wv_E = self._it_boundary_weights('v')
 
         # Accumulate contributions from all omega/theta (as sums of 2D arrays)
         u_S = jnp.zeros((self.ny,   self.nx-1))
@@ -983,12 +792,12 @@ class CSWm:
 
             phi_h, amp_h, kx_h, ky_h = phases['S']['h']
             phi_v, amp_v, kx_v, ky_v = phases['S']['v']
-            h_S = h_S + self.sponge_on_h_S * _h_field(phi_h, amp_h, hc_xb, hs_xb)
-            v_S = v_S + self.sponge_on_v_S * _vel_field(
+            h_S = h_S + _h_field(phi_h, amp_h, hc_xb, hs_xb)
+            v_S = v_S + _vel_field(
                     phi_v, amp_v, ky_v, kx_v, self.f_on_v, hc_xb, hs_xb, w2f2_v)
             if flag_tangent:
                 phi_u, amp_u, kx_u, ky_u = phases['S']['u']
-                u_S = u_S + self.sponge_on_u_S * _vel_field(
+                u_S = u_S + _vel_field(
                         phi_u, amp_u, kx_u, ky_u, self.f_on_u, hc_ub, hs_ub, w2f2_u)
 
             # ------- North -------
@@ -1001,12 +810,12 @@ class CSWm:
 
             phi_h, amp_h, kx_h, ky_h = phases['N']['h']
             phi_v, amp_v, kx_v, ky_v = phases['N']['v']
-            h_N = h_N + self.sponge_on_h_N * _h_field(phi_h, amp_h, hc_xb, hs_xb)
-            v_N = v_N + self.sponge_on_v_N * _vel_field(
+            h_N = h_N + _h_field(phi_h, amp_h, hc_xb, hs_xb)
+            v_N = v_N + _vel_field(
                     phi_v, amp_v, ky_v, kx_v, self.f_on_v, hc_xb, hs_xb, w2f2_v)
             if flag_tangent:
                 phi_u, amp_u, kx_u, ky_u = phases['N']['u']
-                u_N = u_N + self.sponge_on_u_N * _vel_field(
+                u_N = u_N + _vel_field(
                         phi_u, amp_u, kx_u, ky_u, self.f_on_u, hc_ub, hs_ub, w2f2_u)
 
             # ------- West -------
@@ -1022,12 +831,12 @@ class CSWm:
 
             phi_h, amp_h, kx_h, ky_h = phases['W']['h']
             phi_u, amp_u, kx_u, ky_u = phases['W']['u']
-            h_W = h_W + self.sponge_on_h_W * _h_field(phi_h, amp_h, hc_yb, hs_yb)
-            u_W = u_W + self.sponge_on_u_W * _vel_field(
+            h_W = h_W + _h_field(phi_h, amp_h, hc_yb, hs_yb)
+            u_W = u_W + _vel_field(
                     phi_u, amp_u, kx_u, ky_u, self.f_on_u, hc_yb, hs_yb, w2f2_u)
             if flag_tangent:
                 phi_v, amp_v, kx_v, ky_v = phases['W']['v']
-                v_W = v_W + self.sponge_on_v_W * _vel_field(
+                v_W = v_W + _vel_field(
                         phi_v, amp_v, ky_v, kx_v, self.f_on_v, hc_vb, hs_vb, w2f2_v)
 
             # ------- East -------
@@ -1040,17 +849,17 @@ class CSWm:
 
             phi_h, amp_h, kx_h, ky_h = phases['E']['h']
             phi_u, amp_u, kx_u, ky_u = phases['E']['u']
-            h_E = h_E + self.sponge_on_h_E * _h_field(phi_h, amp_h, hc_yb, hs_yb)
-            u_E = u_E + self.sponge_on_u_E * _vel_field(
+            h_E = h_E + _h_field(phi_h, amp_h, hc_yb, hs_yb)
+            u_E = u_E + _vel_field(
                     phi_u, amp_u, kx_u, ky_u, self.f_on_u, hc_yb, hs_yb, w2f2_u)
             if flag_tangent:
                 phi_v, amp_v, kx_v, ky_v = phases['E']['v']
-                v_E = v_E + self.sponge_on_v_E * _vel_field(
+                v_E = v_E + _vel_field(
                         phi_v, amp_v, ky_v, kx_v, self.f_on_v, hc_vb, hs_vb, w2f2_v)
 
-        u_it = (u_S + u_N + u_W + u_E) / self.weight_sponge_u
-        v_it = (v_S + v_N + v_W + v_E) / self.weight_sponge_v
-        h_it = (h_S + h_N + h_W + h_E) / self.weight_sponge_h
+        u_it = wu_S * u_S + wu_N * u_N + wu_W * u_W + wu_E * u_E
+        v_it = wv_S * v_S + wv_N * v_N + wv_W * v_W + wv_E * v_E
+        h_it = wh_S * h_S + wh_N * h_N + wh_W * h_W + wh_E * h_E
 
         return u_it, v_it, h_it
 

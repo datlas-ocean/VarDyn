@@ -141,6 +141,7 @@ class Obsop_interp:
             _obs_mask |= State.mask
         if getattr(State, 'sponge_mask', None) is not None:
             _obs_mask |= State.sponge_mask
+        self.obs_mask = _obs_mask
         self.ind_mask = set(np.flatnonzero(_obs_mask.ravel()).tolist())
         
         # Mask boundary pixels
@@ -230,9 +231,17 @@ class Obsop_interp_l3(Obsop_interp):
         # KDTree for nearest neighbor search
         tree = KDTree(self.coords_car)
         D, ind_closest = tree.query(coords_car_obs, k=self.Npix)
+        if self.Npix == 1:
+            D = D[:, None]
+            ind_closest = ind_closest[:, None]
 
         # Apply distance threshold
         valid_mask = (D <= self.dmax)
+        if len(self.ind_mask) > 0:
+            masked_candidates = np.isin(ind_closest, list(self.ind_mask))
+            nearest_is_masked = masked_candidates[:, 0]
+            valid_mask &= ~masked_candidates
+            valid_mask[nearest_is_masked, :] = False
 
         if np.any(valid_mask):
 
@@ -524,8 +533,8 @@ class Obsop_interp_l4(Obsop_interp):
         self.DX = State.DX
         self.DY = State.DY
         
-        # Mask
-        self.mask = State.mask
+        # Mask land and sponge cells for observations only.
+        self.mask = self.obs_mask
 
         # Misfit on gradients
         self.gradients = config.OBSOP.gradients
@@ -759,8 +768,14 @@ class Obsop_interp_l4(Obsop_interp):
                     with open(file_L4, "wb") as f:
                         pickle.dump((var_obs_interp,err_obs_interp), f)
 
-                if var_bc is not None and self.name_var in var_bc:
-                    var_obs_interp -= var_bc[self.name_var][i].flatten()
+            mask = ((var_obs_interp < np.nanmin(var_obs)) |
+                    (var_obs_interp > np.nanmax(var_obs)) |
+                    self.mask)
+            var_obs_interp[mask] = np.nan
+            err_obs_interp[mask] = np.nan
+
+            if var_bc is not None and self.name_var in var_bc:
+                var_obs_interp -= var_bc[self.name_var][i].flatten()
                 
             if self.gradients:
                     # Compute gradients
