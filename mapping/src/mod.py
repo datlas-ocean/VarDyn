@@ -1565,6 +1565,10 @@ class Model_csw1l(M):
             
         # Equivalent depth
         self.Heb = self.c**2 / self.g
+        if getattr(config.MOD, 'constant_He', False):
+            He0 = np.nanmean(self.c)**2 / self.g
+            self.Heb = He0 * np.ones((State.ny, State.nx))
+            print(f'He set to constant: He = {He0:.4f} m')
 
         # Open Bathymetryc if provided
         if config.MOD.file_H_aux is not None and os.path.exists(config.MOD.file_H_aux):
@@ -5606,6 +5610,17 @@ class Model_bmit(M):
                             self.name_var['V_BM']+'_interp',
                             'He',
                             'He_mean']
+        bm_name_params = getattr(self.model_bm, 'name_params', [])
+        if self.bm_kind == 'MOD_QGSW' and 'H' in bm_name_params:
+            State.var['H'] = self.model_bm._H_control_to_total_state(State.params['H'])
+            State.var['H_control'] = +State.params['H']
+            name_var_to_save += ['H', 'H_control']
+        if self.bm_kind == 'MOD_QGSW' and 'h_wind' in bm_name_params:
+            State.var['h_wind'] = +State.params['h_wind']
+            name_var_to_save += ['h_wind']
+        if self.bm_kind == 'MOD_QGSW' and 'wind_strength' in bm_name_params:
+            State.var['wind_strength'] = +State.params['wind_strength']
+            name_var_to_save += ['wind_strength']
         if 'alpha' in self.name_params_it:
             name_var_to_save += ['alpha', 'alpha_control']
         else:

@@ -312,6 +312,9 @@ MOD_CSW1L = dict(
 
     name_var_c = {'lon':'','lat':'','var':''}, # Variable names for the phase velocity auxilliary file 
 
+    constant_He = False, # if True, use the spatial mean of c to derive a
+                         # spatially constant equivalent depth He = mean(c)^2 / g
+
     # Bathymetry parameters
 
     H = 4e3, # Mean depth (in m)
@@ -590,6 +593,7 @@ MOD_BMIT = dict(
         name_var_c = {'lon':'','lat':'','var':''},
         cmin = None,
         cmax = None,
+        constant_He = False,
         H = 4e3,
         file_H_aux = None,
         name_var_H = {'lon':'','lat':'','var':''},

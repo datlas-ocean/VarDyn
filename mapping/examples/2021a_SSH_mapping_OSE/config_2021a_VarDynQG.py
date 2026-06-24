@@ -84,30 +84,21 @@ myMOD = dict(
 
     name_var_c = {'lon':'lon','lat':'lat','var':'c1'},
 
-    init_from_bc = True
-    
-)
+    init_from_bc = True,
 
-#################################################################################################################################
-# BOUNDARY CONDITIONS
-#################################################################################################################################
-NAME_BC = 'myBC' # For now, only BC_EXT is available
+    # Boundary conditions are handled by the model class. External fields are
+    # loaded and interpolated through these model-level bc_* settings.
+    bc_file = 'data/OSE_ssh_mapping_DUACS.nc',
 
-myBC = dict(
+    bc_name_lon = 'lon',
 
-    super = 'BC_EXT',
+    bc_name_lat = 'lat',
 
-    file = 'data/OSE_ssh_mapping_DUACS.nc', # netcdf file(s) in whihch the boundary conditions fields are stored
+    bc_name_time = 'time',
 
-    name_lon = 'lon',
+    bc_name_var = {'SSH':'ssh'},
 
-    name_lat = 'lat',
-
-    name_time = 'time',
-
-    name_var = {'SSH':'ssh'}, # name of the boundary conditions variable
-
-    name_mod_var = {'SSH':'ssh'},
+    bc_c_grid = False,
 
 )
 
