@@ -39,3 +39,7 @@ dependencies = [
     "numpy_groupies"
 ]
 dynamic = ["version"]
+
+[tool.setuptools.packages.find]
+include = ["mapping*"]
+exclude = ["slurm*"]
