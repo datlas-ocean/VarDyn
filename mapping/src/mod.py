@@ -2303,24 +2303,40 @@ class Model_csw1l(_ITOpenBoundaryExtensionMixin, M):
                                 method='linear')
             h_all = dsbm[name_var_bm['ssh_bm']].values  # (nt_bm, ny, nx)
         else:
-            # 2D coordinates: use scipy griddata directly
-            from scipy.interpolate import griddata
+            # 2D coordinates: build the triangulation once, then reuse the
+            # target barycentric weights for every BM time slice. This avoids
+            # scipy.griddata rebuilding the same Delaunay geometry in a loop.
+            from scipy.spatial import Delaunay
             lon_bm_2d = dsbm[name_lon_bm].values
             lat_bm_2d = dsbm[name_lat_bm].values
             if len(lon_bm_2d.shape) == 1:
                 lon_bm_2d, lat_bm_2d = np.meshgrid(lon_bm_2d, lat_bm_2d)
             nt_bm = dsbm.sizes['time']
             h_all = np.full((nt_bm, self.ny, self.nx), np.nan)
-            for it in range(nt_bm):
-                var_vals = dsbm[name_var_bm['ssh_bm']].isel(time=it).values
-                valid = ~np.isnan(var_vals) & ~np.isnan(lon_bm_2d) & ~np.isnan(lat_bm_2d)
-                if not valid.any():
-                    continue
-                h_all[it] = griddata(
-                    (lon_bm_2d[valid], lat_bm_2d[valid]),
-                    var_vals[valid],
-                    (State.lon, State.lat),
-                    method='linear').reshape(self.ny, self.nx)
+            valid = np.isfinite(lon_bm_2d) & np.isfinite(lat_bm_2d)
+            if valid.any():
+                points = np.column_stack((lon_bm_2d[valid], lat_bm_2d[valid]))
+                tri = Delaunay(points)
+                targets = np.column_stack((State.lon.ravel(), State.lat.ravel()))
+                simplex = tri.find_simplex(targets)
+                inside = simplex >= 0
+                vertices = np.zeros((targets.shape[0], tri.ndim + 1), dtype=int)
+                weights = np.zeros((targets.shape[0], tri.ndim + 1), dtype=float)
+                if inside.any():
+                    transform = tri.transform[simplex[inside]]
+                    delta = targets[inside] - transform[:, tri.ndim]
+                    bary = np.einsum('nij,nj->ni', transform[:, :tri.ndim], delta)
+                    weights[inside, :-1] = bary
+                    weights[inside, -1] = 1. - bary.sum(axis=1)
+                    vertices[inside] = tri.simplices[simplex[inside]]
+
+                values_all = dsbm[name_var_bm['ssh_bm']].values.reshape(nt_bm, -1)[:, valid.ravel()]
+                for it in range(nt_bm):
+                    out = np.full(targets.shape[0], np.nan)
+                    if inside.any():
+                        vals = values_all[it, vertices[inside]]
+                        out[inside] = np.sum(vals * weights[inside], axis=1)
+                    h_all[it] = out.reshape(self.ny, self.nx)
 
         # 2) Compute geostrophic velocities on all BM timesteps
         u_all = np.zeros_like(h_all)
