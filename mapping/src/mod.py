@@ -446,6 +446,124 @@ def Model(config, State, verbose=True):
 #                            Mother Model                                     #
 ###############################################################################
 
+class _ITOpenBoundaryExtensionMixin:
+
+    def _init_it_open_boundary_extension(self, config_mod):
+        """Precompute S/N/W/E sponge extension weights on h-points.
+
+        The current implementation intentionally targets only open-boundary
+        sponge bands. Coast, island, and land-adjacent sponge extensions are a
+        separate future step because their interior-edge geometry is not a
+        simple S/N/W/E row or column.
+        """
+
+        self.extend_it_open_boundary_sponge = bool(
+            getattr(config_mod, 'extend_it_open_boundary_sponge', False))
+        self._it_open_boundary_extension_active = False
+        self._it_open_boundary_extension_shape = (self.ny, self.nx)
+        self._it_open_boundary_extension_active_mask = jnp.zeros((self.ny, self.nx), dtype=bool)
+        self._it_open_boundary_extension_wS = jnp.zeros((self.ny, self.nx))
+        self._it_open_boundary_extension_wN = jnp.zeros((self.ny, self.nx))
+        self._it_open_boundary_extension_wW = jnp.zeros((self.ny, self.nx))
+        self._it_open_boundary_extension_wE = jnp.zeros((self.ny, self.nx))
+        self._it_open_boundary_extension_iS = 0
+        self._it_open_boundary_extension_iN = self.ny - 1
+        self._it_open_boundary_extension_jW = 0
+        self._it_open_boundary_extension_jE = self.nx - 1
+
+        if not self.extend_it_open_boundary_sponge:
+            return
+        if not getattr(self, 'flag_bc_sponge', False):
+            return
+        mask_names = ('sponge_on_h_S', 'sponge_on_h_N',
+                      'sponge_on_h_W', 'sponge_on_h_E')
+        if not all(hasattr(self, name) for name in mask_names):
+            return
+
+        masks = [np.asarray(getattr(self, name), dtype=bool) for name in mask_names]
+        if not any(np.any(mask) for mask in masks):
+            return
+
+        yy, xx = np.indices((self.ny, self.nx))
+
+        def edge_weight(mask, distance):
+            if not np.any(mask):
+                return np.zeros((self.ny, self.nx), dtype=float)
+            width = np.nanmax(np.where(mask, distance, 0.0))
+            if not np.isfinite(width) or width <= 0:
+                width = 1.0
+            r = np.clip(distance / width, 0.0, 1.0)
+            smooth = r * r * r * (r * (r * 6.0 - 15.0) + 10.0)
+            return np.where(mask, 1.0 - smooth, 0.0)
+
+        wS = edge_weight(masks[0], yy.astype(float))
+        wN = edge_weight(masks[1], (self.ny - 1 - yy).astype(float))
+        wW = edge_weight(masks[2], xx.astype(float))
+        wE = edge_weight(masks[3], (self.nx - 1 - xx).astype(float))
+        power = float(getattr(config_mod, 'bc_it_corner_weight_power', 1.0))
+        if power != 1.0:
+            wS, wN, wW, wE = (wS**power, wN**power, wW**power, wE**power)
+        wsum = wS + wN + wW + wE
+        active = wsum > 0
+        wsum_safe = np.where(active, wsum, 1.0)
+        wS, wN, wW, wE = (wS / wsum_safe, wN / wsum_safe,
+                          wW / wsum_safe, wE / wsum_safe)
+
+        def sponge_interior_row(mask, from_south):
+            rows = np.where(np.any(mask, axis=1))[0]
+            if rows.size == 0:
+                return 0 if from_south else self.ny - 1
+            if from_south:
+                return int(rows.max())
+            return int(rows.min())
+
+        def sponge_interior_col(mask, from_west):
+            cols = np.where(np.any(mask, axis=0))[0]
+            if cols.size == 0:
+                return 0 if from_west else self.nx - 1
+            if from_west:
+                return int(cols.max())
+            return int(cols.min())
+
+        self._it_open_boundary_extension_active = True
+        self._it_open_boundary_extension_active_mask = jnp.asarray(active)
+        self._it_open_boundary_extension_wS = jnp.asarray(wS)
+        self._it_open_boundary_extension_wN = jnp.asarray(wN)
+        self._it_open_boundary_extension_wW = jnp.asarray(wW)
+        self._it_open_boundary_extension_wE = jnp.asarray(wE)
+        self._it_open_boundary_extension_iS = sponge_interior_row(masks[0], True)
+        self._it_open_boundary_extension_iN = sponge_interior_row(masks[1], False)
+        self._it_open_boundary_extension_jW = sponge_interior_col(masks[2], True)
+        self._it_open_boundary_extension_jE = sponge_interior_col(masks[3], False)
+
+    def _extend_it_open_boundary_field(self, field):
+        if field is None or not getattr(self, '_it_open_boundary_extension_active', False):
+            return field
+        field = jnp.asarray(field)
+        if field.shape != getattr(self, '_it_open_boundary_extension_shape', None):
+            return field
+
+        refS = jnp.broadcast_to(field[self._it_open_boundary_extension_iS:self._it_open_boundary_extension_iS + 1, :], field.shape)
+        refN = jnp.broadcast_to(field[self._it_open_boundary_extension_iN:self._it_open_boundary_extension_iN + 1, :], field.shape)
+        refW = jnp.broadcast_to(field[:, self._it_open_boundary_extension_jW:self._it_open_boundary_extension_jW + 1], field.shape)
+        refE = jnp.broadcast_to(field[:, self._it_open_boundary_extension_jE:self._it_open_boundary_extension_jE + 1], field.shape)
+        extended = (
+            self._it_open_boundary_extension_wS * refS
+            + self._it_open_boundary_extension_wN * refN
+            + self._it_open_boundary_extension_wW * refW
+            + self._it_open_boundary_extension_wE * refE
+        )
+        return jnp.where(self._it_open_boundary_extension_active_mask, extended, field)
+
+    def _extend_it_open_boundary_static_field(self, field):
+        if field is None:
+            return None
+        arr = np.asarray(field)
+        if arr.shape != (self.ny, self.nx):
+            return field
+        return np.asarray(self._extend_it_open_boundary_field(jnp.asarray(arr)))
+
+
 class M:
 
     def __init__(self,config,State):
@@ -523,7 +641,6 @@ class M:
             self._bc_fields = bc_fields[0]
         elif len(bc_fields) > 1:
             self._bc_fields = _MultiBcFields(bc_fields)
-
 
     def _land_mask_for_shape(self, State, shape):
         if State.mask is None or len(shape) < 2:
@@ -1142,28 +1259,62 @@ class Model_qg1l(M):
                 ssh = State0.getvar(name_var=self.name_var['SSH'])
             
             # Current velocities
-            # Geostrophy
-            result = jaxparrow.geostrophy(ssh, State0.lat, State0.lon, State0.mask)
-            ug, vg = result[0], result[1]
-            ug_t = jaxparrow.tools.operators.interpolation(ug, State0.mask, axis=1, padding="left")  # (U(i), U(i+1)) -> T(i+1)
-            vg_t = jaxparrow.tools.operators.interpolation(vg, State0.mask, axis=0, padding="left")  # (V(j), V(j+1)) -> T(j+1)
-            # Cyclogeostrophy
-            result = jaxparrow.cyclogeostrophy(ssh, State0.lat, State0.lon, State0.mask)
-            uc, vc = result[0], result[1]
-            uc_t = jaxparrow.tools.operators.interpolation(uc, State0.mask, axis=1, padding="left")  # (U(i), U(i+1)) -> T(i+1)
-            vc_t = jaxparrow.tools.operators.interpolation(vc, State0.mask, axis=0, padding="left")  # (V(j), V(j+1)) -> T(j+1)
+            # Geostrophy. Recent jaxparrow versions return velocities on T points.
+            try:
+                ug_t, vg_t = jaxparrow.geostrophy(
+                    ssh, State0.lat, State0.lon, land_mask=State0.mask
+                )
+            except Exception as exc:
+                warnings.warn(
+                    'jaxparrow geostrophy failed; falling back to Qgm.h2uv: '
+                    f'{exc}'
+                )
+                ug, vg = self.qgm.h2uv(jnp.asarray(ssh))
+                ug_t = np.zeros((State0.ny, State0.nx))
+                vg_t = np.zeros((State0.ny, State0.nx))
+                ug_t[1:-1, 1:-1] = np.array(
+                    0.5 * (ug[1:-1, 1:-1] + ug[1:-1, 2:])
+                )
+                vg_t[1:-1, 1:-1] = np.array(
+                    0.5 * (vg[1:-1, 1:-1] + vg[2:, 1:-1])
+                )
+                if State0.mask is not None:
+                    ug_t[State0.mask] = np.nan
+                    vg_t[State0.mask] = np.nan
+            # Cyclogeostrophy. New jaxparrow exposes algorithms such as fixed_point.
+            try:
+                if hasattr(jaxparrow, 'fixed_point'):
+                    result = jaxparrow.fixed_point(
+                        State0.lat, State0.lon, ssh_t=ssh, land_mask=State0.mask
+                    )
+                else:
+                    result = jaxparrow.cyclogeostrophy(
+                        ssh, State0.lat, State0.lon, State0.mask
+                    )
+                uc_t = result.ucg if hasattr(result, 'ucg') else result[0]
+                vc_t = result.vcg if hasattr(result, 'vcg') else result[1]
+            except Exception as exc:
+                warnings.warn(
+                    'jaxparrow cyclogeostrophy failed; skipping '
+                    f'cyclogeostrophic velocity diagnostics: {exc}'
+                )
+                uc_t = None
+                vc_t = None
             # Set geostrophic velocities
             State0.setvar(ug_t, name_var='ug')
             State0.setvar(vg_t, name_var='vg')
             # Set cyclogeostrophic velocities
-            State0.setvar(uc_t, name_var='uc')
-            State0.setvar(vc_t, name_var='vc')
+            if uc_t is not None and vc_t is not None:
+                State0.setvar(uc_t, name_var='uc')
+                State0.setvar(vc_t, name_var='vc')
             # Flux
             Fssh = State0.params[self.name_var['SSH']]
             State0.setvar(Fssh, name_var='Fssh')
 
             if name_var is not None:
-                name_var_diag += ['ug', 'vg', 'uc', 'vc', 'Fssh']
+                name_var_diag += ['ug', 'vg', 'Fssh']
+                if uc_t is not None and vc_t is not None:
+                    name_var_diag += ['uc', 'vc']
 
         if 'c' in self.name_params:
             State0.var['c_anomaly'] = State.params['c']
@@ -1457,7 +1608,7 @@ class Model_qg1l(M):
 #                         Shallow Water Models                                #
 ###############################################################################
 
-class Model_csw1l(M):
+class Model_csw1l(_ITOpenBoundaryExtensionMixin, M):
 
     def __init__(self,config,State):
 
@@ -1841,6 +1992,8 @@ class Model_csw1l(M):
                     State.sponge_mask = np.asarray(State.sponge_mask, dtype=bool) | sponge_mask
         
         self.mask = State.mask
+        self._init_it_open_boundary_extension(config.MOD)
+        self.H_it_open_boundary = self._extend_it_open_boundary_static_field(self.H)
 
         # Model initialization
         self.swm = model(X=X,
@@ -1852,6 +2005,7 @@ class Model_csw1l(M):
                          Heb=self.Heb,
                          periodic_x=config.MOD.periodic_x,
                          periodic_y=config.MOD.periodic_y,
+                         time_scheme=self.time_scheme,
                          )
     
         # Set sponge attributes on SW model for compute_IT_2D
@@ -1894,11 +2048,18 @@ class Model_csw1l(M):
             self.swm_step_nstep = self.swm._step_euler_nstep
             self.swm_step_tgl = self.swm.step_euler_tgl_jit
             self.swm_step_adj = self.swm.step_euler_adj_jit
+        elif self.time_scheme=='rk3':
+            self.swm_step = self.swm.step_rk3_jit
+            self.swm_step_nstep = self.swm._step_rk3_nstep
+            self.swm_step_tgl = self.swm.step_rk3_tgl_jit
+            self.swm_step_adj = self.swm.step_rk3_adj_jit
         elif self.time_scheme=='rk4':
             self.swm_step = self.swm.step_rk4_jit
             self.swm_step_nstep = self.swm._step_rk4_nstep
             self.swm_step_tgl = self.swm.step_rk4_tgl_jit
             self.swm_step_adj = self.swm.step_rk4_adj_jit
+        else:
+            raise ValueError(f"Unsupported time_scheme: {self.time_scheme}")
         
         if config.INV is not None and config.INV.super=='INV_4DVAR' and config.INV.compute_test:
             print('CSW1L Tangent test:')
@@ -2223,6 +2384,13 @@ class Model_csw1l(M):
         
         return He2d
 
+    def _compute_it_open_boundary_He_total(self, He, alpha_He, h_bm):
+
+        Heb = self._extend_it_open_boundary_field(self.Heb)
+        He_bc = self._extend_it_open_boundary_field(He)
+        alpha_He_bc = self._extend_it_open_boundary_field(alpha_He)
+        return Heb + self._compute_He_from_bm(He_bc, alpha_He_bc, h_bm)
+
     def _compute_advective_terms_from_bm(self, alpha_Uu, alpha_Up, alpha_Uz, u_bm, v_bm):
 
         """ Compute advective terms with coupling term
@@ -2269,6 +2437,7 @@ class Model_csw1l(M):
 
         # Compute equivalent depth anomaly from control parameters (once, before scan)
         He2d = self._compute_He_from_bm(He_mean, alpha_He, h_bm)
+        He_total = self._compute_it_open_boundary_He_total(He_mean, alpha_He, h_bm)
 
         # Compute advective terms from control parameters (once, before scan)
         u11u, v11u, u11p, v11p, u11z, v11z = self._compute_advective_terms_from_bm(alpha_Uu, alpha_Up, alpha_Uz, u_bm, v_bm)
@@ -2277,7 +2446,7 @@ class Model_csw1l(M):
         u1, v1, h1 = self.swm_step_nstep(
             u, v, h, He2d,
             u11u=u11u, v11u=v11u, u11z=u11z, v11z=v11z, u11p=u11p, v11p=v11p,
-            nstep=nstep, t=t, He_total=self.Heb+He2d, h_SN=h_SN, h_WE=h_WE)
+            nstep=nstep, t=t, He_total=He_total, h_SN=h_SN, h_WE=h_WE)
     
         return u1, v1, h1
 
@@ -4802,7 +4971,7 @@ class Model_qgsw(M):
         
 
 
-class Model_bmit(M):
+class Model_bmit(_ITOpenBoundaryExtensionMixin, M):
 
     def _load_component_bc_fields(self, component_config, config, State):
         bc_sources = []
@@ -4935,7 +5104,8 @@ class Model_bmit(M):
                 'name_var_H', 'H', 'Ntheta', 'w_waves', 'g',
                 'periodic_x', 'periodic_y', 'flag_bc_sponge', 'dist_sponge_bc',
                 'sponge_coef', 'use_sponge_on_coast', 'tangential_sponge_factor',
-                'bc_it_method', 'bc_it_corner_weight_power']:
+                'bc_it_method', 'bc_it_corner_weight_power',
+                'extend_it_open_boundary_sponge']:
             config.MOD[key] = getattr(self.it_config, key)
         config.MOD.mask_sponge_bc = self.mask_sponge_bc
         config.MOD.name_params_it = getattr(self.it_config, 'name_params', [])
@@ -5454,6 +5624,9 @@ class Model_bmit(M):
                 else:
                     State.sponge_mask = np.asarray(State.sponge_mask, dtype=bool) | sponge_mask
         
+        self._init_it_open_boundary_extension(config.MOD)
+        self.H_it_open_boundary = self._extend_it_open_boundary_static_field(self.H)
+
         # Coupling terms from vertical modes
         self.flag_coupling_from_bm = config.MOD.flag_coupling_from_bm
         if self.flag_coupling_from_bm:
@@ -5508,6 +5681,7 @@ class Model_bmit(M):
             Heb=self.Heb,
             periodic_x=config.MOD.periodic_x,
             periodic_y=config.MOD.periodic_y,
+            time_scheme=config.MOD.time_scheme_it,
             )
     
         # Set sponge attributes on IT model for compute_IT_2D
@@ -5547,8 +5721,12 @@ class Model_bmit(M):
         self.time_scheme_it = config.MOD.time_scheme_it
         if self.time_scheme_it == 'Euler':
             self.model_it_step_nstep = self.model_it._step_euler_nstep
+        elif self.time_scheme_it == 'rk3':
+            self.model_it_step_nstep = self.model_it._step_rk3_nstep
         elif self.time_scheme_it == 'rk4':
             self.model_it_step_nstep = self.model_it._step_rk4_nstep
+        else:
+            raise ValueError(f"Unsupported time_scheme_it: {self.time_scheme_it}")
         
         if config.INV is not None and config.INV.super=='INV_4DVAR' and config.INV.compute_test:
             print('BM/IT Tangent test:')
@@ -5957,6 +6135,28 @@ class Model_bmit(M):
         
         return He2d
 
+    def _compute_it_open_boundary_He_total(self, He, alpha_He, h_bm):
+
+        Heb = self._extend_it_open_boundary_field(self.Heb)
+        if He is not None:
+            He_eff = He + self.He_mean_bg
+        else:
+            He_eff = self.He_mean_bg
+        He_eff = self._extend_it_open_boundary_field(He_eff)
+
+        if self.flag_coupling_from_bm and h_bm is not None:
+            alpha_He_eff = self._alpha_control_to_centered(alpha_He, self.alpha_He_ref)
+            alpha_He_eff = self._extend_it_open_boundary_field(alpha_He_eff)
+            dHe_bm = self.dHe * h_bm
+            if self.flag_bc_sponge:
+                dHe_bm = dHe_bm * (1 - self.sponge_h)
+            He2d = He_eff + (.5 + alpha_He_eff) * dHe_bm
+        else:
+            He2d = He_eff
+
+        He2d = jnp.where(self.mask, 0., He2d)
+        return Heb + He2d
+
     def _compute_advective_terms_from_bm(self, alpha_Uu, alpha_Up, u_bm, v_bm):
 
         """ Compute advective terms with coupling term.
@@ -6043,15 +6243,16 @@ class Model_bmit(M):
         return self.model_bm.h2uv(ssh_full)
 
     def _bm_step_qgsw(self, t, u_bm, v_bm, h_bm,
-                      Fu_bm, Fv_bm, Fh_bm,
+                      Fu_bm, Fv_bm, Fh_bm, H_bm,
                       u_bm_bc, v_bm_bc, h_bm_bc,
                       taux_bm=None, tauy_bm=None, nstep=1):
         dtype = self.model_bm.dtype
         u0 = jnp.expand_dims(jnp.asarray(u_bm, dtype=dtype).T, axis=(0, 1))
         v0 = jnp.expand_dims(jnp.asarray(v_bm, dtype=dtype).T, axis=(0, 1))
         h0 = jnp.expand_dims(jnp.asarray(h_bm, dtype=dtype).T, axis=(0, 1))
+        H = None if H_bm is None else jnp.expand_dims(jnp.asarray(H_bm, dtype=dtype).T, axis=0)
         u1, v1, h1 = self.model_bm.jstep_jit(
-            t, u0, v0, h0, None, Fu_bm, Fv_bm, Fh_bm,
+            t, u0, v0, h0, H, Fu_bm, Fv_bm, Fh_bm,
             u_bm_bc, v_bm_bc, h_bm_bc,
             taux=taux_bm, tauy=tauy_bm,
             h_wind=None, wind_strength=None, nstep=nstep)
@@ -6059,7 +6260,7 @@ class Model_bmit(M):
 
     def _jstep(self, t,
             u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
-            Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+            Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
             h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
             taux_bm=None, tauy_bm=None, nstep=1):
 
@@ -6067,7 +6268,7 @@ class Model_bmit(M):
 
         h_for_He = self._bm_height_for_He(h_bm)
         He2d = self._compute_He_from_bm(He_mean, alpha_He, h_for_He)
-        He_tot = self.Heb + He2d
+        He_tot = self._compute_it_open_boundary_He_total(He_mean, alpha_He, h_for_He)
 
         u_bm_h, v_bm_h = self._bm_velocity_on_h(u_bm, v_bm, h_bm)
         u11, v11, u11p, v11p = self._compute_advective_terms_from_bm(
@@ -6077,7 +6278,7 @@ class Model_bmit(M):
         if self.bm_kind == 'MOD_QGSW':
             u_bm, v_bm, h_bm = self._bm_step_qgsw(
                 t, u_bm, v_bm, h_bm,
-                Fu_bm, Fv_bm, Fh_bm,
+                Fu_bm, Fv_bm, Fh_bm, H_bm,
                 u_bm_bc, v_bm_bc, h_bm_bc,
                 taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=nstep)
         else:
@@ -6098,64 +6299,66 @@ class Model_bmit(M):
 
     def _jstep_tgl(self, t,
                 du_bm, dv_bm, dh_bm, du_it, dv_it, dh_it, dh_tot,
-                dFu_bm, dFv_bm, dFh_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up,
+                dFu_bm, dFv_bm, dFh_bm, dH_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up,
                 dh_SN, dh_WE,
                 u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
-                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
                 h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
                 taux_bm=None, tauy_bm=None, nstep=1):
         """Multi-step tangent linear of the coupled BM/IT model using JVP."""
 
         def wrapped_jstep(x):
             u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot, \
-                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = x
+                Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = x
             return self._jstep(
                 t, u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
-                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
                 h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
                 taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=nstep)
 
         primals = ((u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
-                    Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE),)
+                    Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE),)
         tangents = ((du_bm, dv_bm, dh_bm, du_it, dv_it, dh_it, dh_tot,
-                     dFu_bm, dFv_bm, dFh_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE),)
+                     dFu_bm, dFv_bm, dFh_bm, dH_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE),)
 
         _, dy = jax.jvp(wrapped_jstep, primals, tangents)
         return dy
 
     def _jstep_adj(self, t,
                 adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot,
-                adFu_bm, adFv_bm, adFh_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up,
+                adFu_bm, adFv_bm, adFh_bm, adH_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up,
                 adh_SN, adh_WE,
                 u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
-                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
                 h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
                 taux_bm=None, tauy_bm=None, nstep=1):
         """Multi-step adjoint of the coupled BM/IT model using VJP."""
 
         def wrapped_jstep(x):
             u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot, \
-                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = x
+                Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = x
             return self._jstep(
                 t, u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
-                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
                 h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
                 taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=nstep)
 
         primals = ((u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
-                    Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE),)
+                    Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE),)
         cotangents = (adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot)
 
         _, vjp_fn = jax.vjp(wrapped_jstep, *primals)
         adjoints = vjp_fn(cotangents)
 
         adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot, \
-            _adFu_bm, _adFv_bm, _adFh_bm, _adHe_mean, _adalpha_He, \
+            _adFu_bm, _adFv_bm, _adFh_bm, _adH_bm, _adHe_mean, _adalpha_He, \
             _adalpha_Uu, _adalpha_Up, _adhSN, _adhWE = adjoints[0]
 
         adFu_bm += _adFu_bm
         adFv_bm += _adFv_bm
         adFh_bm += _adFh_bm
+        if adH_bm is not None:
+            adH_bm += _adH_bm
         if adHe_mean is not None:
             adHe_mean += _adHe_mean
         if adalpha_He is not None:
@@ -6170,7 +6373,7 @@ class Model_bmit(M):
             adh_WE += _adhWE
 
         return (adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot,
-                adFu_bm, adFv_bm, adFh_bm, adHe_mean, adalpha_He,
+                adFu_bm, adFv_bm, adFh_bm, adH_bm, adHe_mean, adalpha_He,
                 adalpha_Uu, adalpha_Up, adh_SN, adh_WE)
 
     def _bm_bc_for_chunk(self, t_chunk, n_chunk):
@@ -6194,6 +6397,11 @@ class Model_bmit(M):
         Fv = State.params.get(v_name, np.zeros_like(State.var[v_name]))
         Fh = State.params.get(h_name, np.zeros_like(State.var[h_name]))
         return Fu, Fv, Fh
+
+    def _bm_H_control(self, State):
+        if self.bm_kind == 'MOD_QGSW' and 'H' in getattr(self.model_bm, 'name_params', []):
+            return State.params['H']
+        return None
 
     def _it_controls(self, State):
         if 'He_mean' in self.name_params_it:
@@ -6237,6 +6445,7 @@ class Model_bmit(M):
         h_tot = +State.getvar(name_var=self.name_var['SSH'])
 
         Fu_bm, Fv_bm, Fh_bm = self._bm_controls(State)
+        H_bm = self._bm_H_control(State)
         He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = self._it_controls(State)
 
         step_done = 0
@@ -6248,7 +6457,7 @@ class Model_bmit(M):
             u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot = self._jstep_jit(
                 t_chunk,
                 u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
-                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
                 h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
                 taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=n_chunk)
             step_done += n_chunk
@@ -6282,6 +6491,8 @@ class Model_bmit(M):
 
         Fu_bm, Fv_bm, Fh_bm = self._bm_controls(State)
         dFu_bm, dFv_bm, dFh_bm = self._bm_controls(dState)
+        H_bm = self._bm_H_control(State)
+        dH_bm = self._bm_H_control(dState)
         He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = self._it_controls(State)
         dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE = self._it_controls(dState)
 
@@ -6294,9 +6505,9 @@ class Model_bmit(M):
             du_bm, dv_bm, dh_bm, du_it, dv_it, dh_it, dh_tot = self._jstep_tgl_jit(
                 t_chunk,
                 du_bm, dv_bm, dh_bm, du_it, dv_it, dh_it, dh_tot,
-                dFu_bm, dFv_bm, dFh_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE,
+                dFu_bm, dFv_bm, dFh_bm, dH_bm, dHe_mean, dalpha_He, dalpha_Uu, dalpha_Up, dh_SN, dh_WE,
                 u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
-                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
+                Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE,
                 u_bm_bc, v_bm_bc, h_bm_bc,
                 taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=n_chunk)
             step_done += n_chunk
@@ -6304,7 +6515,7 @@ class Model_bmit(M):
                 u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot = self._jstep_jit(
                     t_chunk,
                     u_bm, v_bm, h_bm, u_it, v_it, h_it, h_tot,
-                    Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                    Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
                     h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
                     taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=n_chunk)
 
@@ -6337,6 +6548,8 @@ class Model_bmit(M):
 
         Fu_bm, Fv_bm, Fh_bm = self._bm_controls(State)
         adFu_bm, adFv_bm, adFh_bm = self._bm_controls(adState)
+        H_bm = self._bm_H_control(State)
+        adH_bm = self._bm_H_control(adState)
         He_mean, alpha_He, alpha_Uu, alpha_Up, h_SN, h_WE = self._it_controls(State)
         adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up, adh_SN, adh_WE = self._it_controls(adState)
 
@@ -6356,7 +6569,7 @@ class Model_bmit(M):
             u_fwd, v_fwd, h_fwd, uit_fwd, vit_fwd, hit_fwd, htot_fwd = self._jstep_jit(
                 t_chunk,
                 u_fwd, v_fwd, h_fwd, uit_fwd, vit_fwd, hit_fwd, htot_fwd,
-                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
                 h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
                 taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=n_chunk)
             fwd_states.append((u_fwd, v_fwd, h_fwd, uit_fwd, vit_fwd, hit_fwd, htot_fwd))
@@ -6367,14 +6580,14 @@ class Model_bmit(M):
             u_bm_bc, v_bm_bc, h_bm_bc = self._bm_bc_for_chunk(t_chunk, n_chunk)
             taux_bm, tauy_bm = self._bm_wind_for_chunk(t_chunk)
             (adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot,
-             adFu_bm, adFv_bm, adFh_bm, adHe_mean, adalpha_He,
+             adFu_bm, adFv_bm, adFh_bm, adH_bm, adHe_mean, adalpha_He,
              adalpha_Uu, adalpha_Up, adh_SN, adh_WE) = self._jstep_adj_jit(
                 t_chunk,
                 adu_bm, adv_bm, adh_bm, adu_it, adv_it, adh_it, adh_tot,
-                adFu_bm, adFv_bm, adFh_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up,
+                adFu_bm, adFv_bm, adFh_bm, adH_bm, adHe_mean, adalpha_He, adalpha_Uu, adalpha_Up,
                 adh_SN, adh_WE,
                 u_i, v_i, h_i, uit_i, vit_i, hit_i, htot_i,
-                Fu_bm, Fv_bm, Fh_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
+                Fu_bm, Fv_bm, Fh_bm, H_bm, He_mean, alpha_He, alpha_Uu, alpha_Up,
                 h_SN, h_WE, u_bm_bc, v_bm_bc, h_bm_bc,
                 taux_bm=taux_bm, tauy_bm=tauy_bm, nstep=n_chunk)
 
@@ -6391,6 +6604,8 @@ class Model_bmit(M):
         adState.params[self.name_var['U_BM']] = adFu_bm
         adState.params[self.name_var['V_BM']] = adFv_bm
         adState.params[self.name_var['SSH_BM']] = adFh_bm
+        if adH_bm is not None:
+            adState.params['H'] = adH_bm
         if 'He_mean' in self.name_params_it:
             adState.params['He_mean'] = adHe_mean
         adalpha = 0.

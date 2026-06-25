@@ -147,6 +147,15 @@ class CSWm:
             self.step_tgl      = self.step_rk4_tgl_jit
             self.step_adj      = self.step_rk4_adj_jit
             self.step_nstep    = self.step_rk4_nstep
+        elif time_scheme == 'rk3':
+            self.step_rk3_jit   = jit(self.step_rk3)
+            self.step_rk3_tgl_jit = jit(self.step_rk3_tgl)
+            self.step_rk3_adj_jit = jit(self.step_rk3_adj)
+            self.step_rk3_nstep = jit(self._step_rk3_nstep, static_argnames=['nstep'])
+            self.step          = self.step_rk3_jit
+            self.step_tgl      = self.step_rk3_tgl_jit
+            self.step_adj      = self.step_rk3_adj_jit
+            self.step_nstep    = self.step_rk3_nstep
         elif time_scheme == 'Euler':
             self.step_euler_jit   = jit(self.step_euler)
             self.step_euler_tgl_jit = jit(self.step_euler_tgl)
@@ -156,6 +165,8 @@ class CSWm:
             self.step_tgl      = self.step_euler_tgl_jit
             self.step_adj      = self.step_euler_adj_jit
             self.step_nstep    = self.step_euler_nstep
+        else:
+            raise ValueError(f"Unsupported time_scheme: {time_scheme}")
 
     ###########################################################################
     #                           Spatial scheme                                #
@@ -478,6 +489,53 @@ class CSWm:
         # Boundary conditions #
         #######################
         u,v,h = self.boundary_conditions(u,v,h,u0,v0,h0,w1ext)
+        
+        return u, v, h
+
+
+    def step_rk3(self, u0, v0, h0, He=None, w1ext=None, u11u=None, v11u=None, u11z=None, v11z=None, u11p=None, v11p=None):
+        
+        #######################
+        #   Init local state  #
+        #######################
+        u = +u0
+        v = +v0
+        h = +h0
+        He = self.Heb if He is None else He + self.Heb
+
+        #######################
+        # Boundary conditions #
+        #######################
+        u, v, h = self.periodic_boundary_conditions(u, v, h)
+
+        def _rhs(u_, v_, h_):
+            du = self.rhs_u(u_, v_, h_, u11u, v11u, u11z, v11z)
+            dv = self.rhs_v(u_, v_, h_, u11u, v11u, u11z, v11z)
+            dh = self.rhs_h(u_, v_, h_, He, u11p, v11p)
+            return du, dv, dh
+
+        #######################
+        #  RK3-SSP stages     #
+        #######################
+        du0, dv0, dh0 = _rhs(u, v, h)
+        u = u + self.dt * du0
+        v = v + self.dt * dv0
+        h = h + self.dt * dh0
+
+        du1, dv1, dh1 = _rhs(u, v, h)
+        u = u + (self.dt / 4.0) * (du1 - 3.0 * du0)
+        v = v + (self.dt / 4.0) * (dv1 - 3.0 * dv0)
+        h = h + (self.dt / 4.0) * (dh1 - 3.0 * dh0)
+
+        du2, dv2, dh2 = _rhs(u, v, h)
+        u = u + (self.dt / 12.0) * (8.0 * du2 - du1 - du0)
+        v = v + (self.dt / 12.0) * (8.0 * dv2 - dv1 - dv0)
+        h = h + (self.dt / 12.0) * (8.0 * dh2 - dh1 - dh0)
+
+        #######################
+        # Boundary conditions #
+        #######################
+        u, v, h = self.boundary_conditions(u, v, h, u0, v0, h0, w1ext)
         
         return u, v, h
 
@@ -901,6 +959,26 @@ class CSWm:
         (u, v, h, _), _ = scan(body, (u0, v0, h0, t), None, length=nstep)
         return u, v, h
       
+
+    def _step_rk3_nstep(self, u0, v0, h0, He=None, w1ext=None,
+                         u11u=None, v11u=None, u11z=None, v11z=None, u11p=None, v11p=None,
+                         nstep=1, t=0., He_total=None, h_SN=None, h_WE=None):
+        """Multi-step RK3-SSP with lax.scan and checkpointing."""
+
+        def body(carry, _):
+            u, v, h, tc = carry
+            u1, v1, h1 = self.step_rk3(u, v, h, He, w1ext, u11u, v11u, u11z, v11z, u11p, v11p)
+            if self.flag_sponge_bc:
+                _u_b, _v_b, _h_b = self.compute_IT_2D(tc, He_total, h_SN, h_WE)
+                u1 = u1 + self.sponge_coef * self.sponge_u * (_u_b - u)
+                v1 = v1 + self.sponge_coef * self.sponge_v * (_v_b - v)
+                h1 = h1 + self.sponge_coef * self.sponge_h * (_h_b - h)
+            return (u1, v1, h1, tc + self.dt), None
+
+        body = jax_checkpoint(body)
+        (u, v, h, _), _ = scan(body, (u0, v0, h0, t), None, length=nstep)
+        return u, v, h
+
     def step_euler_tgl(self,
                        du0, dv0, dh0, u0, v0, h0, 
                        dHe=None, dw1ext=None, du11=None, dv11=None, du11p=None, dv11p=None, ddc2=None,
@@ -932,6 +1010,22 @@ class CSWm:
 
         return dy  # returns (du, dv, dh)
       
+
+    def step_rk3_tgl(self,
+                     du0, dv0, dh0, u0, v0, h0, 
+                     dHe=None, dw1ext=None, du11u=None, dv11u=None, du11z=None, dv11z=None, du11p=None, dv11p=None, ddc2=None,
+                     He=None, w1ext=None, u11u=None, v11u=None, u11z=None, v11z=None, u11p=None, v11p=None, dc2=None):
+        
+        def wrapped_step(x):
+            u0, v0, h0, He, w1ext, u11u, v11u, u11z, v11z, u11p, v11p, dc2 = x
+            return self.step_rk3(u0, v0, h0, He, w1ext, u11u, v11u, u11z, v11z, u11p, v11p)
+
+        primals = ((u0, v0, h0, He, w1ext, u11u, v11u, u11z, v11z, u11p, v11p, dc2),)
+        tangents = ((du0, dv0, dh0, dHe, dw1ext, du11u, dv11u, du11z, dv11z, du11p, dv11p, ddc2),)
+        _, dy = jax.jvp(wrapped_step, primals, tangents)
+
+        return dy  # returns (du, dv, dh)
+
     def step_euler_adj(self,
                        adu0, adv0, adh0, u0, v0, h0,
                        He=None, w1ext=None, u11u=None, v11u=None, u11z=None, v11z=None, u11p=None, v11p=None, dc2=None):
@@ -955,6 +1049,23 @@ class CSWm:
         def wrapped_step(x):
             u0, v0, h0, He, w1ext, u11u, v11u, u11z, v11z, u11p, v11p, dc2 = x
             return self.step_rk4(u0, v0, h0, He, w1ext, u11u, v11u, u11z, v11z, u11p, v11p, dc2)
+        
+        primals = ((u0, v0, h0, He, w1ext, u11u, v11u, u11z, v11z, u11p, v11p, dc2),)
+        cotangents = (adu0, adv0, adh0)  
+
+        _, vjp_fn = jax.vjp(wrapped_step, *primals)
+        adjoints = vjp_fn(cotangents)
+
+        return adjoints  # returns (adj_u0, adj_v0, adj_h0, adj_He, adj_w1ext, adj_u11, adj_v11, adj_u11z, adj_v11z, adj_u11p, adj_v11p, adj_dc2)
+
+
+    def step_rk3_adj(self,
+                     adu0, adv0, adh0, u0, v0, h0,
+                    He=None, w1ext=None, u11u=None, v11u=None, u11z=None, v11z=None, u11p=None, v11p=None, dc2=None):
+        
+        def wrapped_step(x):
+            u0, v0, h0, He, w1ext, u11u, v11u, u11z, v11z, u11p, v11p, dc2 = x
+            return self.step_rk3(u0, v0, h0, He, w1ext, u11u, v11u, u11z, v11z, u11p, v11p)
         
         primals = ((u0, v0, h0, He, w1ext, u11u, v11u, u11z, v11z, u11p, v11p, dc2),)
         cotangents = (adu0, adv0, adh0)  

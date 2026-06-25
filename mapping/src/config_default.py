@@ -296,7 +296,7 @@ MOD_CSW1L = dict(
 
     cfl = None, # If not None, dtmodel is set such as dtmodel=cfl*dx/sqrt(gHe)
 
-    time_scheme = 'rk4', # Time scheme of the model (e.g. Euler,rk4)
+    time_scheme = 'rk4', # Time scheme of the model (e.g. Euler,rk3,rk4)
 
     # MDT data
 
@@ -371,6 +371,11 @@ MOD_CSW1L = dict(
                                      # 'wkb'            : WKB cumulative-phase integral + He^{-1/4} amplitude correction
 
     bc_it_corner_weight_power = 1.0, # Power applied to smooth S/N/W/E corner partition weights
+
+    extend_it_open_boundary_sponge = False, # If True, extend IT-side Heb, He_mean, alpha* controls, and Bathymetry H
+                                            # from the Sponge Interior Edge across open-boundary S/N/W/E sponge bands
+                                            # before constructing entering-wave/generation media. Coast/island/land
+                                            # sponge extension is intentionally left for a future implementation.
 
     bc_file = None,  # Path to NetCDF file containing boundary conditions
 
@@ -609,6 +614,7 @@ MOD_BMIT = dict(
         tangential_sponge_factor = 1.,
         bc_it_method = 'plane_wave_bdy',
         bc_it_corner_weight_power = 1.0,
+        extend_it_open_boundary_sponge = False,
     ),
 
     alpha_eps = 1e-6, # safety margin for alpha logit references loaded from background files
@@ -1144,6 +1150,5 @@ DIAG_OSE = dict(
     name_bas_var = None
 
 )
-
 
 
