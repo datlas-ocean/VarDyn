@@ -428,26 +428,46 @@ class State:
                 coords[lon_name] = (('y' + suffix, 'x' + suffix), _lon)
                 coords[lat_name] = (('y' + suffix, 'x' + suffix), _lat)
 
-        if os.path.exists(filename):
-            ds = xr.open_dataset(filename)
-            dsout = ds.copy().load()
-            ds.close()
-            del ds 
-            # Add new coordinates
-            for k, v in coords.items():
-                if k not in dsout.coords:
-                    dsout = dsout.assign_coords({k: v})
-            for name in var.keys():
-                dsout[name] = (var[name][0], var[name][1])
-            dsout.to_netcdf(filename,
-                         unlimited_dims={'time':True})
-            
-        else:
+        def _write_fresh():
             ds = xr.Dataset(var, coords=coords)
             ds.to_netcdf(filename,
                         unlimited_dims={'time':True})
             ds.close()
             del ds
+
+        if os.path.exists(filename):
+            try:
+                ds = xr.open_dataset(filename)
+                dsout = ds.copy().load()
+                ds.close()
+                del ds 
+                # Add new coordinates
+                for k, v in coords.items():
+                    if k not in dsout.coords:
+                        dsout = dsout.assign_coords({k: v})
+                for name in var.keys():
+                    dsout[name] = (var[name][0], var[name][1])
+                dsout.to_netcdf(filename,
+                             unlimited_dims={'time':True})
+                dsout.close()
+                del dsout
+            except Exception as exc:
+                print(f"WARNING: failed to update existing output {filename}: {exc}")
+                print("WARNING: overwriting output file from scratch")
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+                try:
+                    dsout.close()
+                except Exception:
+                    pass
+                if os.path.exists(filename):
+                    os.remove(filename)
+                _write_fresh()
+            
+        else:
+            _write_fresh()
         
         return 
 
