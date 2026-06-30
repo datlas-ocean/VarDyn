@@ -23,6 +23,45 @@ import jax
 jax.config.update("jax_enable_x64", USE_FLOAT64)
 
 
+def _as_name_list(name_mod_var):
+    if isinstance(name_mod_var, (list, tuple, np.ndarray)):
+        return list(name_mod_var)
+    return [name_mod_var]
+
+
+def _primary_name(name_mod_var):
+    return _as_name_list(name_mod_var)[0]
+
+
+def _assign_to_state_names(obj, State, value):
+    for name in _as_name_list(obj.name_mod_var):
+        if not obj.multi_mode:
+            State[name] = value
+        else:
+            State[name] += value
+
+
+def _ensure_adstate_names(obj, adState, zero):
+    for name in _as_name_list(obj.name_mod_var):
+        if adState[name] is None:
+            adState[name] = zero.copy() if hasattr(zero, 'copy') else +zero
+
+
+def _sum_adstate_names(obj, adState):
+    adparams = None
+    for name in _as_name_list(obj.name_mod_var):
+        if adparams is None:
+            adparams = +adState[name]
+        else:
+            adparams = adparams + adState[name]
+    return adparams
+
+
+def _clear_adstate_names(obj, adState):
+    for name in _as_name_list(obj.name_mod_var):
+        adState[name] *= 0.
+
+
 def Basis(config, State, verbose=True, multi_mode=False, *args, **kwargs):
     """
     NAME
@@ -429,10 +468,7 @@ class _Basis_gauss3d:
     
         # Update State
         if State is not None:
-            if not self.multi_mode:
-                State[self.name_mod_var] = phi
-            else:
-                State[self.name_mod_var] += phi
+            _assign_to_state_names(self, State, phi)
         else:
             if self.compute_velocities:
                 return phi, u, v
@@ -444,18 +480,17 @@ class _Basis_gauss3d:
             Project to reduced space
         """
 
-        if adState[self.name_mod_var] is None:
-            adState[self.name_mod_var] = np.zeros((self.nphys,))
+        _ensure_adstate_names(self, adState, np.zeros(self.shape_phys))
         
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
-            adState[self.name_mod_u] = np.zeros((self.nphys,))
-            adState[self.name_mod_v] = np.zeros((self.nphys,))
+            adState[self.name_mod_u] = np.zeros_like(self.f_on_u)
+            adState[self.name_mod_v] = np.zeros_like(self.f_on_v)
 
         adX = np.zeros(self.nbasis)
-        adparams = adState[self.name_mod_var].ravel()
+        adparams = _sum_adstate_names(self, adState).ravel()
 
         if self.compute_velocities:
-            adparams += self._ssh2uv_adj(adState[self.name_mod_u], adState[self.name_mod_v])
+            adparams += self._ssh2uv_adj(adState[self.name_mod_u], adState[self.name_mod_v]).ravel()
 
         Gt = self.Gauss_t[t]
         ind0 = np.nonzero(Gt)[0]
@@ -466,7 +501,7 @@ class _Basis_gauss3d:
             adX[ind0] += (Gt*adGtX).ravel()
 
         if not self.multi_mode:
-            adState[self.name_mod_var] *= 0.
+            _clear_adstate_names(self, adState)
 
         return adX
  
@@ -610,10 +645,7 @@ class Basis_gauss3d(_Basis_gauss3d):
 
         # Update State
         if State is not None:
-            if not self.multi_mode:
-                State[self.name_mod_var] = phi
-            else:
-                State[self.name_mod_var] += phi
+            _assign_to_state_names(self, State, phi)
         else:
             if self.compute_velocities:
                 return phi, u, v
@@ -626,19 +658,18 @@ class Basis_gauss3d(_Basis_gauss3d):
             Project to reduced space
         """
 
-        if adState[self.name_mod_var] is None:
-            adState[self.name_mod_var] = self.zero_phys
+        _ensure_adstate_names(self, adState, jnp.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
-            adState[self.name_mod_u] = self.zero_phys
-            adState[self.name_mod_v] = self.zero_phys
+            adState[self.name_mod_u] = jnp.zeros_like(self.f_on_u)
+            adState[self.name_mod_v] = jnp.zeros_like(self.f_on_v)
 
-        adparams = adState[self.name_mod_var]
+        adparams = _sum_adstate_names(self, adState)
         if self.compute_velocities:
             adparams = adparams + self._ssh2uv_adj_jit(adState[self.name_mod_u], adState[self.name_mod_v])
         adX = self._operg_reduced_jit(t, adparams)
         
         if not self.multi_mode:
-            adState[self.name_mod_var] *= 0.
+            _clear_adstate_names(self, adState)
             if self.compute_velocities:
                 adState[self.name_mod_u] *= 0.
                 adState[self.name_mod_v] *= 0.
@@ -913,10 +944,7 @@ class _Basis_gauss2d:
                     State[self.name_mod_v] += v
 
         if State is not None:
-            if not self.multi_mode:
-                State[self.name_mod_var] = phi
-            else:
-                State[self.name_mod_var] += phi
+            _assign_to_state_names(self, State, phi)
         else:
             if self.compute_velocities:
                 return phi, u, v
@@ -926,20 +954,19 @@ class _Basis_gauss2d:
     def operg_transpose(self, t, adState):
         """Project adjoint physical-space field to control space."""
 
-        if adState[self.name_mod_var] is None:
-            adState[self.name_mod_var] = np.zeros((self.nphys,))
+        _ensure_adstate_names(self, adState, np.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
-            adState[self.name_mod_u] = np.zeros_like(adState[self.name_mod_var])
-            adState[self.name_mod_v] = np.zeros_like(adState[self.name_mod_var])
+            adState[self.name_mod_u] = np.zeros_like(self.f_on_u)
+            adState[self.name_mod_v] = np.zeros_like(self.f_on_v)
 
-        adparams = adState[self.name_mod_var].ravel()
+        adparams = _sum_adstate_names(self, adState).ravel()
         if self.compute_velocities:
             adparams = adparams + self._ssh2uv_adj(adState[self.name_mod_u], adState[self.name_mod_v]).ravel()
 
         adX = self.Gauss_xy.T.dot(adparams)
 
         if not self.multi_mode:
-            adState[self.name_mod_var] *= 0.
+            _clear_adstate_names(self, adState)
             if self.compute_velocities:
                 adState[self.name_mod_u] *= 0.
                 adState[self.name_mod_v] *= 0.
@@ -1016,10 +1043,7 @@ class Basis_gauss2d(_Basis_gauss2d):
                     State[self.name_mod_v] += v
 
         if State is not None:
-            if not self.multi_mode:
-                State[self.name_mod_var] = phi
-            else:
-                State[self.name_mod_var] += phi
+            _assign_to_state_names(self, State, phi)
         else:
             if self.compute_velocities:
                 return phi, u, v
@@ -1029,20 +1053,19 @@ class Basis_gauss2d(_Basis_gauss2d):
     def operg_transpose(self, t, adState):
         """Project adjoint physical-space field to control space."""
 
-        if adState[self.name_mod_var] is None:
-            adState[self.name_mod_var] = self.zero_phys
+        _ensure_adstate_names(self, adState, jnp.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
-            adState[self.name_mod_u] = self.zero_phys
-            adState[self.name_mod_v] = self.zero_phys
+            adState[self.name_mod_u] = jnp.zeros_like(self.f_on_u)
+            adState[self.name_mod_v] = jnp.zeros_like(self.f_on_v)
 
-        adparams = adState[self.name_mod_var]
+        adparams = _sum_adstate_names(self, adState)
         if self.compute_velocities:
             adparams = adparams + self._ssh2uv_adj_jit(adState[self.name_mod_u], adState[self.name_mod_v])
 
         adX = self._operg_reduced_jit(adparams)
 
         if not self.multi_mode:
-            adState[self.name_mod_var] *= 0.
+            _clear_adstate_names(self, adState)
             if self.compute_velocities:
                 adState[self.name_mod_u] *= 0.
                 adState[self.name_mod_v] *= 0.
@@ -1727,10 +1750,7 @@ class _Basis_bmaux:
 
         # Update State
         if State is not None:
-            if not self.multi_mode:
-                State[self.name_mod_var] = ssh
-            else:
-                State[self.name_mod_var] += ssh
+            _assign_to_state_names(self, State, ssh)
         else:
             if self.compute_velocities:
                 return ssh, u, v
@@ -1743,15 +1763,14 @@ class _Basis_bmaux:
             Project to reduced space
         """
 
-        if adState[self.name_mod_var] is None:
-            adState[self.name_mod_var] = np.zeros((self.nphys,))
+        _ensure_adstate_names(self, adState, np.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
-            adState[self.name_mod_u] = np.zeros((self.nphys,))
-            adState[self.name_mod_v] = np.zeros((self.nphys,))
+            adState[self.name_mod_u] = np.zeros_like(self.f_on_u)
+            adState[self.name_mod_v] = np.zeros_like(self.f_on_v)
             
         adX = np.zeros(self.nbasis)
 
-        adssh = adState[self.name_mod_var]
+        adssh = _sum_adstate_names(self, adState)
 
         if self.compute_velocities:
             adssh += self._ssh2uv_adj(adState[self.name_mod_u], adState[self.name_mod_v])
@@ -1766,7 +1785,7 @@ class _Basis_bmaux:
                 adX[self.iff_wavebounds[iff]:self.iff_wavebounds[iff+1]][indNoNan] += (Gt*adGtXf).ravel()
         
         if not self.multi_mode:
-            adState[self.name_mod_var] *= 0.
+            _clear_adstate_names(self, adState)
             if self.compute_velocities:
                 adState[self.name_mod_u] *= 0.
                 adState[self.name_mod_v] *= 0.
@@ -1979,10 +1998,7 @@ class Basis_bmaux(_Basis_bmaux):
         
         # Update State
         if State is not None:
-            if not self.multi_mode:
-                State[self.name_mod_var] = ssh
-            else:
-                State[self.name_mod_var] += ssh
+            _assign_to_state_names(self, State, ssh)
         else:
             if self.compute_velocities:
                 return ssh, u, v
@@ -1995,19 +2011,18 @@ class Basis_bmaux(_Basis_bmaux):
             Project to reduced space
         """
 
-        if adState[self.name_mod_var] is None:
-            adState[self.name_mod_var] = self.zero_phys
+        _ensure_adstate_names(self, adState, jnp.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
-            adState[self.name_mod_u] = self.zero_phys
-            adState[self.name_mod_v] = self.zero_phys
+            adState[self.name_mod_u] = jnp.zeros_like(self.f_on_u)
+            adState[self.name_mod_v] = jnp.zeros_like(self.f_on_v)
 
-        adssh = adState[self.name_mod_var]
+        adssh = _sum_adstate_names(self, adState)
         if self.compute_velocities:
             adssh += self._ssh2uv_adj_jit(adState[self.name_mod_u], adState[self.name_mod_v])
         adX = self._operg_reduced_jit(t, adssh)
 
         if not self.multi_mode:
-            adState[self.name_mod_var] *= 0.
+            _clear_adstate_names(self, adState)
             if self.compute_velocities:
                 adState[self.name_mod_u] *= 0.
                 adState[self.name_mod_v] *= 0.
@@ -2624,7 +2639,13 @@ class _Basis_offset:
     def __init__(self,config, State, multi_mode=False):
         
         self.name_mod_var = config.BASIS.name_mod_var
-        self.shape_phys = State.params[self.name_mod_var].shape
+        self.shape_phys = State.params[_primary_name(self.name_mod_var)].shape
+        for _name in _as_name_list(self.name_mod_var)[1:]:
+            if State.params[_name].shape != self.shape_phys:
+                raise ValueError(
+                    f"BASIS_OFFSET shared name_mod_var entries must have the same shape; "
+                    f"{_name} has {State.params[_name].shape}, expected {self.shape_phys}"
+                )
         self.nphys = np.prod(self.shape_phys)
         self.ny = State.ny
         self.nx = State.nx
@@ -2655,10 +2676,7 @@ class _Basis_offset:
 
         # Update State
         if State is not None:
-            if not self.multi_mode:
-                State[self.name_mod_var] = phi
-            else:
-                State[self.name_mod_var] += phi
+            _assign_to_state_names(self, State, phi)
         else:
             return phi
         
@@ -2666,14 +2684,13 @@ class _Basis_offset:
         """
             Project to reduced space
         """
-        if adState[self.name_mod_var] is None:
-            adState[self.name_mod_var] = np.zeros((self.nphys,))
-        adparams = adState[self.name_mod_var]
+        _ensure_adstate_names(self, adState, np.zeros(self.shape_phys))
+        adparams = _sum_adstate_names(self, adState)
 
         adX = [np.sum(adparams)]
         
         if not self.multi_mode:
-            adState[self.name_mod_var] *= 0.
+            _clear_adstate_names(self, adState)
         
         return adX
 
@@ -2693,10 +2710,7 @@ class Basis_offset(_Basis_offset):
 
         # Update State
         if State is not None:
-            if not self.multi_mode:
-                State[self.name_mod_var] = phi
-            else:
-                State[self.name_mod_var] += phi
+            _assign_to_state_names(self, State, phi)
         else:
             return phi
         
@@ -2704,14 +2718,13 @@ class Basis_offset(_Basis_offset):
         """
             Project to reduced space
         """
-        if adState[self.name_mod_var] is None:
-            adState[self.name_mod_var] = jnp.zeros((self.nphys,))
-        adparams = adState[self.name_mod_var]
+        _ensure_adstate_names(self, adState, jnp.zeros(self.shape_phys))
+        adparams = _sum_adstate_names(self, adState)
 
         adX = jnp.expand_dims(jnp.sum(adparams), axis=0)
         
         if not self.multi_mode:
-            adState[self.name_mod_var] *= 0.
+            _clear_adstate_names(self, adState)
         
         return adX
     
@@ -2726,25 +2739,21 @@ class Basis_multi:
         self.Basis = []
         _config = config.copy()
 
-        self.jax = True
         self.name_mod_var = []
         for _BASIS in config.BASIS:
             _config.BASIS = config.BASIS[_BASIS]
 
             self.Basis.append(Basis(_config,State,verbose=verbose, multi_mode=True))
-            if 'name_mod_var' in _config.BASIS and _config.BASIS.name_mod_var is not None and _config.BASIS.name_mod_var not in self.name_mod_var:
-                self.name_mod_var.append(_config.BASIS.name_mod_var)
+            if 'name_mod_var' in _config.BASIS and _config.BASIS.name_mod_var is not None:
+                for _name_mod_var in _as_name_list(_config.BASIS.name_mod_var):
+                    if _name_mod_var not in self.name_mod_var:
+                        self.name_mod_var.append(_name_mod_var)
                 if 'compute_velocities' in _config.BASIS and _config.BASIS.compute_velocities:
                     if 'name_mod_u' in _config.BASIS and _config.BASIS.name_mod_u is not None and _config.BASIS.name_mod_u not in self.name_mod_var:
                         self.name_mod_var.append(_config.BASIS.name_mod_u)
                     if 'name_mod_v' in _config.BASIS and _config.BASIS.name_mod_v is not None and _config.BASIS.name_mod_v not in self.name_mod_var:
                         self.name_mod_var.append(_config.BASIS.name_mod_v)
 
-            if '_JAX' not in _config.BASIS.super:
-                self.jax = False
-
-        if self.jax:
-            print('Basis_multi: Full JAX mode')
         
     def set_basis(self,time,return_q=False,**kwargs):
 
@@ -2774,10 +2783,7 @@ class Basis_multi:
         """
 
         if State is None:
-            if self.jax:
-                phi = jnp.array([])
-            else:
-                phi = np.array([])
+            phi_parts = []
 
         if State is not None:
             for name_mod_var in self.name_mod_var:
@@ -2787,13 +2793,10 @@ class Basis_multi:
             _X = X[self.slice_basis[i]]
             _phi = B.operg(t, _X, State=State)
             if State is None:
-                if self.jax:
-                    phi = jnp.append(phi, _phi)
-                else:
-                    phi = np.append(phi, _phi)
+                phi_parts.append(jnp.ravel(_phi))
         
         if State is None:
-            return phi
+            return jnp.concatenate(phi_parts)
 
 
     def operg_transpose(self, t, adState):
@@ -2803,10 +2806,7 @@ class Basis_multi:
         """
         
         adX_parts = [B.operg_transpose(t, adState=adState) for B in self.Basis]
-        if self.jax:
-            adX = jnp.concatenate(adX_parts)
-        else:
-            adX = np.concatenate(adX_parts)
+        adX = jnp.concatenate(adX_parts)
         
         for name_mod_var in self.name_mod_var:
             adState[name_mod_var] *= 0.

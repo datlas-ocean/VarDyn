@@ -86,7 +86,7 @@ CSWM = dict(
 
     name_var = {'U': 'u_it', 'V': 'v_it', 'SSH': 'ssh_it'}, # Map model roles to state/output variable names.
 
-    name_params = ['He_mean', 'hbc', 'alpha'], # Controlled IT parameters: equivalent depth, boundary waves, and BM coupling.
+    name_params = ['He_mean', 'hbc', 'alpha_He', 'alpha_Uu', 'alpha_Uz', 'alpha_Up'], # Controlled IT parameters: equivalent depth, boundary waves, and BM coupling terms.
 
     g = 9.81, # Gravity acceleration in m s-2.
 
@@ -192,7 +192,7 @@ OBSOP_NR = dict(
 # Reduced basis parameters
 #################################################################################################################################
 
-NAME_BASIS = ['Basis_He', 'Basis_alpha', 'Basis_hbc'] # Reduced-basis blocks composing the control vector.
+NAME_BASIS = ['Basis_He', 'Basis_alpha_He', 'Basis_alpha_adv', 'Basis_alpha_Uz', 'Basis_hbc'] # Reduced-basis blocks composing the control vector.
 
 Basis_He = dict(
 
@@ -216,13 +216,33 @@ Basis_He = dict(
 
 )
 
-Basis_alpha = dict(
+Basis_alpha_He = dict(
 
     super = 'BASIS_OFFSET', # Use one domain-wide offset basis vector.
 
-    name_mod_var = 'alpha', # Controlled BM-to-IT coupling coefficient.
+    name_mod_var = 'alpha_He', # Controlled BM-to-IT equivalent-depth coupling coefficient.
 
-    sigma_B = .1, # Prior standard deviation for the alpha offset.
+    sigma_B = .1, # Prior standard deviation for the alpha_He offset.
+
+)
+
+Basis_alpha_adv = dict(
+
+    super = 'BASIS_OFFSET', # Use one shared domain-wide offset basis vector.
+
+    name_mod_var = ['alpha_Uu', 'alpha_Up'], # Link advective coupling coefficients to the same control.
+
+    sigma_B = .1, # Prior standard deviation for the shared advective-alpha offset.
+
+)
+
+Basis_alpha_Uz = dict(
+
+    super = 'BASIS_OFFSET', # Use one domain-wide offset basis vector.
+
+    name_mod_var = 'alpha_Uz', # Controlled vertical-shear coupling coefficient.
+
+    sigma_B = .1, # Prior standard deviation for the alpha_Uz offset.
 
 )
 

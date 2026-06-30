@@ -793,7 +793,7 @@ NAME_BASIS = None
 # Offset basis (i.e. a single basis vector with value 1 everywhere)
 BASIS_OFFSET = dict(
 
-    name_mod_var = None,
+    name_mod_var = None, # String or list of model parameter names sharing this basis
 
     sigma_B = None, 
 
@@ -804,7 +804,7 @@ BASIS_GAUSS2D = dict(
 
     super = 'BASIS_GAUSS2D',
 
-    name_mod_var = '', # Name of the related model variable
+    name_mod_var = '', # String or list of related model parameter names
 
     c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 
@@ -834,7 +834,7 @@ BASIS_GAUSS2D = dict(
 
 BASIS_GAUSS3D = dict(
 
-    name_mod_var = '', # Name of the related model variable 
+    name_mod_var = '', # String or list of related model parameter names 
 
     c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 
@@ -877,7 +877,7 @@ BASIS_GAUSS3D = dict(
 # Balanced Motions with auxilliary data 
 BASIS_BMaux = dict(
 
-    name_mod_var = None, # Name of the related model variable 
+    name_mod_var = None, # String or list of related model parameter names 
 
     c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 
