@@ -250,6 +250,7 @@ barrier_wait() {
 # -------------------- TILE WORKER --------------------
 run_single_tile() {
     local TILE="$1"
+    local IW="$2"
     local TILE_BASENAME=$(basename "$TILE")
     local TILE_PARENT=$(basename "$(dirname "$TILE")")
     local LOG_SUBDIR="${LOGDIR}/${TILE_PARENT}"
@@ -261,6 +262,9 @@ run_single_tile() {
     local status=$?
     if [ $status -eq 0 ]; then
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | DONE  tile ${TILE}" >> "$TILE_LOG"
+        if grep -Fq "Finished tile:" "$TILE_LOG"; then
+            touch "${BARRIER_DIR}/computed_iw${IW}_${ARRAY_ID}"
+        fi
     elif [ $status -eq 137 ]; then
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | KILLED (OOM?) tile ${TILE}" >> "$TILE_LOG"
     else
@@ -295,7 +299,7 @@ for TIME_DIR in $TIME_WINDOWS; do
             # Try to claim this tile; skip if another GPU already got it
             try_claim_tile "$TILE" || continue
 
-            run_single_tile "$TILE" &
+            run_single_tile "$TILE" "$IW" &
             ((running++))
             ((tiles_done++))
 
@@ -312,6 +316,13 @@ for TIME_DIR in $TIME_WINDOWS; do
 
     # Barrier: wait for all GPUs to finish this time window
     barrier_wait "tw${IW}"
+
+    if ! $FORCE_MERGE && ! compgen -G "${BARRIER_DIR}/computed_iw${IW}_"'*' > /dev/null; then
+        echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Skipping spatial merge for time window ${IW}: no tile computed and --force-merge not set"
+        barrier_wait "merge${IW}"
+        ((IW++))
+        continue
+    fi
 
     # Spatial merge: every array task processes its share of dates
     echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Spatial merge for time window ${IW} (rank ${ARRAY_ID}/${NUM_ARRAY})"
