@@ -812,11 +812,24 @@ def compute_weights_map(State, list_State, path_save_pickle=None,
         lon_in = _State.lon
         lat_in = _State.lat
 
-        # Build interpolation operator (precomputed, reused for all dates)
-        _interp_func, _weights_space_interp = _build_interpolator(
-            lon_in, lat_in, _weights_space, lon_out, lat_out,
-            _State.lon_unit, State.lon_unit, State.ny, State.nx,
-            _State.geo_grid)
+        same_target_grid = (
+            single_subwindow
+            and lon_in.shape == lon_out.shape
+            and lat_in.shape == lat_out.shape
+            and np.allclose(lon_in, lon_out, equal_nan=True)
+            and np.allclose(lat_in, lat_out, equal_nan=True)
+        )
+        if same_target_grid:
+            # One tile on the target grid is already the merged grid: keep this
+            # as a strict copy path and avoid interpolation edge/precision artefacts.
+            _interp_func = None
+            _weights_space_interp = np.ones((State.ny, State.nx))
+        else:
+            # Build interpolation operator (precomputed, reused for all dates)
+            _interp_func, _weights_space_interp = _build_interpolator(
+                lon_in, lat_in, _weights_space, lon_out, lat_out,
+                _State.lon_unit, State.lon_unit, State.ny, State.nx,
+                _State.geo_grid)
 
         ind = ~np.isnan(_weights_space_interp)
         weights_space_sum[ind] += _weights_space_interp[ind]
@@ -1193,6 +1206,16 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
 
     # Tile-partitioned design (avoids per-worker cache blow-up).
     n_tiles = len(list_tile_paths)
+    direct_copy_single_tile = (
+        n_tiles == 1
+        and len(list_State) == 1
+        and list_State[0].lon.shape == State.lon.shape
+        and list_State[0].lat.shape == State.lat.shape
+        and np.allclose(list_State[0].lon, State.lon, equal_nan=True)
+        and np.allclose(list_State[0].lat, State.lat, equal_nan=True)
+    )
+    if direct_copy_single_tile:
+        weights_space_sum = np.ones((State.ny, State.nx))
     nw = min(num_workers, n_tiles)
 
     # Round-robin partition so workers get roughly equal load.
@@ -1211,7 +1234,7 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
             target=_merge_worker_loop,
             args=(parts_paths[k], parts_states[k], name_var_save,
                   State.ny, State.nx, weights_space_sum,
-                  task_qs[k], result_qs[k]),
+                  task_qs[k], result_qs[k], direct_copy_single_tile),
             daemon=False,
         )
         p.start()
@@ -1225,26 +1248,23 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
             for q in task_qs:
                 q.put(date)
             dict_var = {n: np.zeros((State.ny, State.nx)) for n in name_var_save}
-            # Accumulate the fractional weight from failed tiles (0‥1 per cell).
-            # A cell where missing_weight == 1 was covered only by failed tiles.
-            total_missing_weight = np.zeros((State.ny, State.nx))
+            # Accumulate the fractional weight from failed tiles (0‥1 per cell),
+            # tracked per variable so one missing diagnostic does not poison all fields.
+            total_missing_weight = {n: np.zeros((State.ny, State.nx)) for n in name_var_save}
             for k, q in enumerate(result_qs):
                 result = q.get()
                 if result is None:
                     raise RuntimeError(f'merge worker {k} died on date {date}')
                 for n in name_var_save:
                     dict_var[n] += result['contrib'][n]
-                total_missing_weight += result['missing_weight']
-
-            # Cells whose entire coverage came from failed tiles → NaN
-            tile_failed_mask = total_missing_weight > 0
+                    total_missing_weight[n] += result['missing_weight'][n]
 
             try:
                 State0 = _copy.copy(State)
                 State0.var = dict(State.var)
                 for n in name_var_save:
                     dict_var[n][no_coverage] = np.nan
-                    dict_var[n][tile_failed_mask] = np.nan
+                    dict_var[n][total_missing_weight[n] >= 1.0 - 1e-12] = np.nan
                     if State0.mask is not None and np.any(State0.mask):
                         dict_var[n][State0.mask] = np.nan
                     State0.setvar(dict_var[n], n)
@@ -1265,7 +1285,8 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
 
 
 def _merge_worker_loop(tile_paths, states, name_var_save, ny, nx,
-                       weights_space_sum, task_q, result_q):
+                       weights_space_sum, task_q, result_q,
+                       direct_copy_single_tile=False):
     """Worker: load assigned tiles once, then process dates sent via task_q."""
     try:
         tiles = [_load_tile_weights(p) for p in tile_paths]
@@ -1293,35 +1314,48 @@ def _merge_worker_loop(tile_paths, states, name_var_save, ny, nx,
             return
 
         contrib = {n: np.zeros((ny, nx)) for n in name_var_save}
-        # Weight fraction lost to failed tiles for this date.
-        missing_weight = np.zeros((ny, nx))
+        # Weight fraction lost to failed tiles for this date, per variable.
+        missing_weight = {n: np.zeros((ny, nx)) for n in name_var_save}
         for tile_data, _State in zip(tiles, states):
-            _weights_space = tile_data['weights_space']
-            _interp_func = tile_data['interpolator']
+            if direct_copy_single_tile:
+                _weights_space = np.ones((ny, nx))
+                _interp_func = None
+            else:
+                _weights_space = tile_data['weights_space']
+                _interp_func = tile_data['interpolator']
             try:
                 _ds = _State.load_output(date)
-                for name in name_var_save:
-                    _var = _ds[name].values
-                    if _var.shape == (_State.ny, _State.nx + 1):
-                        _var = 0.5 * (_var[:, :-1] + _var[:, 1:])
-                    elif _var.shape == (_State.ny + 1, _State.nx):
-                        _var = 0.5 * (_var[:-1, :] + _var[1:, :])
-                    if np.any(np.isnan(_var)):
-                        _var = _fill_nans_nearest(_var)
-                    if _interp_func is not None:
-                        _var_interp = _interp_func(_var)
-                    else:
-                        _var_interp = _var
-                    ind = ~np.isnan(_var_interp)
-                    contrib[name][ind] += (_weights_space * _var_interp * inv_wsum)[ind]
-                _ds.close()
-                del _ds
             except Exception as e:
                 print(f'[merge worker] tile failed for {date}: {e}', flush=True)
                 # Accumulate the fractional weight this tile would have contributed
                 # so the main process can mark those cells NaN instead of 0.
-                missing_weight += _weights_space * inv_wsum
+                for n in name_var_save:
+                    missing_weight[n] += _weights_space * inv_wsum
                 continue
+
+            try:
+                for name in name_var_save:
+                    try:
+                        _var = _ds[name].values
+                        if _var.shape == (_State.ny, _State.nx + 1):
+                            _var = 0.5 * (_var[:, :-1] + _var[:, 1:])
+                        elif _var.shape == (_State.ny + 1, _State.nx):
+                            _var = 0.5 * (_var[:-1, :] + _var[1:, :])
+                        if np.any(np.isnan(_var)):
+                            _var = _fill_nans_nearest(_var)
+                        if _interp_func is not None:
+                            _var_interp = _interp_func(_var)
+                        else:
+                            _var_interp = _var
+                        ind = ~np.isnan(_var_interp)
+                        contrib[name][ind] += (_weights_space * _var_interp * inv_wsum)[ind]
+                    except Exception as e:
+                        print(f'[merge worker] variable {name} failed for {date}: {e}', flush=True)
+                        missing_weight[name] += _weights_space * inv_wsum
+                        continue
+            finally:
+                _ds.close()
+                del _ds
 
         try:
             result_q.put({'contrib': contrib, 'missing_weight': missing_weight})
