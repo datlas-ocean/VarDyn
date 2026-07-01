@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import datetime
 import pickle
 
+import traceback
 import warnings
 from pathlib import Path
 
@@ -124,7 +125,7 @@ def main():
         run_tile(tile_dir, restart=RESTART)
     except Exception as e:
         print(f"[ERROR] Tile failed: {tile_dir}", file=sys.stderr)
-        print(str(e), file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
         sys.exit(2)
 
 

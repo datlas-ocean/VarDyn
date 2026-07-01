@@ -269,6 +269,10 @@ run_single_tile() {
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | KILLED (OOM?) tile ${TILE}" >> "$TILE_LOG"
     else
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | ERROR exit=${status} tile ${TILE}" >> "$TILE_LOG"
+        # Echo the tail of the tile log to the main log so the error is visible
+        # without having to dig into individual tile log files.
+        echo "$(date '+%F %T') | GPU ${ARRAY_ID} | ERROR tile ${TILE} — last 40 lines of ${TILE_LOG}:" >&2
+        tail -n 40 "$TILE_LOG" >&2
     fi
 }
 

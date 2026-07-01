@@ -2979,6 +2979,30 @@ class Model_qgsw(M):
             # so NaN would survive the clamp and propagate to H as 0,
             # creating sharp unphysical gradients that destabilise the model).
             c_fill = np.nanmean(self.c)
+            if np.isnan(c_fill):
+                # All interpolated values are NaN — tile is likely outside the
+                # aux file domain.  Use cmin first, cmax second as fallback so
+                # that H stays finite and the model can proceed.
+                if config.MOD.cmin is not None:
+                    c_fill = config.MOD.cmin
+                    print(
+                        f'WARNING: all Rossby phase velocity values are NaN '
+                        f'after interpolation (tile may lie outside the aux '
+                        f'file domain). Falling back to cmin={c_fill} m/s.'
+                    )
+                elif config.MOD.cmax is not None:
+                    c_fill = config.MOD.cmax
+                    print(
+                        f'WARNING: all Rossby phase velocity values are NaN '
+                        f'after interpolation (tile may lie outside the aux '
+                        f'file domain). Falling back to cmax={c_fill} m/s.'
+                    )
+                else:
+                    print(
+                        f'WARNING: all Rossby phase velocity values are NaN '
+                        f'after interpolation and no cmin/cmax fallback is '
+                        f'defined. H will be NaN and the model will likely fail.'
+                    )
             self.c[np.isnan(self.c)] = c_fill
 
             if config.MOD.cmin is not None:
