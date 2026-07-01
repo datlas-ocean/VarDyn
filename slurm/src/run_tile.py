@@ -61,6 +61,12 @@ def run_tile(tile_dir: Path, restart:bool):
     with open(state_path, "rb") as f:
         State = pickle.load(f)
 
+    # Skip tiles with no ocean points: nothing to assimilate and the SW model
+    # core will hard-fail on an all-zero mask.
+    if getattr(State, 'mask', None) is not None and State.mask.all():
+        print(f"[SKIP] Tile is all land (no ocean points), skipping: {tile_dir}")
+        return
+
     print(f"Running inversion, output path: {config.EXP.path_save}")
 
     success_marker = marker_path(config)

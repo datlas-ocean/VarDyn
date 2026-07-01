@@ -174,8 +174,10 @@ class SW:
             shape = mask.shape[0], mask.shape[1]
             assert  shape == (nx, ny), f'Invalid mask shape {shape=}!=({nx},{ny})'
             vals = jnp.unique(mask).tolist()
-            assert  all([v in [0,1] for v in vals]) and vals != [0], \
-                    f'Invalid mask with non-binary values : {vals}'
+            assert all([v in [0, 1] for v in vals]), \
+                f'Mask must be binary (0=land, 1=ocean), got unique values: {vals}'
+            assert vals != [0], \
+                f'Mask is all zeros (all-land tile): no ocean points to integrate over'
             print(f'  - {"non-" if len(vals)==2 else ""}trivial mask provided')
 
         else:
