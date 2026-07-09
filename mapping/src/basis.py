@@ -2633,7 +2633,7 @@ class Basis_hbc:
 ###############################################################################
 #                                Offset                                       #
 ###############################################################################   
-# Old version of the basis class, kept for reference. The new Basis_bmaux class is preferred.
+# Old version of the basis class, kept for reference. The new Basis_offset class is preferred.
 class _Basis_offset:
 
     def __init__(self,config, State, multi_mode=False):

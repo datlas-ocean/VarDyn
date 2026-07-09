@@ -120,7 +120,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     #if 'JAX' in config.MOD.super:
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     if gpu_device is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = gpu_device
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_device)
         
     
     # Module initializations

@@ -3811,6 +3811,12 @@ class Model_qgsw(M):
             State0.var['H'] = self._H_control_to_total_state(State.params['H'])
             State0.var['H_control'] = +State.params['H']
             _name_var += ['H', 'H_control']
+
+        if self.mdt is not None:
+            State0.var['mdt'] = np.array(self.mdt[0, 0]).T
+            State0.var['mdu'] = np.array(self.mdu[0, 0]).T
+            State0.var['mdv'] = np.array(self.mdv[0, 0]).T
+            _name_var += ['mdt', 'mdu', 'mdv']
         
         if 'h_wind' in self.name_params:
             State0.var['h_wind'] = +State.params['h_wind']

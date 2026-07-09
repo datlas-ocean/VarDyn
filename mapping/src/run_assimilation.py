@@ -1402,7 +1402,8 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
             active_processes = set()  # set of (process, gpu_id)
 
             for worker in processes[:nprocs]:  # Start initial nprocs processes
-                gpu_id = min(gpu_load, key=gpu_load.get)
+                gpu_id = str(min(gpu_load, key=gpu_load.get))
+                os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
                 p = mp.get_context("spawn").Process(target=worker, kwargs={'gpu_device': gpu_id})
                 p.start()
                 active_processes.add((p, gpu_id))
@@ -1417,7 +1418,8 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
                             gpu_load[g] -= 1
                             break
 
-                gpu_id = min(gpu_load, key=gpu_load.get)
+                gpu_id = str(min(gpu_load, key=gpu_load.get))
+                os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
                 p = mp.get_context("spawn").Process(target=worker, kwargs={'gpu_device': gpu_id})
                 p.start()
                 active_processes.add((p, gpu_id))
