@@ -95,6 +95,12 @@ while [ $i -lt ${#args[@]} ]; do
     esac
     i=$(( i + 1 ))
 done
+
+# A dedicated background experiment necessarily requires background mode.
+if [ -n "$NAME_EXP_BACKGROUND_OVERRIDE" ]; then
+    FLAG_BACKGROUND=true
+fi
+
 RESTART="$RESTART_ARGS"
 FORCE_MERGE_ARG=""
 $FORCE_MERGE && FORCE_MERGE_ARG="--force"
