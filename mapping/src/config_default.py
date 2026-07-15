@@ -820,6 +820,8 @@ BASIS_GAUSS2D = dict(
 
     sigma_Q = 0.01, # Prior standard deviation for each control coefficient
 
+    facQ = 1., # Factor multiplied to the estimated Q
+
     flag_variable_Q = False, # If True, read spatially varying std from *path_sad*
 
     path_sad = None, # Path to a netcdf file with a spatially varying std field (used when flag_variable_Q=True)
@@ -856,7 +858,7 @@ BASIS_GAUSS3D = dict(
 
     sigma_Q = 0.01, # Standard deviation for matrix Q 
 
-    fcor = .5,
+    facQ = 1., # Factor multiplied to the estimated Q
 
     normalize_fact = True,
 

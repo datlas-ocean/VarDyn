@@ -116,10 +116,10 @@ class _Basis_gauss3d:
         self.sigma_D = config.BASIS.sigma_D
         self.sigma_T = config.BASIS.sigma_T
         self.sigma_Q = config.BASIS.sigma_Q
+        self.facQ = config.BASIS.facQ
         self.normalize_fact = config.BASIS.normalize_fact
         self.name_mod_var = config.BASIS.name_mod_var
         self.time_spinup = config.BASIS.time_spinup
-        self.fcor = config.BASIS.fcor
         self.flag_variable_Q = config.BASIS.flag_variable_Q
         self.path_sad = config.BASIS.path_sad
         self.name_var_sad = config.BASIS.name_var_sad
@@ -297,12 +297,12 @@ class _Basis_gauss3d:
                 std_tmp_values = sad.interp({self.name_var_sad['lon']:elon2.ravel(), 
                                             self.name_var_sad['lat']:elat2.ravel()}).values
                 std_tmp = np.nanmean(std_tmp_values) if not np.all(np.isnan(std_tmp_values)) else 10**-10
-                Q_tmp = std_tmp / ((self.facns*self.facnlt))**.5 
+                Q_tmp = self.facQ * std_tmp / ((self.facns*self.facnlt))**.5
                 Q.append(Q_tmp) 
             # Repeat for all time centers
             Q = np.tile(Q, len(self.ENST))
         else:
-            Q = self.sigma_Q / ((self.facns*self.facnlt))**.5 * np.ones((self.nbasis))
+            Q = self.facQ * self.sigma_Q / ((self.facns*self.facnlt))**.5 * np.ones((self.nbasis))
 
 
         
@@ -696,6 +696,7 @@ class _Basis_gauss2d:
         self.facns = config.BASIS.facns
         self.sigma_D = config.BASIS.sigma_D
         self.sigma_Q = config.BASIS.sigma_Q
+        self.facQ = config.BASIS.facQ
         self.name_mod_var = config.BASIS.name_mod_var
         self.flag_variable_Q = config.BASIS.flag_variable_Q
         self.path_sad = config.BASIS.path_sad
@@ -850,10 +851,10 @@ class _Basis_gauss2d:
                 std_tmp_values = sad.interp({self.name_var_sad['lon']: elon2.ravel(),
                                              self.name_var_sad['lat']: elat2.ravel()}).values
                 std_tmp = np.nanmean(std_tmp_values) if not np.all(np.isnan(std_tmp_values)) else 10**-10
-                Q.append(std_tmp / self.facns**.5)
+                Q.append(self.facQ * std_tmp / self.facns**.5)
             Q = np.array(Q)
         else:
-            Q = self.sigma_Q / self.facns**.5 * np.ones((self.nbasis,))
+            Q = self.facQ * self.sigma_Q / self.facns**.5 * np.ones((self.nbasis,))
 
         Xb = np.zeros_like(Q)
         if self.path_background is not None and os.path.exists(self.path_background):
