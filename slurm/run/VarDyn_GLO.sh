@@ -68,8 +68,9 @@ BARRIER_TIMEOUT=7200   # 2 hours
 
 # Init / background from a previous experiment (written into tile config pickles)
 FLAG_INIT=false        # initialize control vectors from NAME_EXP/Xres.nc
-FLAG_BACKGROUND=false  # use background field from NAME_EXP/Xres.nc
-NAME_EXP=""            # name of the previous experiment (used when FLAG_INIT or FLAG_BACKGROUND is true)
+FLAG_BACKGROUND=false  # use background field from NAME_EXP_BACKGROUND/Xres.nc
+NAME_EXP=""            # name of the previous experiment used for initialization
+NAME_EXP_BACKGROUND="" # name of the previous experiment used for background; falls back to NAME_EXP
 
 # -------------------- USER INPUT (optional CLI flags) --------------------
 # Parse optional flags
@@ -78,6 +79,7 @@ RESTART_ARGS=""
 FORCE_MERGE=false
 MERGE_ONLY=false
 NAME_EXP_OVERRIDE=""
+NAME_EXP_BACKGROUND_OVERRIDE=""
 args=("$@")
 i=0
 while [ $i -lt ${#args[@]} ]; do
@@ -88,6 +90,8 @@ while [ $i -lt ${#args[@]} ]; do
         --merge-only)    MERGE_ONLY=true; SKIP_PREPARE=true ;;
         --name_exp)      i=$(( i + 1 )); NAME_EXP_OVERRIDE="${args[$i]}" ;;
         --name_exp=*)    NAME_EXP_OVERRIDE="${args[$i]#--name_exp=}" ;;
+        --name_exp_background) i=$(( i + 1 )); NAME_EXP_BACKGROUND_OVERRIDE="${args[$i]}" ;;
+        --name_exp_background=*) NAME_EXP_BACKGROUND_OVERRIDE="${args[$i]#--name_exp_background=}" ;;
     esac
     i=$(( i + 1 ))
 done
@@ -123,6 +127,8 @@ INIT_BG_ARGS=""
 $FLAG_INIT       && INIT_BG_ARGS+=" --flag_init"
 $FLAG_BACKGROUND && INIT_BG_ARGS+=" --flag_background"
 [ -n "$NAME_EXP" ] && INIT_BG_ARGS+=" --name_exp $NAME_EXP"
+[ -n "$NAME_EXP_BACKGROUND_OVERRIDE" ] && NAME_EXP_BACKGROUND="$NAME_EXP_BACKGROUND_OVERRIDE"
+[ -n "$NAME_EXP_BACKGROUND" ] && INIT_BG_ARGS+=" --name_exp_background $NAME_EXP_BACKGROUND"
 
 PREPARE_ARGS="\
     --init_date $INIT_DATE \
