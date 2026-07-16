@@ -258,6 +258,36 @@ class Qgm:
         self.sponge_coef = float(sponge_coef)
         self.ocean_h = (self.ind0 == False).astype(self.dtype)
 
+        # Passive tracers use a third-order upwind stencil.  The QG velocity
+        # mask alone is not enough around an irregular coast: a wet target
+        # cell may still read one or more land cells in that stencil.  Those
+        # land values are prescribed from the external BC field and can then
+        # inject sharp, non-physical gradients into the ocean.  Keep a
+        # two-cell no-transport collar around land so that neither the
+        # advection nor the tracer Laplacian ever crosses a land cell.
+        #
+        # ``tracer_update_mask`` is indexed like q[2:-2, 2:-2], while
+        # ``tracer_transport_mask`` is indexed like u_on_T/v_on_T
+        # (q[1:-1, 1:-1]).  The latter is zero outside the update region.
+        # This conservative treatment is preferable to extrapolating across
+        # complex coastlines: the collar can still be relaxed by the optional
+        # tracer sponge, but cannot be destabilised by the transport scheme.
+        ocean_bool = self.ocean_h.astype(bool)
+        update_mask = np.zeros((max(ny - 4, 0), max(nx - 4, 0)), dtype=bool)
+        if ny > 4 and nx > 4:
+            update_mask[:] = True
+            for di in range(-2, 3):
+                for dj in range(-2, 3):
+                    update_mask &= ocean_bool[
+                        2 + di:ny - 2 + di,
+                        2 + dj:nx - 2 + dj,
+                    ]
+        transport_mask = np.zeros((max(ny - 2, 0), max(nx - 2, 0)), dtype=bool)
+        if ny > 4 and nx > 4:
+            transport_mask[1:-1, 1:-1] = update_mask
+        self.tracer_update_mask = jnp.asarray(update_mask)
+        self.tracer_transport_mask = jnp.asarray(transport_mask)
+
         # Dynamics options
         self.advect_pv = advect_pv
         self.ageo_velocities = ageo_velocities
@@ -497,21 +527,25 @@ class Qgm:
                 vp += vap
                 vm += vam
 
-            u_mask = self.ocean_h[1:-1,1:-1]
-            up = up * u_mask
-            um = um * u_mask
-            vp = vp * u_mask
-            vm = vm * u_mask
+            # Prevent the high-order advection stencil from sampling across
+            # land.  A simple wet-cell mask here is insufficient because the
+            # stencil reaches two cells away from its update point.
+            up = up * self.tracer_transport_mask
+            um = um * self.tracer_transport_mask
+            vp = vp * self.tracer_transport_mask
+            vm = vm * self.tracer_transport_mask
 
             for i in range(c0.shape[0]):
                 rhs_c = self.adv(up, vp, um, vm, c0[i])
                 if self.Kdiffus_trac is not None:
-                    rhs_c = rhs_c.at[2:-2,2:-2].set(
-                        rhs_c[2:-2,2:-2] +
+                    diffus_c = (
                         self.Kdiffus_trac/(self.dx**2) *
                             (c0[i,2:-2,3:-1] + c0[i,2:-2,1:-3] - 2*c0[i,2:-2,2:-2]) +
                         self.Kdiffus_trac/(self.dy**2) *
                             (c0[i,3:-1,2:-2] + c0[i,1:-3,2:-2] - 2*c0[i,2:-2,2:-2])
+                    )
+                    rhs_c = rhs_c.at[2:-2,2:-2].add(
+                        self.tracer_update_mask * diffus_c
                     )
                 rhs_c = jnp.where(jnp.isnan(rhs_c), 0, rhs_c)
                 rhs_c = rhs_c.at[self.ind0].set(0)
