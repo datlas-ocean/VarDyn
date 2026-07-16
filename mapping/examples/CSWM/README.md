@@ -1,11 +1,13 @@
 # CSWM VarDyn Example
 
-This directory contains a VarDyn 4DVar example for the JET BM-IT internal-tide OSSE using the current `MOD_CSW1L` implementation.
+This directory contains VarDyn 4DVar examples for the JET BM-IT OSSE, using either the standalone internal-tide model or the coupled BM-IT model.
 
 ## Files
 
 - `config_VarDyn-CSWM-JET.py`: configuration for the CSW internal-tide model with Balanced Motion coupling.
 - `run_VarDyn-CSWM-JET.ipynb`: notebook that loads the config, builds the state/model/observations/operators/basis, runs 4DVar, and optionally runs diagnostics.
+- `config_VarDyn-BMIT-JET.py`: coupled `MOD_BMIT` configuration using a QG balanced-motion component and a CSW internal-tide component.
+- `run_VarDyn-BMIT-JET.ipynb`: notebook that runs the coupled BM-IT inversion against total SLA observations.
 
 ## Configuration Summary
 
