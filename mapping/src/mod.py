@@ -3725,7 +3725,11 @@ class Model_qgsw(M):
         return self._h_wind_control_to_total_sw(h_wind_control) - self.h_wind_ref_sw
 
     def _h_wind_control_to_total_state(self, h_wind_control):
-        return np.array(self._h_wind_control_to_total_sw(h_wind_control).T)
+        # Controls are stored in State's (ny, nx) layout, whereas the JAX SW
+        # kernel and reference fields use (nx, ny). Mirror step()/step_tgl()
+        # before converting, then return to State layout for output.
+        h_wind_control_sw = jnp.asarray(h_wind_control, dtype=self.dtype).T
+        return np.array(self._h_wind_control_to_total_sw(h_wind_control_sw).T)
 
     def _load_wind_forcing(self, config, State):
         """
