@@ -2805,14 +2805,37 @@ class Model_qgsw(M):
             self.dtype = jnp.float32
 
         self.nl = config.MOD.nl
+        self.height_representation = getattr(config.MOD, 'height_representation', 'ssh')
+        if self.height_representation not in ('ssh', 'interface_displacement'):
+            raise ValueError(
+                "MOD.height_representation must be 'ssh' or 'interface_displacement'."
+            )
+        self._physical_interface_height = (
+            self.height_representation == 'interface_displacement'
+        )
         self._configured_name_params = config.MOD.name_params if config.MOD.name_params is not None else []
         self._controls_H = 'H' in self._configured_name_params
+        self._controls_h_wind = 'h_wind' in self._configured_name_params
 
         if config.MOD.name_class.lower()=='qg':
             model = model_qg
         else:
             model = model_sw
         self._is_qg_class = (config.MOD.name_class.lower() == 'qg')
+        if self._physical_interface_height:
+            if self.nl != 1:
+                raise NotImplementedError(
+                    'height_representation=interface_displacement is implemented for nl=1 only. '
+                    'A multilayer SSH/modal projection must be specified first.'
+                )
+            if self._is_qg_class:
+                raise NotImplementedError(
+                    'height_representation=interface_displacement is currently supported by the SW class only.'
+                )
+            if config.MOD.H is None:
+                raise ValueError(
+                    'interface_displacement requires MOD.H so g_prime can be defined physically.'
+                )
 
         # Coriolis
         if config.MOD.f0 is not None and config.MOD.constant_f:
@@ -2826,8 +2849,9 @@ class Model_qgsw(M):
         self.f_on_v = 0.5*(_f[:,1:] + _f[:,:-1])
         self.f_on_u = 0.5*(_f[1:,:] + _f[:-1,:])
         
-        # Gravity 
-        self.g = 9.81
+        # Physical gravity used to convert between external SSH and the
+        # reduced-gravity interface displacement in physical interface mode.
+        self.g = float(getattr(config.MOD, 'physical_gravity', 9.81))
 
         # Grid spacing
         self.dx = np.pad(State.DX, pad_width=pad, mode='edge')
@@ -3023,8 +3047,14 @@ class Model_qgsw(M):
         
         # Reduced gravity
         if config.MOD.nl==1:
+            # In physical interface mode, leaving g_prime unset means retain the
+            # supplied physical layer depth and diagnose g' = c1**2 / H. This
+            # keeps the first-baroclinic wave speed while making H a real depth.
+            diagnose_g_prime = (
+                self._physical_interface_height and config.MOD.g_prime is None
+            )
             if config.MOD.g_prime is None:
-                g_prime = np.array([[[9.81]]])
+                g_prime = None if diagnose_g_prime else np.array([[[9.81]]])
             else:
                 g_prime = config.MOD.g_prime
                 if not hasattr(g_prime,'shape'):
@@ -3035,6 +3065,10 @@ class Model_qgsw(M):
                     g_prime = np.expand_dims(g_prime, axis=(0,1))
                     
             if config.MOD.H is None:
+                if diagnose_g_prime:
+                    raise ValueError(
+                        'Physical interface mode needs MOD.H before deriving g_prime = c1**2 / H.'
+                    )
                 # self.c is interpolated onto State.lon/State.lat, so its shape
                 # must be (State.ny, State.nx). The .T below converts to (nx, ny),
                 # which is then nl-expanded to (1, nx, ny) — the layout sw.py expects.
@@ -3065,6 +3099,12 @@ class Model_qgsw(M):
                     H = H0 = np.expand_dims(H, axis=0)   
                 elif len(H.shape)==1:
                     H = H0 = np.expand_dims(H, axis=(0,1))
+
+            if diagnose_g_prime:
+                assert self.c.shape == (State.ny, State.nx), \
+                    f'self.c has shape {self.c.shape}, expected (ny, nx)=' \
+                    f'({State.ny}, {State.nx}).'
+                g_prime = np.expand_dims(self.c.T**2 / H[0], axis=0)
         else:
             g_prime = config.MOD.g_prime
             if not hasattr(g_prime, 'shape'):
@@ -3083,6 +3123,23 @@ class Model_qgsw(M):
         if H_from_init is not None:
             H = H_from_init
 
+        self.g_prime = np.asarray(g_prime, dtype=float)
+        if self._physical_interface_height:
+            # Both factors have State's (ny, nx) layout. The state stores eta;
+            # external BCs, observations, and output use physical SSH.
+            self.ssh_to_model_height = self.g / self.g_prime[0].T
+            self.ssh_observation_scale = self.g_prime[0].T / self.g
+            if not np.all(np.isfinite(self.ssh_observation_scale)) or np.any(self.ssh_observation_scale <= 0.):
+                raise ValueError('Physical interface mode requires finite, strictly positive g_prime.')
+            if self.mdt is not None:
+                # MDT is provided as physical SSH but is added to the SW height
+                # state, so convert it to interface displacement here. mdu/mdv
+                # were diagnosed from physical SSH and therefore need no scaling.
+                self.mdt = self.mdt * jnp.asarray(self.ssh_to_model_height.T, dtype=self.dtype)[None, None]
+        else:
+            self.ssh_to_model_height = 1.
+            self.ssh_observation_scale = 1.
+
         self.H0 = H
         self._H_from_init_file_used = H_from_init is not None
         self.H_max_bound = getattr(config.MOD, 'H_max', None)
@@ -3095,6 +3152,41 @@ class Model_qgsw(M):
         self.H_floor = self._as_H_model_array(H_floor, State, 'H_floor')
         self.H_floor = self._zero_H_floor_on_mask(self.H_floor, State)
         self._validate_H_floor(self.H0, self.H_floor)
+
+        # Keep controlled wind depth in SW layout so its transformation is
+        # differentiated within the same JAX forward kernel as H.
+        if self._controls_h_wind:
+            h_wind_ref = getattr(config.MOD, 'h_wind', None)
+            if h_wind_ref is None:
+                raise ValueError("Controlling 'h_wind' requires MOD.h_wind to define a positive reference depth.")
+            h_wind_ref = np.asarray(h_wind_ref, dtype=float)
+            if h_wind_ref.ndim == 0:
+                h_wind_ref = np.full((State.ny, State.nx), float(h_wind_ref))
+            if h_wind_ref.shape != (State.ny, State.nx):
+                raise ValueError(f"MOD.h_wind must be scalar or shape (ny, nx); got {h_wind_ref.shape}.")
+            h_wind_floor = getattr(config.MOD, 'h_wind_floor', None)
+            h_wind_floor = 0. if h_wind_floor is None else h_wind_floor
+            h_wind_floor = np.asarray(h_wind_floor, dtype=float)
+            if h_wind_floor.ndim == 0:
+                h_wind_floor = np.full((State.ny, State.nx), float(h_wind_floor))
+            if h_wind_floor.shape != (State.ny, State.nx):
+                raise ValueError(f"MOD.h_wind_floor must be scalar or shape (ny, nx); got {h_wind_floor.shape}.")
+            if np.any(h_wind_ref <= h_wind_floor):
+                raise ValueError('MOD.h_wind must be strictly greater than MOD.h_wind_floor.')
+            h_wind_max = getattr(config.MOD, 'h_wind_max', None)
+            if h_wind_max is not None:
+                h_wind_max = np.asarray(h_wind_max, dtype=float)
+                if h_wind_max.ndim == 0:
+                    h_wind_max = np.full((State.ny, State.nx), float(h_wind_max))
+                if h_wind_max.shape != (State.ny, State.nx):
+                    raise ValueError(f"MOD.h_wind_max must be scalar or shape (ny, nx); got {h_wind_max.shape}.")
+                if np.any(h_wind_max < h_wind_ref):
+                    raise ValueError('MOD.h_wind_max must be greater than or equal to MOD.h_wind.')
+                self.h_wind_max_bound_sw = jnp.asarray(h_wind_max.T, dtype=self.dtype)
+            else:
+                self.h_wind_max_bound_sw = None
+            self.h_wind_ref_sw = jnp.asarray(h_wind_ref.T, dtype=self.dtype)
+            self.h_wind_floor_sw = jnp.asarray(h_wind_floor.T, dtype=self.dtype)
         
         # CFL
         if config.MOD.cfl is not None:
@@ -3148,6 +3240,10 @@ class Model_qgsw(M):
                         arr = _fill_nan_nearest(arr)
                     else:
                         arr[np.isnan(arr)] = 0.
+                    if name == 'SSH':
+                        # Grid/restart files use physical SSH. Convert once at
+                        # the I/O boundary when the model state is eta.
+                        arr = self._ssh_to_model_height(arr)
                     State.var[self.name_var[name]] = arr
                 else:
                     if name=='U':
@@ -3447,12 +3543,19 @@ class Model_qgsw(M):
                 State.params['H'] = np.zeros((State.ny,State.nx))
 
         if 'h_wind' in self.name_params:
-            self.h_wind = getattr(config.MOD, 'h_wind', None)
             if (config.GRID.super == 'GRID_FROM_FILE'):
                 dsin = xr.open_dataset(config.GRID.path_init_grid)
-                if 'h_wind' in dsin:
-                    State.params['h_wind'] = dsin['h_wind'].values.squeeze()
+                if 'h_wind_control' in dsin:
+                    State.params['h_wind'] = dsin['h_wind_control'].values.squeeze()
                     State.params['h_wind'][np.isnan(State.params['h_wind'])] = 0.
+                elif 'h_wind' in dsin:
+                    # Legacy outputs stored additive h_wind increments.
+                    h_wind_legacy = dsin['h_wind'].values.squeeze()
+                    h_wind_legacy[np.isnan(h_wind_legacy)] = 0.
+                    h_wind_ref = np.asarray(self.h_wind_ref_sw.T)
+                    h_wind_floor = np.asarray(self.h_wind_floor_sw.T)
+                    h_wind_total = np.maximum(h_wind_ref + h_wind_legacy, h_wind_floor + 1e-12)
+                    State.params['h_wind'] = np.log((h_wind_total - h_wind_floor) / (h_wind_ref - h_wind_floor))
                 else:
                     State.params['h_wind'] = np.zeros((State.ny,State.nx))
                 dsin.close()
@@ -3608,6 +3711,22 @@ class Model_qgsw(M):
             raise NotImplementedError('Saving controlled H for nl > 1 is not implemented.')
         return np.array(H_total[0].T)
 
+    def _h_wind_control_to_total_sw(self, h_wind_control):
+        """Map a 2-D logarithmic wind-depth control to total depth in SW layout."""
+        h_wind_control = jnp.asarray(h_wind_control, dtype=self.dtype)
+        h_wind_total = self.h_wind_floor_sw + (self.h_wind_ref_sw - self.h_wind_floor_sw) * jnp.exp(h_wind_control)
+        if self.h_wind_max_bound_sw is not None:
+            h_wind_total = jnp.minimum(h_wind_total, self.h_wind_max_bound_sw)
+        return h_wind_total
+
+    def _h_wind_control_to_model_increment(self, h_wind_control):
+        if h_wind_control is None:
+            return None
+        return self._h_wind_control_to_total_sw(h_wind_control) - self.h_wind_ref_sw
+
+    def _h_wind_control_to_total_state(self, h_wind_control):
+        return np.array(self._h_wind_control_to_total_sw(h_wind_control).T)
+
     def _load_wind_forcing(self, config, State):
         """
         Read a NetCDF wind file, convert (u10, v10) to wind stress using the
@@ -3750,6 +3869,14 @@ class Model_qgsw(M):
         tauy = (1 - self.sponge_v) * jnp.asarray(self.tauy_wind[it], dtype=self.dtype)  # (ny+1, nx)
         return taux, tauy
 
+    def _ssh_to_model_height(self, ssh):
+        """Convert external physical SSH to the model's height coordinate."""
+        return ssh * self.ssh_to_model_height
+
+    def _model_height_to_ssh(self, height):
+        """Diagnose external physical SSH from the model height coordinate."""
+        return height * self.ssh_observation_scale
+
     def _sync_layers_from_surface(self, State):
         """Project 2D surface fields into per-layer arrays (layer 0 gets the perturbation)."""
         ssh = jnp.asarray(State.getvar(name_var=self.name_var['SSH']), dtype=self.dtype)
@@ -3801,7 +3928,14 @@ class Model_qgsw(M):
 
         State0 = State.copy()
 
-        _name_var = [self.name_var['U'], self.name_var['V'], self.name_var['SSH']] if name_var is None else name_var
+        _name_var = [self.name_var['U'], self.name_var['V'], self.name_var['SSH']] if name_var is None else list(name_var)
+
+        if self._physical_interface_height:
+            ssh_name = self.name_var['SSH']
+            State0.var['interface_displacement'] = +State0.var[ssh_name]
+            State0.var[ssh_name] = self._model_height_to_ssh(State0.var[ssh_name])
+            if 'interface_displacement' not in _name_var:
+                _name_var.append('interface_displacement')
 
         if name_var is None and self.advect_tracer:
             for name in self.tracer_names:
@@ -3813,14 +3947,15 @@ class Model_qgsw(M):
             _name_var += ['H', 'H_control']
 
         if self.mdt is not None:
-            State0.var['mdt'] = np.array(self.mdt[0, 0]).T
+            State0.var['mdt'] = np.array(self._model_height_to_ssh(self.mdt[0, 0]).T)
             State0.var['mdu'] = np.array(self.mdu[0, 0]).T
             State0.var['mdv'] = np.array(self.mdv[0, 0]).T
             _name_var += ['mdt', 'mdu', 'mdv']
         
         if 'h_wind' in self.name_params:
-            State0.var['h_wind'] = +State.params['h_wind']
-            _name_var += ['h_wind']
+            State0.var['h_wind'] = self._h_wind_control_to_total_state(State.params['h_wind'])
+            State0.var['h_wind_control'] = +State.params['h_wind']
+            _name_var += ['h_wind', 'h_wind_control']
         
         if 'wind_strength' in self.name_params:
             State0.var['wind_strength'] = State.params['wind_strength']
@@ -3842,9 +3977,10 @@ class Model_qgsw(M):
         time_keys = t_bc if t_bc is not None else time_bc
 
         for i,t in enumerate(time_keys):
-            ssh_bc_t = +var_bc['SSH'][i]
-            # Remove nan
-            ssh_bc_t[np.isnan(ssh_bc_t)] = 0.
+            # Boundary products carry physical SSH. Retain it for geostrophic
+            # velocity diagnosis, then convert only the model height target.
+            ssh_bc_external = +var_bc['SSH'][i]
+            ssh_bc_external[np.isnan(ssh_bc_external)] = 0.
 
             if 'U' in var_bc and 'V' in var_bc:
                 u = +var_bc['U'][i]
@@ -3853,7 +3989,7 @@ class Model_qgsw(M):
                 u[np.isnan(u)] = 0.
                 v[np.isnan(v)] = 0.
             else:
-                u, v = self.ssh2uv(ssh_bc_t)
+                u, v = self.ssh2uv(ssh_bc_external)
                 if 'U' in var_bc:
                     u = +var_bc['U'][i]
                     u[np.isnan(u)] = 0.
@@ -3861,10 +3997,11 @@ class Model_qgsw(M):
                     v = +var_bc['V'][i]
                     v[np.isnan(v)] = 0.
 
-            # Fill bc dictionnary
+            # Store interface displacement in the model BC while retaining
+            # physical SSH at the file boundary.
             self.bc['U'][t] = u
             self.bc['V'][t] = v
-            self.bc['SSH'][t] = ssh_bc_t
+            self.bc['SSH'][t] = self._ssh_to_model_height(ssh_bc_external)
 
         # Tracer BCs
         for name in self.tracer_names:
@@ -4038,7 +4175,7 @@ class Model_qgsw(M):
         They are converted to SW model convention (nx-1, ny) and (nx, ny-1) internally.
         Fu/Fv/Fh: 2D forcing in State convention — converted to per-layer for nl>1.
         u_b/v_b/h_b: 2D BCs in State convention — converted to per-layer for nl>1.
-        h_wind: mixed-layer depth perturbation (nx, ny) in SW convention, or None.
+        h_wind: logarithmic wind-depth control (nx, ny) in SW convention, or None.
         """
         u, v, h = u0, v0, h0
 
@@ -4096,6 +4233,7 @@ class Model_qgsw(M):
             )
 
         H_model = self._H_control_to_model_increment(H)
+        h_wind_model = self._h_wind_control_to_model_increment(h_wind)
 
         # Step
         if self._is_qg_class:
@@ -4110,7 +4248,7 @@ class Model_qgsw(M):
                 u_b=u_b_sw, v_b=v_b_sw, h_b=h_b_sw,
                 Fu=Fu_sw, Fv=Fv_sw, Fh=Fh_sw,
                 taux=_taux, tauy=_tauy,
-                h_wind=h_wind,
+                h_wind=h_wind_model,
                 wind_strength=wind_strength,
             )
 
@@ -4196,6 +4334,7 @@ class Model_qgsw(M):
             )
 
         H_model = self._H_control_to_model_increment(H)
+        h_wind_model = self._h_wind_control_to_model_increment(h_wind)
 
         # Joint step (u, v, h, c)
         u1, v1, h1, c1 = self.model.step_with_tracer(
@@ -4204,7 +4343,7 @@ class Model_qgsw(M):
             u_b=u_b_sw, v_b=v_b_sw, h_b=h_b_sw, c_b=c_b_sw,
             Fu=Fu_sw, Fv=Fv_sw, Fh=Fh_sw, Fc=Fc_sw,
             taux=_taux, tauy=_tauy,
-            h_wind=h_wind,
+            h_wind=h_wind_model,
             wind_strength=wind_strength,
         )
 
@@ -5840,8 +5979,9 @@ class Model_bmit(_ITOpenBoundaryExtensionMixin, M):
             State.var['H_control'] = +State.params['H']
             name_var_to_save += ['H', 'H_control']
         if self.bm_kind == 'MOD_QGSW' and 'h_wind' in bm_name_params:
-            State.var['h_wind'] = +State.params['h_wind']
-            name_var_to_save += ['h_wind']
+            State.var['h_wind'] = self.model_bm._h_wind_control_to_total_state(State.params['h_wind'])
+            State.var['h_wind_control'] = +State.params['h_wind']
+            name_var_to_save += ['h_wind', 'h_wind_control']
         if self.bm_kind == 'MOD_QGSW' and 'wind_strength' in bm_name_params:
             State.var['wind_strength'] = +State.params['wind_strength']
             name_var_to_save += ['wind_strength']

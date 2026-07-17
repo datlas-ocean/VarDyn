@@ -431,6 +431,15 @@ MOD_QGSW = dict(
 
     g_prime = None, # reduced gravity(ies).  Scalar or list, e.g. g_prime=[9.81, 0.02] for nl=2
 
+    # Meaning of the 2-D state field named by name_var['SSH']:
+    # 'ssh' keeps the historical direct-height formulation.
+    # 'interface_displacement' (nl=1 SW only) stores reduced-gravity interface
+    # displacement eta. External SSH is diagnosed as (g_prime / physical_gravity) * eta.
+    # With H set and g_prime=None, g_prime is diagnosed from c1**2 / H.
+    height_representation = 'ssh',
+
+    physical_gravity = 9.81, # m s^-2, used only for SSH <-> interface-displacement conversion
+
     init_from_bc = True,
 
     cfl = .25,
@@ -504,6 +513,11 @@ MOD_QGSW = dict(
     # Leave None to use the model's reference layer thickness (correct only for multi-layer
     # models where H represent the true physical layer depths).
     h_wind = None,
+
+    # Bounds for the dimensionless logarithmic h_wind control. When h_wind is
+    # controlled, VarDyn uses h_wind_total = floor + (h_wind-floor)*exp(alpha).
+    h_wind_floor = None, # None means 0
+    h_wind_max = None, # None means no upper bound
 
     wind_timestep = 3600, # wind update interval in seconds (default: 1 hour). Wind stress is
                           # precomputed at this cadence and held constant between updates.
