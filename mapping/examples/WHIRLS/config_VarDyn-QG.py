@@ -479,17 +479,33 @@ myINV = dict(
 
     super = 'INV_4DVAR', # Inherit defaults for the 4DVar minimization driver.
 
-    save_minimization = True, # Save cost-function and gradient history during minimization.
+    minimizer = 'optax-decoupled', # Keep L-BFGS vectors on GPU and drive only the scalar Armijo line search from Python.
 
-    ftol = 5e-5, # Relative cost-function decrease threshold used for convergence.
+    device_resident_state = True, # Keep QG state, controls, BCs and adjoint fields resident on GPU.
 
-    convergence_nit = 10, # Required number of consecutive converged iterations before stopping.
+    jit_cost_and_grad = True, # Compile one complete forward/misfit/adjoint cost-gradient evaluation on GPU.
+
+    cost_and_grad_schedule = 'scan', # Roll monthly forward/adjoint checkpoint loops with lax.scan; use 'python' for the previous formulation.
+
+    cost_and_grad_scan_unroll = 1, # Fully rolled reference; increase to benchmark compilation/runtime trade-offs.
+
+    save_minimization = False, # Keep the Optax hot path scalar-only; Xres.nc is still saved after minimization.
+
+    ftol = None, # Disable the cost-change criterion in favor of the benchmarked relative-gradient criterion.
+
+    relative_gradient_tolerance = 0.1, # Stop below 10% of the initial L2 gradient norm.
+
+    convergence_nit = 2, # Require two consecutive accepted iterations below the gradient threshold.
+
+    minimum_iterations = 5, # Ignore early transient threshold crossings.
 
     maxiter = 50, # Maximum number of minimizer iterations. Here is we set 100 for testing purposes, but in practice, it can be set to a higher value (e.g. 1000).
 
     gradient_max_norm = 1e12, # Restart from the best state if the gradient norm exceeds this value.
     
     max_retries = 10, # Maximum restart attempts after unstable minimizer steps.
+
+    lbfgs_history_size = 10, # Retain ten accepted L-BFGS correction pairs on GPU.
 
     path_save_control_vectors = f'{myPath}/controls/{name_experiment}', # Directory where control vectors are saved.
 
@@ -501,5 +517,3 @@ myINV = dict(
 
  
 )
-
-

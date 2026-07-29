@@ -10,8 +10,9 @@ inversion, windowed orchestration, and diagnostics.
 
 ## Main features
 
-- **4DVar assimilation** with a reduced-basis control vector and SciPy
-  L-BFGS-B minimization.
+- **4DVar assimilation** with a reduced-basis control vector and two maintained
+  minimizers: historical SciPy L-BFGS-B and device-resident Optax L-BFGS with a
+  decoupled scalar line search.
 - **Forward-only integrations** when no inversion block is configured.
 - **Dynamical model cores** for diffusion/identity mappings, 1.5-layer QG,
   1.5-layer shallow-water, QG/SW variants, and balanced-motion/internal-tide
@@ -118,9 +119,45 @@ Each selected block normally has a `super` field pointing to a default block
 family. For example, a custom model block can set `super = 'MOD_QG1L'` and then
 override only the fields needed for the experiment.
 
+### Choosing the 4DVar minimizer
+
+`INV_4DVAR.minimizer` selects the minimization adapter. Existing configurations
+keep the historical default:
+
+```python
+myINV = dict(
+    super='INV_4DVAR',
+    minimizer='scipy',
+)
+```
+
+The device-resident path is explicit:
+
+```python
+myINV = dict(
+    super='INV_4DVAR',
+    minimizer='optax-decoupled',
+    device_resident_state=True,
+    jit_cost_and_grad=True,
+    cost_and_grad_schedule='scan',
+    relative_gradient_tolerance=0.1,
+    convergence_nit=2,
+    minimum_iterations=5,
+)
+```
+
+The Optax adapter keeps the control, gradient, direction, and L-BFGS history on
+the JAX device. With `save_minimization=False`, Python receives only scalar
+line-search diagnostics. Enabling per-iteration saves transfers and writes the
+complete Control Vector after every accepted iteration; the final `Xres.nc` is
+saved in either mode. See
+[the GPU minimization benchmark](docs/benchmarks/gpu-4dvar-minimization.md) for
+performance results and configuration constraints.
+
 ## Testing and checks
 
-There is no dedicated test suite in this condensed repository. For small edits,
+Unit checks for the compiled variational path and minimizer live under
+`mapping/tests`. Run them with an environment containing `pytest`, or at least
 run syntax checks on touched modules, for example:
 
 ```bash

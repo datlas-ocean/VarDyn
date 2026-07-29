@@ -17,6 +17,12 @@ import pyinterp
 
 from . import tools as grid
 
+
+def _is_jax_array(value):
+    """Return True without importing JAX in the state/I/O module."""
+    module = type(value).__module__
+    return module.startswith('jax') or module.startswith('jaxlib')
+
 class State:
     """
     NAME
@@ -32,6 +38,10 @@ class State:
             print(config.GRID)
         
         self.config = config
+        self.preserve_device_arrays = bool(
+            config.INV is not None
+            and getattr(config.INV, 'device_resident_state', False)
+        )
         
         # Parameters
         self.name_time = config.EXP.name_time
@@ -541,12 +551,12 @@ class State:
         other.lon_v = self.lon_v
         other.lat_v = self.lat_v
         other.geo_grid = self.geo_grid
+        other.preserve_device_arrays = self.preserve_device_arrays
 
         def _copy_array(v):
             # JAX arrays are immutable: each step() replaces the reference rather than
             # mutating the buffer, so the existing reference is already a valid snapshot.
-            module = type(v).__module__
-            if module.startswith('jax') or module.startswith('jaxlib'):
+            if _is_jax_array(v):
                 return v
             return np.array(v, copy=True)
 
@@ -567,6 +577,15 @@ class State:
         return other
     
     def getvar(self,name_var=None,vect=False):
+        # Preserve device residency for the single-field model hot path.
+        if isinstance(name_var, str):
+            var_to_return = self.var[name_var]
+            if vect:
+                var_to_return = var_to_return.ravel()
+            if self.preserve_device_arrays and _is_jax_array(var_to_return):
+                return var_to_return
+            return np.array(var_to_return, copy=True)
+
         if name_var is not None:
             if type(name_var) in (list,np.ndarray):
                 var_to_return = []
@@ -591,6 +610,14 @@ class State:
         return deepcopy(np.asarray(var_to_return))
 
     def getparams(self,name_params=None,vect=False):
+        if isinstance(name_params, str):
+            params_to_return = self.params[name_params]
+            if vect:
+                params_to_return = params_to_return.ravel()
+            if self.preserve_device_arrays and _is_jax_array(params_to_return):
+                return params_to_return
+            return np.array(params_to_return, copy=True)
+
         if name_params is not None:
             if type(name_params) in (list,np.ndarray):
                 params_to_return = []
@@ -618,8 +645,7 @@ class State:
 
         def _store_value(v):
             # JAX arrays are immutable; keep reference to avoid costly deepcopy/device copies.
-            module = type(v).__module__
-            if module.startswith('jax') or module.startswith('jaxlib'):
+            if _is_jax_array(v):
                 return v
             return np.array(v, copy=True)
 
@@ -641,6 +667,21 @@ class State:
                     self.var[name_var] += var
                 else:
                     self.var[name_var] = _store_value(var)
+
+    def to_device(self, device=None):
+        """Place model variables and controls on a JAX device once."""
+        import jax
+
+        self.preserve_device_arrays = True
+        self.var = jax.tree_util.tree_map(
+            lambda value: jax.device_put(value, device=device),
+            self.var,
+        )
+        self.params = jax.tree_util.tree_map(
+            lambda value: jax.device_put(value, device=device),
+            self.params,
+        )
+        return self
     
     def scalar(self,coeff,copy=False):
         if copy:

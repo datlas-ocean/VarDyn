@@ -671,13 +671,17 @@ class M:
         for name in name_var:
             if name not in State.var:
                 continue
-            arr = np.asarray(State.var[name])
+            arr = State.var[name]
             mask = self._land_mask_for_shape(State, arr.shape)
             if mask is None:
                 continue
-            arr = arr.astype(float, copy=True)
-            arr[..., mask] = np.nan
-            State.var[name] = arr
+            if State.preserve_device_arrays and isinstance(arr, jax.Array):
+                arr = jnp.asarray(arr, dtype=float)
+                State.var[name] = jnp.where(jnp.asarray(mask), jnp.nan, arr)
+            else:
+                arr = np.asarray(arr).astype(float, copy=True)
+                arr[..., mask] = np.nan
+                State.var[name] = arr
 
     def _finite_model_array(self, State, name, fill_land='zero'):
         arr = np.asarray(State.var[name], dtype=float)
@@ -1185,6 +1189,12 @@ class Model_qg1l(M):
                          bathymetry_PV_term=self.bathymetry_PV_term,
                          formulation=config.MOD.formulation)
 
+        self.Wbc_device = jnp.asarray(self.Wbc, dtype=self.qgm.dtype)
+        self.zero_bc_device = jnp.zeros(
+            (self.ny, self.nx),
+            dtype=self.qgm.dtype,
+        )
+
         # Control parameters (mirrors Model_qgsw name_params contract)
         self.name_params = config.MOD.name_params if config.MOD.name_params is not None else []
         if 'c' in self.name_params:
@@ -1363,21 +1373,27 @@ class Model_qg1l(M):
                         self.forcing[_name_var_mod][t] = var_bc[_name_var_bc][i]
         
         self.bc_time = np.array(list(self.bc['SSH'].keys()))
-        self.bc_values = {t: np.array(self.bc['SSH'][t]) for t in self.bc['SSH']}
+        self.bc_values = {
+            t: jnp.asarray(self.bc['SSH'][t], dtype=self.qgm.dtype)
+            for t in self.bc['SSH']
+        }
         for name in self.name_var:
             if name in self.bc and len(self.bc[name].keys()) > 0:
-                self.bc_values[name] = np.array(list(self.bc[name].values()))
+                self.bc_values[name] = {
+                    t: jnp.asarray(value, dtype=self.qgm.dtype)
+                    for t, value in self.bc[name].items()
+                }
             else:
-                self.bc_values[name] = np.array(list(self.bc['SSH'].values()))
+                self.bc_values[name] = {
+                    t: self.bc_values[t] for t in self.bc['SSH']
+                }
             
     def _apply_bc(self,t0,t1):
-        
-        Xb = jnp.zeros((self.ny,self.nx,))
-        
+
         if 'SSH' not in self.bc:
-            return Xb
+            return self.zero_bc_device
         elif len(self.bc['SSH'].keys())==0:
-             return Xb
+            return self.zero_bc_device
         elif t0 not in self.bc_time:
             # Find closest time
             idx_closest = np.argmin(np.abs(self.bc_time-t0))
@@ -1389,22 +1405,32 @@ class Model_qg1l(M):
             Xb = Xb[np.newaxis,:,:]
             for name in self.name_var:
                 if name!='SSH' and name in self.bc and len(self.bc[name].keys())>0:
-                    if t1 in self.bc[name]: 
-                        Cb = self.bc[name][t1]
+                    device_bc = self.bc_values[name]
+                    if t1 in device_bc:
+                        Cb = device_bc[t1]
                     else:
-                        # Find closest time
-                        t_list = np.array(list(self.bc['SSH'].keys()))
+                        t_list = np.asarray(list(device_bc.keys()))
                         idx_closest = np.argmin(np.abs(t_list-t1))
                         new_t1 = t_list[idx_closest]
-                        Cb = self.bc[name][new_t1]
-                    Xb = np.append(Xb, Cb[np.newaxis,:,:], axis=0)     
+                        Cb = device_bc[new_t1]
+                    Xb = jnp.concatenate((Xb, Cb[jnp.newaxis,:,:]), axis=0)
         
         return Xb
     
-    def step(self,State,nstep=1,t=0):
+    def prepare_scan_boundary_conditions(self, times, nstep):
+        """Stack QG boundary fields for a device-side checkpoint scan."""
+        fields = []
+        for t in np.asarray(times):
+            t0 = t.item() if hasattr(t, 'item') else t
+            t1 = int(t0 + nstep * self.dt)
+            fields.append(self._apply_bc(t0, t1))
+        return jnp.stack(fields)
+
+    def step(self,State,nstep=1,t=0,Xb=None):
 
         # Boundary feld
-        Xb = self._apply_bc(t,int(t+nstep*self.dt))
+        if Xb is None:
+            Xb = self._apply_bc(t,int(t+nstep*self.dt))
 
         # c-anomaly: c_eff = prior scalar (fixed throughout 4DVar) + 2-D anomaly dc.
         # self.qgm.c is never modified here so the forward and adjoint sweeps
@@ -1413,7 +1439,10 @@ class Model_qg1l(M):
                  ) if 'c' in self.name_params else None
 
         # Get state variable(s)
-        X0 = State.getvar(name_var=self.name_var['SSH'])
+        X0 = jnp.asarray(
+            State.getvar(name_var=self.name_var['SSH']),
+            dtype=self.qgm.dtype,
+        )
         if self.advect_tracer:
             X0 = X0[np.newaxis,:,:]
             # Ageostrophic velocities
@@ -1425,7 +1454,10 @@ class Model_qg1l(M):
             # Tracers
             for name in self.name_var:
                 if name not in ['SSH', 'U', 'V']:
-                    C0 = State.getvar(name_var=self.name_var[name])[jnp.newaxis,:,:]
+                    C0 = jnp.asarray(
+                        State.getvar(name_var=self.name_var[name]),
+                        dtype=self.qgm.dtype,
+                    )[jnp.newaxis,:,:]
                     X0 = jnp.append(X0, C0, axis=0)
         
         # init
@@ -1448,10 +1480,10 @@ class Model_qg1l(M):
                         Fc = State.params[self.name_var[name]] # Forcing term for tracer or ageostrophic velocities
                         # Add Nudging to BC 
                         if self.forcing_tracer_from_bc:
-                            X1_i = X1_i + nstep*self.dt/(3600*24) * (1-self.Wbc)  * Fc * (Xb[i] - X0[i])
+                            X1_i = X1_i + nstep*self.dt/(3600*24) * (1-self.Wbc_device) * Fc * (Xb[i] - X0[i])
                         # Only forcing flux
                         else:
-                            X1_i = X1_i + nstep*self.dt/(3600*24) * (1-self.Wbc)  * Fc
+                            X1_i = X1_i + nstep*self.dt/(3600*24) * (1-self.Wbc_device) * Fc
                         State.setvar(X1_i, name_var=self.name_var[name])
             else:
                 X1 += nstep*self.dt/(3600*24) * Fssh
@@ -1530,18 +1562,25 @@ class Model_qg1l(M):
                 dX1 += nstep*self.dt/(3600*24) * dFssh  
                 dState.setvar(dX1, name_var=self.name_var['SSH'])
 
-    def step_adj(self,adState,State,nstep=1,t=0):
+    def step_adj(self,adState,State,nstep=1,t=0,Xb=None):
 
         # Boundary field
-        Xb = self._apply_bc(t,int(t+nstep*self.dt))
+        if Xb is None:
+            Xb = self._apply_bc(t,int(t+nstep*self.dt))
 
         # c-anomaly: c_eff = prior scalar + 2-D anomaly dc
         c_eff = (self.qgm.c + State.params['c'].astype(self.qgm.dtype)
                  ) if 'c' in self.name_params else None
 
         # Get state variable
-        adSSH0 = adState.getvar(name_var=self.name_var['SSH'])#.astype('float64')
-        SSH0 = State.getvar(name_var=self.name_var['SSH'])#.astype('float64')
+        adSSH0 = jnp.asarray(
+            adState.getvar(name_var=self.name_var['SSH']),
+            dtype=self.qgm.dtype,
+        )
+        SSH0 = jnp.asarray(
+            State.getvar(name_var=self.name_var['SSH']),
+            dtype=self.qgm.dtype,
+        )
         if self.advect_tracer:
             adX0 = adSSH0[jnp.newaxis,:,:]
             X0 = SSH0[jnp.newaxis,:,:]
@@ -1558,9 +1597,15 @@ class Model_qg1l(M):
             # Tracers
             for name in self.name_var:
                 if name not in ['SSH', 'U', 'V']:
-                    adC0 = adState.getvar(name_var=self.name_var[name])[jnp.newaxis,:,:]
+                    adC0 = jnp.asarray(
+                        adState.getvar(name_var=self.name_var[name]),
+                        dtype=self.qgm.dtype,
+                    )[jnp.newaxis,:,:]
                     adX0 = jnp.append(adX0, adC0, axis=0)
-                    C0 = State.getvar(name_var=self.name_var[name])[jnp.newaxis,:,:]
+                    C0 = jnp.asarray(
+                        State.getvar(name_var=self.name_var[name]),
+                        dtype=self.qgm.dtype,
+                    )[jnp.newaxis,:,:]
                     X0 = jnp.append(X0, C0, axis=0)
         else:
             adX0 = adSSH0
@@ -1578,7 +1623,7 @@ class Model_qg1l(M):
                 lambda X, c: self.qgm.step_jit(X, Xb, nstep=nstep, c=c),
                 X1, c_eff)
             adX1, adc = vjp_fun(adX0)
-            adState.params['c'] = adState.params['c'] + np.array(adc)
+            adState.params['c'] = adState.params['c'] + adc
         else:
             adX1 = self.qgm_step_adj(adX0, X1, Xb, nstep=nstep)
 
@@ -1588,12 +1633,17 @@ class Model_qg1l(M):
                 adparams = nstep*self.dt/(3600*24) *\
                     adState.getvar(name_var=self.name_var[name])#.astype('float64') 
                 if name!='SSH':
-                    adparams *= (1-self.Wbc)
+                    adparams *= (1-self.Wbc_device)
                     if self.forcing_tracer_from_bc:
                         Fc = State.params[self.name_var[name]] 
                         adparams *=  (Xb[i] - X0[i])
-                        adX1[i] += -nstep*self.dt/(3600*24) * (1-self.Wbc) * Fc * adX0[i]
-                adState.params[self.name_var[name]] += adparams  
+                        adX1 = adX1.at[i].add(
+                            -nstep*self.dt/(3600*24)
+                            * (1-self.Wbc_device) * Fc * adX0[i]
+                        )
+                adState.params[self.name_var[name]] = (
+                    adState.params[self.name_var[name]] + adparams
+                )
                 
         if self.advect_tracer:
             adState.setvar(adX1[0],self.name_var['SSH'])

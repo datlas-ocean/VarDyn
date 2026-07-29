@@ -421,6 +421,11 @@ class Obsop_interp_l3(Obsop_interp):
         
     def is_obs_time(self,t):
         """Check if t is in observation times."""
+        # This result controls a Python branch in the current orchestration.
+        return bool(np.any(np.isclose(t, self.t_obs)))
+
+    def is_obs_time_jax(self, t):
+        """Device-side observation mask for a rolled checkpoint scan."""
         return jnp.any(jnp.isclose(t, self.t_obs_jax))
 
     def _misfit(self, t, X):
@@ -480,6 +485,23 @@ class Obsop_interp_l3(Obsop_interp):
         X = State_var[self.name_mod_var[self.name_var]].ravel() 
 
         return self._misfit_jit(t, X)
+
+    def scan_misfit_size(self):
+        return int(self.varobs_arr.shape[1])
+
+    def scan_misfit(self, t, State_var):
+        """Return a fixed-size, zero-masked L3 misfit for every checkpoint."""
+        raw = self.misfit_jax(t, State_var)
+        return jnp.where(self.is_obs_time_jax(t), raw, jnp.zeros_like(raw))
+
+    def scan_adj(self, t, adState_var, State_var, misfit):
+        """Pure-pytree L3 adjoint used inside ``lax.scan``."""
+        name = self.name_mod_var[self.name_var]
+        var = State_var[name]
+        adX = self._misfit_reduced_jit(t, misfit, var.ravel())
+        result = dict(adState_var)
+        result[name] = result[name] + adX.reshape(result[name].shape)
+        return result
     
     def adj(self, t, adState, State, misfit):
 
@@ -816,6 +838,10 @@ class Obsop_interp_l4(Obsop_interp):
     
     def is_obs_time(self,t):
         """Check if t is in observation times."""
+        return bool(np.any(np.isclose(t, self.t_obs)))
+
+    def is_obs_time_jax(self, t):
+        """Device-side observation mask for a rolled checkpoint scan."""
         return jnp.any(jnp.isclose(t, self.t_obs_jax))
                 
     def misfit(self, t, State):
@@ -826,6 +852,41 @@ class Obsop_interp_l4(Obsop_interp):
             return self._misfit_grad(t, X)
         else:
             return self._misfit(t, X)
+
+    def scan_misfit_size(self):
+        if self.gradients:
+            raise NotImplementedError(
+                'lax.scan does not yet support gradient-form L4 observations'
+            )
+        return int(np.prod(self.varobs_arr.shape[1:]))
+
+    def scan_misfit(self, t, State_var):
+        """Return a fixed-size, zero-masked L4 misfit for every checkpoint."""
+        if self.gradients:
+            raise NotImplementedError(
+                'lax.scan does not yet support gradient-form L4 observations'
+            )
+        name = self.name_mod_var[self.name_var]
+        raw = self._misfit(t, State_var[name].flatten())
+        return jnp.where(self.is_obs_time_jax(t), raw, jnp.zeros_like(raw))
+
+    def scan_adj(self, t, adState_var, State_var, misfit):
+        """Pure-pytree L4 adjoint used inside ``lax.scan``."""
+        if self.gradients:
+            raise NotImplementedError(
+                'lax.scan does not yet support gradient-form L4 observations'
+            )
+        idt = jnp.where(self.t_obs_jax == t, size=1)[0]
+        inverr = 1 / self.errobs_arr[idt]
+        increment = jnp.where(
+            jnp.isnan(inverr * misfit),
+            0.,
+            inverr * misfit,
+        )
+        name = self.name_mod_var[self.name_var]
+        result = dict(adState_var)
+        result[name] = result[name] + increment.reshape(result[name].shape)
+        return result
 
     def _misfit(self, t, X):
 
@@ -1008,7 +1069,7 @@ class Obsop_multi:
 
     def misfit(self,t,State):
 
-        misfit = np.array([])
+        misfit_parts = []
         
         self.misfit_indt[t] = [None for _ in self.Obsop]
         indt = 0
@@ -1017,13 +1078,38 @@ class Obsop_multi:
                 _misfit = _Obsop.misfit(t,State)
                 self.misfit_indt[t][i] = slice(indt, indt+_misfit.size)
                 indt += _misfit.size
-                misfit = np.concatenate((misfit,_misfit))
+                misfit_parts.append(jnp.ravel(_misfit))
 
-        if len(misfit)==0:
+        if not misfit_parts:
             print(t)
-            misfit = np.array([1e-7]) # To avoid problems with empty misfit
+            return jnp.array([1e-7]) # To avoid problems with empty misfit
     
-        return misfit
+        return jnp.concatenate(misfit_parts)
+
+    def scan_misfit_size(self):
+        return sum(operator.scan_misfit_size() for operator in self.Obsop)
+
+    def scan_misfit(self, t, State_var):
+        """Concatenate fixed-size, masked misfits from every sub-operator."""
+        return jnp.concatenate([
+            operator.scan_misfit(t, State_var)
+            for operator in self.Obsop
+        ])
+
+    def scan_adj(self, t, adState_var, State_var, misfit):
+        """Apply every sub-operator adjoint to its fixed misfit slice."""
+        result = adState_var
+        offset = 0
+        for operator in self.Obsop:
+            size = operator.scan_misfit_size()
+            result = operator.scan_adj(
+                t,
+                result,
+                State_var,
+                misfit[offset:offset + size],
+            )
+            offset += size
+        return result
 
     def adj(self, t, adState, State, misfit):
     

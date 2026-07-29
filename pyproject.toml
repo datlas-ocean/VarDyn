@@ -28,6 +28,7 @@ dependencies = [
     "matplotlib",
     "xarray",
     "scipy",
+    "optax",
     "logging",
     "xrft",
     "netCDF4",

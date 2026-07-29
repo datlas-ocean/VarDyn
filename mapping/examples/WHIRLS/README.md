@@ -131,6 +131,16 @@ If no per-satellite error files are available, use the constant
 
 ## Other settings users commonly adapt
 
+- `myINV['minimizer']`: `scipy` keeps the Historical SciPy Minimizer;
+  `optax-decoupled` selects the Device-Resident Optax Minimizer and requires
+  `device_resident_state=True`, `jit_cost_and_grad=True`, and
+  `cost_and_grad_schedule='scan'`.
+- `myINV['relative_gradient_tolerance']`, `myINV['convergence_nit']`, and
+  `myINV['minimum_iterations']`: common stopping rule for the Optax path.
+- `myINV['save_minimization']`: keep it `False` for the scalar-only Optax hot
+  path. Set it to `True` only when per-iteration restart files justify
+  transferring and writing the complete Control Vector; `Xres.nc` is always
+  saved at the end.
 - `EXP['init_date']` and `EXP['final_date']`: experiment time window.
 - `myGRID['lon_min']`, `myGRID['lon_max']`, `myGRID['lat_min']`,
   `myGRID['lat_max']`, `myGRID['dlon']`, and `myGRID['dlat']`: regional grid.
