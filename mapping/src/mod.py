@@ -25,6 +25,7 @@ from jax import jit
 jax.config.update("jax_enable_x64", USE_FLOAT64)
 
 import warnings 
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import jaxparrow
@@ -51,6 +52,19 @@ def _fill_nan_nearest(arr):
     if out.ndim == 2:
         slices = [out]
     elif out.ndim == 3:
+        nan_masks = np.isnan(out)
+        if np.all(nan_masks == nan_masks[0]):
+            nan_mask = nan_masks[0]
+            if not nan_mask.any():
+                return out
+            if nan_mask.all():
+                out[:] = 0.
+                return out
+            ind = distance_transform_edt(
+                nan_mask, return_distances=False, return_indices=True
+            )
+            out[:, nan_mask] = out[:, ind[0][nan_mask], ind[1][nan_mask]]
+            return out
         slices = [out[k] for k in range(out.shape[0])]
     else:
         out[np.isnan(out)] = 0.
@@ -75,9 +89,19 @@ class _MultiBcFields:
         self.bc_fields = bc_fields
 
     def interp(self, time):
+        if len(self.bc_fields) == 1:
+            return self.bc_fields[0].interp(time)
+
+        # Sources are fully loaded by _BcFields.__init__, so concurrent work
+        # below is CPU-only and never reads netCDF/HDF5 handles from threads.
+        with ThreadPoolExecutor(max_workers=len(self.bc_fields)) as executor:
+            interpolated = list(executor.map(
+                lambda bc_field: bc_field.interp(time),
+                self.bc_fields,
+            ))
         out = {}
-        for bc_field in self.bc_fields:
-            out.update(bc_field.interp(time))
+        for fields in interpolated:
+            out.update(fields)
         return out
 
 
@@ -101,7 +125,7 @@ class _BcFields:
         dlon = np.nanmean(self.lon[:,1:]-self.lon[:,:-1])
         dlat = np.nanmean(self.lat[1:,:]-self.lat[:-1,:])
 
-        _ds = xr.open_mfdataset(config_bc.file)
+        _ds = xr.open_mfdataset(config_bc.file, chunks=-1)
         ds = _ds.copy()
         _ds.close()
 
@@ -329,15 +353,12 @@ class _BcFields:
             da = self.var[name]
             src, x_source_axis, y_source_axis = self._prepare_source_3D(name, da, needed)
 
-            filled = np.empty_like(src)
-            for k in range(src.shape[0]):
-                sl = src[k]
-                if np.isnan(sl).any():
-                    g2 = pyinterp.Grid2D(x_source_axis, y_source_axis, sl.T.copy())
-                    _, sl_filled = pyinterp.fill.gauss_seidel(g2)
-                    filled[k] = sl_filled.T
-                else:
-                    filled[k] = sl
+            # Land/no-data masks are normally invariant through time.
+            # Reuse one nearest-neighbour index map for the entire stack,
+            # instead of solving the same Gauss-Seidel fill independently for
+            # every date.  Model-specific set_bc still applies its established
+            # target-grid land/coast handling afterwards.
+            filled = _fill_nan_nearest(src)
 
             nt_out = len(time)
             n_needed = src.shape[0]
@@ -675,7 +696,7 @@ class M:
             mask = self._land_mask_for_shape(State, arr.shape)
             if mask is None:
                 continue
-            if State.preserve_device_arrays and isinstance(arr, jax.Array):
+            if State.preserve_device_arrays and isinstance(arr, (jax.Array, jax.core.Tracer)):
                 arr = jnp.asarray(arr, dtype=float)
                 State.var[name] = jnp.where(jnp.asarray(mask), jnp.nan, arr)
             else:
@@ -684,7 +705,15 @@ class M:
                 State.var[name] = arr
 
     def _finite_model_array(self, State, name, fill_land='zero'):
-        arr = np.asarray(State.var[name], dtype=float)
+        arr = State.var[name]
+        if isinstance(arr, (jax.Array, jax.core.Tracer)):
+            return jnp.nan_to_num(
+                jnp.asarray(arr),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        arr = np.asarray(arr, dtype=float)
         arr = np.where(np.isfinite(arr), arr, np.nan)
         if fill_land == 'nearest':
             return _fill_nan_nearest(arr)
@@ -2325,7 +2354,7 @@ class Model_csw1l(_ITOpenBoundaryExtensionMixin, M):
 
     def _compute_bm_fields(self, path_bm, name_var_bm, State):
 
-        dsbm = xr.open_mfdataset(path_bm, chunks=None)
+        dsbm = xr.open_mfdataset(path_bm, chunks=-1)
         name_lon_bm = name_var_bm['lon']
         name_lat_bm = name_var_bm['lat']
 
@@ -3689,7 +3718,7 @@ class Model_qgsw(M):
                      {'lon': 'longitude', 'lat': 'latitude', 'time': 'time',
                       'u10': 'u10', 'v10': 'v10'})
 
-        ds = xr.open_mfdataset(path_wind)
+        ds = xr.open_mfdataset(path_wind, chunks=-1)
 
         # --- longitude convention ---
         lon_vals = ds[nv['lon']].values
@@ -3967,6 +3996,86 @@ class Model_qgsw(M):
             c_b_list.append(jnp.asarray(cb_i, dtype=self.dtype))
         return jnp.stack(c_b_list, axis=0)  # (n_trac, ny, nx)
     
+    def prepare_scan_boundary_conditions(self, times, nstep):
+        """Pre-stack QGSW forcing for each checkpoint and internal chunk."""
+        chunk_specs = []
+        step_done = 0
+        while step_done < nstep:
+            n_chunk = (
+                min(nstep - step_done, self.max_nstep)
+                if self.max_nstep > 0
+                else nstep - step_done
+            )
+            chunk_specs.append((step_done, n_chunk))
+            step_done += n_chunk
+
+        intervals = []
+        for interval_time in np.asarray(times):
+            t0 = interval_time.item() if hasattr(interval_time, 'item') else interval_time
+            chunks = []
+            for step_offset, n_chunk in chunk_specs:
+                t_chunk = t0 + step_offset * self.dt
+                t_end = t_chunk + n_chunk * self.dt
+                u_b, v_b, h_b = self._apply_bc(t_chunk, t_end)
+                c_b = (
+                    self._apply_bc_tracer(t_chunk, t_end)
+                    if self.advect_tracer
+                    else jnp.zeros((0, self.ny, self.nx), dtype=self.dtype)
+                )
+                taux, tauy = self._get_wind_stress(t_chunk)
+                if taux is None:
+                    constant_taux = jnp.asarray(
+                        getattr(self.model, 'taux', 0.0),
+                        dtype=self.dtype,
+                    )
+                    taux = jnp.zeros(
+                        (self.ny, self.nx + 1), dtype=self.dtype
+                    )
+                    if constant_taux.ndim == 0:
+                        taux = jnp.full_like(taux, constant_taux)
+                    else:
+                        taux = taux.at[:, 1:-1].set(constant_taux.T)
+                if tauy is None:
+                    constant_tauy = jnp.asarray(
+                        getattr(self.model, 'tauy', 0.0),
+                        dtype=self.dtype,
+                    )
+                    tauy = jnp.zeros(
+                        (self.ny + 1, self.nx), dtype=self.dtype
+                    )
+                    if constant_tauy.ndim == 0:
+                        tauy = jnp.full_like(tauy, constant_tauy)
+                    else:
+                        tauy = tauy.at[1:-1, :].set(constant_tauy.T)
+                chunks.append(tuple(
+                    jnp.asarray(value, dtype=self.dtype)
+                    for value in (u_b, v_b, h_b, c_b, taux, tauy)
+                ))
+            intervals.append(tuple(
+                jnp.stack(values, axis=0)
+                for values in zip(*chunks)
+            ))
+
+        return tuple(
+            jnp.stack(values, axis=0)
+            for values in zip(*intervals)
+        )
+
+    def _chunk_forcing(self, forcing, chunk_index, t_chunk, n_chunk):
+        """Select pre-stacked scan forcing or use the historical lookup."""
+        if forcing is not None:
+            return tuple(value[chunk_index] for value in forcing)
+
+        t_end = t_chunk + n_chunk * self.dt
+        u_b, v_b, h_b = self._apply_bc(t_chunk, t_end)
+        c_b = (
+            self._apply_bc_tracer(t_chunk, t_end)
+            if self.advect_tracer
+            else None
+        )
+        taux, tauy = self._get_wind_stress(t_chunk)
+        return u_b, v_b, h_b, c_b, taux, tauy
+
     def ssh2uv(self, ssh):
         """Geostrophic SSH → (u, v) model."""
         if self._is_qg_class:
@@ -4425,7 +4534,7 @@ class Model_qgsw(M):
                 adh_wind, adwind_strength,
                 adu_b, adv_b, adh_b, adc_b)
 
-    def step(self,State,nstep=1,t=0):
+    def step(self,State,nstep=1,t=0,Xb=None):
 
         if self.nl > 1:
             # Read per-layer state and convert to SW convention (1, nl, nx, ny)
@@ -4484,14 +4593,15 @@ class Model_qgsw(M):
         while step_done < nstep:
             n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
             t_chunk = t + step_done * self.dt
-            u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            u_b, v_b, h_b, c_b, taux, tauy = self._chunk_forcing(
+                Xb, step_done // self.max_nstep if self.max_nstep > 0 else 0,
+                t_chunk, n_chunk,
+            )
             if bc_du is not None:
                 u_b = u_b + bc_du
                 v_b = v_b + bc_dv
                 h_b = h_b + bc_dh
-            taux, tauy = self._get_wind_stress(t_chunk)
             if self.advect_tracer:
-                c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
                 u, v, h, c = self.jstep_core_trac_jit(
                     t_chunk, u, v, h, c, H, Fu, Fv, Fh, Fc,
                     u_b, v_b, h_b, c_b,
@@ -4526,7 +4636,7 @@ class Model_qgsw(M):
 
         self._set_land_nan(State)
 
-    def step_tgl(self,dState,State,nstep=1,t=0):
+    def step_tgl(self,dState,State,nstep=1,t=0,Xb=None):
 
         if self.nl > 1:
             # Per-layer perturbation
@@ -4612,14 +4722,15 @@ class Model_qgsw(M):
         while step_done < nstep:
             n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
             t_chunk = t + step_done * self.dt
-            u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            u_b, v_b, h_b, c_b, taux, tauy = self._chunk_forcing(
+                Xb, step_done // self.max_nstep if self.max_nstep > 0 else 0,
+                t_chunk, n_chunk,
+            )
             if bc_du is not None:
                 u_b = u_b + bc_du
                 v_b = v_b + bc_dv
                 h_b = h_b + bc_dh
-            taux, tauy = self._get_wind_stress(t_chunk)
             if self.advect_tracer:
-                c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
                 # Propagate tangent (JVP includes forward internally)
                 du, dv, dh, dc = self.jstep_tgl_trac_jit(
                     t_chunk, du, dv, dh, dc, dH, dFu, dFv, dFh, dFc,
@@ -4672,7 +4783,7 @@ class Model_qgsw(M):
             for i, name in enumerate(self.tracer_names):
                 dState.setvar(dc[i], name_var=self.name_var[name])
 
-    def step_adj(self,adState,State,nstep=1,t=0):
+    def step_adj(self,adState,State,nstep=1,t=0,Xb=None):
 
         if self.nl > 1:
             # --- Combine surface adjoint (from obs) with per-layer adjoint ---
@@ -4797,15 +4908,15 @@ class Model_qgsw(M):
             u_fwd, v_fwd, h_fwd = u, v, h
             if self.advect_tracer:
                 c_fwd = c
-            for t_chunk, n_chunk in chunks[:-1]:
-                u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            for chunk_index, (t_chunk, n_chunk) in enumerate(chunks[:-1]):
+                u_b, v_b, h_b, c_b, taux, tauy = self._chunk_forcing(
+                    Xb, chunk_index, t_chunk, n_chunk,
+                )
                 if bc_du is not None:
                     u_b = u_b + bc_du
                     v_b = v_b + bc_dv
                     h_b = h_b + bc_dh
-                taux, tauy = self._get_wind_stress(t_chunk)
                 if self.advect_tracer:
-                    c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
                     u_fwd, v_fwd, h_fwd, c_fwd = self.jstep_core_trac_jit(
                         t_chunk, u_fwd, v_fwd, h_fwd, c_fwd, H, Fu, Fv, Fh, Fc,
                         u_b, v_b, h_b, c_b,
@@ -4821,15 +4932,15 @@ class Model_qgsw(M):
         # Reverse adjoint through chunks
         for i in range(len(chunks) - 1, -1, -1):
             t_chunk, n_chunk = chunks[i]
-            u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            u_b, v_b, h_b, c_b, taux, tauy = self._chunk_forcing(
+                Xb, i, t_chunk, n_chunk,
+            )
             if bc_du is not None:
                 u_b = u_b + bc_du
                 v_b = v_b + bc_dv
                 h_b = h_b + bc_dh
-            taux, tauy = self._get_wind_stress(t_chunk)
             if self.advect_tracer:
                 u_i, v_i, h_i, c_i = fwd_states[i]
-                c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
                 (adu, adv, adh, adc,
                  adH, adFu, adFv, adFh, adFc,
                  adh_wind, adwind_strength,

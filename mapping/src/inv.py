@@ -20,7 +20,7 @@ import gc
 import xarray as xr
 
 import glob
-from contextlib import ExitStack, nullcontext
+from contextlib import nullcontext
 from importlib.machinery import SourceFileLoader
 
 import jax
@@ -73,8 +73,8 @@ def _criterion_reached(
     *,
     cost_history,
     gradient_norm_history,
-    relative_gradient_tolerance,
-    relative_cost_tolerance,
+    gtol,
+    ftol,
     patience,
     minimum_iterations,
 ):
@@ -86,16 +86,16 @@ def _criterion_reached(
 
     initial_gradient_norm = max(float(gradient_norm_history[0]), 1e-30)
     criteria = []
-    if relative_gradient_tolerance is not None:
+    if gtol is not None:
         recent_gradients = gradient_norm_history[-patience:]
         criteria.append(
             all(
                 float(norm) / initial_gradient_norm
-                <= relative_gradient_tolerance
+                <= gtol
                 for norm in recent_gradients
             )
         )
-    if relative_cost_tolerance is not None:
+    if ftol is not None:
         recent_pairs = zip(
             cost_history[-patience - 1 : -1],
             cost_history[-patience:],
@@ -104,7 +104,7 @@ def _criterion_reached(
             all(
                 abs(float(previous) - float(current))
                 / max(abs(float(previous)), abs(float(current)), 1.0)
-                <= relative_cost_tolerance
+                <= ftol
                 for previous, current in recent_pairs
             )
         )
@@ -117,8 +117,8 @@ def minimize_optax_decoupled(
     *,
     maxiter,
     history_size=10,
-    relative_gradient_tolerance=None,
-    relative_cost_tolerance=None,
+    gtol=None,
+    ftol=None,
     convergence_patience=1,
     minimum_iterations=1,
     gradient_max_norm=None,
@@ -338,8 +338,8 @@ def minimize_optax_decoupled(
         if _criterion_reached(
             cost_history=cost_history,
             gradient_norm_history=gradient_norm_history,
-            relative_gradient_tolerance=relative_gradient_tolerance,
-            relative_cost_tolerance=relative_cost_tolerance,
+            gtol=gtol,
+            ftol=ftol,
             patience=convergence_patience,
             minimum_iterations=minimum_iterations,
         ):
@@ -450,11 +450,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             f"{supported_minimizers}"
         )
     if minimizer_name == 'optax-decoupled':
-        if not getattr(config.INV, 'device_resident_state', False):
-            raise ValueError(
-                "minimizer='optax-decoupled' requires "
-                "device_resident_state=True"
-            )
         if not getattr(config.INV, 'jit_cost_and_grad', False):
             raise ValueError(
                 "minimizer='optax-decoupled' requires "
@@ -533,7 +528,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
 
     # Initialization, I/O and plotting are complete. Keep every state field and
     # control parameter resident on the selected accelerator from here on.
-    if getattr(config.INV, 'device_resident_state', False):
+    if getattr(config.INV, 'jit_cost_and_grad', False):
         State.to_device()
 
     # Covariance matrix
@@ -646,13 +641,13 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             var.cost_and_grad,
             jnp.asarray(Xopt, dtype=var.cost_dtype),
             maxiter=maxiter,
-            history_size=getattr(config.INV, 'lbfgs_history_size', 10),
-            relative_gradient_tolerance=getattr(
+            history_size=10,
+            gtol=getattr(
                 config.INV,
-                'relative_gradient_tolerance',
+                'gtol',
                 None,
             ),
-            relative_cost_tolerance=getattr(config.INV, 'ftol', None),
+            ftol=getattr(config.INV, 'ftol', None),
             convergence_patience=patience,
             minimum_iterations=getattr(
                 config.INV,
@@ -696,42 +691,20 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         # Main function
         raw_fun = var.cost_and_grad
         first_cost_eval = True
-        cost_eval = 0
-        transfer_guard = getattr(config.INV, 'transfer_guard', None)
-        profile_dir = getattr(config.INV, 'profile_dir', None)
-        profile_cost_eval = getattr(config.INV, 'profile_cost_eval', 2)
-
         def fun(XX):
-            nonlocal first_cost_eval, cost_eval
+            nonlocal first_cost_eval
 
-            cost_eval += 1
             is_first = first_cost_eval
             first_cost_eval = False
-            should_profile = profile_dir is not None and cost_eval == profile_cost_eval
             XX_device = jax.device_put(XX)
 
-            with ExitStack() as stack:
-                # The first call may still load captured constants while XLA
-                # builds the executable. Guard steady-state evaluations, where
-                # any transfer indicates a real regression in the hot path.
-                if transfer_guard is not None and not is_first:
-                    stack.enter_context(jax.transfer_guard(transfer_guard))
-                if should_profile:
-                    os.makedirs(profile_dir, exist_ok=True)
-                    stack.enter_context(jax.profiler.trace(
-                        profile_dir,
-                        create_perfetto_trace=True,
-                    ))
-
-                time0 = time.time()
-                J, G = raw_fun(XX_device)
-                if is_first or should_profile:
-                    _block_until_ready((J, G))
+            time0 = time.time()
+            J, G = raw_fun(XX_device)
+            if is_first:
+                _block_until_ready((J, G))
 
             if is_first:
                 print("[cost] first evaluation compile+run time: {:.2f} seconds".format(time.time() - time0))
-            if should_profile:
-                print(f"[cost] profiled evaluation {cost_eval} in {profile_dir}")
 
             # Historical SciPy Minimizer boundary: convert the shared device-native
             # evaluation to the host arrays required by scipy.optimize.
@@ -858,7 +831,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         while True:
             try:
                 res = opt.minimize(wrapper, Xopt,
-                                method=config.INV.opt_method,
+                                method='L-BFGS-B',
                                 jac=wrapper.jac,
                                 options=options,
                                 callback=callback)
@@ -996,11 +969,6 @@ class Variational:
                 "cost_and_grad_schedule must be 'python' or 'scan', got "
                 f"{self.cost_and_grad_schedule!r}"
             )
-        self.cost_and_grad_scan_unroll = int(
-            getattr(config.INV, 'cost_and_grad_scan_unroll', 1)
-        )
-        if self.cost_and_grad_scan_unroll < 1:
-            raise ValueError('cost_and_grad_scan_unroll must be >= 1')
         requested_cost_float64 = bool(
             getattr(config.INV, 'cost_float64', True)
         )
@@ -1070,10 +1038,6 @@ class Variational:
             self._prepare_scan_schedule()
 
         if self.jit_cost_and_grad:
-            if not getattr(config.INV, 'device_resident_state', False):
-                raise ValueError(
-                    'jit_cost_and_grad requires device_resident_state=True'
-                )
             if self.print_time:
                 raise ValueError(
                     'jit_cost_and_grad is incompatible with print_time=True; '
@@ -1167,7 +1131,7 @@ class Variational:
         print(
             '[cost] lax.scan checkpoint schedule: '
             f'{scan_times.size} uniform intervals, nstep={self._scan_nstep}, '
-            f'unroll={self.cost_and_grad_scan_unroll}'
+            'unroll=1'
         )
 
         
@@ -1424,7 +1388,7 @@ class Variational:
             forward_body,
             (initial_var, initial_params, Jo0),
             scan_inputs,
-            unroll=self.cost_and_grad_scan_unroll,
+            unroll=1,
         )
         trajectory_var, trajectory_params, trajectory_misfit = trajectory
 
@@ -1519,7 +1483,7 @@ class Variational:
             (adjoint_var, adjoint_params, adX0),
             reverse_inputs,
             reverse=True,
-            unroll=self.cost_and_grad_scan_unroll,
+            unroll=1,
         )
 
         with self.cost_precision():

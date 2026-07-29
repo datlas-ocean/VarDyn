@@ -81,8 +81,8 @@ is therefore mostly a discrete stopping effect.
 ## Operational conclusions
 
 - Keep `scipy` as the default to preserve existing configurations.
-- Select `optax-decoupled` only with `device_resident_state=True`,
-  `jit_cost_and_grad=True`, and `cost_and_grad_schedule='scan'`.
+- Select `optax-decoupled` only with `jit_cost_and_grad=True` and
+  `cost_and_grad_schedule='scan'`; device residency is automatic.
 - Use relative gradient stopping for comparisons across 4DVar Minimizers.
 - Keep `save_minimization=False` on the Optax hot path. Per-iteration saves
   transfer and write the complete Control Vector; the final `Xres.nc` remains

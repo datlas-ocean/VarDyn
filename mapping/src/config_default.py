@@ -991,19 +991,9 @@ INV_4DVAR = dict(
 
     cost_float64 = True, # Accumulate cost/control terms in float64 while model kernels may stay float32
 
-    device_resident_state = False, # Experimental: preserve JAX state arrays instead of materializing NumPy copies
-
     jit_cost_and_grad = False, # Compile the complete forward/adjoint checkpoint schedule as one device executable
 
     cost_and_grad_schedule = 'python', # 'python': historical unrolled checkpoint loops; 'scan': rolled lax.scan loops
-
-    cost_and_grad_scan_unroll = 1, # Checkpoint intervals unrolled inside lax.scan; larger values trade compilation time for throughput
-
-    transfer_guard = None, # Optional transfer guard around the device-native cost evaluation
-
-    profile_dir = None, # Optional directory for a JAX/Perfetto cost-evaluation trace
-
-    profile_cost_eval = 2, # Evaluation to profile; 2 normally excludes first-call compilation
 
     path_init_4Dvar = None, # To restart the minimization process from a specified control vector
 
@@ -1011,11 +1001,9 @@ INV_4DVAR = dict(
 
     ftol = None, # Relative accepted-cost change criterion; supported by both minimizers
 
-    gtol = None, # Historical SciPy projected-gradient tolerance relative to its initial value
+    gtol = None, # Gradient tolerance relative to the initial norm; projected max norm in SciPy, L2 norm in Optax
 
     convergence_nit = None, # Consecutive accepted iterations satisfying a configured criterion; None means one
-
-    relative_gradient_tolerance = None, # Common L2 criterion ||g_k|| / ||g_0||; supported by optax-decoupled
 
     minimum_iterations = 1, # Do not apply sustained convergence before this accepted iteration
 
@@ -1024,10 +1012,6 @@ INV_4DVAR = dict(
     gradient_max_norm = 1e6, # Reject unstable Optax trials; SciPy restarts from its best state
 
     max_retries = 5, # SciPy-only retries after unstable gradients
-
-    opt_method = 'L-BFGS-B', # Historical SciPy method; ignored by optax-decoupled
-
-    lbfgs_history_size = 10, # Number of accepted vector/gradient differences retained by optax-decoupled
 
     save_minimization = False, # save cost function and its gradient at each iteration 
 

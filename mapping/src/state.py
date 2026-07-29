@@ -40,7 +40,7 @@ class State:
         self.config = config
         self.preserve_device_arrays = bool(
             config.INV is not None
-            and getattr(config.INV, 'device_resident_state', False)
+            and getattr(config.INV, 'jit_cost_and_grad', False)
         )
         
         # Parameters

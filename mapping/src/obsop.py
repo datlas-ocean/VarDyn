@@ -45,6 +45,20 @@ def _open_obs_file(path, _retries=4, _sleep=0.5):
     raise last_exc
 
 
+def _stacked_obs_cache_path(operator, kind):
+    """Return a cache path for already padded observation arrays."""
+    if not operator.write_op or len(operator.date_obs) == 0:
+        return None
+    first = operator.date_obs[0].strftime('%Y%m%d_%H%M')
+    last = operator.date_obs[-1].strftime('%Y%m%d_%H%M')
+    observations = '_'.join(operator.name_obs)
+    return os.path.join(
+        operator.path_save,
+        f'{operator.name_H}_{observations}_{first}_{last}_'
+        f'{len(operator.date_obs)}_{kind}_stacked_v1.pic',
+    )
+
+
 def Obsop(config, State, dict_obs, Model, verbose=1, *args, **kwargs):
     """
     NAME
@@ -301,6 +315,25 @@ class Obsop_interp_l3(Obsop_interp):
     
     def process_obs(self, var_bc=None):
 
+        stacked_cache = _stacked_obs_cache_path(self, 'l3')
+        if (
+            var_bc is None
+            and not self.compute_op
+            and stacked_cache is not None
+            and os.path.exists(stacked_cache)
+        ):
+            with open(stacked_cache, 'rb') as stream:
+                cached = pickle.load(stream)
+            self.n_data = jnp.asarray(cached['n_data'])
+            self.n_obs = jnp.asarray(cached['n_obs'])
+            self.data_arr = jnp.asarray(cached['data_arr'])
+            self.indices_arr = jnp.asarray(
+                cached['indices_arr'], dtype=int
+            )
+            self.varobs_arr = jnp.asarray(cached['varobs_arr'])
+            self.errobs_arr = jnp.asarray(cached['errobs_arr'])
+            return
+
         self.varobs = {}
         self.errobs = {}
         self.data = {}
@@ -316,6 +349,43 @@ class Obsop_interp_l3(Obsop_interp):
             sat_info_list = self.dict_obs[date]['attributes']
             obs_file_list = self.dict_obs[date]['obs_path']
             obs_name_list = self.dict_obs[date]['obs_name']
+
+            file_L3 = (
+                f"{self.path_save}/{self.name_H}_{'_'.join(self.name_obs)}_"
+                f"{date.strftime('%Y%m%d_%H%M')}.pic"
+            )
+            cached_payload = None
+            if (
+                not self.compute_op
+                and self.write_op
+                and os.path.exists(file_L3)
+            ):
+                with open(file_L3, "rb") as f:
+                    cached_payload = pickle.load(f)
+                if isinstance(cached_payload, dict):
+                    data = cached_payload['data']
+                    indices = cached_payload['indices']
+                    var_obs = np.asarray(
+                        cached_payload['var_obs']
+                    ).copy()
+                    err_obs = np.asarray(cached_payload['err_obs'])
+                    lon_obs = np.asarray(cached_payload['lon_obs'])
+                    lat_obs = np.asarray(cached_payload['lat_obs'])
+                    if var_bc is not None and self.name_var in var_bc:
+                        coords_obs = np.column_stack((lon_obs, lat_obs))
+                        mask = np.any(np.isnan(self.coords_geo), axis=1)
+                        var_bc_interp = griddata(
+                            self.coords_geo[~mask],
+                            var_bc[self.name_var][i].ravel()[~mask],
+                            coords_obs,
+                            method='cubic',
+                        )
+                        var_obs -= var_bc_interp
+                    self.data[t] = data
+                    self.indices[t] = indices
+                    self.varobs[t] = var_obs
+                    self.errobs[t] = err_obs
+                    continue
 
             # Init lists
             var_obs = []
@@ -369,7 +439,7 @@ class Obsop_interp_l3(Obsop_interp):
             lat_obs = np.concatenate(lat_obs)
 
             coords_obs = np.column_stack((lon_obs, lat_obs))
-            file_L3 = f"{self.path_save}/{self.name_H}_{'_'.join(self.name_obs)}_{date.strftime('%Y%m%d_%H%M')}.pic"
+            raw_var_obs = var_obs.copy()
             if var_bc is not None and self.name_var in var_bc:
                 mask = np.any(np.isnan(self.coords_geo),axis=1)
                 var_bc_interp = griddata(self.coords_geo[~mask], var_bc[self.name_var][i].flatten()[~mask], coords_obs, method='cubic')
@@ -380,21 +450,29 @@ class Obsop_interp_l3(Obsop_interp):
             self.errobs[t] = err_obs
 
             # Compute Sparse operator
-            if not self.compute_op and self.write_op and os.path.exists(file_L3):
-                with open(file_L3, "rb") as f:
-                    data, indices = pickle.load(f)
-                    self.data[t] = data
-                    self.indices[t] = indices
+            if cached_payload is not None:
+                data, indices = cached_payload
+                self.data[t] = data
+                self.indices[t] = indices
             else:
                 # Compute operator
                 result = self._sparse_op(lon_obs,lat_obs)
                 data, indices = result
                 self.data[t] = data
                 self.indices[t] = indices
-                # Save operator if asked
-                if self.write_op:
-                    with open(file_L3, "wb") as f:
-                        pickle.dump([data, indices], f)
+            # Versioned cache includes observation vectors as well as H,
+            # so repeated inversions no longer reopen every altimetry NetCDF.
+            if self.write_op:
+                with open(file_L3, "wb") as f:
+                    pickle.dump({
+                        'version': 2,
+                        'data': data,
+                        'indices': indices,
+                        'var_obs': raw_var_obs,
+                        'err_obs': err_obs,
+                        'lon_obs': lon_obs,
+                        'lat_obs': lat_obs,
+                    }, f)
         
         self.n_data = np.array([self.data[t].size for t in self.t_obs])
         self.n_obs = np.array([self.varobs[t].size for t in self.t_obs])
@@ -412,6 +490,18 @@ class Obsop_interp_l3(Obsop_interp):
                 self.varobs_arr[i,:self.n_obs[i]] = self.varobs[t]
                 self.errobs_arr[i,:self.n_obs[i]] = self.errobs[t] 
             
+            if stacked_cache is not None and var_bc is None:
+                with open(stacked_cache, 'wb') as stream:
+                    pickle.dump({
+                        'version': 1,
+                        'n_data': self.n_data,
+                        'n_obs': self.n_obs,
+                        'data_arr': self.data_arr,
+                        'indices_arr': self.indices_arr,
+                        'varobs_arr': self.varobs_arr,
+                        'errobs_arr': self.errobs_arr,
+                    }, stream)
+
             self.n_data = jnp.array(self.n_data)
             self.n_obs = jnp.array(self.n_obs)
             self.data_arr = jnp.array(self.data_arr)
@@ -575,6 +665,38 @@ class Obsop_interp_l4(Obsop_interp):
 
     def process_obs(self, var_bc=None):
         
+        stacked_cache = _stacked_obs_cache_path(self, 'l4')
+        if (
+            var_bc is None
+            and not self.compute_op
+            and stacked_cache is not None
+            and os.path.exists(stacked_cache)
+        ):
+            with open(stacked_cache, 'rb') as stream:
+                cached = pickle.load(stream)
+            self.date_obs = cached['date_obs']
+            self.t_obs = np.asarray(cached['t_obs'])
+            self.t_obs_jax = jnp.asarray(self.t_obs)
+            if self.gradients:
+                self.varobs_grady = cached['varobs_grady']
+                self.varobs_gradx = cached['varobs_gradx']
+            else:
+                self.varobs = cached['varobs']
+            self.errobs = cached['errobs']
+            self.varobs_arr = jnp.asarray(
+                self.varobs_grady if self.gradients else self.varobs
+            )
+            self.errobs_arr = jnp.asarray(self.errobs)
+            mask = (
+                jnp.isnan(self.varobs_arr)
+                | jnp.isnan(self.errobs_arr)
+                | (self.errobs_arr < 1e-7)
+                | (self.varobs_arr > 1e7)
+            )
+            self.varobs_arr = jnp.where(mask, 0., self.varobs_arr)
+            self.errobs_arr = jnp.where(mask, 1e15, self.errobs_arr)
+            return
+
         # Initialize dictionnaries
         if self.gradients:
             self.varobs_grady = np.zeros((self.t_obs.size, self.DX.size))
@@ -599,6 +721,50 @@ class Obsop_interp_l4(Obsop_interp):
             lat_obs = []
             var_obs = []
             err_obs = []
+
+            # The L4 cache already contains the fully interpolated and masked
+            # fields.  Reuse it before reopening every source NetCDF file.
+            file_L4 = (
+                f"{self.path_save}/{self.name_H}_{'_'.join(self.name_obs)}_"
+                f"{date.strftime('%Y%m%d_%H%M')}.pic"
+            )
+            cached_L4 = (
+                not self.compute_op
+                and self.write_op
+                and os.path.exists(file_L4)
+            )
+            if cached_L4:
+                with open(file_L4, "rb") as f:
+                    var_obs_interp, err_obs_interp = pickle.load(f)
+                var_obs_interp = np.asarray(var_obs_interp).copy()
+                err_obs_interp = np.asarray(err_obs_interp).copy()
+                if var_bc is not None and self.name_var in var_bc:
+                    var_obs_interp -= var_bc[self.name_var][i]
+                if self.gradients:
+                    var_obs_interp_grady = np.full_like(
+                        var_obs_interp, np.nan
+                    )
+                    var_obs_interp_gradx = np.full_like(
+                        var_obs_interp, np.nan
+                    )
+                    var_obs_interp_grady[1:-1, 1:-1] = (
+                        var_obs_interp[2:, 1:-1]
+                        - var_obs_interp[:-2, 1:-1]
+                    ) / (2 * self.DY[1:-1, 1:-1])
+                    var_obs_interp_gradx[1:-1, 1:-1] = (
+                        var_obs_interp[1:-1, 2:]
+                        - var_obs_interp[1:-1, :-2]
+                    ) / (2 * self.DX[1:-1, 1:-1])
+                    self.varobs_grady[i] = var_obs_interp_grady.ravel()
+                    self.varobs_gradx[i] = var_obs_interp_gradx.ravel()
+                    self.errobs[i] = (
+                        .5 * err_obs_interp
+                        / np.sqrt(self.DY ** 2 + self.DX ** 2)
+                    ).ravel()
+                else:
+                    self.varobs[i] = var_obs_interp.ravel()
+                    self.errobs[i] = err_obs_interp.ravel()
+                continue
 
             ####################
             # Merge observations
@@ -677,12 +843,8 @@ class Obsop_interp_l4(Obsop_interp):
             ################
             # Process L4 obs
             ################
-            file_L4 = f"{self.path_save}/{self.name_H}_{'_'.join(self.name_obs)}_{date.strftime('%Y%m%d_%H%M')}.pic"
-            # Check if spatial interpolations have already been performed
-            if not self.compute_op and self.write_op and os.path.exists(file_L4):
-                with open(file_L4, "rb") as f:
-                    var_obs_interp, err_obs_interp = pickle.load(f)
-            else:
+            # No cache was available above: compute the interpolation.
+            if not cached_L4:
                 # Grid interpolation: performing spatial interpolation now
                 # Loop on different obs for this date and this variable name
                 _coords_obs = np.column_stack((lon_obs, lat_obs))
@@ -828,7 +990,24 @@ class Obsop_interp_l4(Obsop_interp):
                 fig.suptitle(date.strftime('%Y-%m-%d %H:%M'))
                 plt.show()
 
-        self.varobs_arr = jnp.array(self.varobs)
+        if stacked_cache is not None and var_bc is None:
+            cached = {
+                'version': 1,
+                'date_obs': self.date_obs,
+                't_obs': self.t_obs,
+                'errobs': self.errobs,
+            }
+            if self.gradients:
+                cached['varobs_grady'] = self.varobs_grady
+                cached['varobs_gradx'] = self.varobs_gradx
+            else:
+                cached['varobs'] = self.varobs
+            with open(stacked_cache, 'wb') as stream:
+                pickle.dump(cached, stream)
+
+        self.varobs_arr = jnp.array(
+            self.varobs_grady if self.gradients else self.varobs
+        )
         self.errobs_arr = jnp.array(self.errobs)
 
         mask = jnp.isnan(self.varobs_arr) | jnp.isnan(self.errobs_arr) | (self.errobs_arr<1e-7) | (self.varobs_arr>1e7) 

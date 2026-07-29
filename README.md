@@ -137,10 +137,9 @@ The device-resident path is explicit:
 myINV = dict(
     super='INV_4DVAR',
     minimizer='optax-decoupled',
-    device_resident_state=True,
     jit_cost_and_grad=True,
     cost_and_grad_schedule='scan',
-    relative_gradient_tolerance=0.1,
+    gtol=0.1,
     convergence_nit=2,
     minimum_iterations=5,
 )
