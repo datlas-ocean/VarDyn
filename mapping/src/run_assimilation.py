@@ -554,8 +554,16 @@ def prepare_process(config, config_eq, State,
                     for NAME_MOD in _config.MOD:
                         _config.MOD[NAME_MOD] = _base_config.MOD[NAME_MOD].copy()
                         _config.MOD[NAME_MOD].init_from_bc = False
+                        if getattr(_config.MOD[NAME_MOD], 'height_representation', 'ssh') == 'interface_displacement':
+                            _restart_names = dict(getattr(_config.MOD[NAME_MOD], 'name_init_var', {}) or {})
+                            _restart_names['SSH'] = _config.MOD[NAME_MOD].name_var['SSH']
+                            _config.MOD[NAME_MOD].name_init_var = _restart_names
                 else:
                     _config.MOD.init_from_bc = False
+                    if getattr(_config.MOD, 'height_representation', 'ssh') == 'interface_displacement':
+                        _restart_names = dict(getattr(_config.MOD, 'name_init_var', {}) or {})
+                        _restart_names['SSH'] = _config.MOD.name_var['SSH']
+                        _config.MOD.name_init_var = _restart_names
 
             if flag_init and name_exp_init is not None:
                 path_control_init = _config.INV.path_save_control_vectors.replace(

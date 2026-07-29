@@ -436,7 +436,28 @@ MOD_QGSW = dict(
     # 'interface_displacement' (nl=1 SW only) stores reduced-gravity interface
     # displacement eta. External SSH is diagnosed as (g_prime / physical_gravity) * eta.
     # With H set and g_prime=None, g_prime is diagnosed from c1**2 / H.
+    # 'modal_two_layer' (nl=2 SW only) is a physical mixed layer over a first
+    # baroclinic layer. SSH/surface U/V are public diagnosed fields; the
+    # kernel carries h_ml/u_ml/v_ml and h_bc1/u_bc1/v_bc1. Set H_ml/H_bc1 and
+    # include their names in name_params to control the positive log-depths.
     height_representation = 'ssh',
+
+    # Restart coordinate for the field mapped to name_init_var['SSH'] in
+    # interface_displacement mode. The default is the physical `ssh` written
+    # by save_output; use `interface_displacement` only when explicitly
+    # selecting that saved internal field.
+    restart_height_coordinate = 'physical_ssh',
+
+    H_ml = None,       # modal_two_layer mixed-layer reference depth [m]
+    H_ml_floor = None, # strict lower bound for H_ml [m]
+    H_ml_max = None,   # optional upper bound for H_ml [m]
+    H_bc1 = None,       # modal_two_layer first-baroclinic-layer reference depth [m]
+    H_bc1_floor = None, # strict lower bound for H_bc1 [m]
+    H_bc1_max = None,   # optional upper bound for H_bc1 [m]
+    c_mode2_ratio = None, # c_mode2/c1 used with g_prime=None; must be below the two-layer admissibility limit
+    interface_amplification = None, # diagnostic only in modal_two_layer; never a control
+    forcing_vertical_projection = 'surface_baroclinic', # lift surface forcing/BCs into the modal two-layer stack
+    wind_forcing_layer = 'mixed_layer', # modal_two_layer: wind acts only on layer 0 using current H_ml
 
     physical_gravity = 9.81, # m s^-2, used only for SSH <-> interface-displacement conversion
 

@@ -28,22 +28,92 @@ _Avoid_: Bathymetry, ocean depth, topographic depth
 The reference thickness of the active layer in a physical reduced-gravity shallow-water model; together with Reduced Gravity it determines the first-baroclinic wave speed. For the current one-layer implementation, it is 80 m and Reduced Gravity is diagnosed as c1²/H.
 _Avoid_: Equivalent Depth, bathymetry, mixed-layer depth
 
+**Layer-Resolved Depth Controls**:
+Independent, positive controls of the reference depths of the mixed layer and
+the first-baroclinic layer. Their public names are `H_ml` and `H_bc1`.
+_Avoid_: One shared depth control, additive depth correction, stacked public H
+
+**Tropical Two-Layer Reference Depths**:
+The default reference depths for the tropical two-layer modal reduced-gravity
+stack: 40 m for the mixed layer and 80 m for the first-baroclinic layer.
+_Avoid_: Full thermocline depth, fixed global layer depths
+
+**Layer-Resolved State**:
+The six prognostic fields of the two-layer modal reduced-gravity stack:
+`h_ml`, `u_ml`, `v_ml`, `h_bc1`, `u_bc1`, and `v_bc1`. Diagnosed surface
+fields remain separate observational products.
+_Avoid_: Layer-zero state, surface-only restart
+
+**Control-Preserving Restart**:
+A multi-window restart that reloads canonical layer-depth controls before
+physical depth diagnostics, so the optimizer's depth-control coordinates are
+continuous across subwindows.
+_Avoid_: Control rebasing, physical-depth-only restart
+
+**Reference First-Baroclinic Speed**:
+The spatial `c1` field that calibrates the first (fastest) baroclinic mode of the
+two-layer modal reduced-gravity stack at its reference depths.
+_Avoid_: Barotropic speed, arbitrary constant wave speed
+
+**Fixed Reduced Gravity**:
+The reference reduced-gravity field remains fixed while Layer-Resolved Depth
+Controls change the layer depths and therefore the modal dynamics.
+_Avoid_: Gravity compensation, fixed wave speed under depth control
+
+**Diagnosed Modal Fields**:
+The derived Interface Amplification Factor and the two modal wave-speed fields
+saved with output for physical verification; they are recomputed from resumed
+depth controls and Fixed Reduced Gravity.
+_Avoid_: Modal controls, restart inputs
+
 **Interface Displacement**:
 The prognostic displacement of the active reduced-gravity interface or modal surface.
 _Avoid_: SSH, altimetric height, layer-depth control
 
+**Interface Amplification Factor**:
+The ratio used to diagnose internal Interface Displacement from Diagnosed
+Sea-Surface Height when a surface field initializes a multilayer state. It is
+uncontrolled and diagnosed from the current layer depths and fixed reduced
+gravities; it may be supplied by a vertical-mode product when available.
+_Avoid_: SSH scale factor, arbitrary layer split
+
 **Physical Reduced-Gravity Layer Stack**:
 The ordered active-layer representation used by a multilayer physical
-reduced-gravity experiment: Ekman layer at the surface, then mixed layer, then
-the first-baroclinic layer below.
+reduced-gravity experiment: mixed layer at the surface, then the
+first-baroclinic layer below. The Ekman response is represented within the
+mixed-layer dynamics, not as a separate prognostic layer.
 _Avoid_: Arbitrary layer numbering, equivalent-depth stack
+
+**Modal Reduced-Gravity Stack**:
+A multilayer reduced-gravity system that advances slow internal modes and
+diagnoses Sea-Surface Height from them, rather than advancing a fast physical
+free-surface mode.
+_Avoid_: Free-surface stack, barotropic model
+
+**Baroclinic Shear Initialization**:
+The initialization of unobserved lower-layer velocity from observed mixed-layer
+velocity so depth-integrated transport is zero; the two layers carry opposing
+transport in proportion to their reference depths.
+_Avoid_: Zero lower-layer velocity, implicit barotropic current
+
+**Surface-Projected Baroclinic Forcing**:
+A single surface correction projected deterministically into both layers: its
+height follows the selected baroclinic mode and its momentum follows
+zero-transport baroclinic shear.
+_Avoid_: Independent lower-layer forcing, surface-only layer correction
+
+**Surface-Projected Boundary Condition**:
+An open-boundary field obtained from SSH and mixed-layer velocity, then lifted
+to both layers using the same modal-height and baroclinic-shear projections as
+initialization.
+_Avoid_: Independent lower-layer boundary condition, layer-zero copy
 
 **Diagnosed Sea-Surface Height**:
 The free-surface observable used for boundary and altimetric comparisons. In a
 one-layer reduced-gravity model it can be diagnosed from Interface
-Displacement using a physical-gravity scaling; for multiple layers it requires
-an explicit modal/interface projection and is not the model's internal
-pressure diagnostic by default.
+Displacement using a physical-gravity scaling. In the two-layer modal stack it
+is the explicit sum of mixed-layer and first-baroclinic thickness anomalies;
+the individual layer states are unobserved.
 _Avoid_: Model height, interface displacement, top-layer internal pressure
 
 **Antilles Domain**:

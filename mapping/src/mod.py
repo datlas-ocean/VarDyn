@@ -2806,15 +2806,19 @@ class Model_qgsw(M):
 
         self.nl = config.MOD.nl
         self.height_representation = getattr(config.MOD, 'height_representation', 'ssh')
-        if self.height_representation not in ('ssh', 'interface_displacement'):
+        if self.height_representation not in ('ssh', 'interface_displacement', 'modal_two_layer'):
             raise ValueError(
-                "MOD.height_representation must be 'ssh' or 'interface_displacement'."
+                "MOD.height_representation must be 'ssh', 'interface_displacement', or 'modal_two_layer'."
             )
         self._physical_interface_height = (
             self.height_representation == 'interface_displacement'
         )
         self._configured_name_params = config.MOD.name_params if config.MOD.name_params is not None else []
         self._controls_H = 'H' in self._configured_name_params
+        self._modal_two_layer = self.height_representation == 'modal_two_layer'
+        self._controls_modal_depths = self._modal_two_layer and any(
+            name in self._configured_name_params for name in ('H_ml', 'H_bc1')
+        )
         self._controls_h_wind = 'h_wind' in self._configured_name_params
 
         if config.MOD.name_class.lower()=='qg':
@@ -2822,6 +2826,17 @@ class Model_qgsw(M):
         else:
             model = model_sw
         self._is_qg_class = (config.MOD.name_class.lower() == 'qg')
+        if self._modal_two_layer:
+            if self.nl != 2 or self._is_qg_class:
+                raise NotImplementedError(
+                    'height_representation=modal_two_layer requires the two-layer SW class (nl=2, name_class="sw").'
+                )
+            if config.MOD.H_ml is None or config.MOD.H_bc1 is None:
+                raise ValueError('modal_two_layer requires positive MOD.H_ml and MOD.H_bc1.')
+            if self._controls_H:
+                raise ValueError("modal_two_layer uses H_ml/H_bc1 controls; do not also configure the legacy 'H' control.")
+            if getattr(config.MOD, 'wind_forcing_layer', 'mixed_layer') != 'mixed_layer':
+                raise ValueError('modal_two_layer supports wind_forcing_layer="mixed_layer" only.')
         if self._physical_interface_height:
             if self.nl != 1:
                 raise NotImplementedError(
@@ -3045,8 +3060,70 @@ class Model_qgsw(M):
         else:
             self.c = config.MOD.c0 * np.ones((State.ny,State.nx))
         
-        # Reduced gravity
-        if config.MOD.nl==1:
+        # Reduced gravity and reference depths. modal_two_layer has two real
+        # physical layers and keeps g' fixed after deriving it from the two
+        # requested reference modal speeds.
+        if self._modal_two_layer:
+            def _modal_depth(value, label):
+                depth = self._as_H_model_array(value, State, label)
+                if depth.shape[0] != 1:
+                    raise ValueError(f'{label} must be scalar or a single 2-D field.')
+                depth = depth[0]
+                if not np.all(np.isfinite(depth)) or np.any(depth <= 0.):
+                    raise ValueError(f'{label} must be finite and strictly positive.')
+                return depth
+
+            self.H_ml_ref_sw = _modal_depth(config.MOD.H_ml, 'H_ml')
+            self.H_bc1_ref_sw = _modal_depth(config.MOD.H_bc1, 'H_bc1')
+            self.H_ml_floor_sw = _modal_depth(
+                config.MOD.H_ml_floor if config.MOD.H_ml_floor is not None else 0.01,
+                'H_ml_floor',
+            )
+            self.H_bc1_floor_sw = _modal_depth(
+                config.MOD.H_bc1_floor if config.MOD.H_bc1_floor is not None else 0.01,
+                'H_bc1_floor',
+            )
+            if np.any(self.H_ml_floor_sw >= self.H_ml_ref_sw) or np.any(self.H_bc1_floor_sw >= self.H_bc1_ref_sw):
+                raise ValueError('Modal depth floors must be strictly below their reference depths.')
+
+            def _modal_max(value, reference, label):
+                if value is None:
+                    return None
+                bound = _modal_depth(value, label)
+                if np.any(bound < reference):
+                    raise ValueError(f'{label} must be greater than or equal to its reference depth.')
+                return bound
+
+            self.H_ml_max_sw = _modal_max(config.MOD.H_ml_max, self.H_ml_ref_sw, 'H_ml_max')
+            self.H_bc1_max_sw = _modal_max(config.MOD.H_bc1_max, self.H_bc1_ref_sw, 'H_bc1_max')
+            H = np.stack((self.H_ml_ref_sw, self.H_bc1_ref_sw), axis=0)
+            H0 = H.copy()
+
+            if config.MOD.g_prime is None:
+                ratio = getattr(config.MOD, 'c_mode2_ratio', None)
+                if ratio is None or not (0. < float(ratio) < 1.):
+                    raise ValueError('modal_two_layer with g_prime=None requires 0 < c_mode2_ratio < 1.')
+                c1_sq = self.c.T ** 2
+                c2_sq = (float(ratio) * self.c.T) ** 2
+                trace = c1_sq + c2_sq
+                determinant = c1_sq * c2_sq
+                discriminant = trace**2 - 4. * (self.H_ml_ref_sw + self.H_bc1_ref_sw) * determinant / self.H_ml_ref_sw
+                if np.any(discriminant <= 0.):
+                    ratio_max = np.sqrt(5. - 2. * np.sqrt(6.)) if np.allclose(self.H_ml_ref_sw, self.H_bc1_ref_sw / 2.) else None
+                    extra = f' (for H_ml=H_bc1/2, ratio must be < {ratio_max:.3f})' if ratio_max is not None else ''
+                    raise ValueError('c_mode2_ratio gives no positive two-layer reduced-gravity solution' + extra + '.')
+                # The smaller surface reduced gravity gives the conventional
+                # interface-amplified first baroclinic eigenvector.
+                gp0 = (trace - np.sqrt(discriminant)) / (2. * (self.H_ml_ref_sw + self.H_bc1_ref_sw))
+                gp1 = determinant / (self.H_ml_ref_sw * self.H_bc1_ref_sw * gp0)
+                g_prime = np.stack((gp0, gp1), axis=0)
+            else:
+                g_prime = np.asarray(config.MOD.g_prime, dtype=float)
+                if g_prime.ndim == 1:
+                    g_prime = g_prime.reshape(-1, 1, 1)
+                if g_prime.shape[0] != 2 or np.any(g_prime <= 0.) or not np.all(np.isfinite(g_prime)):
+                    raise ValueError('modal_two_layer g_prime must contain two finite positive reduced gravities.')
+        elif config.MOD.nl==1:
             # In physical interface mode, leaving g_prime unset means retain the
             # supplied physical layer depth and diagnose g' = c1**2 / H. This
             # keeps the first-baroclinic wave speed while making H a real depth.
@@ -3119,7 +3196,7 @@ class Model_qgsw(M):
             elif len(H.shape) == 2:
                 H = np.expand_dims(H, axis=0)
         
-        H_from_init = self._H_from_init_file(config, State)
+        H_from_init = None if self._modal_two_layer else self._H_from_init_file(config, State)
         if H_from_init is not None:
             H = H_from_init
 
@@ -3142,15 +3219,19 @@ class Model_qgsw(M):
 
         self.H0 = H
         self._H_from_init_file_used = H_from_init is not None
-        self.H_max_bound = getattr(config.MOD, 'H_max', None)
-        H_floor = getattr(config.MOD, 'H_floor', None)
-        if H_floor is None:
-            if getattr(config.MOD, 'cmin', None) is not None and config.MOD.nl == 1:
-                H_floor = float(config.MOD.cmin)**2 / float(g_prime[0, 0, 0])
-            else:
-                H_floor = 0.
-        self.H_floor = self._as_H_model_array(H_floor, State, 'H_floor')
-        self.H_floor = self._zero_H_floor_on_mask(self.H_floor, State)
+        if self._modal_two_layer:
+            self.H_max_bound = None
+            self.H_floor = np.stack((self.H_ml_floor_sw, self.H_bc1_floor_sw), axis=0)
+        else:
+            self.H_max_bound = getattr(config.MOD, 'H_max', None)
+            H_floor = getattr(config.MOD, 'H_floor', None)
+            if H_floor is None:
+                if getattr(config.MOD, 'cmin', None) is not None and config.MOD.nl == 1:
+                    H_floor = float(config.MOD.cmin)**2 / float(g_prime[0, 0, 0])
+                else:
+                    H_floor = 0.
+            self.H_floor = self._as_H_model_array(H_floor, State, 'H_floor')
+            self.H_floor = self._zero_H_floor_on_mask(self.H_floor, State)
         self._validate_H_floor(self.H0, self.H_floor)
 
         # Keep controlled wind depth in SW layout so its transformation is
@@ -3191,8 +3272,12 @@ class Model_qgsw(M):
         # CFL
         if config.MOD.cfl is not None:
             grid_spacing = min(np.nanmin(State.DX), np.nanmin(State.DY)) 
-            # For nl>1 the fastest wave is the barotropic mode sqrt(g*sum(H))
-            if self.nl > 1:
+            if self._modal_two_layer:
+                # No free-surface/barotropic mode is introduced: c is the
+                # selected fastest internal mode at the reference depths.
+                c_max = float(np.nanmax(self.c))
+                print(f'Modal-two-layer fastest reference wave speed c_max = {c_max:.2f} m/s')
+            elif self.nl > 1:
                 H_arr = np.asarray(config.MOD.H)
                 g_arr = np.asarray(config.MOD.g_prime)
                 c_max = float(np.sqrt(g_arr[0] * H_arr.sum()))
@@ -3240,10 +3325,22 @@ class Model_qgsw(M):
                         arr = _fill_nan_nearest(arr)
                     else:
                         arr[np.isnan(arr)] = 0.
-                    if name == 'SSH':
-                        # Grid/restart files use physical SSH. Convert once at
-                        # the I/O boundary when the model state is eta.
-                        arr = self._ssh_to_model_height(arr)
+                    if name == 'SSH' and self._physical_interface_height:
+                        # The standard saved `ssh` is physical SSH and must be
+                        # converted once. An explicit `interface_displacement`
+                        # selection is already in the model coordinate and must
+                        # never be scaled again.
+                        restart_coordinate = getattr(
+                            config.MOD, 'restart_height_coordinate', 'physical_ssh')
+                        if name_init_var == 'interface_displacement':
+                            restart_coordinate = 'interface_displacement'
+                        if restart_coordinate == 'physical_ssh':
+                            arr = self._ssh_to_model_height(arr)
+                        elif restart_coordinate != 'interface_displacement':
+                            raise ValueError(
+                                "MOD.restart_height_coordinate must be 'physical_ssh' "
+                                "or 'interface_displacement'."
+                            )
                     State.var[self.name_var[name]] = arr
                 else:
                     if name=='U':
@@ -3520,6 +3617,23 @@ class Model_qgsw(M):
 
         # Control parameters
         self.name_params = self._configured_name_params
+        if self._modal_two_layer:
+            if config.GRID.super == 'GRID_FROM_FILE':
+                dsin = xr.open_dataset(config.GRID.path_init_grid)
+                try:
+                    if 'H_ml' in self.name_params:
+                        State.params['H_ml'] = self._modal_restart_control(
+                            dsin, 'H_ml', self.H_ml_ref_sw.T, self.H_ml_floor_sw.T)
+                    if 'H_bc1' in self.name_params:
+                        State.params['H_bc1'] = self._modal_restart_control(
+                            dsin, 'H_bc1', self.H_bc1_ref_sw.T, self.H_bc1_floor_sw.T)
+                finally:
+                    dsin.close()
+            else:
+                if 'H_ml' in self.name_params:
+                    State.params['H_ml'] = np.zeros((State.ny, State.nx))
+                if 'H_bc1' in self.name_params:
+                    State.params['H_bc1'] = np.zeros((State.ny, State.nx))
         if 'H' in self.name_params:
             if (config.GRID.super == 'GRID_FROM_FILE'):
                 dsin = xr.open_dataset(config.GRID.path_init_grid)
@@ -3691,6 +3805,8 @@ class Model_qgsw(M):
         )
 
     def _H_control_to_total(self, H_control, apply_bounds=True):
+        if self._modal_two_layer:
+            return self._modal_H_control_to_total(H_control)
         H_control_sw = self._H_control_to_sw(H_control)
         H_ref = jnp.asarray(self.H0, dtype=self.dtype)
         H_floor = jnp.asarray(self.H_floor, dtype=self.dtype)
@@ -3881,14 +3997,91 @@ class Model_qgsw(M):
         """Diagnose external physical SSH from the model height coordinate."""
         return height * self.ssh_observation_scale
 
+    # --- Modal two-layer transforms -------------------------------------------------
+    # The SW core uses layer-thickness perturbations.  For a physical surface
+    # SSH amplitude s, the selected first baroclinic eigenvector is
+    # [h_ml, h_bc1] = [(1-r)s, r s].  Surface velocity is lifted into a
+    # zero-depth-transport shear [u_s, -(H_ml/H_bc1)u_s], likewise for v.
+    def _modal_H_control_to_total(self, H_control):
+        if H_control is None:
+            return jnp.asarray(self.H0, dtype=self.dtype)
+        control = jnp.asarray(H_control, dtype=self.dtype)
+        if control.ndim == 4 and control.shape[0] == 1:
+            control = control[0]
+        if control.ndim != 3 or control.shape[0] != 2:
+            raise ValueError(f'modal depth control must have shape (2, nx, ny); got {control.shape}.')
+        ref = jnp.stack((jnp.asarray(self.H_ml_ref_sw, dtype=self.dtype),
+                         jnp.asarray(self.H_bc1_ref_sw, dtype=self.dtype)))
+        floor = jnp.stack((jnp.asarray(self.H_ml_floor_sw, dtype=self.dtype),
+                           jnp.asarray(self.H_bc1_floor_sw, dtype=self.dtype)))
+        total = floor + (ref - floor) * jnp.exp(control)
+        if self.H_ml_max_sw is not None:
+            total = total.at[0].set(jnp.minimum(total[0], jnp.asarray(self.H_ml_max_sw, dtype=self.dtype)))
+        if self.H_bc1_max_sw is not None:
+            total = total.at[1].set(jnp.minimum(total[1], jnp.asarray(self.H_bc1_max_sw, dtype=self.dtype)))
+        return total
+
+    def _modal_depth_control(self, State):
+        if not self._modal_two_layer:
+            return None
+        zeros = jnp.zeros((self.nx, self.ny), dtype=self.dtype)
+        ml = State.params['H_ml'].astype(self.dtype).T if 'H_ml' in self.name_params else zeros
+        bc1 = State.params['H_bc1'].astype(self.dtype).T if 'H_bc1' in self.name_params else zeros
+        return jnp.stack((ml, bc1), axis=0)
+
+    def _modal_properties(self, H_total):
+        """Return (r, c_fast, c_slow) for the current physical depths."""
+        H_ml, H_bc1 = H_total[0], H_total[1]
+        gp0 = jnp.asarray(self.g_prime[0], dtype=self.dtype)
+        gp1 = jnp.asarray(self.g_prime[1], dtype=self.dtype)
+        trace = gp0 * (H_ml + H_bc1) + gp1 * H_bc1
+        determinant = H_ml * H_bc1 * gp0 * gp1
+        root = jnp.sqrt(jnp.maximum(trace**2 - 4. * determinant, 0.))
+        lambda_fast = 0.5 * (trace + root)
+        lambda_slow = 0.5 * (trace - root)
+        # The h_ml component of the fast eigenvector normalised by SSH is
+        # H_ml*g'_surface/lambda_fast; r is therefore the h_bc1 component.
+        r = 1. - H_ml * gp0 / jnp.maximum(lambda_fast, 1.e-12)
+        return r, jnp.sqrt(jnp.maximum(lambda_fast, 0.)), jnp.sqrt(jnp.maximum(lambda_slow, 0.))
+
+    def _modal_project_surface_sw(self, u, v, ssh, H_total):
+        r, _, _ = self._modal_properties(H_total)
+        shear = H_total[0] / jnp.maximum(H_total[1], 1.e-12)
+        shear_u_pad = jnp.pad(shear, ((1, 1), (0, 0)), mode='edge')
+        shear_v_pad = jnp.pad(shear, ((0, 0), (1, 1)), mode='edge')
+        shear_u = 0.5 * (shear_u_pad[1:, :] + shear_u_pad[:-1, :])
+        shear_v = 0.5 * (shear_v_pad[:, 1:] + shear_v_pad[:, :-1])
+        h_layers = jnp.stack(((1. - r) * ssh, r * ssh), axis=0)
+        u_layers = jnp.stack((u, -shear_u * u), axis=0)
+        v_layers = jnp.stack((v, -shear_v * v), axis=0)
+        return u_layers, v_layers, h_layers
+
+    def _modal_restart_control(self, dsin, name, reference, floor):
+        control_name = f'{name}_control'
+        if control_name in dsin:
+            value = np.asarray(dsin[control_name].values.squeeze(), dtype=float)
+            return np.nan_to_num(value, nan=0., posinf=0., neginf=0.)
+        if name in dsin:
+            total = np.asarray(dsin[name].values.squeeze(), dtype=float)
+            total = np.nan_to_num(total, nan=reference, posinf=reference, neginf=reference)
+            return np.log(np.maximum(total - floor, 1.e-12) / (reference - floor))
+        return np.zeros((self.ny, self.nx))
+
     def _sync_layers_from_surface(self, State):
-        """Project 2D surface fields into per-layer arrays (layer 0 gets the perturbation)."""
+        """Project public surface SSH/U/V into the kernel's layer variables."""
         ssh = jnp.asarray(State.getvar(name_var=self.name_var['SSH']), dtype=self.dtype)
         u   = jnp.asarray(State.getvar(name_var=self.name_var['U']),   dtype=self.dtype)
         v   = jnp.asarray(State.getvar(name_var=self.name_var['V']),   dtype=self.dtype)
-        State.var['h_layers'] = jnp.zeros((self.nl, self.ny, self.nx), dtype=self.dtype).at[0].set(ssh)
-        State.var['u_layers'] = jnp.zeros((self.nl, self.ny, self.nx+1), dtype=self.dtype).at[0].set(u)
-        State.var['v_layers'] = jnp.zeros((self.nl, self.ny+1, self.nx), dtype=self.dtype).at[0].set(v)
+        if self._modal_two_layer:
+            H_total = self._modal_H_control_to_total(self._modal_depth_control(State))
+            u_layers, v_layers, h_layers = self._modal_project_surface_sw(u.T, v.T, ssh.T, H_total)
+            State.var['h_layers'] = h_layers.transpose(0, 2, 1)
+            State.var['u_layers'] = u_layers.transpose(0, 2, 1)
+            State.var['v_layers'] = v_layers.transpose(0, 2, 1)
+        else:
+            State.var['h_layers'] = jnp.zeros((self.nl, self.ny, self.nx), dtype=self.dtype).at[0].set(ssh)
+            State.var['u_layers'] = jnp.zeros((self.nl, self.ny, self.nx+1), dtype=self.dtype).at[0].set(u)
+            State.var['v_layers'] = jnp.zeros((self.nl, self.ny+1, self.nx), dtype=self.dtype).at[0].set(v)
 
     def _diagnose_surface(self, State):
         """Set 2D surface SSH/U/V from per-layer arrays."""
@@ -3945,7 +4138,29 @@ class Model_qgsw(M):
             for name in self.tracer_names:
                 _name_var.append(self.name_var[name])
 
-        if 'H' in self.name_params:
+        if self._modal_two_layer:
+            H_total = self._modal_H_control_to_total(self._modal_depth_control(State))
+            r, c_fast, c_slow = self._modal_properties(H_total)
+            layer_names = {
+                'h_ml': State0.var['h_layers'][0],
+                'u_ml': State0.var['u_layers'][0],
+                'v_ml': State0.var['v_layers'][0],
+                'h_bc1': State0.var['h_layers'][1],
+                'u_bc1': State0.var['u_layers'][1],
+                'v_bc1': State0.var['v_layers'][1],
+                'H_ml': np.array(H_total[0].T),
+                'H_bc1': np.array(H_total[1].T),
+                'interface_amplification': np.array(r.T),
+                'c_mode1': np.array(c_fast.T),
+                'c_mode2': np.array(c_slow.T),
+            }
+            if 'H_ml' in self.name_params:
+                layer_names['H_ml_control'] = +State.params['H_ml']
+            if 'H_bc1' in self.name_params:
+                layer_names['H_bc1_control'] = +State.params['H_bc1']
+            State0.var.update(layer_names)
+            _name_var += list(layer_names)
+        elif 'H' in self.name_params:
             State0.var['H'] = self._H_control_to_total_state(State.params['H'])
             State0.var['H_control'] = +State.params['H']
             _name_var += ['H', 'H_control']
@@ -4200,8 +4415,17 @@ class Model_qgsw(M):
         _taux = taux[:, 1:-1].T if taux is not None else None   # (nx-1, ny)
         _tauy = tauy[1:-1, :].T if tauy is not None else None   # (nx, ny-1)
 
-        # Convert BCs and forcing from State convention to SW convention
-        if self.nl > 1:
+        # Convert BCs and forcing from State convention to SW convention.
+        # Modal depth controls remain inside this JAX path, so their effect on
+        # vertical projection, wave speeds, and wind inertia is differentiated.
+        H_total_modal = self._modal_H_control_to_total(H) if self._modal_two_layer else None
+        if self._modal_two_layer:
+            u_b_sw, v_b_sw, h_b_sw = self._modal_project_surface_sw(u_b.T, v_b.T, h_b.T, H_total_modal)
+            Fu_sw, Fv_sw, Fh_sw = self._modal_project_surface_sw(Fu.T, Fv.T, Fh.T, H_total_modal)
+            Fu_sw = Fu_sw / (3600 * 24)
+            Fv_sw = Fv_sw / (3600 * 24)
+            Fh_sw = Fh_sw / (3600 * 24)
+        elif self.nl > 1:
             # Per-layer: put 2D BC/forcing in layer 0, zeros in other layers
             u_b_sw = jnp.zeros((self.nl, self.nx+1, self.ny), dtype=self.dtype).at[0].set(u_b.T)
             v_b_sw = jnp.zeros((self.nl, self.nx, self.ny+1), dtype=self.dtype).at[0].set(v_b.T)
@@ -4237,7 +4461,9 @@ class Model_qgsw(M):
             )
 
         H_model = self._H_control_to_model_increment(H)
-        h_wind_model = self._h_wind_control_to_model_increment(h_wind)
+        # Modal wind stress is confined to the mixed layer and uses its current
+        # controlled total depth, never an independent h_wind control.
+        h_wind_model = H_total_modal[0] if self._modal_two_layer else self._h_wind_control_to_model_increment(h_wind)
 
         # Step
         if self._is_qg_class:
@@ -4299,11 +4525,18 @@ class Model_qgsw(M):
 
         # Convert BCs and forcing State → SW convention
         # Tracer: (n_trac, ny, nx) → (1, n_trac, nx, ny)
+        H_total_modal = self._modal_H_control_to_total(H) if self._modal_two_layer else None
         c_sw   = jnp.expand_dims(c0.transpose(0, 2, 1), axis=0)
         c_b_sw = jnp.expand_dims(c_b.transpose(0, 2, 1), axis=0)
         Fc_sw  = jnp.expand_dims(Fc.transpose(0, 2, 1), axis=0) / (3600 * 24)
 
-        if self.nl > 1:
+        if self._modal_two_layer:
+            u_b_sw, v_b_sw, h_b_sw = self._modal_project_surface_sw(u_b.T, v_b.T, h_b.T, H_total_modal)
+            Fu_sw, Fv_sw, Fh_sw = self._modal_project_surface_sw(Fu.T, Fv.T, Fh.T, H_total_modal)
+            Fu_sw = Fu_sw / (3600 * 24)
+            Fv_sw = Fv_sw / (3600 * 24)
+            Fh_sw = Fh_sw / (3600 * 24)
+        elif self.nl > 1:
             u_b_sw = jnp.zeros((self.nl, self.nx+1, self.ny), dtype=self.dtype).at[0].set(u_b.T)
             v_b_sw = jnp.zeros((self.nl, self.nx, self.ny+1), dtype=self.dtype).at[0].set(v_b.T)
             h_b_sw = jnp.zeros((self.nl, self.nx, self.ny),   dtype=self.dtype).at[0].set(h_b.T)
@@ -4338,7 +4571,9 @@ class Model_qgsw(M):
             )
 
         H_model = self._H_control_to_model_increment(H)
-        h_wind_model = self._h_wind_control_to_model_increment(h_wind)
+        # Modal wind stress is confined to the mixed layer and uses its current
+        # controlled total depth, never an independent h_wind control.
+        h_wind_model = H_total_modal[0] if self._modal_two_layer else self._h_wind_control_to_model_increment(h_wind)
 
         # Joint step (u, v, h, c)
         u1, v1, h1, c1 = self.model.step_with_tracer(
@@ -4540,7 +4775,9 @@ class Model_qgsw(M):
         Fu = State.params[self.name_var['U']]
         Fv = State.params[self.name_var['V']]
         Fh = State.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
+        if self._modal_two_layer:
+            H = self._modal_depth_control(State)
+        elif 'H' in self.name_params:
             H = State.params['H']
             H = jnp.expand_dims(H.astype(self.dtype).T, axis=0)
         else:
@@ -4657,7 +4894,10 @@ class Model_qgsw(M):
         dFu = dState.params[self.name_var['U']]
         dFv = dState.params[self.name_var['V']]
         dFh = dState.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
+        if self._modal_two_layer:
+            H = self._modal_depth_control(State)
+            dH = self._modal_depth_control(dState)
+        elif 'H' in self.name_params:
             H = State.params['H']
             dH = dState.params['H']
             H = jnp.expand_dims(H.astype(self.dtype ).T, axis=0)
@@ -4817,7 +5057,9 @@ class Model_qgsw(M):
         Fu = State.params[self.name_var['U']]
         Fv = State.params[self.name_var['V']]
         Fh = State.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
+        if self._modal_two_layer:
+            H = self._modal_depth_control(State)
+        elif 'H' in self.name_params:
             H = State.params['H']
             H = jnp.expand_dims(H.astype(self.dtype).T, axis=0)
         else:
@@ -4835,7 +5077,9 @@ class Model_qgsw(M):
         adFu = adState.params[self.name_var['U']]
         adFv = adState.params[self.name_var['V']]
         adFh = adState.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
+        if self._modal_two_layer:
+            adH = jnp.zeros((2, self.nx, self.ny), dtype=self.dtype)
+        elif 'H' in self.name_params:
             adH = adState.params['H']
             adH = jnp.expand_dims(adH.astype(self.dtype).T, axis=0)
         else:
@@ -4969,7 +5213,12 @@ class Model_qgsw(M):
             adState.setvar(adv,self.name_var['V'])
             adState.setvar(adh,self.name_var['SSH'])
 
-        if 'H' in self.name_params:
+        if self._modal_two_layer:
+            if 'H_ml' in self.name_params:
+                adState.params['H_ml'] = adH[0].T
+            if 'H_bc1' in self.name_params:
+                adState.params['H_bc1'] = adH[1].T
+        elif 'H' in self.name_params:
             adH = adH[0].T
             adState.params['H'] = adH
         if 'h_wind' in self.name_params:
