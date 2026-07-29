@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from src.mod import M, Model_multi, Model_qgsw
+from src.mod import M, Model_diffusion, Model_multi, Model_qgsw
 
 
 def _scan_model():
@@ -145,3 +145,40 @@ def test_multi_model_forwards_scan_boundary_conditions_under_jit():
             backward_body, initial, (jnp.asarray(times), forcing), reverse=True
         )
         return forward, adjoint
+
+    forward, adjoint = run(jnp.asarray(0.0, dtype=jnp.float32))
+    np.testing.assert_allclose(forward, 12.0)
+    np.testing.assert_allclose(adjoint, 12.0)
+
+
+class _TraceState:
+    def __init__(self, var, params):
+        self.var = var
+        self.params = params
+
+    def getvar(self, name):
+        return self.var[name]
+
+    def setvar(self, value, name):
+        self.var[name] = value
+
+
+def test_diffusion_adjoint_is_traceable_with_identity_configuration():
+    model = Model_diffusion.__new__(Model_diffusion)
+    model.name_var = {'SSH': 'sla_barotrop'}
+    model.Kdiffus = 0
+    model.dt = 1800
+
+    @jax.jit
+    def run(adjoint_value):
+        zeros = jnp.zeros_like(adjoint_value)
+        state = _TraceState({'sla_barotrop': zeros}, {'sla_barotrop': zeros})
+        adjoint = _TraceState({'sla_barotrop': adjoint_value}, {'sla_barotrop': zeros})
+        model.step_adj(adjoint, state, nstep=12, t=jnp.asarray(0))
+        return adjoint.var['sla_barotrop'], adjoint.params['sla_barotrop']
+
+    values = jnp.array([[1.0, jnp.nan], [2.0, 3.0]], dtype=jnp.float32)
+    state_adjoint, parameter_adjoint = run(values)
+    expected = np.array([[1.0, 0.0], [2.0, 3.0]], dtype=np.float32)
+    np.testing.assert_allclose(state_adjoint, expected)
+    np.testing.assert_allclose(parameter_adjoint, expected * 0.25)

@@ -873,7 +873,7 @@ class Model_diffusion(M):
         for name in self.name_var:
 
             # Get state variable
-            var0 = State.getvar(self.name_var[name])
+            var0 = jnp.asarray(State.getvar(self.name_var[name]))
             
             # Init
             var1 = +var0
@@ -881,14 +881,15 @@ class Model_diffusion(M):
             # Time propagation
             if self.Kdiffus>0:
                 for _ in range(nstep):
-                    var1[1:-1,1:-1] += self.dt*self.Kdiffus*(\
+                    tendency = self.dt*self.Kdiffus*(\
                         (var1[1:-1,2:]+var1[1:-1,:-2]-2*var1[1:-1,1:-1])/(self.dx[1:-1,1:-1]**2) +\
                         (var1[2:,1:-1]+var1[:-2,1:-1]-2*var1[1:-1,1:-1])/(self.dy[1:-1,1:-1]**2))
+                    var1 = var1.at[1:-1,1:-1].add(tendency)
             
             # Update state
             if self.name_var[name] in State.params:
                 params = State.params[self.name_var[name]]
-                var1 += nstep*self.dt/(3600*24) * params
+                var1 = var1 + nstep*self.dt/(3600*24) * params
 
             State.setvar(var1, self.name_var[name])
         
@@ -900,7 +901,7 @@ class Model_diffusion(M):
         for name in self.name_var:
 
             # Get state variable
-            var0 = dState.getvar(self.name_var[name])
+            var0 = jnp.asarray(dState.getvar(self.name_var[name]))
             
             # Init
             var1 = +var0
@@ -908,15 +909,16 @@ class Model_diffusion(M):
             # Time propagation
             if self.Kdiffus>0:
                 for _ in range(nstep):
-                    var1[1:-1,1:-1] += self.dt*self.Kdiffus*(\
+                    tendency = self.dt*self.Kdiffus*(\
                         (var1[1:-1,2:]+var1[1:-1,:-2]-2*var1[1:-1,1:-1])/(self.dx[1:-1,1:-1]**2) +\
                         (var1[2:,1:-1]+var1[:-2,1:-1]-2*var1[1:-1,1:-1])/(self.dy[1:-1,1:-1]**2))
+                    var1 = var1.at[1:-1,1:-1].add(tendency)
             
 
             # Update state
             if self.name_var[name] in dState.params:
                 params = dState.params[self.name_var[name]]
-                var1 += nstep*self.dt/(3600*24) * params
+                var1 = var1 + nstep*self.dt/(3600*24) * params
 
             dState.setvar(var1,self.name_var[name])
         
@@ -926,31 +928,32 @@ class Model_diffusion(M):
         for name in self.name_var:
 
             # Get state variable
-            advar0 = adState.getvar(self.name_var[name])
+            ad_output = jnp.asarray(adState.getvar(self.name_var[name]))
+            ad_output = jnp.where(jnp.isnan(ad_output), 0, ad_output)
+            advar1 = ad_output
 
-            # Init
-            advar1 = +advar0
-            
             # Time propagation
             if self.Kdiffus>0:
                 for _ in range(nstep):
+                    advar0 = advar1
+                    x_weight = self.dt*self.Kdiffus/(self.dx[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
+                    y_weight = self.dt*self.Kdiffus/(self.dy[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
+                    advar1 = advar0.at[1:-1,2:].add(x_weight)
+                    advar1 = advar1.at[1:-1,:-2].add(x_weight)
+                    advar1 = advar1.at[1:-1,1:-1].add(-2*x_weight)
+                    advar1 = advar1.at[2:,1:-1].add(y_weight)
+                    advar1 = advar1.at[:-2,1:-1].add(y_weight)
+                    advar1 = advar1.at[1:-1,1:-1].add(-2*y_weight)
                     
-                    advar1[1:-1,2:] += self.dt*self.Kdiffus/(self.dx[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    advar1[1:-1,:-2] += self.dt*self.Kdiffus/(self.dx[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    advar1[1:-1,1:-1] += -2*self.dt*self.Kdiffus/(self.dx[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    
-                    advar1[2:,1:-1] += self.dt*self.Kdiffus/(self.dy[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    advar1[:-2,1:-1] += self.dt*self.Kdiffus/(self.dy[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    advar1[1:-1,1:-1] += -2*self.dt*self.Kdiffus/(self.dy[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    
-                    advar0 = +advar1
                 
 
             # Update state and parameters
             if self.name_var[name] in State.params:
-                adState.params[self.name_var[name]] += nstep*self.dt/(3600*24) * advar0 
+                adState.params[self.name_var[name]] = (
+                    adState.params[self.name_var[name]]
+                    + nstep*self.dt/(3600*24) * ad_output
+                )
             
-            advar1[np.isnan(advar1)] = 0
             adState.setvar(advar1,self.name_var[name])
 
 
