@@ -1518,10 +1518,11 @@ class Model_qg1l(M):
                 X1 += nstep*self.dt/(3600*24) * Fssh
                 State.setvar(X1, name_var=self.name_var['SSH'])
     
-    def step_tgl(self,dState,State,nstep=1,t=0):
+    def step_tgl(self,dState,State,nstep=1,t=0,Xb=None):
 
         # Boundary field
-        Xb = self._apply_bc(t,int(t+nstep*self.dt))
+        if Xb is None:
+            Xb = self._apply_bc(t,int(t+nstep*self.dt))
 
         # c-anomaly: c_eff = prior scalar + 2-D anomaly dc
         c_eff = (self.qgm.c + State.params['c'].astype(self.qgm.dtype)
@@ -6943,7 +6944,29 @@ class Model_multi:
         
         State.save_output(present_date,name_var=self.var_to_save)
 
-    def step(self,State,nstep=1,t=None):
+    def prepare_scan_boundary_conditions(self, times, nstep):
+        """Prepare one scan-forcing pytree entry per component model.
+
+        Models without device-side forcing preparation keep a static ``None``
+        leaf. Models such as QG and QGSW receive their own effective number
+        of time steps, matching the conversion performed by ``step``.
+        """
+        forcing = []
+        for M in self.Models:
+            _nstep = nstep * self.dt // M.dt
+            prepare = getattr(M, 'prepare_scan_boundary_conditions', None)
+            forcing.append(
+                prepare(times, _nstep) if prepare is not None else None
+            )
+        return tuple(forcing)
+
+    @staticmethod
+    def _component_boundary(boundary_conditions, model_index):
+        if boundary_conditions is None:
+            return None
+        return boundary_conditions[model_index]
+
+    def step(self,State,nstep=1,t=None,Xb=None):
 
         # Intialization
         var_tot_tmp = {}
@@ -6951,10 +6974,19 @@ class Model_multi:
             var_tot_tmp[name] = jnp.zeros_like(State.var[self.name_var[name]]) 
         
         # Loop over models
-        for M in self.Models:
+        for model_index, M in enumerate(self.Models):
             _nstep = nstep*self.dt//M.dt
+            component_boundary = self._component_boundary(Xb, model_index)
             # Forward propagation
-            M.step(State,nstep=_nstep,t=t)
+            if component_boundary is None:
+                M.step(State,nstep=_nstep,t=t)
+            else:
+                M.step(
+                    State,
+                    nstep=_nstep,
+                    t=t,
+                    Xb=component_boundary,
+                )
             # Add to total variables
             for name in self.name_var:
                 if name in M.name_var and (name in self.name_var_tot):
@@ -6964,7 +6996,7 @@ class Model_multi:
         for name in self.name_var_tot:
             State.var[self.name_var_tot[name]] = var_tot_tmp[name]
 
-    def step_tgl(self,dState,State,nstep=1,t=None):
+    def step_tgl(self,dState,State,nstep=1,t=None,Xb=None):
 
         # Intialization
         var_tot_tmp = {}
@@ -6972,10 +7004,20 @@ class Model_multi:
             var_tot_tmp[name] = np.zeros_like(State.var[self.name_var[name]]) 
 
         # Loop over models
-        for M in self.Models:
+        for model_index, M in enumerate(self.Models):
             _nstep = nstep*self.dt//M.dt
+            component_boundary = self._component_boundary(Xb, model_index)
             # Tangent propagation
-            M.step_tgl(dState,State,nstep=_nstep,t=t)
+            if component_boundary is None:
+                M.step_tgl(dState,State,nstep=_nstep,t=t)
+            else:
+                M.step_tgl(
+                    dState,
+                    State,
+                    nstep=_nstep,
+                    t=t,
+                    Xb=component_boundary,
+                )
             # Add to total variables
             for name in self.name_var:
                 if name in M.name_var and name in var_tot_tmp:
@@ -6985,7 +7027,7 @@ class Model_multi:
         for name in self.name_var_tot:
             dState.var[self.name_var_tot[name]] = var_tot_tmp[name]
 
-    def step_adj(self,adState,State,nstep=1,t=None):
+    def step_adj(self,adState,State,nstep=1,t=None,Xb=None):
 
         # Intialization
         var_tot_tmp = {}
@@ -6993,14 +7035,24 @@ class Model_multi:
             var_tot_tmp[name] = adState.var[self.name_var_tot[name]]
         
         # Loop over models
-        for M in self.Models:
+        for model_index, M in enumerate(self.Models):
             _nstep = nstep*self.dt//M.dt
+            component_boundary = self._component_boundary(Xb, model_index)
             # Add to local variable
             for name in self.name_var:
                 if name in M.name_var and name in self.name_var_tot:
                     adState.var[M.name_var[name]] += var_tot_tmp[name]  
             # Adjoint propagation
-            M.step_adj(adState,State,nstep=_nstep,t=t)
+            if component_boundary is None:
+                M.step_adj(adState,State,nstep=_nstep,t=t)
+            else:
+                M.step_adj(
+                    adState,
+                    State,
+                    nstep=_nstep,
+                    t=t,
+                    Xb=component_boundary,
+                )
         
         for name in self.name_var_tot:
             adState.var[self.name_var_tot[name]] *= 0 
