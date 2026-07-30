@@ -179,3 +179,32 @@ _Avoid_: BM BC file, edge forcing
 ## Configuration conventions
 
 - Whenever a configuration key is added, removed, renamed, or changes meaning, update `mapping/src/config_default.py` in the same change. Keep the relevant default block complete and synchronized with every factory or runtime consumer.
+
+## 4DVar and inversion terminology
+
+**Analysis Window**:
+The time interval jointly optimized by one 4DVar inversion.
+_Avoid_: Batch, run period
+
+**Checkpoint**:
+A time in the Analysis Window where VarDyn applies the Reduced Basis, evaluates
+observation misfits, or stores state needed by the adjoint.
+_Avoid_: Snapshot, save time
+
+**Control Vector**:
+The coefficients optimized by 4DVar; the Reduced Basis maps them to model
+variables and parameters.
+_Avoid_: Parameter vector, weights
+
+**Cost-Gradient Evaluation**:
+One complete background-cost, forward-model, observation-misfit, and adjoint
+calculation for a Control Vector.
+_Avoid_: Objective call, model pass
+
+**Historical SciPy Minimizer**:
+The host-resident SciPy L-BFGS-B 4DVar Minimizer retained for compatibility and
+reference comparisons.
+_Avoid_: CPU mode, legacy solver
+
+**Device-Resident Optax Minimizer**:
+The L-BFGS 4DVar Minimizer whose Control Vector and history remain on the JAX

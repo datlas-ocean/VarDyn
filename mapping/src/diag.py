@@ -117,7 +117,7 @@ class Diag_osse():
         self.name_ref_lon = config.DIAG.name_ref_lon
         self.name_ref_lat = config.DIAG.name_ref_lat
         self.name_ref_var = config.DIAG.name_ref_var
-        ref = xr.open_mfdataset(config.DIAG.name_ref,**config.DIAG.options_ref, preprocess=lambda ds: ds[[self.name_ref_time, self.name_ref_lon, self.name_ref_lat, self.name_ref_var]]).squeeze()
+        ref = xr.open_mfdataset(config.DIAG.name_ref, chunks=-1, **config.DIAG.options_ref, preprocess=lambda ds: ds[[self.name_ref_time, self.name_ref_lon, self.name_ref_lat, self.name_ref_var]]).squeeze()
         try:
             if np.sign(ref[self.name_ref_lon].data.min())==-1 and State.lon_unit=='0_360':
                 ref = ref.assign_coords({self.name_ref_lon:((self.name_ref_lon, ref[self.name_ref_lon].data % 360))})
@@ -162,7 +162,7 @@ That could be due to non regular grid or bad written netcdf file')
         else:
             self.name_exp_lat = config.EXP.name_lat + suffix
         self.name_exp_var = config.DIAG.name_exp_var
-        exp = xr.open_mfdataset(f'{config.EXP.path_save}/{config.EXP.name_exp_save}*nc',preprocess=lambda ds: ds[[self.name_exp_var]])
+        exp = xr.open_mfdataset(f'{config.EXP.path_save}/{config.EXP.name_exp_save}*nc', chunks=-1, preprocess=lambda ds: ds[[self.name_exp_var]])
         exp = exp.assign_coords({self.name_exp_lon:exp[self.name_exp_lon]})
         dt = (exp[self.name_exp_time][1]-exp[self.name_exp_time][0]).values
         self.exp = exp.sel(
@@ -190,9 +190,9 @@ That could be due to non regular grid or bad written netcdf file')
             self.name_bas_lat = config.DIAG.name_bas_lat
             self.name_bas_var = config.DIAG.name_bas_var
             try:
-                bas = xr.open_mfdataset(config.DIAG.name_bas,preprocess=lambda ds: ds[[self.name_bas_time, self.name_bas_lon, self.name_bas_lat, self.name_bas_var]])
+                bas = xr.open_mfdataset(config.DIAG.name_bas, chunks=-1, preprocess=lambda ds: ds[[self.name_bas_time, self.name_bas_lon, self.name_bas_lat, self.name_bas_var]])
             except:
-                bas = xr.open_mfdataset(config.DIAG.name_bas)
+                bas = xr.open_mfdataset(config.DIAG.name_bas, chunks=-1)
             if np.sign(bas[self.name_bas_lon].data.min())==-1 and State.lon_unit=='0_360':
                 bas = bas.assign_coords({self.name_bas_lon:((self.name_bas_lon, bas[self.name_bas_lon].data % 360))})
             elif np.sign(bas[self.name_bas_lon].data.min())==1 and State.lon_unit=='-180_180':
@@ -236,7 +236,7 @@ That could be due to non regular grid or bad written netcdf file')
             name_lon = config.DIAG.name_var_mask['lon']
             name_lat = config.DIAG.name_var_mask['lat']
             name_var = config.DIAG.name_var_mask['var']
-            mask = xr.open_mfdataset(config.DIAG.name_mask)
+            mask = xr.open_mfdataset(config.DIAG.name_mask, chunks=-1)
             if np.sign(mask[name_lon].data.min())==-1 and State.lon_unit=='0_360':
                 mask = mask.assign_coords({name_lon:((name_lon, mask[name_lon].data % 360))})
             elif np.sign(mask[name_lon].data.min())==1 and State.lon_unit=='-180_180':
@@ -913,7 +913,7 @@ class Diag_ose():
         delta_x = []
         for name_ref in config.DIAG.name_ref:
             try:
-                _ref = xr.open_mfdataset(name_ref,**config.DIAG.options_ref,preprocess=preprocess,compat='override',coords='minimal')
+                _ref = xr.open_mfdataset(name_ref, chunks=-1, **config.DIAG.options_ref,preprocess=preprocess,compat='override',coords='minimal')
             except:
                 files = sorted(glob.glob(name_ref))
 
@@ -1007,7 +1007,7 @@ class Diag_ose():
         self.name_exp_var = config.DIAG.name_exp_var
         exp_files = sorted(glob.glob(f'{config.EXP.path_save}/{config.EXP.name_exp_save}*nc'))
         try:
-            exp = xr.open_mfdataset(exp_files)[self.name_exp_var]
+            exp = xr.open_mfdataset(exp_files, chunks=-1)[self.name_exp_var]
         except:
             exp_datasets = []
             for file in exp_files:
