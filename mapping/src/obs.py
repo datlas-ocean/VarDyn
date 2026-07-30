@@ -160,7 +160,7 @@ def _open_obs_dataset(name_obs, OBS, date_start=None, date_end=None):
             return xr.open_mfdataset(
                 files, combine='nested', concat_dim=name_time_dim,
                 preprocess=preprocess, compat='override', coords='minimal',
-                parallel=False)
+                parallel=False, chunks=-1)
         except Exception:
             pass
 
@@ -168,17 +168,20 @@ def _open_obs_dataset(name_obs, OBS, date_start=None, date_end=None):
         try:
             return xr.open_mfdataset(
                 files, combine='nested', concat_dim=name_time_dim,
-                compat='override', coords='minimal', parallel=False)
+                compat='override', coords='minimal', parallel=False,
+                chunks=-1)
         except Exception:
             pass
 
     # Last resort: by_coords
     try:
         return xr.open_mfdataset(
-            files, preprocess=preprocess, compat='override', coords='minimal')
+            files, preprocess=preprocess, compat='override', coords='minimal',
+            chunks=-1)
     except Exception:
         try:
-            return xr.open_mfdataset(files, compat='override', coords='minimal')
+            return xr.open_mfdataset(
+                files, compat='override', coords='minimal', chunks=-1)
         except Exception:
             print(f'[{name_obs}] Error: unable to open multiple netcdf files')
             return None

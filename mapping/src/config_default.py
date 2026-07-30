@@ -977,31 +977,41 @@ NAME_INV = None
 # 4-Dimensional Variational 
 INV_4DVAR = dict(
 
+    minimizer = 'scipy', # 'scipy': historical host L-BFGS-B; 'optax-decoupled': device L-BFGS with a scalar Python line search
+
     compute_test = False, # TLM, ADJ & GRAD tests
 
     freq_it_plot = 10, # Frequency of iteration to plot the cost function and its gradient  
+
+    plot_state_during_minimization = False, # Opt in to costly device-to-host state plots from cost evaluations
 
     print_time = False, # Whether to print the time taken for each iteration, split by model, obs operator and gradient computation
 
     JAX_mem_fraction = None,
 
+    cost_float64 = True, # Accumulate cost/control terms in float64 while model kernels may stay float32
+
+    jit_cost_and_grad = False, # Compile the complete forward/adjoint checkpoint schedule as one device executable
+
+    cost_and_grad_schedule = 'python', # 'python': historical unrolled checkpoint loops; 'scan': rolled lax.scan loops
+
     path_init_4Dvar = None, # To restart the minimization process from a specified control vector
 
     restart_4Dvar = False, # To restart the minimization process from the last control vector
 
-    ftol = None, # The iteration stops when (f^k - f^{k+1})/max{|f^k|,|f^{k+1}|,1} <= ftol.
+    ftol = None, # Relative accepted-cost change criterion; supported by both minimizers
 
-    gtol = None, # Gradient norm must be less than gtol*g0 (g0 being the gradient at first iteration) before successful termination.
+    gtol = None, # Gradient tolerance relative to the initial norm; projected max norm in SciPy, L2 norm in Optax
 
-    convergence_nit = None, # Number of consecutive iterations the convergence criteria (ftol/gtol) must be met before stopping. If None, scipy stops as soon as the criteria is met once.
+    convergence_nit = None, # Consecutive accepted iterations satisfying a configured criterion; None means one
+
+    minimum_iterations = 1, # Do not apply sustained convergence before this accepted iteration
 
     maxiter = 10, # Maximal number of iterations for the minimization process
 
-    gradient_max_norm = 1e6, # If the gradient norm exceeds this, minimization will restart from best state
+    gradient_max_norm = 1e6, # Reject unstable Optax trials; SciPy restarts from its best state
 
-    max_retries = 5, # Number of times to retry minimization after crazy gradients
-
-    opt_method = 'L-BFGS-B', # method for scipy.optimize.minimize
+    max_retries = 5, # SciPy-only retries after unstable gradients
 
     save_minimization = False, # save cost function and its gradient at each iteration 
 
@@ -1152,5 +1162,3 @@ DIAG_OSE = dict(
     name_bas_var = None
 
 )
-
-

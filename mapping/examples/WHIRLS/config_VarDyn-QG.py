@@ -479,11 +479,21 @@ myINV = dict(
 
     super = 'INV_4DVAR', # Inherit defaults for the 4DVar minimization driver.
 
-    save_minimization = True, # Save cost-function and gradient history during minimization.
+    minimizer = 'optax-decoupled', # Keep L-BFGS vectors on GPU and drive only the scalar Armijo line search from Python.
 
-    ftol = 5e-5, # Relative cost-function decrease threshold used for convergence.
+    jit_cost_and_grad = True, # Compile one complete forward/misfit/adjoint cost-gradient evaluation on GPU.
 
-    convergence_nit = 10, # Required number of consecutive converged iterations before stopping.
+    cost_and_grad_schedule = 'scan', # Roll monthly forward/adjoint checkpoint loops with lax.scan; use 'python' for the previous formulation.
+
+    save_minimization = False, # Keep the Optax hot path scalar-only; Xres.nc is still saved after minimization.
+
+    ftol = None, # Disable the cost-change criterion in favor of the benchmarked relative-gradient criterion.
+
+    gtol = 0.1, # Stop below 10% of the initial gradient norm.
+
+    convergence_nit = 2, # Require two consecutive accepted iterations below the gradient threshold.
+
+    minimum_iterations = 5, # Ignore early transient threshold crossings.
 
     maxiter = 50, # Maximum number of minimizer iterations. Here is we set 100 for testing purposes, but in practice, it can be set to a higher value (e.g. 1000).
 
@@ -501,5 +511,3 @@ myINV = dict(
 
  
 )
-
-

@@ -25,6 +25,7 @@ from jax import jit
 jax.config.update("jax_enable_x64", USE_FLOAT64)
 
 import warnings 
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import jaxparrow
@@ -51,6 +52,19 @@ def _fill_nan_nearest(arr):
     if out.ndim == 2:
         slices = [out]
     elif out.ndim == 3:
+        nan_masks = np.isnan(out)
+        if np.all(nan_masks == nan_masks[0]):
+            nan_mask = nan_masks[0]
+            if not nan_mask.any():
+                return out
+            if nan_mask.all():
+                out[:] = 0.
+                return out
+            ind = distance_transform_edt(
+                nan_mask, return_distances=False, return_indices=True
+            )
+            out[:, nan_mask] = out[:, ind[0][nan_mask], ind[1][nan_mask]]
+            return out
         slices = [out[k] for k in range(out.shape[0])]
     else:
         out[np.isnan(out)] = 0.
@@ -75,9 +89,19 @@ class _MultiBcFields:
         self.bc_fields = bc_fields
 
     def interp(self, time):
+        if len(self.bc_fields) == 1:
+            return self.bc_fields[0].interp(time)
+
+        # Sources are fully loaded by _BcFields.__init__, so concurrent work
+        # below is CPU-only and never reads netCDF/HDF5 handles from threads.
+        with ThreadPoolExecutor(max_workers=len(self.bc_fields)) as executor:
+            interpolated = list(executor.map(
+                lambda bc_field: bc_field.interp(time),
+                self.bc_fields,
+            ))
         out = {}
-        for bc_field in self.bc_fields:
-            out.update(bc_field.interp(time))
+        for fields in interpolated:
+            out.update(fields)
         return out
 
 
@@ -101,7 +125,7 @@ class _BcFields:
         dlon = np.nanmean(self.lon[:,1:]-self.lon[:,:-1])
         dlat = np.nanmean(self.lat[1:,:]-self.lat[:-1,:])
 
-        _ds = xr.open_mfdataset(config_bc.file)
+        _ds = xr.open_mfdataset(config_bc.file, chunks=-1)
         ds = _ds.copy()
         _ds.close()
 
@@ -329,15 +353,12 @@ class _BcFields:
             da = self.var[name]
             src, x_source_axis, y_source_axis = self._prepare_source_3D(name, da, needed)
 
-            filled = np.empty_like(src)
-            for k in range(src.shape[0]):
-                sl = src[k]
-                if np.isnan(sl).any():
-                    g2 = pyinterp.Grid2D(x_source_axis, y_source_axis, sl.T.copy())
-                    _, sl_filled = pyinterp.fill.gauss_seidel(g2)
-                    filled[k] = sl_filled.T
-                else:
-                    filled[k] = sl
+            # Land/no-data masks are normally invariant through time.
+            # Reuse one nearest-neighbour index map for the entire stack,
+            # instead of solving the same Gauss-Seidel fill independently for
+            # every date.  Model-specific set_bc still applies its established
+            # target-grid land/coast handling afterwards.
+            filled = _fill_nan_nearest(src)
 
             nt_out = len(time)
             n_needed = src.shape[0]
@@ -671,16 +692,28 @@ class M:
         for name in name_var:
             if name not in State.var:
                 continue
-            arr = np.asarray(State.var[name])
+            arr = State.var[name]
             mask = self._land_mask_for_shape(State, arr.shape)
             if mask is None:
                 continue
-            arr = arr.astype(float, copy=True)
-            arr[..., mask] = np.nan
-            State.var[name] = arr
+            if State.preserve_device_arrays and isinstance(arr, (jax.Array, jax.core.Tracer)):
+                arr = jnp.asarray(arr, dtype=float)
+                State.var[name] = jnp.where(jnp.asarray(mask), jnp.nan, arr)
+            else:
+                arr = np.asarray(arr).astype(float, copy=True)
+                arr[..., mask] = np.nan
+                State.var[name] = arr
 
     def _finite_model_array(self, State, name, fill_land='zero'):
-        arr = np.asarray(State.var[name], dtype=float)
+        arr = State.var[name]
+        if isinstance(arr, (jax.Array, jax.core.Tracer)):
+            return jnp.nan_to_num(
+                jnp.asarray(arr),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        arr = np.asarray(arr, dtype=float)
         arr = np.where(np.isfinite(arr), arr, np.nan)
         if fill_land == 'nearest':
             return _fill_nan_nearest(arr)
@@ -840,7 +873,7 @@ class Model_diffusion(M):
         for name in self.name_var:
 
             # Get state variable
-            var0 = State.getvar(self.name_var[name])
+            var0 = jnp.asarray(State.getvar(self.name_var[name]))
             
             # Init
             var1 = +var0
@@ -848,14 +881,15 @@ class Model_diffusion(M):
             # Time propagation
             if self.Kdiffus>0:
                 for _ in range(nstep):
-                    var1[1:-1,1:-1] += self.dt*self.Kdiffus*(\
+                    tendency = self.dt*self.Kdiffus*(\
                         (var1[1:-1,2:]+var1[1:-1,:-2]-2*var1[1:-1,1:-1])/(self.dx[1:-1,1:-1]**2) +\
                         (var1[2:,1:-1]+var1[:-2,1:-1]-2*var1[1:-1,1:-1])/(self.dy[1:-1,1:-1]**2))
+                    var1 = var1.at[1:-1,1:-1].add(tendency)
             
             # Update state
             if self.name_var[name] in State.params:
                 params = State.params[self.name_var[name]]
-                var1 += nstep*self.dt/(3600*24) * params
+                var1 = var1 + nstep*self.dt/(3600*24) * params
 
             State.setvar(var1, self.name_var[name])
         
@@ -867,7 +901,7 @@ class Model_diffusion(M):
         for name in self.name_var:
 
             # Get state variable
-            var0 = dState.getvar(self.name_var[name])
+            var0 = jnp.asarray(dState.getvar(self.name_var[name]))
             
             # Init
             var1 = +var0
@@ -875,15 +909,16 @@ class Model_diffusion(M):
             # Time propagation
             if self.Kdiffus>0:
                 for _ in range(nstep):
-                    var1[1:-1,1:-1] += self.dt*self.Kdiffus*(\
+                    tendency = self.dt*self.Kdiffus*(\
                         (var1[1:-1,2:]+var1[1:-1,:-2]-2*var1[1:-1,1:-1])/(self.dx[1:-1,1:-1]**2) +\
                         (var1[2:,1:-1]+var1[:-2,1:-1]-2*var1[1:-1,1:-1])/(self.dy[1:-1,1:-1]**2))
+                    var1 = var1.at[1:-1,1:-1].add(tendency)
             
 
             # Update state
             if self.name_var[name] in dState.params:
                 params = dState.params[self.name_var[name]]
-                var1 += nstep*self.dt/(3600*24) * params
+                var1 = var1 + nstep*self.dt/(3600*24) * params
 
             dState.setvar(var1,self.name_var[name])
         
@@ -893,31 +928,32 @@ class Model_diffusion(M):
         for name in self.name_var:
 
             # Get state variable
-            advar0 = adState.getvar(self.name_var[name])
+            ad_output = jnp.asarray(adState.getvar(self.name_var[name]))
+            ad_output = jnp.where(jnp.isnan(ad_output), 0, ad_output)
+            advar1 = ad_output
 
-            # Init
-            advar1 = +advar0
-            
             # Time propagation
             if self.Kdiffus>0:
                 for _ in range(nstep):
+                    advar0 = advar1
+                    x_weight = self.dt*self.Kdiffus/(self.dx[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
+                    y_weight = self.dt*self.Kdiffus/(self.dy[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
+                    advar1 = advar0.at[1:-1,2:].add(x_weight)
+                    advar1 = advar1.at[1:-1,:-2].add(x_weight)
+                    advar1 = advar1.at[1:-1,1:-1].add(-2*x_weight)
+                    advar1 = advar1.at[2:,1:-1].add(y_weight)
+                    advar1 = advar1.at[:-2,1:-1].add(y_weight)
+                    advar1 = advar1.at[1:-1,1:-1].add(-2*y_weight)
                     
-                    advar1[1:-1,2:] += self.dt*self.Kdiffus/(self.dx[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    advar1[1:-1,:-2] += self.dt*self.Kdiffus/(self.dx[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    advar1[1:-1,1:-1] += -2*self.dt*self.Kdiffus/(self.dx[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    
-                    advar1[2:,1:-1] += self.dt*self.Kdiffus/(self.dy[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    advar1[:-2,1:-1] += self.dt*self.Kdiffus/(self.dy[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    advar1[1:-1,1:-1] += -2*self.dt*self.Kdiffus/(self.dy[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    
-                    advar0 = +advar1
                 
 
             # Update state and parameters
             if self.name_var[name] in State.params:
-                adState.params[self.name_var[name]] += nstep*self.dt/(3600*24) * advar0 
+                adState.params[self.name_var[name]] = (
+                    adState.params[self.name_var[name]]
+                    + nstep*self.dt/(3600*24) * ad_output
+                )
             
-            advar1[np.isnan(advar1)] = 0
             adState.setvar(advar1,self.name_var[name])
 
 
@@ -1185,6 +1221,12 @@ class Model_qg1l(M):
                          bathymetry_PV_term=self.bathymetry_PV_term,
                          formulation=config.MOD.formulation)
 
+        self.Wbc_device = jnp.asarray(self.Wbc, dtype=self.qgm.dtype)
+        self.zero_bc_device = jnp.zeros(
+            (self.ny, self.nx),
+            dtype=self.qgm.dtype,
+        )
+
         # Control parameters (mirrors Model_qgsw name_params contract)
         self.name_params = config.MOD.name_params if config.MOD.name_params is not None else []
         if 'c' in self.name_params:
@@ -1363,21 +1405,27 @@ class Model_qg1l(M):
                         self.forcing[_name_var_mod][t] = var_bc[_name_var_bc][i]
         
         self.bc_time = np.array(list(self.bc['SSH'].keys()))
-        self.bc_values = {t: np.array(self.bc['SSH'][t]) for t in self.bc['SSH']}
+        self.bc_values = {
+            t: jnp.asarray(self.bc['SSH'][t], dtype=self.qgm.dtype)
+            for t in self.bc['SSH']
+        }
         for name in self.name_var:
             if name in self.bc and len(self.bc[name].keys()) > 0:
-                self.bc_values[name] = np.array(list(self.bc[name].values()))
+                self.bc_values[name] = {
+                    t: jnp.asarray(value, dtype=self.qgm.dtype)
+                    for t, value in self.bc[name].items()
+                }
             else:
-                self.bc_values[name] = np.array(list(self.bc['SSH'].values()))
+                self.bc_values[name] = {
+                    t: self.bc_values[t] for t in self.bc['SSH']
+                }
             
     def _apply_bc(self,t0,t1):
-        
-        Xb = jnp.zeros((self.ny,self.nx,))
-        
+
         if 'SSH' not in self.bc:
-            return Xb
+            return self.zero_bc_device
         elif len(self.bc['SSH'].keys())==0:
-             return Xb
+            return self.zero_bc_device
         elif t0 not in self.bc_time:
             # Find closest time
             idx_closest = np.argmin(np.abs(self.bc_time-t0))
@@ -1389,22 +1437,32 @@ class Model_qg1l(M):
             Xb = Xb[np.newaxis,:,:]
             for name in self.name_var:
                 if name!='SSH' and name in self.bc and len(self.bc[name].keys())>0:
-                    if t1 in self.bc[name]: 
-                        Cb = self.bc[name][t1]
+                    device_bc = self.bc_values[name]
+                    if t1 in device_bc:
+                        Cb = device_bc[t1]
                     else:
-                        # Find closest time
-                        t_list = np.array(list(self.bc['SSH'].keys()))
+                        t_list = np.asarray(list(device_bc.keys()))
                         idx_closest = np.argmin(np.abs(t_list-t1))
                         new_t1 = t_list[idx_closest]
-                        Cb = self.bc[name][new_t1]
-                    Xb = np.append(Xb, Cb[np.newaxis,:,:], axis=0)     
+                        Cb = device_bc[new_t1]
+                    Xb = jnp.concatenate((Xb, Cb[jnp.newaxis,:,:]), axis=0)
         
         return Xb
     
-    def step(self,State,nstep=1,t=0):
+    def prepare_scan_boundary_conditions(self, times, nstep):
+        """Stack QG boundary fields for a device-side checkpoint scan."""
+        fields = []
+        for t in np.asarray(times):
+            t0 = t.item() if hasattr(t, 'item') else t
+            t1 = int(t0 + nstep * self.dt)
+            fields.append(self._apply_bc(t0, t1))
+        return jnp.stack(fields)
+
+    def step(self,State,nstep=1,t=0,Xb=None):
 
         # Boundary feld
-        Xb = self._apply_bc(t,int(t+nstep*self.dt))
+        if Xb is None:
+            Xb = self._apply_bc(t,int(t+nstep*self.dt))
 
         # c-anomaly: c_eff = prior scalar (fixed throughout 4DVar) + 2-D anomaly dc.
         # self.qgm.c is never modified here so the forward and adjoint sweeps
@@ -1413,7 +1471,10 @@ class Model_qg1l(M):
                  ) if 'c' in self.name_params else None
 
         # Get state variable(s)
-        X0 = State.getvar(name_var=self.name_var['SSH'])
+        X0 = jnp.asarray(
+            State.getvar(name_var=self.name_var['SSH']),
+            dtype=self.qgm.dtype,
+        )
         if self.advect_tracer:
             X0 = X0[np.newaxis,:,:]
             # Ageostrophic velocities
@@ -1425,7 +1486,10 @@ class Model_qg1l(M):
             # Tracers
             for name in self.name_var:
                 if name not in ['SSH', 'U', 'V']:
-                    C0 = State.getvar(name_var=self.name_var[name])[jnp.newaxis,:,:]
+                    C0 = jnp.asarray(
+                        State.getvar(name_var=self.name_var[name]),
+                        dtype=self.qgm.dtype,
+                    )[jnp.newaxis,:,:]
                     X0 = jnp.append(X0, C0, axis=0)
         
         # init
@@ -1448,19 +1512,20 @@ class Model_qg1l(M):
                         Fc = State.params[self.name_var[name]] # Forcing term for tracer or ageostrophic velocities
                         # Add Nudging to BC 
                         if self.forcing_tracer_from_bc:
-                            X1_i = X1_i + nstep*self.dt/(3600*24) * (1-self.Wbc)  * Fc * (Xb[i] - X0[i])
+                            X1_i = X1_i + nstep*self.dt/(3600*24) * (1-self.Wbc_device) * Fc * (Xb[i] - X0[i])
                         # Only forcing flux
                         else:
-                            X1_i = X1_i + nstep*self.dt/(3600*24) * (1-self.Wbc)  * Fc
+                            X1_i = X1_i + nstep*self.dt/(3600*24) * (1-self.Wbc_device) * Fc
                         State.setvar(X1_i, name_var=self.name_var[name])
             else:
                 X1 += nstep*self.dt/(3600*24) * Fssh
                 State.setvar(X1, name_var=self.name_var['SSH'])
     
-    def step_tgl(self,dState,State,nstep=1,t=0):
+    def step_tgl(self,dState,State,nstep=1,t=0,Xb=None):
 
         # Boundary field
-        Xb = self._apply_bc(t,int(t+nstep*self.dt))
+        if Xb is None:
+            Xb = self._apply_bc(t,int(t+nstep*self.dt))
 
         # c-anomaly: c_eff = prior scalar + 2-D anomaly dc
         c_eff = (self.qgm.c + State.params['c'].astype(self.qgm.dtype)
@@ -1530,18 +1595,25 @@ class Model_qg1l(M):
                 dX1 += nstep*self.dt/(3600*24) * dFssh  
                 dState.setvar(dX1, name_var=self.name_var['SSH'])
 
-    def step_adj(self,adState,State,nstep=1,t=0):
+    def step_adj(self,adState,State,nstep=1,t=0,Xb=None):
 
         # Boundary field
-        Xb = self._apply_bc(t,int(t+nstep*self.dt))
+        if Xb is None:
+            Xb = self._apply_bc(t,int(t+nstep*self.dt))
 
         # c-anomaly: c_eff = prior scalar + 2-D anomaly dc
         c_eff = (self.qgm.c + State.params['c'].astype(self.qgm.dtype)
                  ) if 'c' in self.name_params else None
 
         # Get state variable
-        adSSH0 = adState.getvar(name_var=self.name_var['SSH'])#.astype('float64')
-        SSH0 = State.getvar(name_var=self.name_var['SSH'])#.astype('float64')
+        adSSH0 = jnp.asarray(
+            adState.getvar(name_var=self.name_var['SSH']),
+            dtype=self.qgm.dtype,
+        )
+        SSH0 = jnp.asarray(
+            State.getvar(name_var=self.name_var['SSH']),
+            dtype=self.qgm.dtype,
+        )
         if self.advect_tracer:
             adX0 = adSSH0[jnp.newaxis,:,:]
             X0 = SSH0[jnp.newaxis,:,:]
@@ -1558,9 +1630,15 @@ class Model_qg1l(M):
             # Tracers
             for name in self.name_var:
                 if name not in ['SSH', 'U', 'V']:
-                    adC0 = adState.getvar(name_var=self.name_var[name])[jnp.newaxis,:,:]
+                    adC0 = jnp.asarray(
+                        adState.getvar(name_var=self.name_var[name]),
+                        dtype=self.qgm.dtype,
+                    )[jnp.newaxis,:,:]
                     adX0 = jnp.append(adX0, adC0, axis=0)
-                    C0 = State.getvar(name_var=self.name_var[name])[jnp.newaxis,:,:]
+                    C0 = jnp.asarray(
+                        State.getvar(name_var=self.name_var[name]),
+                        dtype=self.qgm.dtype,
+                    )[jnp.newaxis,:,:]
                     X0 = jnp.append(X0, C0, axis=0)
         else:
             adX0 = adSSH0
@@ -1578,7 +1656,7 @@ class Model_qg1l(M):
                 lambda X, c: self.qgm.step_jit(X, Xb, nstep=nstep, c=c),
                 X1, c_eff)
             adX1, adc = vjp_fun(adX0)
-            adState.params['c'] = adState.params['c'] + np.array(adc)
+            adState.params['c'] = adState.params['c'] + adc
         else:
             adX1 = self.qgm_step_adj(adX0, X1, Xb, nstep=nstep)
 
@@ -1588,12 +1666,17 @@ class Model_qg1l(M):
                 adparams = nstep*self.dt/(3600*24) *\
                     adState.getvar(name_var=self.name_var[name])#.astype('float64') 
                 if name!='SSH':
-                    adparams *= (1-self.Wbc)
+                    adparams *= (1-self.Wbc_device)
                     if self.forcing_tracer_from_bc:
                         Fc = State.params[self.name_var[name]] 
                         adparams *=  (Xb[i] - X0[i])
-                        adX1[i] += -nstep*self.dt/(3600*24) * (1-self.Wbc) * Fc * adX0[i]
-                adState.params[self.name_var[name]] += adparams  
+                        adX1 = adX1.at[i].add(
+                            -nstep*self.dt/(3600*24)
+                            * (1-self.Wbc_device) * Fc * adX0[i]
+                        )
+                adState.params[self.name_var[name]] = (
+                    adState.params[self.name_var[name]] + adparams
+                )
                 
         if self.advect_tracer:
             adState.setvar(adX1[0],self.name_var['SSH'])
@@ -2275,7 +2358,7 @@ class Model_csw1l(_ITOpenBoundaryExtensionMixin, M):
 
     def _compute_bm_fields(self, path_bm, name_var_bm, State):
 
-        dsbm = xr.open_mfdataset(path_bm, chunks=None)
+        dsbm = xr.open_mfdataset(path_bm, chunks=-1)
         name_lon_bm = name_var_bm['lon']
         name_lat_bm = name_var_bm['lat']
 
@@ -3639,7 +3722,7 @@ class Model_qgsw(M):
                      {'lon': 'longitude', 'lat': 'latitude', 'time': 'time',
                       'u10': 'u10', 'v10': 'v10'})
 
-        ds = xr.open_mfdataset(path_wind)
+        ds = xr.open_mfdataset(path_wind, chunks=-1)
 
         # --- longitude convention ---
         lon_vals = ds[nv['lon']].values
@@ -3917,6 +4000,86 @@ class Model_qgsw(M):
             c_b_list.append(jnp.asarray(cb_i, dtype=self.dtype))
         return jnp.stack(c_b_list, axis=0)  # (n_trac, ny, nx)
     
+    def prepare_scan_boundary_conditions(self, times, nstep):
+        """Pre-stack QGSW forcing for each checkpoint and internal chunk."""
+        chunk_specs = []
+        step_done = 0
+        while step_done < nstep:
+            n_chunk = (
+                min(nstep - step_done, self.max_nstep)
+                if self.max_nstep > 0
+                else nstep - step_done
+            )
+            chunk_specs.append((step_done, n_chunk))
+            step_done += n_chunk
+
+        intervals = []
+        for interval_time in np.asarray(times):
+            t0 = interval_time.item() if hasattr(interval_time, 'item') else interval_time
+            chunks = []
+            for step_offset, n_chunk in chunk_specs:
+                t_chunk = t0 + step_offset * self.dt
+                t_end = t_chunk + n_chunk * self.dt
+                u_b, v_b, h_b = self._apply_bc(t_chunk, t_end)
+                c_b = (
+                    self._apply_bc_tracer(t_chunk, t_end)
+                    if self.advect_tracer
+                    else jnp.zeros((0, self.ny, self.nx), dtype=self.dtype)
+                )
+                taux, tauy = self._get_wind_stress(t_chunk)
+                if taux is None:
+                    constant_taux = jnp.asarray(
+                        getattr(self.model, 'taux', 0.0),
+                        dtype=self.dtype,
+                    )
+                    taux = jnp.zeros(
+                        (self.ny, self.nx + 1), dtype=self.dtype
+                    )
+                    if constant_taux.ndim == 0:
+                        taux = jnp.full_like(taux, constant_taux)
+                    else:
+                        taux = taux.at[:, 1:-1].set(constant_taux.T)
+                if tauy is None:
+                    constant_tauy = jnp.asarray(
+                        getattr(self.model, 'tauy', 0.0),
+                        dtype=self.dtype,
+                    )
+                    tauy = jnp.zeros(
+                        (self.ny + 1, self.nx), dtype=self.dtype
+                    )
+                    if constant_tauy.ndim == 0:
+                        tauy = jnp.full_like(tauy, constant_tauy)
+                    else:
+                        tauy = tauy.at[1:-1, :].set(constant_tauy.T)
+                chunks.append(tuple(
+                    jnp.asarray(value, dtype=self.dtype)
+                    for value in (u_b, v_b, h_b, c_b, taux, tauy)
+                ))
+            intervals.append(tuple(
+                jnp.stack(values, axis=0)
+                for values in zip(*chunks)
+            ))
+
+        return tuple(
+            jnp.stack(values, axis=0)
+            for values in zip(*intervals)
+        )
+
+    def _chunk_forcing(self, forcing, chunk_index, t_chunk, n_chunk):
+        """Select pre-stacked scan forcing or use the historical lookup."""
+        if forcing is not None:
+            return tuple(value[chunk_index] for value in forcing)
+
+        t_end = t_chunk + n_chunk * self.dt
+        u_b, v_b, h_b = self._apply_bc(t_chunk, t_end)
+        c_b = (
+            self._apply_bc_tracer(t_chunk, t_end)
+            if self.advect_tracer
+            else None
+        )
+        taux, tauy = self._get_wind_stress(t_chunk)
+        return u_b, v_b, h_b, c_b, taux, tauy
+
     def ssh2uv(self, ssh):
         """Geostrophic SSH → (u, v) model."""
         if self._is_qg_class:
@@ -4375,7 +4538,7 @@ class Model_qgsw(M):
                 adh_wind, adwind_strength,
                 adu_b, adv_b, adh_b, adc_b)
 
-    def step(self,State,nstep=1,t=0):
+    def step(self,State,nstep=1,t=0,Xb=None):
 
         if self.nl > 1:
             # Read per-layer state and convert to SW convention (1, nl, nx, ny)
@@ -4434,14 +4597,15 @@ class Model_qgsw(M):
         while step_done < nstep:
             n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
             t_chunk = t + step_done * self.dt
-            u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            u_b, v_b, h_b, c_b, taux, tauy = self._chunk_forcing(
+                Xb, step_done // self.max_nstep if self.max_nstep > 0 else 0,
+                t_chunk, n_chunk,
+            )
             if bc_du is not None:
                 u_b = u_b + bc_du
                 v_b = v_b + bc_dv
                 h_b = h_b + bc_dh
-            taux, tauy = self._get_wind_stress(t_chunk)
             if self.advect_tracer:
-                c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
                 u, v, h, c = self.jstep_core_trac_jit(
                     t_chunk, u, v, h, c, H, Fu, Fv, Fh, Fc,
                     u_b, v_b, h_b, c_b,
@@ -4476,7 +4640,7 @@ class Model_qgsw(M):
 
         self._set_land_nan(State)
 
-    def step_tgl(self,dState,State,nstep=1,t=0):
+    def step_tgl(self,dState,State,nstep=1,t=0,Xb=None):
 
         if self.nl > 1:
             # Per-layer perturbation
@@ -4562,14 +4726,15 @@ class Model_qgsw(M):
         while step_done < nstep:
             n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
             t_chunk = t + step_done * self.dt
-            u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            u_b, v_b, h_b, c_b, taux, tauy = self._chunk_forcing(
+                Xb, step_done // self.max_nstep if self.max_nstep > 0 else 0,
+                t_chunk, n_chunk,
+            )
             if bc_du is not None:
                 u_b = u_b + bc_du
                 v_b = v_b + bc_dv
                 h_b = h_b + bc_dh
-            taux, tauy = self._get_wind_stress(t_chunk)
             if self.advect_tracer:
-                c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
                 # Propagate tangent (JVP includes forward internally)
                 du, dv, dh, dc = self.jstep_tgl_trac_jit(
                     t_chunk, du, dv, dh, dc, dH, dFu, dFv, dFh, dFc,
@@ -4622,7 +4787,7 @@ class Model_qgsw(M):
             for i, name in enumerate(self.tracer_names):
                 dState.setvar(dc[i], name_var=self.name_var[name])
 
-    def step_adj(self,adState,State,nstep=1,t=0):
+    def step_adj(self,adState,State,nstep=1,t=0,Xb=None):
 
         if self.nl > 1:
             # --- Combine surface adjoint (from obs) with per-layer adjoint ---
@@ -4747,15 +4912,15 @@ class Model_qgsw(M):
             u_fwd, v_fwd, h_fwd = u, v, h
             if self.advect_tracer:
                 c_fwd = c
-            for t_chunk, n_chunk in chunks[:-1]:
-                u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            for chunk_index, (t_chunk, n_chunk) in enumerate(chunks[:-1]):
+                u_b, v_b, h_b, c_b, taux, tauy = self._chunk_forcing(
+                    Xb, chunk_index, t_chunk, n_chunk,
+                )
                 if bc_du is not None:
                     u_b = u_b + bc_du
                     v_b = v_b + bc_dv
                     h_b = h_b + bc_dh
-                taux, tauy = self._get_wind_stress(t_chunk)
                 if self.advect_tracer:
-                    c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
                     u_fwd, v_fwd, h_fwd, c_fwd = self.jstep_core_trac_jit(
                         t_chunk, u_fwd, v_fwd, h_fwd, c_fwd, H, Fu, Fv, Fh, Fc,
                         u_b, v_b, h_b, c_b,
@@ -4771,15 +4936,15 @@ class Model_qgsw(M):
         # Reverse adjoint through chunks
         for i in range(len(chunks) - 1, -1, -1):
             t_chunk, n_chunk = chunks[i]
-            u_b, v_b, h_b = self._apply_bc(t_chunk, int(t_chunk + n_chunk * self.dt))
+            u_b, v_b, h_b, c_b, taux, tauy = self._chunk_forcing(
+                Xb, i, t_chunk, n_chunk,
+            )
             if bc_du is not None:
                 u_b = u_b + bc_du
                 v_b = v_b + bc_dv
                 h_b = h_b + bc_dh
-            taux, tauy = self._get_wind_stress(t_chunk)
             if self.advect_tracer:
                 u_i, v_i, h_i, c_i = fwd_states[i]
-                c_b = self._apply_bc_tracer(t_chunk, int(t_chunk + n_chunk * self.dt))
                 (adu, adv, adh, adc,
                  adH, adFu, adFv, adFh, adFc,
                  adh_wind, adwind_strength,
@@ -6782,7 +6947,29 @@ class Model_multi:
         
         State.save_output(present_date,name_var=self.var_to_save)
 
-    def step(self,State,nstep=1,t=None):
+    def prepare_scan_boundary_conditions(self, times, nstep):
+        """Prepare one scan-forcing pytree entry per component model.
+
+        Models without device-side forcing preparation keep a static ``None``
+        leaf. Models such as QG and QGSW receive their own effective number
+        of time steps, matching the conversion performed by ``step``.
+        """
+        forcing = []
+        for M in self.Models:
+            _nstep = nstep * self.dt // M.dt
+            prepare = getattr(M, 'prepare_scan_boundary_conditions', None)
+            forcing.append(
+                prepare(times, _nstep) if prepare is not None else None
+            )
+        return tuple(forcing)
+
+    @staticmethod
+    def _component_boundary(boundary_conditions, model_index):
+        if boundary_conditions is None:
+            return None
+        return boundary_conditions[model_index]
+
+    def step(self,State,nstep=1,t=None,Xb=None):
 
         # Intialization
         var_tot_tmp = {}
@@ -6790,10 +6977,19 @@ class Model_multi:
             var_tot_tmp[name] = jnp.zeros_like(State.var[self.name_var[name]]) 
         
         # Loop over models
-        for M in self.Models:
+        for model_index, M in enumerate(self.Models):
             _nstep = nstep*self.dt//M.dt
+            component_boundary = self._component_boundary(Xb, model_index)
             # Forward propagation
-            M.step(State,nstep=_nstep,t=t)
+            if component_boundary is None:
+                M.step(State,nstep=_nstep,t=t)
+            else:
+                M.step(
+                    State,
+                    nstep=_nstep,
+                    t=t,
+                    Xb=component_boundary,
+                )
             # Add to total variables
             for name in self.name_var:
                 if name in M.name_var and (name in self.name_var_tot):
@@ -6803,7 +6999,7 @@ class Model_multi:
         for name in self.name_var_tot:
             State.var[self.name_var_tot[name]] = var_tot_tmp[name]
 
-    def step_tgl(self,dState,State,nstep=1,t=None):
+    def step_tgl(self,dState,State,nstep=1,t=None,Xb=None):
 
         # Intialization
         var_tot_tmp = {}
@@ -6811,10 +7007,20 @@ class Model_multi:
             var_tot_tmp[name] = np.zeros_like(State.var[self.name_var[name]]) 
 
         # Loop over models
-        for M in self.Models:
+        for model_index, M in enumerate(self.Models):
             _nstep = nstep*self.dt//M.dt
+            component_boundary = self._component_boundary(Xb, model_index)
             # Tangent propagation
-            M.step_tgl(dState,State,nstep=_nstep,t=t)
+            if component_boundary is None:
+                M.step_tgl(dState,State,nstep=_nstep,t=t)
+            else:
+                M.step_tgl(
+                    dState,
+                    State,
+                    nstep=_nstep,
+                    t=t,
+                    Xb=component_boundary,
+                )
             # Add to total variables
             for name in self.name_var:
                 if name in M.name_var and name in var_tot_tmp:
@@ -6824,7 +7030,7 @@ class Model_multi:
         for name in self.name_var_tot:
             dState.var[self.name_var_tot[name]] = var_tot_tmp[name]
 
-    def step_adj(self,adState,State,nstep=1,t=None):
+    def step_adj(self,adState,State,nstep=1,t=None,Xb=None):
 
         # Intialization
         var_tot_tmp = {}
@@ -6832,14 +7038,24 @@ class Model_multi:
             var_tot_tmp[name] = adState.var[self.name_var_tot[name]]
         
         # Loop over models
-        for M in self.Models:
+        for model_index, M in enumerate(self.Models):
             _nstep = nstep*self.dt//M.dt
+            component_boundary = self._component_boundary(Xb, model_index)
             # Add to local variable
             for name in self.name_var:
                 if name in M.name_var and name in self.name_var_tot:
                     adState.var[M.name_var[name]] += var_tot_tmp[name]  
             # Adjoint propagation
-            M.step_adj(adState,State,nstep=_nstep,t=t)
+            if component_boundary is None:
+                M.step_adj(adState,State,nstep=_nstep,t=t)
+            else:
+                M.step_adj(
+                    adState,
+                    State,
+                    nstep=_nstep,
+                    t=t,
+                    Xb=component_boundary,
+                )
         
         for name in self.name_var_tot:
             adState.var[self.name_var_tot[name]] *= 0 
