@@ -508,6 +508,17 @@ class Obsop_interp_l3(Obsop_interp):
             self.indices_arr = jnp.array(self.indices_arr, dtype=int)
             self.varobs_arr = jnp.array(self.varobs_arr)
             self.errobs_arr = jnp.array(self.errobs_arr)
+        else:
+            # Observation-free tiles are valid in tiled experiments (for
+            # example over polar regions). Keep the scan interface defined
+            # with zero-length, fixed-rank arrays; the misfit is never called
+            # for these tiles because t_obs_jax is empty.
+            self.n_data = jnp.zeros((0,), dtype=int)
+            self.n_obs = jnp.zeros((0,), dtype=int)
+            self.data_arr = jnp.zeros((0, 0))
+            self.indices_arr = jnp.zeros((0, 2, 0), dtype=int)
+            self.varobs_arr = jnp.zeros((0, 0))
+            self.errobs_arr = jnp.zeros((0, 0))
         
     def is_obs_time(self,t):
         """Check if t is in observation times."""
@@ -581,11 +592,17 @@ class Obsop_interp_l3(Obsop_interp):
 
     def scan_misfit(self, t, State_var):
         """Return a fixed-size, zero-masked L3 misfit for every checkpoint."""
+        if self.varobs_arr.shape[0] == 0:
+            # Observation-free tiles still execute the forecast scan, but
+            # have no observation cost contribution.
+            return jnp.zeros((0,), dtype=jnp.asarray(t).dtype)
         raw = self.misfit_jax(t, State_var)
         return jnp.where(self.is_obs_time_jax(t), raw, jnp.zeros_like(raw))
 
     def scan_adj(self, t, adState_var, State_var, misfit):
         """Pure-pytree L3 adjoint used inside ``lax.scan``."""
+        if self.varobs_arr.shape[0] == 0:
+            return adState_var
         name = self.name_mod_var[self.name_var]
         var = State_var[name]
         adX = self._misfit_reduced_jit(t, misfit, var.ravel())
