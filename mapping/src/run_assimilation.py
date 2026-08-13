@@ -1583,7 +1583,21 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
             else:
                 continue
 
-            dsout.to_netcdf(_build_output_path(date))
-            dsout.close()
+            output_path = _build_output_path(date)
+            # Write beside the destination and publish atomically. A direct
+            # to_netcdf(output_path) can leave a truncated HDF5 file when a
+            # merge job is interrupted or a reader opens it mid-write.
+            temporary_path = f'{output_path}.tmp-{os.getpid()}'
+            try:
+                dsout.to_netcdf(temporary_path, mode='w')
+                dsout.close()
+                os.replace(temporary_path, output_path)
+            except Exception:
+                try:
+                    dsout.close()
+                finally:
+                    if os.path.exists(temporary_path):
+                        os.remove(temporary_path)
+                raise
         except Exception as e:
             print(f'[merge_time_windows_outputs] WARNING: failed for {date}: {e}', flush=True)

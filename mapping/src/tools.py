@@ -124,10 +124,32 @@ def interp2d(ds,name_vars,lon_out,lat_out):
     if ds[name_vars['var']].shape[0]!=ds[name_vars['lat']].shape[0]:
         ds[name_vars['var']] = ds[name_vars['var']].transpose()
 
-    if len(ds[name_vars['lon']].shape)==2:
-        dlon = (ds[name_vars['lon']][:,1:].values - ds[name_vars['lon']][:,:-1].values).max()
-        dlat = (ds[name_vars['lat']][1:,:].values - ds[name_vars['lat']][:-1,:].values).max()
+    lon_full = np.asarray(ds[name_vars['lon']].values)
+    lat_full = np.asarray(ds[name_vars['lat']].values)
+    var_full = np.asarray(ds[name_vars['var']].values)
 
+    def _nearest_finite(lon_values, lat_values, values):
+        finite = (np.isfinite(lon_values.ravel())
+                  & np.isfinite(lat_values.ravel())
+                  & np.isfinite(values.ravel()))
+        if not np.any(finite):
+            raise ValueError(f"No finite values in {name_vars['var']!r}")
+        points = np.column_stack((lon_values.ravel()[finite],
+                                  lat_values.ravel()[finite]))
+        tree = spatial.cKDTree(points)
+        query = np.column_stack((np.asarray(lon_out).ravel(),
+                                 np.asarray(lat_out).ravel()))
+        _, nearest = tree.query(query, k=1)
+        return values.ravel()[finite][nearest].reshape(np.asarray(lat_out).shape)
+
+    if lon_full.ndim == 2:
+        dlon = np.nanmax(np.abs(np.diff(lon_full, axis=1)))
+        dlat = np.nanmax(np.abs(np.diff(lat_full, axis=0)))
+    else:
+        dlon = np.nanmax(np.abs(np.diff(lon_full)))
+        dlat = np.nanmax(np.abs(np.diff(lat_full)))
+
+    if len(ds[name_vars['lon']].shape)==2:
         ds = ds.where((ds[name_vars['lon']]<=lon_out.max()+dlon) &\
                       (ds[name_vars['lon']]>=lon_out.min()-dlon) &\
                       (ds[name_vars['lat']]<=lat_out.max()+dlat) &\
@@ -137,8 +159,6 @@ def interp2d(ds,name_vars,lon_out,lat_out):
         lat_sel = ds[name_vars['lat']].values
 
     else:
-        dlon = (ds[name_vars['lon']][1:].values - ds[name_vars['lon']][:-1].values).max()
-        dlat = (ds[name_vars['lat']][1:].values - ds[name_vars['lat']][:-1].values).max()
 
         ds = ds.where((ds[name_vars['lon']]<=lon_out.max()+dlon) &\
                       (ds[name_vars['lon']]>=lon_out.min()-dlon) &\
@@ -151,9 +171,25 @@ def interp2d(ds,name_vars,lon_out,lat_out):
 
     var_sel = ds[name_vars['var']].values
 
-    var_out = interpolate.griddata((lon_sel.ravel(),lat_sel.ravel()),
-                   var_sel.ravel(),
-                   (lon_out.ravel(),lat_out.ravel())).reshape((lat_out.shape))
+    finite_selected = (np.isfinite(lon_sel.ravel())
+                       & np.isfinite(lat_sel.ravel())
+                       & np.isfinite(var_sel.ravel()))
+    if np.count_nonzero(finite_selected) < 3:
+        return _nearest_finite(lon_full, lat_full, var_full)
+
+    try:
+        var_out = interpolate.griddata(
+            (lon_sel.ravel()[finite_selected], lat_sel.ravel()[finite_selected]),
+            var_sel.ravel()[finite_selected],
+            (lon_out.ravel(), lat_out.ravel()),
+        ).reshape(lat_out.shape)
+    except (ValueError, RuntimeError):
+        return _nearest_finite(lon_full, lat_full, var_full)
+
+    invalid = ~np.isfinite(var_out)
+    if np.any(invalid):
+        nearest = _nearest_finite(lon_full, lat_full, var_full)
+        var_out[invalid] = nearest[invalid]
 
     return var_out
 
