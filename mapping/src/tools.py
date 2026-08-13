@@ -127,6 +127,9 @@ def interp2d(ds,name_vars,lon_out,lat_out):
     lon_full = np.asarray(ds[name_vars['lon']].values)
     lat_full = np.asarray(ds[name_vars['lat']].values)
     var_full = np.asarray(ds[name_vars['var']].values)
+    if lon_full.ndim == 1 and lat_full.ndim == 1 and var_full.ndim >= 2:
+        # Rectilinear auxiliary grids store 1-D axes and a 2-D field.
+        lon_full, lat_full = np.meshgrid(lon_full, lat_full)
 
     def _nearest_finite(lon_values, lat_values, values):
         finite = (np.isfinite(lon_values.ravel())
