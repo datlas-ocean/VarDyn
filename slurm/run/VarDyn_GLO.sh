@@ -225,10 +225,41 @@ echo " Memory: $(ulimit -v 2>/dev/null || echo N/A)"
 echo "=========================================="
 
 # -------------------- PREPARE SUBWINDOWS (task 0 only) --------------------
+# Pickles alone are not sufficient for a continuation: scratch directories
+# may have been deleted between jobs. Validate every tile config before
+# honoring --skip-prepare.
+preparation_state_is_complete() {
+    [ -f "$CONFIG_PATH" ] || return 1
+    python3 - "$BASE_DIR" <<'PY_CHECK'
+import pickle
+import sys
+from pathlib import Path
+
+base = Path(sys.argv[1])
+tile_configs = [p for p in base.glob('subwindow_*/subwindow_*/config.pkl')]
+if not tile_configs:
+    raise SystemExit(1)
+for path in tile_configs:
+    try:
+        with path.open('rb') as stream:
+            config = pickle.load(stream)
+        scratch = Path(config.EXP.tmp_DA_path)
+    except Exception:
+        raise SystemExit(1)
+    if not scratch.is_dir():
+        print(f"missing tile scratch directory: {scratch}", file=sys.stderr)
+        raise SystemExit(1)
+raise SystemExit(0)
+PY_CHECK
+}
+
 if [ $ARRAY_ID -eq 0 ]; then
-    if [ -f "$CONFIG_PATH" ] && $SKIP_PREPARE; then
-        echo "$(date '+%F %T') | Skipping preparation (--skip-prepare, pickles exist)"
+    if $SKIP_PREPARE && preparation_state_is_complete; then
+        echo "$(date '+%F %T') | Skipping preparation (--skip-prepare, pickles and tile scratch directories exist)"
     else
+        if $SKIP_PREPARE; then
+            echo "$(date '+%F %T') | --skip-prepare requested, but tile scratch state is incomplete; preparing again"
+        fi
         echo "$(date '+%F %T') | Preparing subwindows and saving pickles"
         MPLBACKEND=Agg python -u "${SRC_DIR}/prepare_VarDyn.py" "$PATH_CONFIG" "$PATH_CONFIG_EQ" $PREPARE_ARGS
         if [ $? -ne 0 ]; then

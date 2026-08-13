@@ -22,6 +22,32 @@ from .tools import detrendn, read_auxdata
 from .exp import Config
 
 
+def _atomic_to_netcdf(dataset, path, **kwargs):
+    """Write a NetCDF cache beside its destination, then publish atomically."""
+    temporary_path = f"{path}.tmp-{os.getpid()}"
+    try:
+        dataset.to_netcdf(temporary_path, mode='w', **kwargs)
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            dataset.close()
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+
+
+def _atomic_write_text(path, text):
+    """Atomically write a small cache metadata file."""
+    temporary_path = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(temporary_path, 'w') as stream:
+            stream.write(text)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
 # Date patterns recognized in obs file names, in order of preference.
 # Each entry is (regex, "fmt") with named groups y, m, d (d optional).
 _FILENAME_DATE_PATTERNS = [
@@ -463,8 +489,10 @@ def Obs(config, State, obs_datasets=None, *args, **kwargs):
         if not os.path.exists(path_save_obs):
             os.makedirs(path_save_obs)
         new_dict_obs = _new_dict_obs(dict_obs,path_save_obs)
-        with open(os.path.join(path_save_obs,name_dict_obs), 'w') as f:
-            f.write(str(new_dict_obs))
+        _atomic_write_text(
+            os.path.join(path_save_obs, name_dict_obs),
+            str(new_dict_obs),
+        )
             
     return dict_obs
 
@@ -627,10 +655,13 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
                 elif obs_attr.substract_mdt:
                     path += '_submdt'
             path += '.nc'
-            dsout.to_netcdf(path, encoding={obs_attr.name_time: {'_FillValue': None},
-                                            obs_attr.name_lon: {'_FillValue': None, 'dtype': 'float32'},
-                                            obs_attr.name_lat: {'_FillValue': None, 'dtype': 'float32'}})
-            dsout.close()
+            _atomic_to_netcdf(
+                dsout,
+                path,
+                encoding={obs_attr.name_time: {'_FillValue': None},
+                          obs_attr.name_lon: {'_FillValue': None, 'dtype': 'float32'},
+                          obs_attr.name_lat: {'_FillValue': None, 'dtype': 'float32'}},
+            )
             _ds.close()
             del dsout,_ds
             
@@ -726,9 +757,12 @@ def _obs_l4(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, ou
             
             date = dt_curr.strftime('%Y%m%d_%Hh%M')
             path = f"{out_path}/{out_name}_{obs_name}_{'_'.join(obs_attr.name_var)}_{date}.nc"
-            dsout.to_netcdf(path, encoding={obs_attr.name_lon: {'_FillValue': None},
-                                            obs_attr.name_lat: {'_FillValue': None}})
-            dsout.close()
+            _atomic_to_netcdf(
+                dsout,
+                path,
+                encoding={obs_attr.name_lon: {'_FillValue': None},
+                          obs_attr.name_lat: {'_FillValue': None}},
+            )
             _ds.close()
             del dsout,_ds
             # Add the path of the new nc file in the dictionnary
