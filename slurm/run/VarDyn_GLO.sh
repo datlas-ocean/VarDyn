@@ -12,7 +12,8 @@
 #SBATCH --qos=gpu_max
 #SBATCH --partition=gpu_std
 #SBATCH --time=48:00:00
-#SBATCH --mem=80G
+#SBATCH --signal=B:TERM@300
+#SBATCH --mem=120G
 #SBATCH --account=swot_duacs
 #SBATCH --export=none
 
@@ -25,52 +26,46 @@ NUM_ARRAY=${SLURM_ARRAY_TASK_COUNT:-$NUM_GPUS}
 # Use SLURM_ARRAY_JOB_ID (common to all array tasks), fall back to SLURM_JOB_ID
 JOB_ID=${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-$$}}
 
-# -------------------- USER SETTINGS (edit for each experiment) --------------------
-MASH_DIR=""          # REQUIRED: absolute path to the MASSH repo root (e.g. /work/scratch/data/leguilf/MASSH)
-DIR_SAVE_PICKLE=""   # REQUIRED: root directory for all pickle/output files
+# -------------------- EXPERIMENT CONFIGURATION --------------------
+# Keep experiment-specific settings in a separate, reproducible shell config.
+# Submit with: sbatch slurm/run/VarDyn_GLO.sh --config path/to/config.sh
+CONFIG_FILE="${VAR_DYN_CONFIG:-}"
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+    case "${args[$i]}" in
+        --config)    i=$(( i + 1 )); CONFIG_FILE="${args[$i]}" ;;
+        --config=*)  CONFIG_FILE="${args[$i]#--config=}" ;;
+    esac
+    i=$(( i + 1 ))
+done
 
-PATH_CONFIG=""          # REQUIRED: path to main MASSH config .py
-PATH_CONFIG_EQ=""       # REQUIRED: path to equatorial MASSH config .py
-INIT_DATE=""            # REQUIRED: start date YYYY-MM-DD
-FINAL_DATE=""           # REQUIRED: end date YYYY-MM-DD
+if [ -z "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: provide an experiment config with --config CONFIG_FILE" >&2
+    exit 1
+fi
+CONFIG_FILE="$(cd "$(dirname "$CONFIG_FILE")" && pwd)/$(basename "$CONFIG_FILE")"
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
 
-NAME_VAR="sla,SSH_tot"
+# Paths in the experiment config are resolved relative to that config file,
+# making submissions independent of the directory from which sbatch is run.
+if [[ "$PATH_CONFIG" != /* ]]; then
+    PATH_CONFIG="$(dirname "$CONFIG_FILE")/$PATH_CONFIG"
+fi
+if [[ "$PATH_CONFIG_EQ" != /* ]]; then
+    PATH_CONFIG_EQ="$(dirname "$CONFIG_FILE")/$PATH_CONFIG_EQ"
+fi
 
-# Spatial subwindow grid
-GRID_TYPE="GRID_CAR"
-GRID_TYPE_EQ="GRID_GEO"
-NX_PROC=512
-NY_PROC=128
-NX_PROC_EQ=512
-NY_PROC_EQ=256
-DX=10
-DY=10
-
-# Spatial subwindow size and overlap (degrees)
-SPACE_WIN_X=50
-SPACE_WIN_Y=12.5
-SPACE_WIN_X_EQ=50
-SPACE_WIN_Y_EQ=25
-SPACE_OVERLAP_X=2.5
-SPACE_OVERLAP_Y=2.5
-
-# Temporal subwindow size and overlap (days)
-TIME_WIN=50
-TIME_OVERLAP=10
-
-# Misc
-FLAG_INIT_FROM_PREVIOUS="--flag_init_from_previous"
-
-# Barrier timeout (seconds): how long to wait for all GPUs at each time-window
-# barrier before proceeding. Must be longer than the slowest tile in any window.
-# For global runs with O(100) tiles per GPU, 2-4 h is a safe value.
-BARRIER_TIMEOUT=7200   # 2 hours
-
-# Init / background from a previous experiment (written into tile config pickles)
-FLAG_INIT=false        # initialize control vectors from NAME_EXP/Xres.nc
-FLAG_BACKGROUND=false  # use background field from NAME_EXP_BACKGROUND/Xres.nc
-NAME_EXP=""            # name of the previous experiment used for initialization
-NAME_EXP_BACKGROUND="" # name of the previous experiment used for background; falls back to NAME_EXP
+# These defaults are orchestration settings and can be overridden by the
+# external config without changing the reusable launcher.
+NUM_MERGE_WORKERS="${NUM_MERGE_WORKERS:-4}"
+NUM_TILES_PER_GPU="${NUM_TILES_PER_GPU:-4}"
+BARRIER_TIMEOUT="${BARRIER_TIMEOUT:-7200}"
+FLAG_INIT_FROM_PREVIOUS="${FLAG_INIT_FROM_PREVIOUS:---flag_init_from_previous}"
+FLAG_INIT="${FLAG_INIT:-false}"
+FLAG_BACKGROUND="${FLAG_BACKGROUND:-false}"
+NAME_EXP="${NAME_EXP:-}"
 
 # -------------------- USER INPUT (optional CLI flags) --------------------
 # Parse optional flags
@@ -84,6 +79,8 @@ args=("$@")
 i=0
 while [ $i -lt ${#args[@]} ]; do
     case "${args[$i]}" in
+        --config)       i=$(( i + 1 )) ;;
+        --config=*)     ;;
         --skip-prepare)  SKIP_PREPARE=true ;;
         --restart)       RESTART_ARGS="--restart" ;;
         --force-merge)   FORCE_MERGE=true ;;
@@ -128,6 +125,35 @@ print(m.group(1) if m else '')
 fi
 BASE_DIR="${DIR_SAVE_PICKLE}/${EXP_NAME}"
 CONFIG_PATH="${BASE_DIR}/config.pkl"
+
+# -------------------- TIME-LIMIT CONTINUATION --------------------
+# Slurm sends TERM 300 seconds before the wall-time limit. Array task 0
+# submits a dependent continuation array; completed tiles and merges are
+# skipped through their existing completion markers.
+CONTINUATION_SCRIPT="${MASH_DIR}/slurm/run/VarDyn_GLO.sh"
+FINAL_MARKER="${BASE_DIR}/experiment_complete.ok"
+CONTINUATION_SUBMITTED=false
+
+submit_continuation() {
+    [ "${ARRAY_ID}" -ne 0 ] && return 0
+    [ -f "${FINAL_MARKER}" ] && return 0
+    [ "${CONTINUATION_SUBMITTED}" = true ] && return 0
+    CONTINUATION_SUBMITTED=true
+
+    local dependency="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"
+    local next_job
+    local continuation_args=(--config "${CONFIG_FILE}" --skip-prepare)
+    [ -n "${NAME_EXP_OVERRIDE}" ] && continuation_args+=(--name_exp "${NAME_EXP_OVERRIDE}")
+    if next_job=$(sbatch --parsable \
+        --dependency="afterany:${dependency}" \
+        "${CONTINUATION_SCRIPT}" "${continuation_args[@]}"); then
+        echo "$(date '+%F %T') | Submitted continuation array ${next_job}"
+    else
+        echo "$(date '+%F %T') | ERROR: failed to submit continuation array" >&2
+    fi
+}
+
+trap 'submit_continuation; exit 0' TERM
 
 INIT_BG_ARGS=""
 $FLAG_INIT       && INIT_BG_ARGS+=" --flag_init"
@@ -362,14 +388,22 @@ done
 # Final: merge all time windows (task 0 only)
 if [ $ARRAY_ID -eq 0 ]; then
     echo "$(date '+%F %T') | Merging all time windows"
-    python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+    if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
         --dir_save_pickle "$DIR_SAVE_PICKLE" \
         --name_var_save "$NAME_VAR" \
         --num_workers "$NUM_MERGE_WORKERS" \
         --skip_spatial_merge \
         --merge_time_windows \
-        $FORCE_MERGE_ARG
-    echo "$(date '+%F %T') | All time windows processed"
+        $FORCE_MERGE_ARG; then
+        tmp_marker="${FINAL_MARKER}.tmp-${SLURM_JOB_ID:-$$}"
+        printf 'Experiment completed: %s\n' "$(date -Is)" > "$tmp_marker"
+        mv -f "$tmp_marker" "$FINAL_MARKER"
+        echo "$(date '+%F %T') | All time windows processed"
+        echo "$(date '+%F %T') | Completion marker: $FINAL_MARKER"
+    else
+        echo "$(date '+%F %T') | ERROR: final time-window merge failed" >&2
+        exit 1
+    fi
 
     # Cleanup barrier files
     rm -rf "$BARRIER_DIR"
