@@ -152,27 +152,20 @@ def interp2d(ds,name_vars,lon_out,lat_out):
         dlon = np.nanmax(np.abs(np.diff(lon_full)))
         dlat = np.nanmax(np.abs(np.diff(lat_full)))
 
-    if len(ds[name_vars['lon']].shape)==2:
-        ds = ds.where((ds[name_vars['lon']]<=lon_out.max()+dlon) &\
-                      (ds[name_vars['lon']]>=lon_out.min()-dlon) &\
-                      (ds[name_vars['lat']]<=lat_out.max()+dlat) &\
-                      (ds[name_vars['lat']]>=lat_out.min()-dlat),drop=True)
-
-        lon_sel = ds[name_vars['lon']].values
-        lat_sel = ds[name_vars['lat']].values
-
-    else:
-
-        ds = ds.where((ds[name_vars['lon']]<=lon_out.max()+dlon) &\
-                      (ds[name_vars['lon']]>=lon_out.min()-dlon) &\
-                      (ds[name_vars['lat']]<=lat_out.max()+dlat) &\
-                      (ds[name_vars['lat']]>=lat_out.min()-dlat),drop=True)
-
-        lon_sel,lat_sel = np.meshgrid(
-            ds[name_vars['lon']].values,
-            ds[name_vars['lat']].values)
-
-    var_sel = ds[name_vars['var']].values
+    # Select with NumPy rather than xarray.where(drop=True). The latter can
+    # fail while materializing a zero-sized lazy selection before the nearest
+    # finite-value fallback gets a chance to handle it.
+    selected = (
+        np.isfinite(lon_full)
+        & np.isfinite(lat_full)
+        & (lon_full <= lon_out.max() + dlon)
+        & (lon_full >= lon_out.min() - dlon)
+        & (lat_full <= lat_out.max() + dlat)
+        & (lat_full >= lat_out.min() - dlat)
+    )
+    lon_sel = lon_full[selected]
+    lat_sel = lat_full[selected]
+    var_sel = var_full[selected]
 
     finite_selected = (np.isfinite(lon_sel.ravel())
                        & np.isfinite(lat_sel.ravel())
