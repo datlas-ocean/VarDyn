@@ -440,6 +440,10 @@ MOD_QGSW = dict(
     # baroclinic layer. SSH/surface U/V are public diagnosed fields; the
     # kernel carries h_ml/u_ml/v_ml and h_bc1/u_bc1/v_bc1. Set H_ml/H_bc1 and
     # include their names in name_params to control the positive log-depths.
+    # 'modal_layer_stack' generalises this contract to an explicit ordered
+    # surface-to-deep layer_stack. Supported physical stacks are baroclinic;
+    # Ekman+baroclinic; mixed-layer+baroclinic; Ekman+mixed-layer+baroclinic;
+    # and a shared Ekman/mixed-layer surface layer over the baroclinic layer.
     height_representation = 'ssh',
 
     # Restart coordinate for the field mapped to name_init_var['SSH'] in
@@ -451,13 +455,56 @@ MOD_QGSW = dict(
     H_ml = None,       # modal_two_layer mixed-layer reference depth [m]
     H_ml_floor = None, # strict lower bound for H_ml [m]
     H_ml_max = None,   # optional upper bound for H_ml [m]
+    constant_MLD = False, # collapse a prescribed H_ml field to its area-weighted mean
+    H_ek = None,       # legacy Ekman reference depth [m]; prefer q_init with H_total
+    q_init = None,     # initial upper-layer fraction; scalar (2 layers) or [q0,q1] (3 layers)
+    H_total = None,    # fixed total depth for a prognostic Ekman–barocline pair [m]
+    H_ek0 = None,      # fixed_two_slab_ekman upper-slab depth [m]
+    H_ek1 = None,      # fixed_two_slab_ekman lower-slab depth [m]
+    H_ek_floor = None, # strict lower bound for H_ek [m]
+    H_ek_max = None,   # optional upper bound for H_ek [m]
+    H_ek_fraction_min = 0.01, # lower bound for controlled H_ek/(H_ek+H_bc1)
+    H_ek_fraction_max = 0.99, # upper bound for controlled H_ek/(H_ek+H_bc1)
+    r_ek = 0.5,        # H_ek/H_ml for a distinct nested Ekman+mixed-layer stack
+    r_ek_min = 0.1,    # lower logistic bound for controlled r_ek
+    r_ek_max = 0.9,    # upper logistic bound for controlled r_ek
+    H_ek0_floor = 0.01, # lower bound for controlled fixed upper Ekman slab depth [m]
+    H_ek0_max = None,   # upper bound for controlled fixed upper Ekman slab depth [m]
+    H_ek1_floor = 0.01, # lower bound for controlled fixed lower Ekman slab depth [m]
+    H_ek1_max = None,   # upper bound for controlled fixed lower Ekman slab depth [m]
+    H_ek_ratio_min = 0.05, # lower bound for H_ek0/H_ek1 ratio control
+    H_ek_ratio_max = 5.0,  # upper bound for H_ek0/H_ek1 ratio control
     H_bc1 = None,       # modal_two_layer first-baroclinic-layer reference depth [m]
     H_bc1_floor = None, # strict lower bound for H_bc1 [m]
     H_bc1_max = None,   # optional upper bound for H_bc1 [m]
     c_mode2_ratio = None, # c_mode2/c1 used with g_prime=None; must be below the two-layer admissibility limit
+    c_mode3_ratio = None, # c_mode3/c1 used by a three-layer stack with g_prime=None
+    layer_stack = None, # ordered surface-to-deep list used by modal_layer_stack
+    fixed_ekman_slabs = 0, # 0 or 2: momentum-only fixed-depth Ekman slabs above baroclinic SW
+    ekman_base_drag_coef = 0., # prognostic Ekman/barocline interfacial drag rate [s^-1]
+    ekman_entrainment_timescale = None, # prognostic Ekman/barocline mass-exchange time scale [s]
+    ekman_internal_drag_coef = 0., # upper/lower Ekman slab drag rate [s^-1]
+    ekman_baroclinic_drag_coef = 0., # lower-slab/baroclinic drag rate [s^-1]
+    ekman_deep_drag_coef = 0., # terminal lower-Ekman drag rate to a resting deep reservoir [s^-1]
+    drag_control_log_min = -6., # lower bound for positive fixed-slab drag log controls
+    drag_control_log_max = 6., # upper bound for positive fixed-slab drag log controls
+    fixed_ekman_pumping = True, # fixed-slab transport divergence forces baroclinic thickness
+    fixed_ekman_pumping_relative_to_baroclinic = True, # remove baroclinic transport before pumping
+    ekman_slab_visc_coef = 0., # fixed-slab horizontal velocity viscosity [m^2 s^-1]
+    reference_pressure_gradient = True, # include the static pressure gradient from spatial reference H
+    enforce_positive_ekman_thickness = False, # conservative forward-only Ekman thickness limiter
+    layer_role_boundary_conditions = True, # SSH/U/V→baroclinic; zero dynamic BCs in Ekman/ML
+    init_surface_velocity_from_bc = False, # Also initialize the uppermost layer U/V from BC fields.
+    modal_ssh_reference = 'initial_bc', # fixed internal SSH background; public output remains full SSH
+    anomaly_reference_state = False, # evolve anomalies while using total reference state in SW equations
+    tracer_conservation = 'concentration', # 'concentration' or thickness-weighted 'upper_layer'
+    tracer_upper_layers = None, # number of surface layers sharing a vertically uniform tracer
     interface_amplification = None, # diagnostic only in modal_two_layer; never a control
     forcing_vertical_projection = 'surface_baroclinic', # lift surface forcing/BCs into the modal two-layer stack
     wind_forcing_layer = 'mixed_layer', # modal_two_layer: wind acts only on layer 0 using current H_ml
+    wind_stress_profile = 'top_layer', # 'top_layer' or Stokes quadratic mixed-layer/transition-layer profile
+    sponge_target = 'bc', # sponge target: external boundary fields ('bc') or zero ('zero')
+    save_wind_work_budget = False, # save instantaneous wind-work/TL shear-production maps
 
     physical_gravity = 9.81, # m s^-2, used only for SSH <-> interface-displacement conversion
 
@@ -523,7 +570,6 @@ MOD_QGSW = dict(
     Cd_wind = 1.3e-3, # drag coefficient used in the bulk wind-stress formula tau = rho_air * Cd * |U10| * U10
 
     Cd_wind_formula = None, # Use the Large & Pond formula for drag coefficient. Set to None to use a constant drag coefficient (Cd_wind)
-
     rho_water = 1025.0, # ocean water density (kg/m³) used to convert wind stress [Pa] to acceleration [m²/s²]: tau/(rho_water*H)*dx
 
     # Physical layer depth (m) for the wind-stress denominator:  tau / (rho_water * h_wind) * dx
@@ -783,6 +829,8 @@ NAME_OBSOP = None
 
 OBSOP_INTERP_L3 = dict(
 
+    observation_role = None, # Optional semantic model role selected by the model (e.g. surface).
+
     name_obs = None, # List of observation class names. If None, all observation will be considered. 
 
     name_var = 'SSH',
@@ -800,6 +848,8 @@ OBSOP_INTERP_L3 = dict(
 )
 
 OBSOP_INTERP_L4 = dict(
+
+    observation_role = None, # Optional semantic model role selected by the model (e.g. surface).
 
     name_obs = None, # List of observation class names. If None, all observation will be considered. 
 

@@ -215,9 +215,48 @@ class SW:
         taux, tauy = param['taux'], param['tauy']
         self.set_wind_forcing(taux, tauy)
         self.bottom_drag_coef = param['bottom_drag_coef']
+        # Linear interfacial friction between the upper Ekman role and the
+        # underlying baroclinic layer (s^-1). The equal-and-opposite lower-layer
+        # tendency is depth-weighted to conserve vertically integrated momentum.
+        self.ekman_base_drag_coef = float(param.get('ekman_base_drag_coef') or 0.0)
+        # Optional hybrid closure: two momentum-only, fixed-depth Ekman slabs
+        # (layers 0 and 1) above the prognostic baroclinic SW layer (layer 2).
+        self.fixed_ekman_slabs = int(param.get('fixed_ekman_slabs', 0))
+        if self.fixed_ekman_slabs not in (0, 1, 2):
+            raise ValueError('fixed_ekman_slabs must be 0, 1, or 2.')
+        if self.fixed_ekman_slabs == 1 and self.nl != 2:
+            raise ValueError('fixed_ekman_slabs=1 requires nl=2.')
+        if self.fixed_ekman_slabs == 2 and self.nl != 3:
+            raise ValueError('fixed_ekman_slabs=2 requires nl=3.')
+        self.ekman_internal_drag_coef = float(param.get('ekman_internal_drag_coef', 0.0))
+        self.ekman_baroclinic_drag_coef = float(param.get('ekman_baroclinic_drag_coef', 0.0))
+        self.ekman_deep_drag_coef = float(param.get('ekman_deep_drag_coef', 0.0))
+        self.fixed_ekman_pumping = bool(param.get('fixed_ekman_pumping', True))
+        self.fixed_ekman_pumping_relative_to_baroclinic = bool(
+            param.get('fixed_ekman_pumping_relative_to_baroclinic', True))
+        self.ekman_slab_visc_coef = float(param.get('ekman_slab_visc_coef', 0.0))
+        if (self.ekman_internal_drag_coef < 0. or self.ekman_baroclinic_drag_coef < 0.
+                or self.ekman_deep_drag_coef < 0. or self.ekman_slab_visc_coef < 0.):
+            raise ValueError('Ekman drag and slab-viscosity coefficients must be non-negative.')
+        # Local, mass-conserving vertical exchange between the upper Ekman
+        # layer and the layer below. None/0 disables the relaxation.
+        self.ekman_entrainment_timescale = param.get('ekman_entrainment_timescale', None)
+        if self.ekman_entrainment_timescale is None:
+            self.ekman_entrainment_rate = 0.0
+        else:
+            self.ekman_entrainment_timescale = float(self.ekman_entrainment_timescale)
+            if self.ekman_entrainment_timescale <= 0.:
+                raise ValueError('ekman_entrainment_timescale must be positive or None.')
+            self.ekman_entrainment_rate = 1. / self.ekman_entrainment_timescale
         # Ocean water density (kg/m³) used in wind-stress → acceleration conversion
         # tau [Pa] / (rho_water [kg/m³] × H [m]) × dx [m] gives m²/s² (scaled tendency)
         self.rho_water = param['rho_water'] if 'rho_water' in param else 1025.0
+        self.wind_use_instantaneous_top_depth = param.get('wind_use_instantaneous_top_depth', False)
+        self.wind_stress_profile = param.get('wind_stress_profile', 'top_layer')
+        if self.wind_stress_profile not in ('top_layer', 'stokes_ml_tl'):
+            raise ValueError("wind_stress_profile must be 'top_layer' or 'stokes_ml_tl'.")
+        if self.wind_stress_profile == 'stokes_ml_tl' and self.nl < 3:
+            raise ValueError("wind_stress_profile='stokes_ml_tl' requires at least three layers.")
 
         # Physical layer depth (m) for wind-stress forcing.
         # IMPORTANT for 1-layer QG/SW models: the model's equivalent depth H = c²/g
@@ -247,6 +286,19 @@ class SW:
         # Equivalent depth bounds
         self.H_min = param['H_min'] if 'H_min' in param.keys() else None
         self.H_max = param['H_max'] if 'H_max' in param.keys() else None
+        # A spatially varying controlled reference depth represents local
+        # inertia/transport capacity here, not a prescribed resting interface.
+        # Its static pressure gradient must therefore not accelerate a state
+        # initialized at rest unless explicitly requested.
+        self.reference_pressure_gradient = bool(
+            param.get('reference_pressure_gradient', True)
+        )
+        self.enforce_positive_ekman_thickness = bool(
+            param.get('enforce_positive_ekman_thickness', False)
+        )
+        self.ekman_thickness_floor = float(
+            param.get('ekman_thickness_floor') or 0.01
+        )
 
         # Diffusion (Laplacian, in m²/s)
         # visc_coef: velocity diffusion, diff_coef: thickness diffusion
@@ -391,6 +443,16 @@ class SW:
         # Tracer diffusivity (m^2/s) — mirrors diff_coef for h
         self.tracer_diff_coef = param.get('diff_coef_trac', 0.)
         self.tracer_adv_scheme = param.get('tracer_adv_scheme', 'weno')  # 'weno' | 'linear_upwind3' | 'linear_upwind5' | 'rusanov1'/'upwind1'
+        self.tracer_conservation = param.get('tracer_conservation', 'concentration')
+        self.tracer_upper_layers = param.get('tracer_upper_layers', None)
+        if self.tracer_conservation not in ('concentration', 'upper_layer'):
+            raise ValueError("tracer_conservation must be 'concentration' or 'upper_layer'.")
+        if self.tracer_conservation == 'upper_layer':
+            if self.tracer_upper_layers is None:
+                self.tracer_upper_layers = 1
+            self.tracer_upper_layers = int(self.tracer_upper_layers)
+            if not (1 <= self.tracer_upper_layers <= self.nl):
+                raise ValueError('tracer_upper_layers must be between 1 and nl.')
 
         # Momentum forcing mode: 'direct' uses Fu/Fv as given,
         # 'mass_consistent' derives Fu/Fv from Fh so that velocity is
@@ -411,14 +473,14 @@ class SW:
         # HBM bandwidth pressure. Keep True (current default is optimal).
         self.scan_checkpoint = True
 
-    def _compute_ref_values(self, H):
+    def _compute_ref_values(self, H, g_prime=None):
         """Pure functional computation of reference values.
         Returns (h_ref, h_ref_ugrid, h_ref_vgrid, dx_p_ref, dy_p_ref).
         No mutation — safe for JAX AD.
         """
         h_ref = H * self.area
         eta_ref = -H.sum(axis=-3) + reverse_cumsum(H, dim=-3)
-        p_ref = jnp.cumsum(self.g_prime * eta_ref, axis=-3)
+        p_ref = jnp.cumsum((self.g_prime if g_prime is None else g_prime) * eta_ref, axis=-3)
 
         # When H is spatially uniform (nx=1, ny=1), padding the 1-element
         # spatial axes produces wrong shapes: (nl,1,1) → (nl,3,1) → h_ref_ugrid
@@ -442,8 +504,12 @@ class SW:
         # Compute reference pressure gradients per dimension independently.
         # The previous AND condition (shape[-2]!=1 AND shape[-1]!=1) missed
         # the case where H varies in only one spatial dimension (nl>1).
-        dx_p_ref = jnp.diff(p_ref, axis=-2) if H.shape[-2] != 1 else 0.
-        dy_p_ref = jnp.diff(p_ref, axis=-1) if H.shape[-1] != 1 else 0.
+        if self.reference_pressure_gradient:
+            dx_p_ref = jnp.diff(p_ref, axis=-2) if H.shape[-2] != 1 else 0.
+            dy_p_ref = jnp.diff(p_ref, axis=-1) if H.shape[-1] != 1 else 0.
+        else:
+            dx_p_ref = 0.
+            dy_p_ref = 0.
 
         return h_ref, h_ref_ugrid, h_ref_vgrid, dx_p_ref, dy_p_ref
 
@@ -612,6 +678,90 @@ class SW:
         # Cancel spurious c*div(u_phys) source -> pure advective form.
         return (dt_c_fluxdiv + c_phys * vel_div_area) * self.masks.h
 
+    def advection_upper_layer_tracer(self, U, V, heat_content, h, h_ref):
+        """Conservative transport of a vertically uniform upper-layer tracer.
+
+        heat_content stores T * D_upper * cell_area. The transport is the sum
+        of the instantaneous thickness transports in the configured surface
+        layers, so both Ekman and mixed-layer thickness anomalies enter the
+        conservation law.
+        """
+        nupper = self.tracer_upper_layers
+        h_ref_upper = h_ref[:nupper][None, ...]
+        h_total_phys = smooth_clamp(
+            (h_ref_upper + h[:, :nupper]) / self.area,
+            self.h_min, self.h_min_sharpness)
+        D_upper_area = jnp.sum(h_ref_upper + h[:, :nupper], axis=1, keepdims=True)
+        D_upper_area = jnp.maximum(D_upper_area, self.h_min*self.area)
+        tracer = heat_content / D_upper_area
+
+        if self.area.ndim >= 2:
+            area_x = 0.5*(self.area[1:, :]+self.area[:-1, :])
+            area_y = 0.5*(self.area[:, 1:]+self.area[:, :-1])
+        else:
+            area_x = area_y = self.area
+        U_upper = U[:, :nupper, 1:-1, :]
+        V_upper = V[:, :nupper, :, 1:-1]
+        if self.h_adv_scheme in ('rusanov1', 'upwind1'):
+            mass_flux_x = self._h_flux_rusanov1(h_total_phys, U_upper, dim=-2)
+            mass_flux_y = self._h_flux_rusanov1(h_total_phys, V_upper, dim=-1)
+        elif self.h_adv_scheme in ('linear_upwind3', 'linear3'):
+            mass_flux_y = flux(
+                h_total_phys, V_upper, dim=-1, n_points=4,
+                rec_func_2=linear2_centered, rec_func_4=linear4_left,
+                rec_func_6=linear6_left,
+                mask_2=self.masks.v_sten_hy_eq2[..., 1:-1],
+                mask_4=self.masks.v_sten_hy_eq4[..., 1:-1],
+                mask_6=self.masks.v_sten_hy_gt6[..., 1:-1])
+            mass_flux_x = flux(
+                h_total_phys, U_upper, dim=-2, n_points=4,
+                rec_func_2=linear2_centered, rec_func_4=linear4_left,
+                rec_func_6=linear6_left,
+                mask_2=self.masks.u_sten_hx_eq2[..., 1:-1, :],
+                mask_4=self.masks.u_sten_hx_eq4[..., 1:-1, :],
+                mask_6=self.masks.u_sten_hx_gt6[..., 1:-1, :])
+        elif self.h_adv_scheme in ('linear_upwind5', 'linear5'):
+            mass_flux_y = flux(
+                h_total_phys, V_upper, dim=-1, n_points=6,
+                rec_func_2=linear2_centered, rec_func_4=linear4_left,
+                rec_func_6=linear6_left,
+                mask_2=self.masks.v_sten_hy_eq2[..., 1:-1],
+                mask_4=self.masks.v_sten_hy_eq4[..., 1:-1],
+                mask_6=self.masks.v_sten_hy_gt6[..., 1:-1])
+            mass_flux_x = flux(
+                h_total_phys, U_upper, dim=-2, n_points=6,
+                rec_func_2=linear2_centered, rec_func_4=linear4_left,
+                rec_func_6=linear6_left,
+                mask_2=self.masks.u_sten_hx_eq2[..., 1:-1, :],
+                mask_4=self.masks.u_sten_hx_eq4[..., 1:-1, :],
+                mask_6=self.masks.u_sten_hx_gt6[..., 1:-1, :])
+        else:
+            mass_flux_x = self.h_flux_x(h_total_phys, U_upper)
+            mass_flux_y = self.h_flux_y(h_total_phys, V_upper)
+        transport_x = jnp.sum(mass_flux_x, axis=1, keepdims=True)
+        transport_y = jnp.sum(mass_flux_y, axis=1, keepdims=True)
+
+        if self.tracer_adv_scheme in ('rusanov1', 'upwind1'):
+            flux_x = self._h_flux_rusanov1(tracer, transport_x, dim=-2)
+            flux_y = self._h_flux_rusanov1(tracer, transport_y, dim=-1)
+        else:
+            n_points = 4 if self.tracer_adv_scheme in ('linear_upwind3', 'linear3') else 6
+            flux_y = flux(
+                tracer, transport_y, dim=-1, n_points=n_points,
+                rec_func_2=linear2_centered, rec_func_4=linear4_left,
+                rec_func_6=linear6_left,
+                mask_2=self.masks.v_sten_hy_eq2[..., 1:-1],
+                mask_4=self.masks.v_sten_hy_eq4[..., 1:-1],
+                mask_6=self.masks.v_sten_hy_gt6[..., 1:-1])
+            flux_x = flux(
+                tracer, transport_x, dim=-2, n_points=n_points,
+                rec_func_2=linear2_centered, rec_func_4=linear4_left,
+                rec_func_6=linear6_left,
+                mask_2=self.masks.u_sten_hx_eq2[..., 1:-1, :],
+                mask_4=self.masks.u_sten_hx_eq4[..., 1:-1, :],
+                mask_6=self.masks.u_sten_hx_gt6[..., 1:-1, :])
+        return -div_nofluxbc(area_x*flux_x, area_y*flux_y)*self.masks.h
+
     def add_tracer_diffusion(self, c_area):
         """
         Laplacian diffusion \u03ba\u2207\u00b2(c_phys) for passive tracers.
@@ -730,7 +880,8 @@ class SW:
         return 0.5 * velocity * (h_left + h_right) - 0.5 * speed * (h_right - h_left)
 
     def advection_momentum(self, u, v, omega, U_m, V_m, k_energy, p, h_tot_ugrid, h_tot_vgrid,
-                           dx_p_ref=None, dy_p_ref=None, taux=None, tauy=None, h_wind=None, wind_strength=None):
+                           dx_p_ref=None, dy_p_ref=None, taux=None, tauy=None, h_wind=None,
+                           wind_strength=None, ekman_base_drag_control=None):
         """
         Advection RHS for momentum (u, v)
         """
@@ -754,9 +905,23 @@ class SW:
         dt_u -= jnp.diff(ke_pressure, axis=-2) + _dx_p_ref
         dt_v -= jnp.diff(ke_pressure, axis=-1) + _dy_p_ref
 
-        # wind forcing and bottom drag
-        dt_u, dt_v = self.add_wind_forcing(dt_u, dt_v, taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength)
+        # Wind forcing and bottom drag. Physical modal stacks use the
+        # instantaneous top-layer thickness with the same smooth positive floor
+        # as the continuity equation.
+        if self.wind_use_instantaneous_top_depth:
+            area_u = self.area_ugrid[1:-1, :] if self.area_ugrid.ndim >= 2 else self.area_ugrid
+            area_v = self.area_vgrid[:, 1:-1] if self.area_vgrid.ndim >= 2 else self.area_vgrid
+            wind_depth = (h_tot_ugrid[..., 0, 1:-1, :]/area_u,
+                          h_tot_vgrid[..., 0, :, 1:-1]/area_v)
+        else:
+            wind_depth = h_wind
+        dt_u, dt_v = self.add_wind_forcing(
+            dt_u, dt_v, taux=taux, tauy=tauy,
+            h_wind=wind_depth, wind_strength=wind_strength)
         dt_u, dt_v = self.add_bottom_drag(dt_u, dt_v, u, v)
+        dt_u, dt_v = self.add_ekman_base_drag(
+            dt_u, dt_v, u, v, h_tot_ugrid, h_tot_vgrid,
+            coef=ekman_base_drag_control)
         dt_u, dt_v = self.add_diffusion(dt_u, dt_v, u, v)
 
         return jnp.pad(dt_u, ((0,0), (0,0), (1, 1), (0, 0)))*self.masks.u, \
@@ -834,13 +999,14 @@ class SW:
 
         return omega_Vm, omega_Um
 
-    def add_diffusion(self, du, dv, u, v):
+    def add_diffusion(self, du, dv, u, v, coef=None):
         """
         Add Laplacian diffusion ν∇²(u_phys) to velocity derivatives.
         Uses Neumann (zero-flux) BCs via edge-padding.
         Applies to all layers.
         """
-        if self.visc_coef is not None and self.visc_coef > 0:
+        viscosity = self.visc_coef if coef is None else coef
+        if viscosity is not None and viscosity > 0:
             # Pad u in y, v in x for Neumann-like boundary treatment
             u_pad = jnp.pad(u, ((0,0), (0,0), (0,0), (1,1)), mode='edge')
             v_pad = jnp.pad(v, ((0,0), (0,0), (1,1), (0,0)), mode='edge')
@@ -875,8 +1041,8 @@ class SW:
                   + (v_phys[..., 1:-1, 2:] - 2*v_phys[..., 1:-1, 1:-1] + v_phys[..., 1:-1, :-2]) / dy_v_int**2
 
             # Convert back to scaled variables
-            du = du + self.visc_coef * lap_u * dx_u_int
-            dv = dv + self.visc_coef * lap_v * dy_v_int
+            du = du + viscosity * lap_u * dx_u_int
+            dv = dv + viscosity * lap_v * dy_v_int
 
         return du, dv
 
@@ -941,7 +1107,10 @@ class SW:
         #   both None       →  use self.h_ref_ugrid (model reference thickness, correct
         #                      for multi-layer models where H is the true layer depth).
         _h_wind = h_wind if h_wind is not None else self.h_wind
-        if _h_wind is not None:
+        if isinstance(_h_wind, tuple):
+            H_ref_u = jnp.maximum(jnp.asarray(_h_wind[0], dtype=self.dtype), self.h_min)
+            H_ref_v = jnp.maximum(jnp.asarray(_h_wind[1], dtype=self.dtype), self.h_min)
+        elif _h_wind is not None:
             _h_wind = jnp.asarray(_h_wind, dtype=self.dtype)
             if _h_wind.ndim >= 2:
                 # 2D field (nx, ny) on h-grid → interpolate to interior u/v grids
@@ -1002,9 +1171,197 @@ class SW:
             wind_u = (1.0 + ws_u) * wind_u
             wind_v = (1.0 + ws_v) * wind_v
 
-        du = du.at[..., 0, :, :].set(du[..., 0, :, :] + wind_u)
-        dv = dv.at[..., 0, :, :].set(dv[..., 0, :, :] + wind_v)
+        if self.wind_stress_profile == 'top_layer':
+            du = du.at[..., 0, :, :].set(du[..., 0, :, :] + wind_u)
+            dv = dv.at[..., 0, :, :].set(dv[..., 0, :, :] + wind_v)
+            return du, dv
+
+        # Stokes et al. (2024) quadratic mixed-layer/transition-layer profile.
+        # The first layer is the mixed layer and the second is the transition
+        # layer. At the ML/TL interface, Sigma=(1-r)/(1+r), r=H_ek/TLD.
+        # Interface-stress differences conserve the vertically integrated
+        # wind impulse while distributing it over the two upper layers.
+        H_u = self.h_ref_ugrid / jnp.maximum(self.area_ugrid, self.h_min)
+        H_v = self.h_ref_vgrid / jnp.maximum(self.area_vgrid, self.h_min)
+        H0_u = jnp.maximum(H_u[0, 1:-1, :], self.h_min)
+        H1_u = jnp.maximum(H_u[1, 1:-1, :], self.h_min)
+        H0_v = jnp.maximum(H_v[0, :, 1:-1], self.h_min)
+        H1_v = jnp.maximum(H_v[1, :, 1:-1], self.h_min)
+        ratio_u = H0_u / jnp.maximum(H0_u + H1_u, self.h_min)
+        ratio_v = H0_v / jnp.maximum(H0_v + H1_v, self.h_min)
+        sigma_u = (1. - ratio_u) / jnp.maximum(1. + ratio_u, self.h_min)
+        sigma_v = (1. - ratio_v) / jnp.maximum(1. + ratio_v, self.h_min)
+
+        wind_u0 = jnp.where(mask_u[..., 0, :, :] > 0.5,
+                            wind_u * (1. - sigma_u) * H_ref_u / H0_u,
+                            jnp.zeros_like(wind_u))
+        wind_v0 = jnp.where(mask_v[..., 0, :, :] > 0.5,
+                            wind_v * (1. - sigma_v) * H_ref_v / H0_v,
+                            jnp.zeros_like(wind_v))
+        wind_u1 = jnp.where(mask_u[..., 0, :, :] > 0.5,
+                            wind_u * sigma_u * H_ref_u / H1_u,
+                            jnp.zeros_like(wind_u))
+        wind_v1 = jnp.where(mask_v[..., 0, :, :] > 0.5,
+                            wind_v * sigma_v * H_ref_v / H1_v,
+                            jnp.zeros_like(wind_v))
+        du = du.at[..., 0, :, :].set(du[..., 0, :, :] + wind_u0)
+        du = du.at[..., 1, :, :].set(du[..., 1, :, :] + wind_u1)
+        dv = dv.at[..., 0, :, :].set(dv[..., 0, :, :] + wind_v0)
+        dv = dv.at[..., 1, :, :].set(dv[..., 1, :, :] + wind_v1)
         return du, dv
+
+    def add_ekman_base_drag(self, du, dv, u, v, h_tot_ugrid, h_tot_vgrid, coef=None):
+        """Apply dissipative friction at the Ekman/baroclinic interface.
+
+        The interfacial stress is proportional to the layer-velocity shear,
+        r_ek*(u_ek-u_bc). The lower-layer acceleration is weighted by H_ek/H_bc,
+        so the depth-integrated internal friction cancels exactly.
+        """
+        if self.nl < 2 or (coef is None and self.ekman_base_drag_coef <= 0.):
+            return du, dv
+        if coef is None:
+            r_u = r_v = self.ekman_base_drag_coef
+        else:
+            # Controls live on h-points; drag acts on C-grid faces.
+            r_u = 0.5 * (coef[:-1, :] + coef[1:, :])
+            r_v = 0.5 * (coef[:, :-1] + coef[:, 1:])
+        Hek_u = jnp.maximum(h_tot_ugrid[..., 0, 1:-1, :], self.h_min)
+        Hbc_u = jnp.maximum(h_tot_ugrid[..., 1, 1:-1, :], self.h_min)
+        Hek_v = jnp.maximum(h_tot_vgrid[..., 0, :, 1:-1], self.h_min)
+        Hbc_v = jnp.maximum(h_tot_vgrid[..., 1, :, 1:-1], self.h_min)
+        shear_u = u[..., 0, 1:-1, :] - u[..., 1, 1:-1, :]
+        shear_v = v[..., 0, :, 1:-1] - v[..., 1, :, 1:-1]
+        du = du.at[..., 0, :, :].add(-r_u * shear_u)
+        dv = dv.at[..., 0, :, :].add(-r_v * shear_v)
+        du = du.at[..., 1, :, :].add(r_u * Hek_u / Hbc_u * shear_u)
+        dv = dv.at[..., 1, :, :].add(r_v * Hek_v / Hbc_v * shear_v)
+        return du, dv
+
+    def add_fixed_ekman_slab_drag(self, du, dv, u, v, h_tot_ugrid, h_tot_vgrid, ekman_drag_controls=None):
+        """Apply conservative vertical drag for fixed mechanical Ekman slabs."""
+        if self.fixed_ekman_slabs == 1:
+            if ekman_drag_controls is None:
+                r_h = self.ekman_baroclinic_drag_coef
+            else:
+                r_h = ekman_drag_controls[0]
+            r_u = 0.5 * (r_h[:-1, :] + r_h[1:, :]) if hasattr(r_h, 'ndim') and r_h.ndim == 2 else r_h
+            r_v = 0.5 * (r_h[:, :-1] + r_h[:, 1:]) if hasattr(r_h, 'ndim') and r_h.ndim == 2 else r_h
+            H0_u = jnp.maximum(h_tot_ugrid[..., 0, 1:-1, :], self.h_min)
+            Hb_u = jnp.maximum(h_tot_ugrid[..., 1, 1:-1, :], self.h_min)
+            H0_v = jnp.maximum(h_tot_vgrid[..., 0, :, 1:-1], self.h_min)
+            Hb_v = jnp.maximum(h_tot_vgrid[..., 1, :, 1:-1], self.h_min)
+            shear_u = u[..., 0, 1:-1, :] - u[..., 1, 1:-1, :]
+            shear_v = v[..., 0, :, 1:-1] - v[..., 1, :, 1:-1]
+            du = du.at[..., 0, :, :].add(-r_u * shear_u)
+            dv = dv.at[..., 0, :, :].add(-r_v * shear_v)
+            du = du.at[..., 1, :, :].add(r_u * H0_u / Hb_u * shear_u)
+            dv = dv.at[..., 1, :, :].add(r_v * H0_v / Hb_v * shear_v)
+            return du, dv
+        if self.fixed_ekman_slabs != 2:
+            return du, dv
+        if ekman_drag_controls is None:
+            r01, r1b, rdeep = (self.ekman_internal_drag_coef,
+                                self.ekman_baroclinic_drag_coef,
+                                self.ekman_deep_drag_coef)
+            r01_v, r1b_v, rdeep_v = r01, r1b, rdeep
+        else:
+            r01_h, r1b_h, rdeep_h = ekman_drag_controls
+            r01 = 0.5 * (r01_h[:-1, :] + r01_h[1:, :])
+            r1b = 0.5 * (r1b_h[:-1, :] + r1b_h[1:, :])
+            rdeep = 0.5 * (rdeep_h[:-1, :] + rdeep_h[1:, :])
+            r01_v = 0.5 * (r01_h[:, :-1] + r01_h[:, 1:])
+            r1b_v = 0.5 * (r1b_h[:, :-1] + r1b_h[:, 1:])
+            rdeep_v = 0.5 * (rdeep_h[:, :-1] + rdeep_h[:, 1:])
+        H0_u = jnp.maximum(h_tot_ugrid[..., 0, 1:-1, :], self.h_min)
+        H1_u = jnp.maximum(h_tot_ugrid[..., 1, 1:-1, :], self.h_min)
+        Hb_u = jnp.maximum(h_tot_ugrid[..., 2, 1:-1, :], self.h_min)
+        H0_v = jnp.maximum(h_tot_vgrid[..., 0, :, 1:-1], self.h_min)
+        H1_v = jnp.maximum(h_tot_vgrid[..., 1, :, 1:-1], self.h_min)
+        Hb_v = jnp.maximum(h_tot_vgrid[..., 2, :, 1:-1], self.h_min)
+        if ekman_drag_controls is not None or self.ekman_internal_drag_coef > 0.:
+            shear_u = u[..., 0, 1:-1, :] - u[..., 1, 1:-1, :]
+            shear_v = v[..., 0, :, 1:-1] - v[..., 1, :, 1:-1]
+            du = du.at[..., 0, :, :].add(-r01 * shear_u)
+            dv = dv.at[..., 0, :, :].add(-r01_v * shear_v)
+            du = du.at[..., 1, :, :].add(r01 * H0_u / H1_u * shear_u)
+            dv = dv.at[..., 1, :, :].add(r01_v * H0_v / H1_v * shear_v)
+        if ekman_drag_controls is not None or self.ekman_baroclinic_drag_coef > 0.:
+            shear_u = u[..., 1, 1:-1, :] - u[..., 2, 1:-1, :]
+            shear_v = v[..., 1, :, 1:-1] - v[..., 2, :, 1:-1]
+            du = du.at[..., 1, :, :].add(-r1b * shear_u)
+            dv = dv.at[..., 1, :, :].add(-r1b_v * shear_v)
+            du = du.at[..., 2, :, :].add(r1b * H1_u / Hb_u * shear_u)
+            dv = dv.at[..., 2, :, :].add(r1b_v * H1_v / Hb_v * shear_v)
+        if ekman_drag_controls is not None or self.ekman_deep_drag_coef > 0.:
+            du = du.at[..., 1, :, :].add(-rdeep * u[..., 1, 1:-1, :])
+            dv = dv.at[..., 1, :, :].add(-rdeep_v * v[..., 1, :, 1:-1])
+        return du, dv
+
+    def add_fixed_ekman_pumping(self, dt_h, U, V, h_ref):
+        """Add conservative fixed-slab pumping using face transport fluxes."""
+        if self.fixed_ekman_slabs != 2 or not self.fixed_ekman_pumping:
+            return dt_h
+        H = h_ref / self.area
+        area_x = (0.5 * (self.area[1:, :] + self.area[:-1, :])
+                  if self.area.ndim >= 2 else self.area)
+        area_y = (0.5 * (self.area[:, 1:] + self.area[:, :-1])
+                  if self.area.ndim >= 2 else self.area)
+        Hx = 0.5 * (H[:, 1:, :] + H[:, :-1, :])
+        Hy = 0.5 * (H[:, :, 1:] + H[:, :, :-1])
+        Urel = U[..., :2, 1:-1, :]
+        Vrel = V[..., :2, :, 1:-1]
+        if self.fixed_ekman_pumping_relative_to_baroclinic:
+            Urel = Urel - U[..., 2:3, 1:-1, :]
+            Vrel = Vrel - V[..., 2:3, :, 1:-1]
+        # Keep a singleton layer axis: div_nofluxbc operates on the same
+        # (batch, layer, x, y) layout as the continuity fluxes.
+        flux_x = area_x * jnp.sum(Hx[:2] * Urel, axis=-3, keepdims=True)
+        flux_y = area_y * jnp.sum(Hy[:2] * Vrel, axis=-3, keepdims=True)
+        pumping = (-div_nofluxbc(flux_x, flux_y) * self.masks.h)[..., 0, :, :]
+        return dt_h.at[..., 2, :, :].add(pumping)
+
+    def add_ekman_entrainment(self, dt_h, h, h_ref, timescale=None):
+        """Relax the Ekman thickness toward its reference by local mass exchange.
+
+        A positive exchange thickens the top layer and thins the layer below by
+        exactly the same column volume. The explicit-stage cap preserves the
+        positive thickness floor in both layers.
+        """
+        if (self.fixed_ekman_slabs == 2 or self.nl < 2 or
+                (timescale is None and self.ekman_entrainment_rate <= 0.)):
+            return dt_h
+        top_ref = h_ref[0]
+        top_total = (top_ref + h[:, 0]) / self.area
+        lower_total = (h_ref[1] + h[:, 1]) / self.area
+        rate = self.ekman_entrainment_rate if timescale is None else 1. / timescale
+        exchange = rate * (top_ref / self.area - top_total)
+        # Do not transfer more volume than either layer can supply in one stage.
+        exchange = jnp.minimum(exchange, (lower_total-self.h_min) / self.dt)
+        exchange = jnp.maximum(exchange, -(top_total-self.h_min) / self.dt)
+        exchange_area = exchange * self.area * self.masks.h[0, 0]
+        dt_h = dt_h.at[:, 0].add(exchange_area)
+        dt_h = dt_h.at[:, 1].add(-exchange_area)
+        return dt_h
+
+    def enforce_ekman_thickness_floor(self, h, h_ref):
+        """Conservatively prevent a prognostic Ekman layer from collapsing.
+
+        Any local volume needed to restore the upper layer to ``h_min`` is
+        transferred from the immediately underlying baroclinic layer. This is
+        an unresolved rapid entrainment closure and is optional because its
+        hard limiter is not suitable for a differentiable 4DVar trajectory.
+        """
+        if (not self.enforce_positive_ekman_thickness
+                or self.fixed_ekman_slabs == 2 or self.nl < 2):
+            return h
+        minimum = max(self.h_min, self.ekman_thickness_floor) * self.area
+        top_total = h_ref[0] + h[:, 0]
+        lower_total = h_ref[1] + h[:, 1]
+        deficit = jnp.maximum(minimum - top_total, 0.)
+        available = jnp.maximum(lower_total - minimum, 0.)
+        transfer = jnp.minimum(deficit, available) * self.masks.h[0, 0]
+        h = h.at[:, 0].add(transfer)
+        return h.at[:, 1].add(-transfer)
 
     def add_bottom_drag(self, du, dv, u, v):
         """
@@ -1032,7 +1389,7 @@ class SW:
 
         return omega
 
-    def compute_diagnostic_variables(self, u, v, h, h_ref_ugrid=None, h_ref_vgrid=None):
+    def compute_diagnostic_variables(self, u, v, h, h_ref_ugrid=None, h_ref_vgrid=None, g_prime=None):
         """
         Compute the model's diagnostic variables given the prognostic
         variables self.u, self.v, self.h .
@@ -1042,7 +1399,7 @@ class SW:
 
         omega = self.compute_omega(u, v)
         eta = reverse_cumsum(h / self.area, dim=-3)
-        p = jnp.cumsum(self.g_prime * eta, axis=-3)
+        p = jnp.cumsum((self.g_prime if g_prime is None else g_prime) * eta, axis=-3)
         U = u / self.dx_ugrid**2
         V = v / self.dy_vgrid**2
         U_m = self.interp_TP(U)
@@ -1090,7 +1447,7 @@ class SW:
                dt_v + filt_v, \
                dt_h
 
-    def compute_time_derivatives(self, u, v, h, ref_vals=None, taux=None, tauy=None, h_wind=None, wind_strength=None, **kwargs):
+    def compute_time_derivatives(self, u, v, h, ref_vals=None, taux=None, tauy=None, h_wind=None, wind_strength=None, ekman_drag_controls=None, g_prime=None, **kwargs):
         """
         Computes the state variables derivatives dt_u, dt_v, dt_h.
         ref_vals: optional tuple (h_ref, h_ref_ugrid, h_ref_vgrid, dx_p_ref, dy_p_ref)
@@ -1106,11 +1463,52 @@ class SW:
             h_ref = h_ref_ugrid = h_ref_vgrid = dx_p_ref = dy_p_ref = None
 
         omega, eta, p, U, V, U_m, V_m, k_energy, h_tot_ugrid, h_tot_vgrid = \
-            self.compute_diagnostic_variables(u, v, h, h_ref_ugrid, h_ref_vgrid)
+            self.compute_diagnostic_variables(u, v, h, h_ref_ugrid, h_ref_vgrid, g_prime=g_prime)
         dt_h = self.advection_h(U, V, h, h_ref) + self.add_h_diffusion(h)
+        base_drag_control = entrainment_timescale_control = None
+        if self.fixed_ekman_slabs == 0 and ekman_drag_controls is not None:
+            base_drag_control, entrainment_timescale_control = ekman_drag_controls
+        dt_h = self.add_ekman_entrainment(
+            dt_h, h, h_ref, timescale=entrainment_timescale_control)
         dt_u, dt_v = self.advection_momentum(
             u, v, omega, U_m, V_m, k_energy, p, h_tot_ugrid, h_tot_vgrid,
-            dx_p_ref, dy_p_ref, taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength)
+            dx_p_ref, dy_p_ref, taux=taux, tauy=tauy, h_wind=h_wind,
+            wind_strength=wind_strength, ekman_base_drag_control=base_drag_control)
+        if self.fixed_ekman_slabs in (1, 2):
+            # Slabs carry only linear Coriolis, wind (upper slab), and vertical
+            # friction. Their thicknesses are fixed, so their continuity RHS is
+            # identically zero and they carry neither pressure nor advection.
+            # ``dt_u``/``dt_v`` are padded C-grid fields here, whereas the
+            # force operators use their interior faces. Build the slab RHS on
+            # those interior faces, then insert it back into the padded fields.
+            slab_du = jnp.zeros_like(dt_u[..., 1:-1, :])
+            slab_dv = jnp.zeros_like(dt_v[..., :, 1:-1])
+            # The pressure-bearing barocline supplies the balanced reference
+            # current.  Coriolis therefore acts on the Ekman departure from
+            # that current, not on the total slab velocity in isolation.
+            slab_du = slab_du.at[..., :self.fixed_ekman_slabs, :, :].set(
+                self.fstar_ugrid[..., 1:-1, :] *
+                (V_m[..., :self.fixed_ekman_slabs, :, :] - V_m[..., self.fixed_ekman_slabs:self.fixed_ekman_slabs+1, :, :]))
+            slab_dv = slab_dv.at[..., :self.fixed_ekman_slabs, :, :].set(
+                -self.fstar_vgrid[..., :, 1:-1] *
+                (U_m[..., :self.fixed_ekman_slabs, :, :] - U_m[..., self.fixed_ekman_slabs:self.fixed_ekman_slabs+1, :, :]))
+            slab_du, slab_dv = self.add_wind_forcing(
+                slab_du, slab_dv, taux=taux, tauy=tauy,
+                h_wind=h_wind, wind_strength=wind_strength)
+            slab_du, slab_dv = self.add_diffusion(
+                slab_du, slab_dv, u, v, coef=self.ekman_slab_visc_coef)
+            # The dedicated viscosity is restricted to E0/E1; the barocline
+            # keeps its own MOD.visc_coef treatment in advection_momentum.
+            slab_du = slab_du.at[..., self.fixed_ekman_slabs, :, :].set(0.)
+            slab_dv = slab_dv.at[..., self.fixed_ekman_slabs, :, :].set(0.)
+            slab_du, slab_dv = self.add_fixed_ekman_slab_drag(
+                slab_du, slab_dv, u, v, h_tot_ugrid, h_tot_vgrid, ekman_drag_controls=ekman_drag_controls)
+            dt_u = dt_u.at[..., :self.fixed_ekman_slabs, 1:-1, :].set(slab_du[..., :self.fixed_ekman_slabs, :, :])
+            dt_v = dt_v.at[..., :self.fixed_ekman_slabs, :, 1:-1].set(slab_dv[..., :self.fixed_ekman_slabs, :, :])
+            dt_u = dt_u.at[..., self.fixed_ekman_slabs, 1:-1, :].add(slab_du[..., self.fixed_ekman_slabs, :, :])
+            dt_v = dt_v.at[..., self.fixed_ekman_slabs, :, 1:-1].add(slab_dv[..., self.fixed_ekman_slabs, :, :])
+            dt_h = self.add_fixed_ekman_pumping(dt_h, U, V, h_ref)
+            dt_h = dt_h.at[..., :self.fixed_ekman_slabs, :, :].set(0.)
         if self.barotropic_filter:
             dt_u, dt_v, dt_h = self.filter_barotropic_waves(dt_u, dt_v, dt_h, u, v, h_tot_ugrid, h_tot_vgrid)
 
@@ -1133,6 +1531,8 @@ class SW:
         tauy=None,
         h_wind=None,
         wind_strength=None,
+        ekman_drag_controls=None,
+        g_prime=None,
     ):
         """
         Performs nstep time-integration with RK3-SSP scheme.
@@ -1173,7 +1573,7 @@ class SW:
             H_total = jnp.maximum(H_total, self.H_min)
         if self.H_max is not None:
             H_total = jnp.minimum(H_total, self.H_max)
-        ref_vals = self._compute_ref_values(H_total)
+        ref_vals = self._compute_ref_values(H_total, g_prime=g_prime)
         _h_ref = ref_vals[0]  # h_ref for h_floor
 
         # Resolve wind stress: prefer argument, fall back to self
@@ -1205,7 +1605,8 @@ class SW:
                 """Tendency + sponge at current state."""
                 dtu, dtv, dth = self.compute_time_derivatives(
                     u_, v_, h_, ref_vals, taux=_taux, tauy=_tauy,
-                    h_wind=_h_wind, wind_strength=wind_strength,
+                    h_wind=_h_wind, wind_strength=wind_strength, ekman_drag_controls=ekman_drag_controls,
+                    g_prime=g_prime,
                     h_b=_h_b if h_b is not None else None)
                 dtu = dtu + _gamma_u * (_u_b - u_)
                 dtv = dtv + _gamma_v * (_v_b - v_)
@@ -1218,6 +1619,7 @@ class SW:
                 u_mid = u + (self.dt * 0.5) * dt0_u
                 v_mid = v + (self.dt * 0.5) * dt0_v
                 h_mid = h + (self.dt * 0.5) * dt0_h
+                h_mid = self.enforce_ekman_thickness_floor(h_mid, ref_vals[0])
                 dt1_u, dt1_v, dt1_h = _f(u_mid, v_mid, h_mid)
                 u = u + self.dt * dt1_u
                 v = v + self.dt * dt1_v
@@ -1229,6 +1631,7 @@ class SW:
                 u1 = u + self.dt * dt0_u
                 v1 = v + self.dt * dt0_v
                 h1 = h + self.dt * dt0_h
+                h1 = self.enforce_ekman_thickness_floor(h1, ref_vals[0])
                 dt1_u, dt1_v, dt1_h = _f(u1, v1, h1)
                 u = u + (self.dt * 0.5) * (dt0_u + dt1_u)
                 v = v + (self.dt * 0.5) * (dt0_v + dt1_v)
@@ -1275,6 +1678,12 @@ class SW:
             u = u + self.dt * _Fu
             v = v + self.dt * _Fv
             h = h + self.dt * _Fh
+            if self.fixed_ekman_slabs in (1, 2):
+                # Enforce the mechanical-slab contract exactly, including if
+                # a generic forcing array accidentally contains upper-layer h.
+                h = h.at[..., :self.fixed_ekman_slabs, :, :].set(0.)
+            else:
+                h = self.enforce_ekman_thickness_floor(h, ref_vals[0])
 
             return (u, v, h), None
 
@@ -1390,11 +1799,6 @@ class SW:
             Fh if Fh is not None else jnp.zeros_like(h0),
         )
 
-        # Prepare tracer in area-scaled form (mirrors h = h_phys * area)
-        c = jnp.asarray(c0, dtype=self.dtype) * self.masks.h * self.area  # (1, n_trac, nx, ny)
-        _c_b = jnp.asarray(c_b, dtype=self.dtype) * self.masks.h * self.area if c_b is not None else c
-        _Fc  = jnp.asarray(Fc, dtype=self.dtype) * self.area if Fc is not None else jnp.zeros_like(c)
-
         # Ref values
         H_total = self.H + H if H is not None else self.H
         if self.H_min is not None:
@@ -1402,6 +1806,26 @@ class SW:
         if self.H_max is not None:
             H_total = jnp.minimum(H_total, self.H_max)
         ref_vals = self._compute_ref_values(H_total)
+
+        c_concentration = jnp.asarray(c0, dtype=self.dtype)*self.masks.h
+        c_boundary = (jnp.asarray(c_b, dtype=self.dtype)*self.masks.h
+                      if c_b is not None else c_concentration)
+        Fc_concentration = (jnp.asarray(Fc, dtype=self.dtype)
+                            if Fc is not None else jnp.zeros_like(c_concentration))
+
+        def _upper_depth_area(h_state):
+            href = ref_vals[0][:self.tracer_upper_layers][None, ...]
+            depth_area = jnp.sum(href+h_state[:, :self.tracer_upper_layers], axis=1, keepdims=True)
+            return jnp.maximum(depth_area, self.h_min*self.area)
+
+        if self.tracer_conservation == 'upper_layer':
+            c = c_concentration*_upper_depth_area(h)
+            _c_b = c_boundary
+            _Fc = Fc_concentration
+        else:
+            c = c_concentration*self.area
+            _c_b = c_boundary*self.area
+            _Fc = Fc_concentration*self.area
 
         _taux = taux if taux is not None else self.taux
         _tauy = tauy if tauy is not None else self.tauy
@@ -1421,6 +1845,7 @@ class SW:
             omega, eta, p, U, V, U_m, V_m, k_energy, h_tot_ugrid, h_tot_vgrid = \
                 self.compute_diagnostic_variables(u, v, h, ref_vals[1], ref_vals[2])
             dt_h = self.advection_h(U, V, h, ref_vals[0]) + self.add_h_diffusion(h)
+            dt_h = self.add_ekman_entrainment(dt_h, h, ref_vals[0])
             dt_u, dt_v = self.advection_momentum(
                 u, v, omega, U_m, V_m, k_energy, p,
                 h_tot_ugrid, h_tot_vgrid,
@@ -1429,8 +1854,11 @@ class SW:
             if self.barotropic_filter:
                 dt_u, dt_v, dt_h = self.filter_barotropic_waves(
                     dt_u, dt_v, dt_h, u, v, h_tot_ugrid, h_tot_vgrid)
-            # Tracer: reuse U, V from above — no extra diagnostic call
-            dt_c = self.advection_tracer(U, V, c) + self.add_tracer_diffusion(c)
+            # Tracer: reuse U, V from above — no extra diagnostic call.
+            if self.tracer_conservation == 'upper_layer':
+                dt_c = self.advection_upper_layer_tracer(U, V, c, h, ref_vals[0])
+            else:
+                dt_c = self.advection_tracer(U, V, c) + self.add_tracer_diffusion(c)
             return dt_u, dt_v, dt_h, dt_c
 
         def single_step(carry, _):
@@ -1447,7 +1875,12 @@ class SW:
                 dtu = dtu + _gamma_u * (_u_b - u_)
                 dtv = dtv + _gamma_v * (_v_b - v_)
                 dth = dth + _gamma_h * (_h_b - h_)
-                dtc = dtc + _gamma_c * (_c_b - c_)
+                if self.tracer_conservation == 'upper_layer':
+                    depth_area = _upper_depth_area(h_)
+                    concentration = c_/depth_area
+                    dtc = dtc + _gamma_c*depth_area*(_c_b-concentration)
+                else:
+                    dtc = dtc + _gamma_c*(_c_b-c_)
                 return dtu, dtv, dth, dtc
 
             if self.time_scheme == 'rk2':
@@ -1517,7 +1950,10 @@ class SW:
             u = u + self.dt * _Fu
             v = v + self.dt * _Fv
             h = h + self.dt * _Fh
-            c = c + self.dt * _Fc
+            if self.tracer_conservation == 'upper_layer':
+                c = c + self.dt*_Fc*_upper_depth_area(h)
+            else:
+                c = c + self.dt*_Fc
 
             return (u, v, h, c), None
 
@@ -1533,7 +1969,10 @@ class SW:
 
         # Back to physical space
         u_phys, v_phys, h_phys = self.get_physical_uvh(u, v, h, numpy=False)
-        c_phys = (c / self.area) * self.masks.h   # physical tracer, masked
+        if self.tracer_conservation == 'upper_layer':
+            c_phys = (c/_upper_depth_area(h))*self.masks.h
+        else:
+            c_phys = (c/self.area)*self.masks.h
 
         return u_phys, v_phys, h_phys, c_phys
 

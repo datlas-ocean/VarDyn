@@ -664,25 +664,34 @@ class M:
             self._bc_fields = _MultiBcFields(bc_fields)
 
     def _land_mask_for_shape(self, State, shape):
-        if State.mask is None or len(shape) < 2:
+        state_mask = getattr(State, 'mask', None)
+        if state_mask is None or len(shape) < 2:
             return None
-        h_shape = State.mask.shape
+        h_shape = state_mask.shape
         var_shape = tuple(shape[-2:])
         if var_shape == h_shape:
-            return State.mask
+            return state_mask
         if var_shape == (h_shape[0], h_shape[1] + 1):
             mask = np.zeros(var_shape, dtype=bool)
-            mask[:, 1:-1] = State.mask[:, :-1] | State.mask[:, 1:]
-            mask[:, 0] = State.mask[:, 0]
-            mask[:, -1] = State.mask[:, -1]
+            mask[:, 1:-1] = state_mask[:, :-1] | state_mask[:, 1:]
+            mask[:, 0] = state_mask[:, 0]
+            mask[:, -1] = state_mask[:, -1]
             return mask
         if var_shape == (h_shape[0] + 1, h_shape[1]):
             mask = np.zeros(var_shape, dtype=bool)
-            mask[1:-1, :] = State.mask[:-1, :] | State.mask[1:, :]
-            mask[0, :] = State.mask[0, :]
-            mask[-1, :] = State.mask[-1, :]
+            mask[1:-1, :] = state_mask[:-1, :] | state_mask[1:, :]
+            mask[0, :] = state_mask[0, :]
+            mask[-1, :] = state_mask[-1, :]
             return mask
         return None
+
+    def _masked_jax_model_array(self, State, value, dtype=None):
+        """Replace prescribed land NaNs only, preserving ocean failures."""
+        arr = jnp.asarray(value, dtype=dtype)
+        mask = self._land_mask_for_shape(State, arr.shape)
+        if mask is not None:
+            arr = jnp.where(jnp.asarray(mask), 0., arr)
+        return arr
 
     def _set_land_nan(self, State, name_var=None):
         if State.mask is None:
@@ -842,9 +851,21 @@ class Model_diffusion(M):
                 if self.init_from_bc[name] and name in self.bc and t0 in self.bc[name]:
                     State.setvar(self.bc[name][t0], self.name_var[name])
         elif self.init_from_bc:
-            for name in self.name_var: 
-                if t0 in self.bc[name]:
-                     State.setvar(self.bc[name][t0], self.name_var[name])
+            # Boundary-condition times are generally stored on the model time
+            # axis (seconds since the experiment start), and may not contain
+            # the exact value passed to ``init``.  Use the same nearest-time
+            # selection as the prognostic BC application instead of silently
+            # leaving the state at its zero initial value.
+            try:
+                u0, v0, ssh0 = self._apply_bc(t0, t0 + self.dt)
+                State.setvar(u0, self.name_var['U'])
+                State.setvar(v0, self.name_var['V'])
+                State.setvar(ssh0, self.name_var['SSH'])
+                print('MOD_QGSW initialization: boundary conditions applied.')
+            except (KeyError, TypeError, ValueError):
+                # Keep the historical zero-initialisation fallback when no
+                # usable BC field is available.
+                print('MOD_QGSW initialization: no usable boundary condition; using zeros.')
         self._set_land_nan(State)
 
     def save_output(self,State,present_date,name_var=None,t=None):
@@ -1271,9 +1292,21 @@ class Model_qg1l(M):
                 if self.init_from_bc[name] and t0 in self.bc[name]:
                     State.setvar(self.bc[name][t0], self.name_var[name])
         elif self.init_from_bc:
-            for name in self.name_var: 
-                if t0 in self.bc[name]:
-                     State.setvar(self.bc[name][t0], self.name_var[name])
+            # Boundary-condition times are generally stored on the model time
+            # axis (seconds since the experiment start), and may not contain
+            # the exact value passed to ``init``.  Use the same nearest-time
+            # selection as the prognostic BC application instead of silently
+            # leaving the state at its zero initial value.
+            try:
+                u0, v0, ssh0 = self._apply_bc(t0, t0 + self.dt)
+                State.setvar(u0, self.name_var['U'])
+                State.setvar(v0, self.name_var['V'])
+                State.setvar(ssh0, self.name_var['SSH'])
+                print('MOD_QGSW initialization: boundary conditions applied.')
+            except (KeyError, TypeError, ValueError):
+                # Keep the historical zero-initialisation fallback when no
+                # usable BC field is available.
+                print('MOD_QGSW initialization: no usable boundary condition; using zeros.')
         self._set_land_nan(State)
     
     def save_output(self,State,present_date,name_var=None,t=None):
@@ -2889,9 +2922,10 @@ class Model_qgsw(M):
 
         self.nl = config.MOD.nl
         self.height_representation = getattr(config.MOD, 'height_representation', 'ssh')
-        if self.height_representation not in ('ssh', 'interface_displacement', 'modal_two_layer'):
+        if self.height_representation not in ('ssh', 'interface_displacement', 'modal_two_layer', 'modal_layer_stack'):
             raise ValueError(
-                "MOD.height_representation must be 'ssh', 'interface_displacement', or 'modal_two_layer'."
+                "MOD.height_representation must be 'ssh', 'interface_displacement', "
+                "'modal_two_layer', or 'modal_layer_stack'."
             )
         self._physical_interface_height = (
             self.height_representation == 'interface_displacement'
@@ -2899,9 +2933,38 @@ class Model_qgsw(M):
         self._configured_name_params = config.MOD.name_params if config.MOD.name_params is not None else []
         self._controls_H = 'H' in self._configured_name_params
         self._modal_two_layer = self.height_representation == 'modal_two_layer'
-        self._controls_modal_depths = self._modal_two_layer and any(
-            name in self._configured_name_params for name in ('H_ml', 'H_bc1')
+        self._modal_layer_stack = self.height_representation == 'modal_layer_stack'
+        self.wind_use_instantaneous_top_depth = getattr(
+            config.MOD, 'wind_use_instantaneous_top_depth', self._modal_layer_stack)
+        self._modal_multilayer = self._modal_two_layer or self._modal_layer_stack
+        self.layer_stack = tuple(getattr(config.MOD, 'layer_stack', None) or ())
+        self.layer_role_boundary_conditions = bool(
+            getattr(config.MOD, 'layer_role_boundary_conditions', True)
         )
+        self.init_surface_velocity_from_bc = bool(
+            getattr(config.MOD, 'init_surface_velocity_from_bc', False)
+        )
+        self.modal_ssh_reference = getattr(config.MOD, 'modal_ssh_reference', 'initial_bc')
+        self.anomaly_reference_state = bool(
+            getattr(config.MOD, 'anomaly_reference_state', False))
+        if self.anomaly_reference_state and self.modal_ssh_reference != 'initial_bc':
+            raise ValueError(
+                "anomaly_reference_state=True requires modal_ssh_reference='initial_bc'."
+            )
+        self.ssh_reference_sw = jnp.zeros((State.nx, State.ny), dtype=self.dtype)
+        self._ssh_reference_initialized = False
+        self._anomaly_reference_initialized = False
+        self.u_reference_sw = jnp.zeros((self.nl, State.nx + 1, State.ny), dtype=self.dtype)
+        self.v_reference_sw = jnp.zeros((self.nl, State.nx, State.ny + 1), dtype=self.dtype)
+        self.h_reference_sw = jnp.zeros((self.nl, State.nx, State.ny), dtype=self.dtype)
+        self.u_reference_surface = jnp.zeros((State.ny, State.nx + 1), dtype=self.dtype)
+        self.v_reference_surface = jnp.zeros((State.ny + 1, State.nx), dtype=self.dtype)
+        self._controls_modal_depths = self._modal_multilayer and any(
+            name in self._configured_name_params for name in ('H_ek', 'H_ml', 'r_ek', 'H_bc1')
+        )
+        self.fixed_ekman_slabs = int(getattr(config.MOD, 'fixed_ekman_slabs', 0))
+        self._two_slab_ekman = self.fixed_ekman_slabs == 2
+        self._one_slab_ekman = self.fixed_ekman_slabs == 1
         self._controls_h_wind = 'h_wind' in self._configured_name_params
 
         if config.MOD.name_class.lower()=='qg':
@@ -2920,6 +2983,50 @@ class Model_qgsw(M):
                 raise ValueError("modal_two_layer uses H_ml/H_bc1 controls; do not also configure the legacy 'H' control.")
             if getattr(config.MOD, 'wind_forcing_layer', 'mixed_layer') != 'mixed_layer':
                 raise ValueError('modal_two_layer supports wind_forcing_layer="mixed_layer" only.')
+        if self._modal_layer_stack:
+            supported_stacks = {
+                ('baroclinic',),
+                ('ekman', 'baroclinic'),
+                ('mixed_layer', 'baroclinic'),
+                ('ekman', 'mixed_layer', 'baroclinic'),
+                ('ekman_mixed_layer', 'baroclinic'),
+                ('ekman_upper', 'ekman_lower', 'baroclinic'),
+            }
+            if self.layer_stack not in supported_stacks:
+                raise ValueError(
+                    'Unsupported MOD.layer_stack. Expected one of: baroclinic; '
+                    'Ekman+baroclinic; mixed_layer+baroclinic; '
+                    'Ekman+mixed_layer+baroclinic; ekman_mixed_layer+baroclinic; '
+                    'or ekman_upper+ekman_lower+baroclinic.'
+                )
+            if self.nl != len(self.layer_stack) or self._is_qg_class:
+                raise NotImplementedError(
+                    'height_representation=modal_layer_stack requires the SW class and '
+                    'MOD.nl == len(MOD.layer_stack).'
+                )
+            if self._controls_H:
+                raise ValueError("modal_layer_stack uses named layer-depth controls; do not configure legacy 'H'.")
+            if self.fixed_ekman_slabs not in (0, 1, 2):
+                raise ValueError('fixed_ekman_slabs must be 0, 1, or 2.')
+            if self._two_slab_ekman and self.layer_stack != ('ekman_upper', 'ekman_lower', 'baroclinic'):
+                raise ValueError('fixed_ekman_slabs=2 requires layer_stack=("ekman_upper", "ekman_lower", "baroclinic").')
+            if self._one_slab_ekman and self.layer_stack != ('ekman', 'baroclinic'):
+                raise ValueError('fixed_ekman_slabs=1 requires layer_stack=("ekman", "baroclinic").')
+            uses_q_init = (getattr(config.MOD, 'q_init', None) is not None and
+                           getattr(config.MOD, 'H_total', None) is not None)
+            if self._two_slab_ekman and not uses_q_init and (config.MOD.H_ek0 is None or config.MOD.H_ek1 is None):
+                raise ValueError('The two-slab Ekman stack requires H_ek0/H_ek1, or H_total with q_init=[q0,q1].')
+            if self.modal_ssh_reference not in ('zero', 'initial_bc'):
+                raise ValueError("MOD.modal_ssh_reference must be 'zero' or 'initial_bc'.")
+            if 'baroclinic' in self.layer_stack and config.MOD.H_bc1 is None and not uses_q_init:
+                raise ValueError('modal_layer_stack requires H_bc1, or H_total with q_init.')
+            if ('ekman' in self.layer_stack and 'mixed_layer' not in self.layer_stack and
+                    config.MOD.H_ek is None and not uses_q_init):
+                raise ValueError('The Ekman+baroclinic stack requires H_ek, or H_total with q_init.')
+            if any(name in self.layer_stack for name in ('mixed_layer', 'ekman_mixed_layer')) and config.MOD.H_ml is None:
+                raise ValueError('A mixed-layer stack requires positive MOD.H_ml.')
+            if not any(name in self.layer_stack for name in ('ekman', 'ekman_mixed_layer', 'ekman_upper')) and config.MOD.path_wind is not None:
+                print('MOD_QGSW layer stack has no Ekman role: wind forcing is disabled.')
         if self._physical_interface_height:
             if self.nl != 1:
                 raise NotImplementedError(
@@ -3079,6 +3186,11 @@ class Model_qgsw(M):
         else:
             self.mdt = self.mdu = self.mdv = None
 
+        if self.mdt is None:
+            print('MOD_QGSW observation height mode: SSH (no MDT prescribed)')
+        else:
+            print(f'MOD_QGSW observation height mode: SLA (MDT prescribed: {config.MOD.path_mdt})')
+
         # Open Rossby Radius if provided
         if config.MOD.filec_aux is not None and os.path.exists(config.MOD.filec_aux):
 
@@ -3143,10 +3255,234 @@ class Model_qgsw(M):
         else:
             self.c = config.MOD.c0 * np.ones((State.ny,State.nx))
         
-        # Reduced gravity and reference depths. modal_two_layer has two real
-        # physical layers and keeps g' fixed after deriving it from the two
-        # requested reference modal speeds.
-        if self._modal_two_layer:
+        # Reduced gravity and reference depths. Modal stacks carry real
+        # physical layers and keep g' fixed after reference-depth calibration.
+        if self._modal_layer_stack:
+            def _depth(value, label, constant=False):
+                return self._read_physical_depth(value, config, State, label, constant=constant)
+
+            H_bc1 = (None if getattr(config.MOD, 'H_bc1', None) is None
+                     else _depth(config.MOD.H_bc1, 'H_bc1'))
+            self.stack_control_names = []
+            self.stack_drag_control_names = []
+            self.stack_control_ref = {}
+            self.stack_drag_control_ref = {}
+            self.drag_control_log_min = float(getattr(config.MOD, 'drag_control_log_min', -6.))
+            self.drag_control_log_max = float(getattr(config.MOD, 'drag_control_log_max', 6.))
+            if self.drag_control_log_min >= self.drag_control_log_max:
+                raise ValueError('drag_control_log_min must be smaller than drag_control_log_max.')
+            self.stack_control_floor = {}
+            self.stack_control_max = {}
+
+            def _register_depth(name, reference, floor_value, max_value):
+                floor = _depth(0.01 if floor_value is None else floor_value, f'{name}_floor')
+                maximum = None if max_value is None else _depth(max_value, f'{name}_max')
+                if np.any(floor >= reference):
+                    raise ValueError(f'{name}_floor must be strictly below the reference depth.')
+                if maximum is not None and np.any(maximum < reference):
+                    raise ValueError(f'{name}_max must be greater than or equal to the reference depth.')
+                self.stack_control_names.append(name)
+                self.stack_control_ref[name] = reference
+                self.stack_control_floor[name] = floor
+                self.stack_control_max[name] = maximum
+
+            if self.layer_stack == ('baroclinic',):
+                _register_depth('H_bc1', H_bc1, config.MOD.H_bc1_floor, config.MOD.H_bc1_max)
+                H = H_bc1[None]
+            elif self._two_slab_ekman:
+                # The two Ekman slabs are mechanical layers: their supplied
+                # depths are fixed inertias, not shallow-water thickness controls.
+                q_init = getattr(config.MOD, 'q_init', None)
+                H_total_config = getattr(config.MOD, 'H_total', None)
+                if q_init is not None:
+                    if H_total_config is None:
+                        raise ValueError('Three-layer q_init requires H_total.')
+                    q_array = np.asarray(q_init, dtype=float).ravel()
+                    if (q_array.size != 2 or np.any(q_array <= 0.) or
+                            q_array.sum() >= 1.):
+                        raise ValueError('Three-layer q_init must be [q0, q1] with q0>0, q1>0 and q0+q1<1.')
+                    H_total_explicit = _depth(H_total_config, 'H_total')
+                    H_ek0, H_ek1 = q_array[0]*H_total_explicit, q_array[1]*H_total_explicit
+                    H_bc1 = (1.-q_array.sum())*H_total_explicit
+                else:
+                    H_ek0 = _depth(config.MOD.H_ek0, 'H_ek0')
+                    H_ek1 = _depth(config.MOD.H_ek1, 'H_ek1')
+                if H_bc1 is None:
+                    raise ValueError('Specify H_total with q_init, or H_bc1.')
+                if 'H_ek_ratio' in self._configured_name_params:
+                    # Control the partition of the two mechanical Ekman
+                    # slabs while preserving their total thickness exactly.
+                    H_ek_total = H_ek0 + H_ek1
+                    ratio_ref = H_ek0 / np.maximum(H_ek1, 1.e-12)
+                    ratio_min = float(getattr(config.MOD, 'H_ek_ratio_min', 0.05))
+                    ratio_max = float(getattr(config.MOD, 'H_ek_ratio_max', 5.0))
+                    if not (0. < ratio_min < ratio_max and
+                            np.all(ratio_ref > ratio_min) and
+                            np.all(ratio_ref < ratio_max)):
+                        raise ValueError(
+                            'Require H_ek_ratio_min < H_ek0/H_ek1 < H_ek_ratio_max.')
+                    self.H_ek_ratio_ref_sw = ratio_ref
+                    self.H_ek_total_ref_sw = H_ek_total
+                    self.H_ek_ratio_min = ratio_min
+                    self.H_ek_ratio_max = ratio_max
+                    self.stack_control_names.append('H_ek_ratio')
+                else:
+                    _register_depth(
+                        'H_ek0', H_ek0,
+                        getattr(config.MOD, 'H_ek0_floor', 0.01),
+                        getattr(config.MOD, 'H_ek0_max', None))
+                    _register_depth(
+                        'H_ek1', H_ek1,
+                        getattr(config.MOD, 'H_ek1_floor', 0.01),
+                        getattr(config.MOD, 'H_ek1_max', None))
+                _register_depth('H_bc1', H_bc1, config.MOD.H_bc1_floor, config.MOD.H_bc1_max)
+                for _drag in ('ekman_internal_drag_coef', 'ekman_baroclinic_drag_coef', 'ekman_deep_drag_coef'):
+                    _ref = float(getattr(config.MOD, _drag))
+                    if _ref <= 0.:
+                        raise ValueError(f'{_drag} must be strictly positive when using the two-slab Ekman closure.')
+                    self.stack_drag_control_names.append(_drag)
+                    self.stack_drag_control_ref[_drag] = np.full_like(H_bc1, _ref)
+                H = np.stack((H_ek0, H_ek1, H_bc1), axis=0)
+            elif self.layer_stack == ('ekman', 'baroclinic'):
+                # Prefer a total depth plus a dimensionless initial fraction.
+                H_total_config = getattr(config.MOD, 'H_total', None)
+                q_init = getattr(config.MOD, 'q_init', None)
+                if q_init is not None:
+                    if H_total_config is None:
+                        raise ValueError('q_init requires H_total.')
+                    q_array = np.asarray(q_init, dtype=float).ravel()
+                    if q_array.size != 1 or not (0. < q_array[0] < 1.):
+                        raise ValueError('Two-layer q_init must be one scalar strictly between zero and one.')
+                    H_total_explicit = _depth(H_total_config, 'H_total')
+                    H_ek = q_array[0] * H_total_explicit
+                    H_bc1 = (1.-q_array[0]) * H_total_explicit
+                else:
+                    H_ek = _depth(config.MOD.H_ek, 'H_ek')
+                    # H_total is authoritative when supplied; H_bc1 is derived.
+                    if H_total_config is not None:
+                        H_total_explicit = _depth(H_total_config, 'H_total')
+                        if np.any(H_total_explicit <= H_ek):
+                            raise ValueError('H_total must be strictly greater than H_ek.')
+                        H_bc1 = H_total_explicit - H_ek
+                if H_bc1 is None:
+                    raise ValueError('Specify H_total with q_init, or H_bc1.')
+                # A single bounded control can redistribute a prescribed total
+                # depth between the prognostic Ekman and baroclinic layers.
+                # This removes the poorly identifiable independent H_ek/H_bc1
+                # degree of freedom while preserving H_ek + H_bc1 exactly.
+                if 'H_ek_fraction' in self._configured_name_params:
+                    H_total = H_ek + H_bc1
+                    q_ref = H_ek / H_total
+                    self.H_ek_fraction_min = float(getattr(config.MOD, 'H_ek_fraction_min', 0.01))
+                    self.H_ek_fraction_max = float(getattr(config.MOD, 'H_ek_fraction_max', 0.99))
+                    if not (0. < self.H_ek_fraction_min < self.H_ek_fraction_max < 1.):
+                        raise ValueError('Require 0 < H_ek_fraction_min < H_ek_fraction_max < 1.')
+                    if np.any(q_ref <= self.H_ek_fraction_min) or np.any(q_ref >= self.H_ek_fraction_max):
+                        raise ValueError('Reference H_ek/(H_ek+H_bc1) must lie strictly inside its configured bounds.')
+                    self.H_ek_fraction_ref_sw = q_ref
+                    self.H_total_ref_sw = H_total
+                    self.H_ek_fraction_logit_ref = np.log(
+                        (q_ref-self.H_ek_fraction_min) / (self.H_ek_fraction_max-q_ref)
+                    )
+                    self.stack_control_names.append('H_ek_fraction')
+                else:
+                    _register_depth('H_ek', H_ek, config.MOD.H_ek_floor, config.MOD.H_ek_max)
+                    _register_depth('H_bc1', H_bc1, config.MOD.H_bc1_floor, config.MOD.H_bc1_max)
+                # Positive dynamical Ekman parameters can be estimated as
+                # spatially uniform log offsets alongside the depth fraction.
+                if self._one_slab_ekman:
+                    for _param in ('ekman_baroclinic_drag_coef',):
+                        if _param not in self._configured_name_params:
+                            continue
+                        _raw_ref = getattr(config.MOD, _param, None)
+                        if _raw_ref is None or float(_raw_ref) <= 0.:
+                            raise ValueError(f'{_param} must be strictly positive when controlled.')
+                        self.stack_drag_control_names.append(_param)
+                        self.stack_drag_control_ref[_param] = np.full_like(H_bc1, float(_raw_ref))
+                if 'c_mode2_ratio' in self._configured_name_params:
+                    _r2 = float(config.MOD.c_mode2_ratio)
+                    if not (0. < _r2 < 1.):
+                        raise ValueError('c_mode2_ratio must be strictly between zero and one when controlled.')
+                    self.stack_control_names.append('c_mode2_ratio')
+                    self.c_mode2_ratio_ref = _r2
+                for _param in ('ekman_base_drag_coef', 'ekman_entrainment_timescale'):
+                    if _param not in self._configured_name_params:
+                        continue
+                    _raw_ref = getattr(config.MOD, _param, None)
+                    if _raw_ref is None:
+                        raise ValueError(
+                            f'{_param} is controlled but has no reference value; '
+                            'set a strictly positive value in MOD.')
+                    _ref = float(_raw_ref)
+                    if _ref <= 0.:
+                        raise ValueError(f'{_param} must be strictly positive when controlled.')
+                    self.stack_drag_control_names.append(_param)
+                    self.stack_drag_control_ref[_param] = np.full_like(H_bc1, _ref)
+                H = np.stack((H_ek, H_bc1), axis=0)
+            elif self.layer_stack in (('mixed_layer', 'baroclinic'), ('ekman_mixed_layer', 'baroclinic')):
+                H_ml = _depth(config.MOD.H_ml, 'H_ml', constant=getattr(config.MOD, 'constant_MLD', False))
+                _register_depth('H_ml', H_ml, config.MOD.H_ml_floor, config.MOD.H_ml_max)
+                _register_depth('H_bc1', H_bc1, config.MOD.H_bc1_floor, config.MOD.H_bc1_max)
+                H = np.stack((H_ml, H_bc1), axis=0)
+            else:
+                H_ml = _depth(config.MOD.H_ml, 'H_ml', constant=getattr(config.MOD, 'constant_MLD', False))
+                r_ref = float(config.MOD.r_ek)
+                self.r_ek_min = float(config.MOD.r_ek_min)
+                self.r_ek_max = float(config.MOD.r_ek_max)
+                if not (0. < self.r_ek_min < r_ref < self.r_ek_max < 1.):
+                    raise ValueError('Require 0 < r_ek_min < r_ek < r_ek_max < 1.')
+                self.r_ek_ref = r_ref
+                self.r_ek_logit_ref = np.log((r_ref-self.r_ek_min)/(self.r_ek_max-r_ref))
+                _register_depth('H_ml', H_ml, config.MOD.H_ml_floor, config.MOD.H_ml_max)
+                self.stack_control_names.append('r_ek')
+                _register_depth('H_bc1', H_bc1, config.MOD.H_bc1_floor, config.MOD.H_bc1_max)
+                H = np.stack((r_ref*H_ml, (1.-r_ref)*H_ml, H_bc1), axis=0)
+
+            H0 = H.copy()
+            if config.MOD.g_prime is None:
+                if self._two_slab_ekman or self._one_slab_ekman:
+                    # Fixed mechanical Ekman slabs carry no pressure/SSH.
+                    # positive placeholders retain the generic multilayer array
+                    # contract while leaving the prescribed Ekman slabs mechanical.
+                    g_epsilon = 1.e-12
+                    bc_index = 2 if self._two_slab_ekman else 1
+                    g_bc = self.c.T**2 / H[bc_index]
+                    if np.any(g_bc <= (2. if self._two_slab_ekman else 1.)*g_epsilon):
+                        raise ValueError('H_bc1/c1 gives an invalid baroclinic reduced gravity.')
+                    if self._two_slab_ekman:
+                        g_prime = np.stack((np.full_like(g_bc, g_epsilon),
+                                            np.full_like(g_bc, g_epsilon),
+                                            g_bc-2.*g_epsilon), axis=0)
+                    else:
+                        g_prime = np.stack((np.full_like(g_bc, g_epsilon),
+                                            g_bc-g_epsilon), axis=0)
+                elif self.nl == 1:
+                    g_prime = np.expand_dims(self.c.T**2/H[0], axis=0)
+                elif self.nl == 2:
+                    ratio = float(config.MOD.c_mode2_ratio)
+                    if not (0. < ratio < 1.):
+                        raise ValueError('Two-layer stack requires 0 < c_mode2_ratio < 1.')
+                    c1_sq = self.c.T**2
+                    c2_sq = (ratio*self.c.T)**2
+                    trace = c1_sq+c2_sq
+                    determinant = c1_sq*c2_sq
+                    discriminant = trace**2 - 4.*(H[0]+H[1])*determinant/H[0]
+                    if np.any(discriminant <= 0.):
+                        raise ValueError('c_mode2_ratio gives no positive two-layer reduced-gravity solution.')
+                    gp0 = (trace-np.sqrt(discriminant))/(2.*(H[0]+H[1]))
+                    gp1 = determinant/(H[0]*H[1]*gp0)
+                    g_prime = np.stack((gp0, gp1), axis=0)
+                else:
+                    g_prime = self._diagnose_three_layer_gprime(
+                        H, self.c.T, float(config.MOD.c_mode2_ratio), float(config.MOD.c_mode3_ratio))
+            else:
+                g_prime = np.asarray(config.MOD.g_prime, dtype=float)
+                if g_prime.ndim == 1:
+                    g_prime = g_prime.reshape(-1, 1, 1)
+                if g_prime.shape[0] != self.nl or np.any(g_prime <= 0.) or not np.all(np.isfinite(g_prime)):
+                    raise ValueError('modal_layer_stack g_prime must contain nl finite positive reduced gravities.')
+        # modal_two_layer retains its established two-layer behaviour.
+        elif self._modal_two_layer:
             def _modal_depth(value, label):
                 depth = self._as_H_model_array(value, State, label)
                 if depth.shape[0] != 1:
@@ -3239,8 +3575,13 @@ class Model_qgsw(M):
                     f'self.c has shape {self.c.shape}, expected (ny, nx)=' \
                     f'({State.ny}, {State.nx}). The .T applied below assumes ' \
                     f'(ny, nx); a mismatch will silently transpose H.'
-                H = np.expand_dims(self.c.T**2/g_prime[0,0,0], axis=0) 
-                H0 = np.array([[[np.nanmean(self.c)**2/g_prime[0,0,0]]]])
+                H = np.expand_dims(self.c.T**2/g_prime[0,0,0], axis=0)
+                weights = np.asarray(State.DX)*np.asarray(State.DY)
+                ocean = ~np.asarray(State.mask, dtype=bool)
+                H_state = H[0].T
+                valid = ocean & np.isfinite(H_state)
+                H_mean = np.sum(H_state[valid]*weights[valid])/np.sum(weights[valid])
+                H0 = np.array([[[H_mean]]])
                 H[np.isnan(H)] = 0.
                 if config.EXP.flag_plot>0:
                     plt.figure()
@@ -3279,7 +3620,7 @@ class Model_qgsw(M):
             elif len(H.shape) == 2:
                 H = np.expand_dims(H, axis=0)
         
-        H_from_init = None if self._modal_two_layer else self._H_from_init_file(config, State)
+        H_from_init = None if self._modal_multilayer else self._H_from_init_file(config, State)
         if H_from_init is not None:
             H = H_from_init
 
@@ -3305,6 +3646,9 @@ class Model_qgsw(M):
         if self._modal_two_layer:
             self.H_max_bound = None
             self.H_floor = np.stack((self.H_ml_floor_sw, self.H_bc1_floor_sw), axis=0)
+        elif self._modal_layer_stack:
+            self.H_max_bound = None
+            self.H_floor = np.full_like(self.H0, 0.01)
         else:
             self.H_max_bound = getattr(config.MOD, 'H_max', None)
             H_floor = getattr(config.MOD, 'H_floor', None)
@@ -3355,11 +3699,11 @@ class Model_qgsw(M):
         # CFL
         if config.MOD.cfl is not None:
             grid_spacing = min(np.nanmin(State.DX), np.nanmin(State.DY)) 
-            if self._modal_two_layer:
-                # No free-surface/barotropic mode is introduced: c is the
-                # selected fastest internal mode at the reference depths.
+            if self._modal_multilayer:
+                # No fast barotropic mode is introduced: c is the selected
+                # fastest internal mode at the reference depths.
                 c_max = float(np.nanmax(self.c))
-                print(f'Modal-two-layer fastest reference wave speed c_max = {c_max:.2f} m/s')
+                print(f'Modal layer-stack fastest reference wave speed c_max = {c_max:.2f} m/s')
             elif self.nl > 1:
                 H_arr = np.asarray(config.MOD.H)
                 g_arr = np.asarray(config.MOD.g_prime)
@@ -3436,8 +3780,51 @@ class Model_qgsw(M):
                             arr[State.mask] = np.nan
                         State.var[self.name_var[name]] = jnp.asarray(arr, dtype=self.dtype)
             dsin.close()
-            del dsin   
+            del dsin
+            # A role-aware stack must restart its *prognostic* layer state,
+            # not merely SSH/U/V (which would reset Ekman to zero).
+            self._restart_layer_state_loaded = False
+            if self._modal_layer_stack:
+                restart_ds = xr.open_dataset(config.GRID.path_init_grid)
+                try:
+                    short_names = [
+                        {'mixed_layer': 'ml', 'baroclinic': 'bc1',
+                         'ekman_mixed_layer': 'ekman_ml',
+                         'ekman_upper': 'ek0', 'ekman_lower': 'ek1'}.get(role, role)
+                        for role in self.layer_stack]
+                    required = [f'{prefix}_{short}'
+                                for prefix in ('h', 'u', 'v') for short in short_names]
+                    if all(name in restart_ds for name in required):
+                        def _layer_field(name):
+                            value = np.asarray(restart_ds[name].values).squeeze()
+                            if config.GRID.subsampling is not None:
+                                value = value[::config.GRID.subsampling, ::config.GRID.subsampling]
+                            return np.nan_to_num(value, nan=0., posinf=0., neginf=0.)
+                        State.var['h_layers'] = jnp.asarray(
+                            np.stack([_layer_field(f'h_{short}') for short in short_names]), dtype=self.dtype)
+                        State.var['u_layers'] = jnp.asarray(
+                            np.stack([_layer_field(f'u_{short}') for short in short_names]), dtype=self.dtype)
+                        State.var['v_layers'] = jnp.asarray(
+                            np.stack([_layer_field(f'v_{short}') for short in short_names]), dtype=self.dtype)
+                        self._restart_layer_state_loaded = True
+                        if 'ssh_reference' in restart_ds:
+                            reference = _layer_field('ssh_reference')
+                            self.ssh_reference_sw = jnp.asarray(reference, dtype=self.dtype).T
+                            self._ssh_reference_initialized = True
+                        elif self.layer_role_boundary_conditions:
+                            # Older restart files lack the fixed SSH background;
+                            # projecting their public fields is safer than using
+                            # layer anomalies against an unknown reference.
+                            self._restart_layer_state_loaded = False
+                            print('MOD_QGSW restart: ssh_reference missing; using legacy surface reconstruction.')
+                        else:
+                            self._ssh_reference_initialized = True
+                        if self._restart_layer_state_loaded:
+                            print('MOD_QGSW restart: restored all prognostic layer fields.')
+                finally:
+                    restart_ds.close()
         else:
+            self._restart_layer_state_loaded = False
             for name in self.name_var:  
                 if name=='U':
                     State.var[self.name_var[name]] = jnp.zeros((State.ny,State.nx+1), dtype=self.dtype)
@@ -3449,8 +3836,11 @@ class Model_qgsw(M):
                         arr[State.mask] = np.nan
                     State.var[self.name_var[name]] = jnp.asarray(arr, dtype=self.dtype)
 
-        # For nl>1, also initialize per-layer storage in State
-        if self.nl > 1:
+        # For nl>1, initialize per-layer storage only when no complete modal
+        # restart was loaded above.  A complete restart already populated these
+        # arrays; unconditionally zeroing them here would erase the prognostic
+        # Ekman/baroclinic state before the first step of the next window.
+        if self.nl > 1 and not self._restart_layer_state_loaded:
             State.var['u_layers'] = jnp.zeros((self.nl, State.ny, State.nx+1), dtype=self.dtype)
             State.var['v_layers'] = jnp.zeros((self.nl, State.ny+1, State.nx), dtype=self.dtype)
             State.var['h_layers'] = jnp.zeros((self.nl, State.ny, State.nx), dtype=self.dtype)
@@ -3466,6 +3856,10 @@ class Model_qgsw(M):
         # Sponge layer
         self.sponge_width = config.MOD.dist_sponge_bc  # km
         self.sponge_coef = 0.0 if self._is_qg_class else config.MOD.sponge_coef
+        self.sponge_target = getattr(config.MOD, 'sponge_target', 'bc')
+        self.save_wind_work_budget = bool(getattr(config.MOD, 'save_wind_work_budget', False))
+        if self.sponge_target not in ('bc', 'zero'):
+            raise ValueError("MOD.sponge_target must be 'bc' or 'zero'.")
 
         if self.sponge_width is not None and self.sponge_width>0:
             lon_h = State.lon
@@ -3559,7 +3953,20 @@ class Model_qgsw(M):
             "taux": 0.,
             "tauy": 0.,
             "bottom_drag_coef": config.MOD.bottom_drag_coef,
+            "ekman_base_drag_coef": getattr(config.MOD, 'ekman_base_drag_coef', 0.),
+            "fixed_ekman_slabs": self.fixed_ekman_slabs,
+            "ekman_internal_drag_coef": getattr(config.MOD, 'ekman_internal_drag_coef', 0.),
+            "ekman_baroclinic_drag_coef": getattr(config.MOD, 'ekman_baroclinic_drag_coef', 0.),
+            "ekman_deep_drag_coef": getattr(config.MOD, 'ekman_deep_drag_coef', 0.),
+            "fixed_ekman_pumping": getattr(config.MOD, 'fixed_ekman_pumping', True),
+            "fixed_ekman_pumping_relative_to_baroclinic": getattr(config.MOD, 'fixed_ekman_pumping_relative_to_baroclinic', True),
+            "ekman_slab_visc_coef": getattr(config.MOD, 'ekman_slab_visc_coef', 0.),
+            "reference_pressure_gradient": getattr(config.MOD, 'reference_pressure_gradient', True),
+            "enforce_positive_ekman_thickness": getattr(config.MOD, 'enforce_positive_ekman_thickness', False),
+            "ekman_thickness_floor": getattr(config.MOD, 'H_ek_floor', 0.01),
+            "ekman_entrainment_timescale": getattr(config.MOD, 'ekman_entrainment_timescale', None),
             "rho_water": getattr(config.MOD, 'rho_water', 1025.0),
+            "wind_stress_profile": getattr(config.MOD, 'wind_stress_profile', 'top_layer'),
             "h_wind": getattr(config.MOD, 'h_wind', None),
             "dtype": self.dtype,
             "mask": (1-State.mask.astype(int).T),
@@ -3579,6 +3986,9 @@ class Model_qgsw(M):
             'h_adv_scheme':      getattr(config.MOD, 'h_adv_scheme',      'weno'),
             'mom_adv_scheme':    getattr(config.MOD, 'mom_adv_scheme',    'weno'),
             'tracer_adv_scheme': getattr(config.MOD, 'tracer_adv_scheme', 'weno'),
+            'tracer_conservation': getattr(config.MOD, 'tracer_conservation', 'concentration'),
+            'tracer_upper_layers': getattr(config.MOD, 'tracer_upper_layers', None),
+            'wind_use_instantaneous_top_depth': self.wind_use_instantaneous_top_depth,
             'solver':            getattr(config.MOD, 'solver',            'dst_cmm'),
         }
 
@@ -3700,7 +4110,24 @@ class Model_qgsw(M):
 
         # Control parameters
         self.name_params = self._configured_name_params
-        if self._modal_two_layer:
+        if self._modal_layer_stack:
+            restart_ds = None
+            if config.GRID.super == 'GRID_FROM_FILE':
+                restart_ds = xr.open_dataset(config.GRID.path_init_grid)
+            try:
+                for name in self.stack_control_names + self.stack_drag_control_names:
+                    if name not in self.name_params:
+                        continue
+                    control_name = f'{name}_control'
+                    if restart_ds is not None and control_name in restart_ds:
+                        value = np.asarray(restart_ds[control_name].values.squeeze(), dtype=float)
+                        State.params[name] = np.nan_to_num(value, nan=0., posinf=0., neginf=0.)
+                    else:
+                        State.params[name] = np.zeros((State.ny, State.nx))
+            finally:
+                if restart_ds is not None:
+                    restart_ds.close()
+        elif self._modal_two_layer:
             if config.GRID.super == 'GRID_FROM_FILE':
                 dsin = xr.open_dataset(config.GRID.path_init_grid)
                 try:
@@ -3792,6 +4219,86 @@ class Model_qgsw(M):
             #self.adjoint_test_jstep(nstep=10)
             adjoint_test(self,State,nstep=10)#, ampl=1e-3)
     
+    def _read_physical_depth(self, value, config, State, label, constant=False):
+        """Read a scalar/array or an unfiltered NetCDF depth field in SW layout."""
+        if isinstance(value, dict):
+            path = value.get('file', value.get('path'))
+            name_var = value.get('name_var')
+            if path is None or name_var is None:
+                raise ValueError(f'{label} file specification requires file/path and name_var.')
+            ds = xr.open_dataset(path)
+            try:
+                da = ds[name_var['var']]
+                name_time = name_var.get('time')
+                if name_time and name_time in da.dims:
+                    da = da.sel({name_time: slice(config.EXP.init_date, config.EXP.final_date)})
+                    if da.sizes.get(name_time, 0) == 0:
+                        raise ValueError(f'{label}: no samples in the experiment time interval.')
+                    da = da.mean(name_time, skipna=True)
+                depth_ds = da.to_dataset(name=name_var['var'])
+                depth = grid.interp2d(depth_ds, name_var, State.lon, State.lat)
+            finally:
+                ds.close()
+            depth = _fill_nan_nearest(np.asarray(depth, dtype=float))
+            print(f'{label} read without spatial filtering from {path}:{name_var["var"]}')
+        else:
+            depth = np.asarray(value, dtype=float)
+            if depth.ndim == 0:
+                depth = np.full((State.ny, State.nx), float(depth))
+            elif depth.shape != (State.ny, State.nx):
+                raise ValueError(f'{label} must be scalar, shape (ny, nx), or a file specification; got {depth.shape}.')
+        if constant:
+            weights = np.asarray(State.DX) * np.asarray(State.DY)
+            ocean = ~np.asarray(State.mask, dtype=bool)
+            valid = ocean & np.isfinite(depth)
+            if not np.any(valid):
+                raise ValueError(f'{label}: no valid ocean values for area-weighted mean.')
+            mean_depth = np.sum(depth[valid] * weights[valid]) / np.sum(weights[valid])
+            depth = np.full((State.ny, State.nx), mean_depth)
+            print(f'{label} set to area-weighted constant: {mean_depth:.4f} m')
+        if not np.all(np.isfinite(depth)) or np.any(depth <= 0.):
+            raise ValueError(f'{label} must be finite and strictly positive.')
+        return depth.T
+
+    @staticmethod
+    def _diagnose_three_layer_gprime(H, c1, ratio2, ratio3):
+        """Vectorised inverse eigenvalue closure for three reduced-gravity layers."""
+        if not (0. < ratio3 < ratio2 < 1.):
+            raise ValueError('Three-layer closure requires 0 < c_mode3_ratio < c_mode2_ratio < 1.')
+        H0, H1, H2 = H
+        lam = np.stack((c1**2, (ratio2*c1)**2, (ratio3*c1)**2), axis=0)
+        s1 = lam.sum(axis=0)
+        s2 = lam[0]*lam[1] + lam[0]*lam[2] + lam[1]*lam[2]
+        s3 = lam.prod(axis=0)
+        A = np.stack((H0+H1+H2, H1+H2, H2), axis=0)
+        B01 = H0*(H1+H2)
+        B02 = H2*(H0+H1)
+        B12 = H1*H2
+        x = np.log(np.stack((lam[2]/H0, lam[1]/H1, lam[0]/H2), axis=0))
+        for _ in range(30):
+            gp = np.exp(x)
+            g0, g1, g2 = gp
+            q01, q02, q12 = B01*g0*g1, B02*g0*g2, B12*g1*g2
+            prod = H0*H1*H2*g0*g1*g2
+            residual = np.stack(((A*gp).sum(axis=0)/s1-1.,
+                                 (q01+q02+q12)/s2-1., prod/s3-1.), axis=-1)
+            jac = np.empty(residual.shape + (3,), dtype=float)
+            jac[..., 0, 0] = A[0]*g0/s1
+            jac[..., 0, 1] = A[1]*g1/s1
+            jac[..., 0, 2] = A[2]*g2/s1
+            jac[..., 1, 0] = (q01+q02)/s2
+            jac[..., 1, 1] = (q01+q12)/s2
+            jac[..., 1, 2] = (q02+q12)/s2
+            jac[..., 2, :] = (prod/s3)[..., None]
+            delta = np.linalg.solve(jac, residual[..., None])[..., 0]
+            x -= np.moveaxis(np.clip(delta, -1., 1.), -1, 0)
+            if np.nanmax(np.abs(residual)) < 1.e-10:
+                break
+        gp = np.exp(x)
+        if not np.all(np.isfinite(gp)) or np.any(gp <= 0.) or np.nanmax(np.abs(residual)) >= 1.e-7:
+            raise ValueError('Unable to diagnose positive three-layer reduced gravities from the requested modal speeds.')
+        return gp
+
     def _H_from_init_file(self, config, State):
         if config.GRID.super != 'GRID_FROM_FILE':
             return None
@@ -3888,7 +4395,7 @@ class Model_qgsw(M):
         )
 
     def _H_control_to_total(self, H_control, apply_bounds=True):
-        if self._modal_two_layer:
+        if self._modal_multilayer:
             return self._modal_H_control_to_total(H_control)
         H_control_sw = self._H_control_to_sw(H_control)
         H_ref = jnp.asarray(self.H0, dtype=self.dtype)
@@ -4066,7 +4573,7 @@ class Model_qgsw(M):
         """
         if self.taux_wind is None:
             return None, None
-        it = int(round(t / self.wind_dt)) if self.wind_dt > 0 else 0
+        it = int(np.floor(t / self.wind_dt)) if self.wind_dt > 0 else 0
         it = int(np.clip(it, 0, len(self.taux_wind) - 1))
         taux = (1 - self.sponge_u) * jnp.asarray(self.taux_wind[it], dtype=self.dtype)  # (ny, nx+1)
         tauy = (1 - self.sponge_v) * jnp.asarray(self.tauy_wind[it], dtype=self.dtype)  # (ny+1, nx)
@@ -4080,12 +4587,189 @@ class Model_qgsw(M):
         """Diagnose external physical SSH from the model height coordinate."""
         return height * self.ssh_observation_scale
 
+    # --- Generic physical modal layer-stack transforms ------------------------------
+    def _stack_depth_control(self, State):
+        zeros = jnp.zeros((self.nx, self.ny), dtype=self.dtype)
+        values = []
+        for name in self.stack_control_names + self.stack_drag_control_names:
+            value = State.params[name].astype(self.dtype).T if name in self.name_params else zeros
+            values.append(value)
+        return jnp.stack(values, axis=0)
+
+    def _stack_H_control_to_total(self, control):
+        if control is None:
+            return jnp.asarray(self.H0, dtype=self.dtype)
+        control = jnp.asarray(control, dtype=self.dtype)
+        if control.ndim == 4 and control.shape[0] == 1:
+            control = control[0]
+        if control.ndim != 3 or control.shape[0] != len(self.stack_control_names + self.stack_drag_control_names):
+            raise ValueError(
+                f'layer-stack control must have shape ({len(self.stack_control_names + self.stack_drag_control_names)}, nx, ny); got {control.shape}.')
+
+        decoded = {}
+        for index, name in enumerate(self.stack_control_names):
+            if name == 'r_ek':
+                decoded[name] = self.r_ek_min + (self.r_ek_max-self.r_ek_min) * jax.nn.sigmoid(
+                    self.r_ek_logit_ref + control[index])
+                continue
+            if name == 'H_ek_ratio':
+                decoded[name] = jnp.clip(
+                    jnp.asarray(self.H_ek_ratio_ref_sw, dtype=self.dtype)
+                    * jnp.exp(control[index]),
+                    self.H_ek_ratio_min,
+                    self.H_ek_ratio_max,
+                )
+                continue
+            if name == 'H_ek_fraction':
+                decoded[name] = self.H_ek_fraction_min + (
+                    self.H_ek_fraction_max-self.H_ek_fraction_min
+                ) * jax.nn.sigmoid(self.H_ek_fraction_logit_ref + control[index])
+                continue
+            # r2 changes the reduced-gravity closure, not a layer depth.
+            if name == 'c_mode2_ratio':
+                continue
+            reference = jnp.asarray(self.stack_control_ref[name], dtype=self.dtype)
+            floor = jnp.asarray(self.stack_control_floor[name], dtype=self.dtype)
+            total = floor + (reference-floor)*jnp.exp(control[index])
+            maximum = self.stack_control_max[name]
+            if maximum is not None:
+                total = jnp.minimum(total, jnp.asarray(maximum, dtype=self.dtype))
+            decoded[name] = total
+
+        if self.layer_stack == ('baroclinic',):
+            return decoded['H_bc1'][None]
+        if self._two_slab_ekman:
+            if 'H_ek_ratio' in decoded:
+                ratio = decoded['H_ek_ratio']
+                total = jnp.asarray(self.H_ek_total_ref_sw, dtype=self.dtype)
+                H_ek1 = total / (1. + ratio)
+                H_ek0 = total - H_ek1
+            else:
+                H_ek0, H_ek1 = decoded['H_ek0'], decoded['H_ek1']
+            return jnp.stack((H_ek0, H_ek1, decoded['H_bc1']), axis=0)
+        if self.layer_stack == ('ekman', 'baroclinic'):
+            if 'H_ek_fraction' in decoded:
+                total = jnp.asarray(self.H_total_ref_sw, dtype=self.dtype)
+                H_ek = decoded['H_ek_fraction'] * total
+                return jnp.stack((H_ek, (1.-decoded['H_ek_fraction']) * total), axis=0)
+            return jnp.stack((decoded['H_ek'], decoded['H_bc1']), axis=0)
+        if self.layer_stack in (('mixed_layer', 'baroclinic'), ('ekman_mixed_layer', 'baroclinic')):
+            return jnp.stack((decoded['H_ml'], decoded['H_bc1']), axis=0)
+        H_ml = decoded['H_ml']
+        r_ek = decoded['r_ek']
+        return jnp.stack((r_ek*H_ml, (1.-r_ek)*H_ml, decoded['H_bc1']), axis=0)
+
+    def _stack_mode2_ratio(self, control, H_total):
+        """Bounded, differentiable r2=c2/c1 for a two-layer stack."""
+        if 'c_mode2_ratio' not in self.stack_control_names:
+            return jnp.full_like(H_total[0], self.c_mode2_ratio_ref)
+        index = self.stack_control_names.index('c_mode2_ratio')
+        alpha = (H_total[0] + H_total[1]) / jnp.maximum(H_total[0], 1.e-12)
+        root = 2.*alpha - 1.
+        rmax = jnp.sqrt(jnp.maximum(root-jnp.sqrt(jnp.maximum(root**2-1., 0.)), 1.e-12))
+        # Keep a small margin from the singular discriminant boundary.
+        upper = .98*rmax
+        ref = jnp.minimum(jnp.asarray(self.c_mode2_ratio_ref, dtype=self.dtype), .95*upper)
+        logit_ref = jnp.log(ref/jnp.maximum(upper-ref, 1.e-12))
+        return upper * jax.nn.sigmoid(logit_ref + control[index])
+
+    def _stack_gprime(self, H_total, control):
+        """Reduced gravities consistent with controlled H and r2."""
+        if self.layer_stack != ('ekman', 'baroclinic') or 'c_mode2_ratio' not in self.stack_control_names:
+            return jnp.asarray(self.g_prime, dtype=self.dtype)
+        ratio = self._stack_mode2_ratio(control, H_total)
+        c1_sq = jnp.asarray(self.c.T, dtype=self.dtype)**2
+        c2_sq = (ratio*jnp.asarray(self.c.T, dtype=self.dtype))**2
+        trace = c1_sq + c2_sq
+        determinant = c1_sq*c2_sq
+        disc = trace**2 - 4.*(H_total[0]+H_total[1])*determinant/H_total[0]
+        gp0 = (trace-jnp.sqrt(jnp.maximum(disc, 1.e-20))) / (2.*(H_total[0]+H_total[1]))
+        gp1 = determinant/(H_total[0]*H_total[1]*gp0)
+        return jnp.stack((gp0, gp1), axis=0)
+
+    def _stack_drag_control_to_total(self, control):
+        """Decode positive Ekman dynamical parameters from log controls."""
+        if not self.stack_drag_control_names:
+            return None
+        values = []
+        offset = len(self.stack_control_names)
+        log_min = self.drag_control_log_min
+        log_max = self.drag_control_log_max
+        if log_min >= log_max:
+            raise ValueError('drag_control_log_min must be smaller than drag_control_log_max.')
+        for index, name in enumerate(self.stack_drag_control_names):
+            reference = jnp.asarray(self.stack_drag_control_ref[name], dtype=self.dtype)
+            values.append(reference * jnp.exp(jnp.clip(
+                control[offset+index], log_min, log_max)))
+        return tuple(values)
+
+    def _stack_eigenmodes(self, H_total):
+        """Return primary height/velocity modes and all modal speeds."""
+        gp = jnp.asarray(self.g_prime, dtype=self.dtype)
+        cumulative_gp = jnp.cumsum(gp, axis=0)
+        rows = []
+        for i in range(self.nl):
+            rows.append(jnp.stack([cumulative_gp[min(i, j)] for j in range(self.nl)], axis=0))
+        pressure_matrix = jnp.stack(rows, axis=0)
+        sqrt_H = jnp.sqrt(jnp.maximum(H_total, 1.e-12))
+        symmetric = pressure_matrix * sqrt_H[:, None] * sqrt_H[None, :]
+        symmetric_batch = jnp.moveaxis(symmetric, (0, 1), (-2, -1))
+        eigenvalues, eigenvectors = jnp.linalg.eigh(symmetric_batch)
+        order = jnp.arange(self.nl-1, -1, -1)
+        eigenvalues = eigenvalues[..., order]
+        eigenvectors = eigenvectors[..., :, order]
+        q_primary = eigenvectors[..., :, 0]
+        h_primary = jnp.moveaxis(q_primary, -1, 0) * sqrt_H
+        pdeep_per_ssh = jnp.sum(cumulative_gp*h_primary, axis=0) / self.g
+        sign = jnp.where(pdeep_per_ssh < 0., -1., 1.)
+        h_primary = h_primary * sign / jnp.maximum(jnp.abs(pdeep_per_ssh), 1.e-12)
+        c_primary = jnp.sqrt(jnp.maximum(eigenvalues[..., 0], 1.e-12))
+        velocity_primary = jnp.einsum('ijxy,jxy->ixy', pressure_matrix, h_primary) / c_primary
+        velocity_primary = velocity_primary / jnp.where(
+            jnp.abs(velocity_primary[0]) > 1.e-12, velocity_primary[0], 1.)
+        speeds = jnp.sqrt(jnp.maximum(jnp.moveaxis(eigenvalues, -1, 0), 0.))
+        return h_primary, velocity_primary, speeds
+
+    def _stack_project_surface_sw(self, u, v, ssh, H_total):
+        """Project dynamic correction fields only onto the baroclinic layer.
+
+        ``Fu``, ``Fv`` and ``Fh`` never force the Ekman or mixed-layer roles.
+        ``Fh`` is converted from a public SSH tendency to the deep-layer
+        thickness coordinate so its diagnosed SSH tendency remains unchanged.
+        ``H_total`` is retained in the signature for the differentiated modal
+        interface, but the role-selective projection does not depend on depth.
+        """
+        del H_total
+        return self._stack_project_boundary_sw(u, v, ssh)
+
+    def _stack_project_boundary_sw(self, u, v, ssh, g_prime=None):
+        """Project U/V/SSH BCs only onto the baroclinic layer.
+
+        Ekman and mixed-layer dynamic boundary targets are zero. Tracer BCs
+        remain independent and are applied by the tracer stepping path.
+        """
+        cumulative_gp = jnp.cumsum(
+            jnp.asarray(self.g_prime if g_prime is None else g_prime, dtype=self.dtype), axis=0)
+        ssh_to_hbc = self.g / jnp.maximum(cumulative_gp[-1], 1.e-12)
+        u_layers = jnp.zeros((self.nl,) + u.shape, dtype=self.dtype).at[-1].set(u)
+        v_layers = jnp.zeros((self.nl,) + v.shape, dtype=self.dtype).at[-1].set(v)
+        h_layers = jnp.zeros((self.nl,) + ssh.shape, dtype=self.dtype)
+        h_layers = h_layers.at[-1].set(ssh_to_hbc*ssh)
+        return u_layers, v_layers, h_layers
+
+    def _stack_diagnose_ssh(self, h_layers, g_prime=None):
+        coefficients = jnp.cumsum(
+            jnp.asarray(self.g_prime if g_prime is None else g_prime, dtype=self.dtype), axis=0) / self.g
+        return jnp.sum(coefficients.transpose(0, 2, 1)*h_layers, axis=0)
+
     # --- Modal two-layer transforms -------------------------------------------------
     # The SW core uses layer-thickness perturbations.  For a physical surface
     # SSH amplitude s, the selected first baroclinic eigenvector is
     # [h_ml, h_bc1] = [(1-r)s, r s].  Surface velocity is lifted into a
     # zero-depth-transport shear [u_s, -(H_ml/H_bc1)u_s], likewise for v.
     def _modal_H_control_to_total(self, H_control):
+        if self._modal_layer_stack:
+            return self._stack_H_control_to_total(H_control)
         if H_control is None:
             return jnp.asarray(self.H0, dtype=self.dtype)
         control = jnp.asarray(H_control, dtype=self.dtype)
@@ -4105,6 +4789,8 @@ class Model_qgsw(M):
         return total
 
     def _modal_depth_control(self, State):
+        if self._modal_layer_stack:
+            return self._stack_depth_control(State)
         if not self._modal_two_layer:
             return None
         zeros = jnp.zeros((self.nx, self.ny), dtype=self.dtype)
@@ -4128,6 +4814,8 @@ class Model_qgsw(M):
         return r, jnp.sqrt(jnp.maximum(lambda_fast, 0.)), jnp.sqrt(jnp.maximum(lambda_slow, 0.))
 
     def _modal_project_surface_sw(self, u, v, ssh, H_total):
+        if self._modal_layer_stack:
+            return self._stack_project_surface_sw(u, v, ssh, H_total)
         r, _, _ = self._modal_properties(H_total)
         shear = H_total[0] / jnp.maximum(H_total[1], 1.e-12)
         shear_u_pad = jnp.pad(shear, ((1, 1), (0, 0)), mode='edge')
@@ -4150,14 +4838,34 @@ class Model_qgsw(M):
             return np.log(np.maximum(total - floor, 1.e-12) / (reference - floor))
         return np.zeros((self.ny, self.nx))
 
+    def _layer_fields_total(self, State):
+        """Return layer fields in absolute physical variables for diagnostics."""
+        u_layers = jnp.asarray(State.var['u_layers'], dtype=self.dtype)
+        v_layers = jnp.asarray(State.var['v_layers'], dtype=self.dtype)
+        h_layers = jnp.asarray(State.var['h_layers'], dtype=self.dtype)
+        if self.anomaly_reference_state and self._anomaly_reference_initialized:
+            u_layers = u_layers + self.u_reference_sw.transpose(0, 2, 1)
+            v_layers = v_layers + self.v_reference_sw.transpose(0, 2, 1)
+            h_layers = h_layers + self.h_reference_sw.transpose(0, 2, 1)
+        return u_layers, v_layers, h_layers
+
     def _sync_layers_from_surface(self, State):
         """Project public surface SSH/U/V into the kernel's layer variables."""
         ssh = jnp.asarray(State.getvar(name_var=self.name_var['SSH']), dtype=self.dtype)
         u   = jnp.asarray(State.getvar(name_var=self.name_var['U']),   dtype=self.dtype)
         v   = jnp.asarray(State.getvar(name_var=self.name_var['V']),   dtype=self.dtype)
-        if self._modal_two_layer:
+        if self.anomaly_reference_state and self._anomaly_reference_initialized:
+            u = u - self.u_reference_surface
+            v = v - self.v_reference_surface
+        if self._modal_multilayer:
             H_total = self._modal_H_control_to_total(self._modal_depth_control(State))
-            u_layers, v_layers, h_layers = self._modal_project_surface_sw(u.T, v.T, ssh.T, H_total)
+            if self._modal_layer_stack and self.layer_role_boundary_conditions:
+                ssh_anomaly = ssh.T - self.ssh_reference_sw
+                u_layers, v_layers, h_layers = self._stack_project_boundary_sw(
+                    u.T, v.T, ssh_anomaly)
+            else:
+                u_layers, v_layers, h_layers = self._modal_project_surface_sw(
+                    u.T, v.T, ssh.T, H_total)
             State.var['h_layers'] = h_layers.transpose(0, 2, 1)
             State.var['u_layers'] = u_layers.transpose(0, 2, 1)
             State.var['v_layers'] = v_layers.transpose(0, 2, 1)
@@ -4167,10 +4875,27 @@ class Model_qgsw(M):
             State.var['v_layers'] = jnp.zeros((self.nl, self.ny+1, self.nx), dtype=self.dtype).at[0].set(v)
 
     def _diagnose_surface(self, State):
-        """Set 2D surface SSH/U/V from per-layer arrays."""
-        State.setvar(State.var['h_layers'].sum(axis=0), name_var=self.name_var['SSH'])
-        State.setvar(State.var['u_layers'][0],          name_var=self.name_var['U'])
-        State.setvar(State.var['v_layers'][0],          name_var=self.name_var['V'])
+        """Set absolute 2D surface SSH/U/V from per-layer arrays."""
+        u_layers, v_layers, h_layers = self._layer_fields_total(State)
+        if self._modal_layer_stack:
+            control = self._modal_depth_control(State)
+            H_total = self._modal_H_control_to_total(control)
+            ssh = self._stack_diagnose_ssh(
+                h_layers, g_prime=self._stack_gprime(H_total, control))
+        else:
+            ssh = h_layers.sum(axis=0)
+        if (self._modal_layer_stack and self.layer_role_boundary_conditions
+                and not (self.anomaly_reference_state and self._anomaly_reference_initialized)):
+            ssh = ssh + self.ssh_reference_sw.T
+        State.setvar(ssh, name_var=self.name_var['SSH'])
+        # In the role-aware stack, U/V boundary targets are projected onto
+        # the baroclinic (boundary-condition) layer. Diagnose the public
+        # velocity from that same layer; taking layer 0 here would overwrite
+        # valid BC velocities with the zero Ekman target.
+        surface_layer = -1 if (self._modal_layer_stack
+                               and self.layer_role_boundary_conditions) else 0
+        State.setvar(u_layers[surface_layer], name_var=self.name_var['U'])
+        State.setvar(v_layers[surface_layer], name_var=self.name_var['V'])
 
     def init(self, State, t0=0):
 
@@ -4186,9 +4911,21 @@ class Model_qgsw(M):
                 if self.init_from_bc[name] and t0 in self.bc[name]:
                     State.setvar(self.bc[name][t0], self.name_var[name])
         elif self.init_from_bc:
-            for name in self.name_var: 
-                if t0 in self.bc[name]:
-                     State.setvar(self.bc[name][t0], self.name_var[name])
+            # Boundary-condition times are generally stored on the model time
+            # axis (seconds since the experiment start), and may not contain
+            # the exact value passed to ``init``.  Use the same nearest-time
+            # selection as the prognostic BC application instead of silently
+            # leaving the state at its zero initial value.
+            try:
+                u0, v0, ssh0 = self._apply_bc(t0, t0 + self.dt)
+                State.setvar(u0, self.name_var['U'])
+                State.setvar(v0, self.name_var['V'])
+                State.setvar(ssh0, self.name_var['SSH'])
+                print('MOD_QGSW initialization: boundary conditions applied.')
+            except (KeyError, TypeError, ValueError):
+                # Keep the historical zero-initialisation fallback when no
+                # usable BC field is available.
+                print('MOD_QGSW initialization: no usable boundary condition; using zeros.')
 
         # In QG mode the velocity field must be geostrophically balanced with SSH.
         # BC files typically only contain SSH, so u/v would otherwise be zero.
@@ -4198,11 +4935,139 @@ class Model_qgsw(M):
             State.setvar(u0, self.name_var['U'])
             State.setvar(v0, self.name_var['V'])
 
-        # For nl>1, project surface fields into per-layer arrays
+        # For nl>1, project surface fields into per-layer arrays. In the
+        # role-aware stack, the first SSH boundary field defines a fixed public
+        # SSH background; only its subsequent anomaly enters baroclinic h.
         if self.nl > 1:
-            self._sync_layers_from_surface(State)
+            if (self._modal_layer_stack
+                    and self.layer_role_boundary_conditions
+                    and self.modal_ssh_reference == 'initial_bc'
+                    and self.mdt is None
+                    and not self._ssh_reference_initialized):
+                ssh_reference = self._finite_model_array(State, self.name_var['SSH'])
+                self.ssh_reference_sw = jnp.asarray(ssh_reference, dtype=self.dtype).T
+                self._ssh_reference_initialized = True
+                print('MOD_QGSW fixed SSH reference initialized from the first boundary field.')
+            if not (self._modal_layer_stack and self._restart_layer_state_loaded):
+                self._sync_layers_from_surface(State)
+                # Keep the BC projection on the baroclinic layer, but allow
+                # the uppermost prognostic layer to start from the same
+                # observed surface velocity. This is intentionally opt-in:
+                # the historical role-aware initialization leaves Ekman U/V at
+                # zero and applies BCs only to the boundary-condition layer.
+                if (self._modal_layer_stack
+                        and self.layer_role_boundary_conditions
+                        and self.init_surface_velocity_from_bc):
+                    u_bc, v_bc, _ = self._apply_bc(t0, t0 + self.dt)
+                    State.var['u_layers'] = State.var['u_layers'].at[0].set(
+                        jnp.asarray(u_bc, dtype=self.dtype))
+                    State.var['v_layers'] = State.var['v_layers'].at[0].set(
+                        jnp.asarray(v_bc, dtype=self.dtype))
+                    print('MOD_QGSW initialization: surface velocity copied from boundary conditions.')
+            if (self.anomaly_reference_state and self._modal_layer_stack
+                    and self.layer_role_boundary_conditions
+                    and not self._anomaly_reference_initialized):
+                self.u_reference_surface = jnp.asarray(
+                    self._finite_model_array(State, self.name_var['U']), dtype=self.dtype)
+                self.v_reference_surface = jnp.asarray(
+                    self._finite_model_array(State, self.name_var['V']), dtype=self.dtype)
+                self.u_reference_sw = jnp.asarray(
+                    State.var['u_layers'].transpose(0, 2, 1), dtype=self.dtype)
+                self.v_reference_sw = jnp.asarray(
+                    State.var['v_layers'].transpose(0, 2, 1), dtype=self.dtype)
+                _, _, h_reference = self._stack_project_boundary_sw(
+                    jnp.zeros((State.nx + 1, State.ny), dtype=self.dtype),
+                    jnp.zeros((State.nx, State.ny + 1), dtype=self.dtype),
+                    self.ssh_reference_sw)
+                self.h_reference_sw = jnp.asarray(h_reference, dtype=self.dtype)
+                State.var['u_layers'] = State.var['u_layers'] - self.u_reference_sw.transpose(0, 2, 1)
+                State.var['v_layers'] = State.var['v_layers'] - self.v_reference_sw.transpose(0, 2, 1)
+                self._anomaly_reference_initialized = True
+                print('MOD_QGSW anomaly reference state initialized from the first BC field.')
+            if self._modal_layer_stack and self.layer_role_boundary_conditions:
+                self._diagnose_surface(State)
 
         self._set_land_nan(State)
+
+    def _wind_work_budget(self, State, t=None):
+        """Return instantaneous wind-work maps in W m-2.
+
+        The distributed MLTL forcing uses interface stresses tau_0, tau_1,
+        tau_2=0. Its resolved work is
+        tau_0.u_ek + tau_1.(u_tl-u_ek), while the positive shear-production
+        proxy is tau_1.(u_ek-u_tl). The two-layer top-forced baseline has
+        tau_1=0, so its resolved work is simply surface stress work.
+        """
+        if t is None:
+            t = 0.
+        taux, tauy = self._get_wind_stress(t)
+        taux = np.asarray(taux)
+        tauy = np.asarray(tauy)
+        tau0_x = 0.5 * (taux[:, :-1] + taux[:, 1:])
+        tau0_y = 0.5 * (tauy[:-1, :] + tauy[1:, :])
+        u_layers, v_layers, _ = self._layer_fields_total(State)
+        u_layers = np.asarray(u_layers)
+        v_layers = np.asarray(v_layers)
+        u0 = 0.5 * (u_layers[0, :, :-1] + u_layers[0, :, 1:])
+        v0 = 0.5 * (v_layers[0, :-1, :] + v_layers[0, 1:, :])
+        surface = tau0_x * u0 + tau0_y * v0
+        if getattr(self.model, 'wind_stress_profile', 'top_layer') == 'stokes_ml_tl' and u_layers.shape[0] >= 2:
+            u1 = 0.5 * (u_layers[1, :, :-1] + u_layers[1, :, 1:])
+            v1 = 0.5 * (v_layers[1, :-1, :] + v_layers[1, 1:, :])
+            H_u = np.asarray(self.model.h_ref_ugrid) / np.maximum(np.asarray(self.model.area_ugrid), self.model.h_min)
+            H_v = np.asarray(self.model.h_ref_vgrid) / np.maximum(np.asarray(self.model.area_vgrid), self.model.h_min)
+            h0 = (0.5 * (H_u[0, :-1, :] + H_u[0, 1:, :])).T
+            h1 = (0.5 * (H_u[1, :-1, :] + H_u[1, 1:, :])).T
+            hm0 = (0.5 * (H_v[0, :, :-1] + H_v[0, :, 1:])).T
+            hm1 = (0.5 * (H_v[1, :, :-1] + H_v[1, :, 1:])).T
+            sigma_x = (1. - h0 / np.maximum(h0 + h1, self.model.h_min)) / (1. + h0 / np.maximum(h0 + h1, self.model.h_min))
+            sigma_y = (1. - hm0 / np.maximum(hm0 + hm1, self.model.h_min)) / (1. + hm0 / np.maximum(hm0 + hm1, self.model.h_min))
+            tau1_x = sigma_x * tau0_x
+            tau1_y = sigma_y * tau0_y
+            interface = tau1_x * (u1 - u0) + tau1_y * (v1 - v0)
+            layer0 = (tau0_x - tau1_x) * u0 + (tau0_y - tau1_y) * v0
+            layer1 = tau1_x * u1 + tau1_y * v1
+            return {'wind_work_surface': surface,
+                    'wind_work_layer_ekman': layer0,
+                    'wind_work_layer_tl': layer1,
+                    'wind_work_resolved': layer0 + layer1,
+                    'wind_work_tke_proxy': -interface}
+        return {'wind_work_surface': surface,
+                'wind_work_layer_ekman': surface,
+                'wind_work_layer_tl': np.zeros_like(surface),
+                'wind_work_resolved': surface,
+                'wind_work_tke_proxy': np.zeros_like(surface)}
+
+    def observation_field(self, State, name_var, role=None):
+        """Return a field for a semantic observation role.
+
+        Observation operators use roles rather than model-specific variable
+        names.  The surface role is the uppermost prognostic layer in a
+        multilayer stack; other roles fall back to the public model field.
+        """
+        fields = State.var if hasattr(State, 'var') else State
+        if role == 'surface' and self._modal_layer_stack and name_var in ('U', 'V'):
+            component = 'u' if name_var == 'U' else 'v'
+            if self.anomaly_reference_state and self._anomaly_reference_initialized:
+                layers = fields[f'{component}_layers']
+                reference = self.u_reference_sw if component == 'u' else self.v_reference_sw
+                return layers[0] + reference[0].transpose(1, 0)
+            return fields[f'{component}_layers'][0]
+        return fields[self.name_var[name_var]]
+
+    def add_observation_adjoint(self, adState, name_var, role, increment):
+        """Accumulate a semantic observation adjoint in model coordinates."""
+        fields = adState.var if hasattr(adState, 'var') else adState
+        if role == 'surface' and self._modal_layer_stack and name_var in ('U', 'V'):
+            component = 'u' if name_var == 'U' else 'v'
+            key = f'{component}_layers'
+            fields[key] = fields[key].at[0].add(increment)
+            return
+        name = self.name_var[name_var]
+        if hasattr(adState, 'setvar'):
+            adState.setvar(fields[name] + increment, name)
+        else:
+            fields[name] = fields[name] + increment
 
     def save_output(self,State,present_date,name_var=None,t=None):
 
@@ -4221,7 +5086,40 @@ class Model_qgsw(M):
             for name in self.tracer_names:
                 _name_var.append(self.name_var[name])
 
-        if self._modal_two_layer:
+        if self._modal_layer_stack:
+            H_total = self._modal_H_control_to_total(self._modal_depth_control(State))
+            _, _, speeds = self._stack_eigenmodes(H_total)
+            layer_names = {}
+            u_layers_total, v_layers_total, h_layers_total = self._layer_fields_total(State)
+            for index, layer_name in enumerate(self.layer_stack):
+                short_name = {'mixed_layer': 'ml', 'baroclinic': 'bc1',
+                              'ekman_mixed_layer': 'ekman_ml',
+                              'ekman_upper': 'ek0', 'ekman_lower': 'ek1'}.get(layer_name, layer_name)
+                layer_names[f'h_{short_name}'] = np.asarray(h_layers_total[index])
+                layer_names[f'u_{short_name}'] = np.asarray(u_layers_total[index])
+                layer_names[f'v_{short_name}'] = np.asarray(v_layers_total[index])
+                layer_names[f'H_{short_name}'] = np.array(H_total[index].T)
+            # Semantic output fields for comparisons with near-surface
+            # observations.  The model-specific layer naming remains available
+            # above, while diagnostics can use a stable surface interface.
+            layer_names['u_surface'] = np.asarray(u_layers_total[0])
+            layer_names['v_surface'] = np.asarray(v_layers_total[0])
+            if self.layer_stack == ('ekman', 'mixed_layer', 'baroclinic'):
+                layer_names['H_ml'] = np.array((H_total[0]+H_total[1]).T)
+                layer_names['r_ek'] = np.array((H_total[0]/jnp.maximum(H_total[0]+H_total[1], 1.e-12)).T)
+            elif self.layer_stack == ('ekman_mixed_layer', 'baroclinic'):
+                layer_names['H_ek'] = np.array(H_total[0].T)
+                layer_names['H_ml'] = np.array(H_total[0].T)
+            for index in range(self.nl):
+                layer_names[f'c_mode{index+1}'] = np.array(speeds[index].T)
+            if self.layer_role_boundary_conditions:
+                layer_names['ssh_reference'] = np.asarray(self.ssh_reference_sw.T)
+            for name in self.stack_control_names + self.stack_drag_control_names:
+                if name in self.name_params:
+                    layer_names[f'{name}_control'] = +State.params[name]
+            State0.var.update(layer_names)
+            _name_var += list(layer_names)
+        elif self._modal_two_layer:
             H_total = self._modal_H_control_to_total(self._modal_depth_control(State))
             r, c_fast, c_slow = self._modal_properties(H_total)
             layer_names = {
@@ -4263,6 +5161,11 @@ class Model_qgsw(M):
             State0.var['wind_strength'] = State.params['wind_strength']
             _name_var += ['wind_strength']
     
+        if getattr(self, 'save_wind_work_budget', False):
+            budget = self._wind_work_budget(State, t=t)
+            State0.var.update(budget)
+            _name_var += list(budget)
+
         State0.save_output(present_date, name_var=_name_var)
     
     def set_bc(self,time_bc,var_bc=None,t_bc=None,**kwargs):
@@ -4356,18 +5259,48 @@ class Model_qgsw(M):
             c_b_list.append(jnp.asarray(cb_i, dtype=self.dtype))
         return jnp.stack(c_b_list, axis=0)  # (n_trac, ny, nx)
     
+    def _chunk_specs(self, t0, nstep):
+        """Split propagation whenever the discrete wind snapshot changes.
+
+        The test uses physical time, rather than ``wind_timestep / dt`` as an
+        integer. It therefore remains correct when the CFL criterion changes
+        ``self.dt``.  A snapshot is held exactly over the same model steps as
+        :meth:`_get_wind_stress`, which selects ``floor(t / wind_dt)``.
+        """
+        specs = []
+        offset = 0
+        wind_dt = getattr(self, 'wind_dt', None)
+        # Within a JAX scan, ``t0`` is a tracer and cannot drive Python
+        # chunking. Scan boundary forcing is pre-stacked with this same static
+        # schedule; daily checkpoints in the standard configuration are
+        # aligned with the hourly wind cadence, so phase zero is exact.
+        try:
+            from jax import core as _jax_core
+            t_schedule = 0. if isinstance(t0, _jax_core.Tracer) else t0
+        except Exception:
+            t_schedule = t0
+        while offset < nstep:
+            maximum = nstep - offset
+            if self.max_nstep > 0:
+                maximum = min(maximum, self.max_nstep)
+            n_chunk = maximum
+            if wind_dt is not None and wind_dt > 0:
+                t_chunk = t_schedule + offset*self.dt
+                wind_index = int(np.floor(t_chunk / wind_dt))
+                # Keep only consecutive model steps that select this same
+                # held hourly (or user-prescribed) wind snapshot.
+                n_chunk = 1
+                while (n_chunk < maximum and
+                       int(np.floor((t_chunk + n_chunk*self.dt) / wind_dt)) == wind_index):
+                    n_chunk += 1
+            specs.append((offset, n_chunk))
+            offset += n_chunk
+        return specs
+
     def prepare_scan_boundary_conditions(self, times, nstep):
         """Pre-stack QGSW forcing for each checkpoint and internal chunk."""
-        chunk_specs = []
-        step_done = 0
-        while step_done < nstep:
-            n_chunk = (
-                min(nstep - step_done, self.max_nstep)
-                if self.max_nstep > 0
-                else nstep - step_done
-            )
-            chunk_specs.append((step_done, n_chunk))
-            step_done += n_chunk
+        first_time = np.asarray(times)[0].item() if hasattr(np.asarray(times)[0], 'item') else np.asarray(times)[0]
+        chunk_specs = self._chunk_specs(first_time, nstep)
 
         intervals = []
         for interval_time in np.asarray(times):
@@ -4561,6 +5494,13 @@ class Model_qgsw(M):
         """
         u, v, h = u0, v0, h0
 
+        # The stored prognostic fields are anomalies; the SW equations use
+        # the corresponding total reference state.
+        if self.anomaly_reference_state and self._anomaly_reference_initialized:
+            u = u + self.u_reference_sw
+            v = v + self.v_reference_sw
+            h = h + self.h_reference_sw
+
         # Add MDT (surface only for nl>1)
         if self.mdt is not None:
             if self.nl > 1:
@@ -4577,14 +5517,36 @@ class Model_qgsw(M):
         #                  tauy on interior v-faces: (nx, ny-1)
         _taux = taux[:, 1:-1].T if taux is not None else None   # (nx-1, ny)
         _tauy = tauy[1:-1, :].T if tauy is not None else None   # (nx, ny-1)
+        if self._modal_layer_stack and not any(name in self.layer_stack for name in ('ekman', 'ekman_mixed_layer', 'ekman_upper')):
+            _taux = _tauy = None
 
         # Convert BCs and forcing from State convention to SW convention.
         # Modal depth controls remain inside this JAX path, so their effect on
         # vertical projection, wave speeds, and wind inertia is differentiated.
-        H_total_modal = self._modal_H_control_to_total(H) if self._modal_two_layer else None
-        if self._modal_two_layer:
-            u_b_sw, v_b_sw, h_b_sw = self._modal_project_surface_sw(u_b.T, v_b.T, h_b.T, H_total_modal)
-            Fu_sw, Fv_sw, Fh_sw = self._modal_project_surface_sw(Fu.T, Fv.T, Fh.T, H_total_modal)
+        H_total_modal = self._modal_H_control_to_total(H) if self._modal_multilayer else None
+        g_prime_modal = (self._stack_gprime(H_total_modal, H)
+                         if self._modal_layer_stack else None)
+        ekman_drag_controls = self._stack_drag_control_to_total(H) if self._modal_layer_stack else None
+        if self._modal_layer_stack and self.layer_role_boundary_conditions:
+            h_b_anomaly = h_b.T - self.ssh_reference_sw
+            if self.anomaly_reference_state and self._anomaly_reference_initialized:
+                u_b_input = u_b - self.u_reference_surface
+                v_b_input = v_b - self.v_reference_surface
+            else:
+                u_b_input = u_b
+                v_b_input = v_b
+            u_b_sw, v_b_sw, h_b_sw = self._stack_project_boundary_sw(
+                u_b_input.T, v_b_input.T, h_b_anomaly, g_prime=g_prime_modal)
+            Fu_sw, Fv_sw, Fh_sw = self._stack_project_surface_sw(
+                Fu.T, Fv.T, Fh.T, H_total_modal)
+            Fu_sw = Fu_sw / (3600 * 24)
+            Fv_sw = Fv_sw / (3600 * 24)
+            Fh_sw = Fh_sw / (3600 * 24)
+        elif self._modal_multilayer:
+            u_b_sw, v_b_sw, h_b_sw = self._modal_project_surface_sw(
+                u_b.T, v_b.T, h_b.T, H_total_modal)
+            Fu_sw, Fv_sw, Fh_sw = self._modal_project_surface_sw(
+                Fu.T, Fv.T, Fh.T, H_total_modal)
             Fu_sw = Fu_sw / (3600 * 24)
             Fv_sw = Fv_sw / (3600 * 24)
             Fh_sw = Fh_sw / (3600 * 24)
@@ -4604,6 +5566,11 @@ class Model_qgsw(M):
             Fv_sw = Fv.T / (3600 * 24)
             Fh_sw = Fh.T / (3600 * 24)
 
+        if self.anomaly_reference_state and self._anomaly_reference_initialized:
+            u_b_sw = u_b_sw + self.u_reference_sw
+            v_b_sw = v_b_sw + self.v_reference_sw
+            h_b_sw = h_b_sw + self.h_reference_sw
+
         # Add MDT to sponge BC target: inside model_step the state already has MDT
         # added, so the sponge must relax toward (anomaly_BC + MDT), not anomaly_BC.
         if self.mdt is not None:
@@ -4622,11 +5589,17 @@ class Model_qgsw(M):
             u_b_sw, v_b_sw, h_b_sw = self._qg_balanced_sponge_target(
                 u, v, h, u_b_sw, v_b_sw, h_b_sw,
             )
+        if self.sponge_target == 'zero':
+            u_b_sw = jnp.zeros_like(u_b_sw)
+            v_b_sw = jnp.zeros_like(v_b_sw)
+            h_b_sw = jnp.zeros_like(h_b_sw)
 
         H_model = self._H_control_to_model_increment(H)
-        # Modal wind stress is confined to the mixed layer and uses its current
-        # controlled total depth, never an independent h_wind control.
-        h_wind_model = H_total_modal[0] if self._modal_two_layer else self._h_wind_control_to_model_increment(h_wind)
+        # Modal-stack wind stress is confined to the top Ekman role and uses
+        # its current depth; legacy modal_two_layer uses its top mixed layer.
+        use_instantaneous_wind_depth = self.wind_use_instantaneous_top_depth
+        h_wind_model = (H_total_modal[0] if (self._modal_multilayer and use_instantaneous_wind_depth)
+                        else self._h_wind_control_to_model_increment(h_wind))
 
         # Step
         if self._is_qg_class:
@@ -4642,7 +5615,8 @@ class Model_qgsw(M):
                 Fu=Fu_sw, Fv=Fv_sw, Fh=Fh_sw,
                 taux=_taux, tauy=_tauy,
                 h_wind=h_wind_model,
-                wind_strength=wind_strength,
+                wind_strength=wind_strength, ekman_drag_controls=ekman_drag_controls,
+                g_prime=g_prime_modal,
             )
 
         # Remove MDT (surface only for nl>1)
@@ -4655,6 +5629,11 @@ class Model_qgsw(M):
                 h1 = h1 - self.mdt
                 u1 = u1 - self.mdu
                 v1 = v1 - self.mdv
+
+        if self.anomaly_reference_state and self._anomaly_reference_initialized:
+            u1 = u1 - self.u_reference_sw
+            v1 = v1 - self.v_reference_sw
+            h1 = h1 - self.h_reference_sw
 
         return u1, v1, h1
     
@@ -4671,6 +5650,13 @@ class Model_qgsw(M):
         """
         u, v, h = u0, v0, h0
 
+        # The stored prognostic fields are anomalies; the SW equations use
+        # the corresponding total reference state.
+        if self.anomaly_reference_state and self._anomaly_reference_initialized:
+            u = u + self.u_reference_sw
+            v = v + self.v_reference_sw
+            h = h + self.h_reference_sw
+
         # Add MDT (surface only for nl>1)
         if self.mdt is not None:
             if self.nl > 1:
@@ -4685,17 +5671,36 @@ class Model_qgsw(M):
         # Wind stress: State (ny, nx+1/ny+1) → SW model (nx-1, ny/ny-1)
         _taux = taux[:, 1:-1].T if taux is not None else None
         _tauy = tauy[1:-1, :].T if tauy is not None else None
+        if self._modal_layer_stack and not any(name in self.layer_stack for name in ('ekman', 'ekman_mixed_layer', 'ekman_upper')):
+            _taux = _tauy = None
 
         # Convert BCs and forcing State → SW convention
         # Tracer: (n_trac, ny, nx) → (1, n_trac, nx, ny)
-        H_total_modal = self._modal_H_control_to_total(H) if self._modal_two_layer else None
+        H_total_modal = self._modal_H_control_to_total(H) if self._modal_multilayer else None
         c_sw   = jnp.expand_dims(c0.transpose(0, 2, 1), axis=0)
         c_b_sw = jnp.expand_dims(c_b.transpose(0, 2, 1), axis=0)
         Fc_sw  = jnp.expand_dims(Fc.transpose(0, 2, 1), axis=0) / (3600 * 24)
 
-        if self._modal_two_layer:
-            u_b_sw, v_b_sw, h_b_sw = self._modal_project_surface_sw(u_b.T, v_b.T, h_b.T, H_total_modal)
-            Fu_sw, Fv_sw, Fh_sw = self._modal_project_surface_sw(Fu.T, Fv.T, Fh.T, H_total_modal)
+        if self._modal_layer_stack and self.layer_role_boundary_conditions:
+            h_b_anomaly = h_b.T - self.ssh_reference_sw
+            if self.anomaly_reference_state and self._anomaly_reference_initialized:
+                u_b_input = u_b - self.u_reference_surface
+                v_b_input = v_b - self.v_reference_surface
+            else:
+                u_b_input = u_b
+                v_b_input = v_b
+            u_b_sw, v_b_sw, h_b_sw = self._stack_project_boundary_sw(
+                u_b_input.T, v_b_input.T, h_b_anomaly)
+            Fu_sw, Fv_sw, Fh_sw = self._stack_project_surface_sw(
+                Fu.T, Fv.T, Fh.T, H_total_modal)
+            Fu_sw = Fu_sw / (3600 * 24)
+            Fv_sw = Fv_sw / (3600 * 24)
+            Fh_sw = Fh_sw / (3600 * 24)
+        elif self._modal_multilayer:
+            u_b_sw, v_b_sw, h_b_sw = self._modal_project_surface_sw(
+                u_b.T, v_b.T, h_b.T, H_total_modal)
+            Fu_sw, Fv_sw, Fh_sw = self._modal_project_surface_sw(
+                Fu.T, Fv.T, Fh.T, H_total_modal)
             Fu_sw = Fu_sw / (3600 * 24)
             Fv_sw = Fv_sw / (3600 * 24)
             Fh_sw = Fh_sw / (3600 * 24)
@@ -4713,6 +5718,11 @@ class Model_qgsw(M):
             Fu_sw = Fu.T / (3600 * 24)
             Fv_sw = Fv.T / (3600 * 24)
             Fh_sw = Fh.T / (3600 * 24)
+
+        if self.anomaly_reference_state and self._anomaly_reference_initialized:
+            u_b_sw = u_b_sw + self.u_reference_sw
+            v_b_sw = v_b_sw + self.v_reference_sw
+            h_b_sw = h_b_sw + self.h_reference_sw
 
         # Add MDT to sponge BC target: inside model.step_with_tracer the state
         # already has MDT added, so the sponge must relax toward
@@ -4732,11 +5742,17 @@ class Model_qgsw(M):
             u_b_sw, v_b_sw, h_b_sw = self._qg_balanced_sponge_target(
                 u, v, h, u_b_sw, v_b_sw, h_b_sw,
             )
+        if self.sponge_target == 'zero':
+            u_b_sw = jnp.zeros_like(u_b_sw)
+            v_b_sw = jnp.zeros_like(v_b_sw)
+            h_b_sw = jnp.zeros_like(h_b_sw)
 
         H_model = self._H_control_to_model_increment(H)
-        # Modal wind stress is confined to the mixed layer and uses its current
-        # controlled total depth, never an independent h_wind control.
-        h_wind_model = H_total_modal[0] if self._modal_two_layer else self._h_wind_control_to_model_increment(h_wind)
+        # Modal-stack wind stress is confined to the top Ekman role and uses
+        # its current depth; legacy modal_two_layer uses its top mixed layer.
+        use_instantaneous_wind_depth = self.wind_use_instantaneous_top_depth
+        h_wind_model = (H_total_modal[0] if (self._modal_multilayer and use_instantaneous_wind_depth)
+                        else self._h_wind_control_to_model_increment(h_wind))
 
         # Joint step (u, v, h, c)
         u1, v1, h1, c1 = self.model.step_with_tracer(
@@ -4762,6 +5778,11 @@ class Model_qgsw(M):
 
         # c1: (1, n_trac, nx, ny) → (n_trac, ny, nx)
         c1_state = c1[0].transpose(0, 2, 1)
+
+        if self.anomaly_reference_state and self._anomaly_reference_initialized:
+            u1 = u1 - self.u_reference_sw
+            v1 = v1 - self.v_reference_sw
+            h1 = h1 - self.h_reference_sw
 
         return u1, v1, h1, c1_state
     
@@ -4920,9 +5941,14 @@ class Model_qgsw(M):
 
         if self.nl > 1:
             # Read per-layer state and convert to SW convention (1, nl, nx, ny)
-            u_layers = np.nan_to_num(np.asarray(State.var['u_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            v_layers = np.nan_to_num(np.asarray(State.var['v_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            h_layers = np.nan_to_num(np.asarray(State.var['h_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            # Keep the nonlinear layer state on the JAX path: these arrays can
+            # be tracers inside the variational scan and derivative paths.
+            u_layers = self._masked_jax_model_array(
+                State, State.var['u_layers'], dtype=self.dtype)
+            v_layers = self._masked_jax_model_array(
+                State, State.var['v_layers'], dtype=self.dtype)
+            h_layers = self._masked_jax_model_array(
+                State, State.var['h_layers'], dtype=self.dtype)
             u = jnp.expand_dims(u_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
             v = jnp.expand_dims(v_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
             h = jnp.expand_dims(h_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
@@ -4938,7 +5964,7 @@ class Model_qgsw(M):
         Fu = State.params[self.name_var['U']]
         Fv = State.params[self.name_var['V']]
         Fh = State.params[self.name_var['SSH']]
-        if self._modal_two_layer:
+        if self._modal_multilayer:
             H = self._modal_depth_control(State)
         elif 'H' in self.name_params:
             H = State.params['H']
@@ -4973,13 +5999,10 @@ class Model_qgsw(M):
                  for n in self.tracer_names], axis=0)  # (n_trac, ny, nx)
 
         # Sub-stepping loop (limits lax.scan length for memory efficiency)
-        step_done = 0
-        while step_done < nstep:
-            n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
+        for chunk_index, (step_done, n_chunk) in enumerate(self._chunk_specs(t, nstep)):
             t_chunk = t + step_done * self.dt
             u_b, v_b, h_b, c_b, taux, tauy = self._chunk_forcing(
-                Xb, step_done // self.max_nstep if self.max_nstep > 0 else 0,
-                t_chunk, n_chunk,
+                Xb, chunk_index, t_chunk, n_chunk,
             )
             if bc_du is not None:
                 u_b = u_b + bc_du
@@ -5024,16 +6047,24 @@ class Model_qgsw(M):
 
         if self.nl > 1:
             # Per-layer perturbation
-            du_layers = np.nan_to_num(np.asarray(dState.var['u_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            dv_layers = np.nan_to_num(np.asarray(dState.var['v_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            dh_layers = np.nan_to_num(np.asarray(dState.var['h_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            du_layers = self._masked_jax_model_array(
+                dState, dState.var['u_layers'], dtype=self.dtype)
+            dv_layers = self._masked_jax_model_array(
+                dState, dState.var['v_layers'], dtype=self.dtype)
+            dh_layers = self._masked_jax_model_array(
+                dState, dState.var['h_layers'], dtype=self.dtype)
             du = jnp.expand_dims(du_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
             dv = jnp.expand_dims(dv_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
             dh = jnp.expand_dims(dh_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
             # Per-layer forward trajectory
-            u_layers = np.nan_to_num(np.asarray(State.var['u_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            v_layers = np.nan_to_num(np.asarray(State.var['v_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            h_layers = np.nan_to_num(np.asarray(State.var['h_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            # Keep the nonlinear layer state on the JAX path: these arrays can
+            # be tracers inside the variational scan and derivative paths.
+            u_layers = self._masked_jax_model_array(
+                State, State.var['u_layers'], dtype=self.dtype)
+            v_layers = self._masked_jax_model_array(
+                State, State.var['v_layers'], dtype=self.dtype)
+            h_layers = self._masked_jax_model_array(
+                State, State.var['h_layers'], dtype=self.dtype)
             u = jnp.expand_dims(u_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
             v = jnp.expand_dims(v_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
             h = jnp.expand_dims(h_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
@@ -5058,7 +6089,7 @@ class Model_qgsw(M):
         dFu = dState.params[self.name_var['U']]
         dFv = dState.params[self.name_var['V']]
         dFh = dState.params[self.name_var['SSH']]
-        if self._modal_two_layer:
+        if self._modal_multilayer:
             H = self._modal_depth_control(State)
             dH = self._modal_depth_control(dState)
         elif 'H' in self.name_params:
@@ -5105,13 +6136,10 @@ class Model_qgsw(M):
                  for n in self.tracer_names], axis=0)
 
         # Sub-stepping loop (limits lax.scan length for memory efficiency)
-        step_done = 0
-        while step_done < nstep:
-            n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
+        for chunk_index, (step_done, n_chunk) in enumerate(self._chunk_specs(t, nstep)):
             t_chunk = t + step_done * self.dt
             u_b, v_b, h_b, c_b, taux, tauy = self._chunk_forcing(
-                Xb, step_done // self.max_nstep if self.max_nstep > 0 else 0,
-                t_chunk, n_chunk,
+                Xb, chunk_index, t_chunk, n_chunk,
             )
             if bc_du is not None:
                 u_b = u_b + bc_du
@@ -5154,9 +6182,13 @@ class Model_qgsw(M):
             dState.var['u_layers'] = du[0].transpose(0, 2, 1)
             dState.var['v_layers'] = dv[0].transpose(0, 2, 1)
             # Diagnose surface TLM
-            dState.setvar(dState.var['h_layers'].sum(axis=0), name_var=self.name_var['SSH'])
-            dState.setvar(dState.var['u_layers'][0],          name_var=self.name_var['U'])
-            dState.setvar(dState.var['v_layers'][0],          name_var=self.name_var['V'])
+            dssh = (self._stack_diagnose_ssh(dState.var['h_layers'])
+                    if self._modal_layer_stack else dState.var['h_layers'].sum(axis=0))
+            dState.setvar(dssh, name_var=self.name_var['SSH'])
+            diagnostic_layer = -1 if (self._modal_layer_stack
+                                      and self.layer_role_boundary_conditions) else 0
+            dState.setvar(dState.var['u_layers'][diagnostic_layer], name_var=self.name_var['U'])
+            dState.setvar(dState.var['v_layers'][diagnostic_layer], name_var=self.name_var['V'])
         else:
             du = du[0,0].T
             dv = dv[0,0].T
@@ -5179,24 +6211,31 @@ class Model_qgsw(M):
             adu_surface = jnp.asarray(self._finite_model_array(adState, self.name_var['U']),   dtype=self.dtype)
             adv_surface = jnp.asarray(self._finite_model_array(adState, self.name_var['V']),   dtype=self.dtype)
 
-            adh_layers = jnp.asarray(np.nan_to_num(
-                            np.asarray(adState.var.get('h_layers',
-                            jnp.zeros((self.nl, self.ny, self.nx), dtype=self.dtype)), dtype=float),
-                            nan=0.0, posinf=0.0, neginf=0.0), dtype=self.dtype)
-            adu_layers = jnp.asarray(np.nan_to_num(
-                            np.asarray(adState.var.get('u_layers',
-                            jnp.zeros((self.nl, self.ny, self.nx+1), dtype=self.dtype)), dtype=float),
-                            nan=0.0, posinf=0.0, neginf=0.0), dtype=self.dtype)
-            adv_layers = jnp.asarray(np.nan_to_num(
-                            np.asarray(adState.var.get('v_layers',
-                            jnp.zeros((self.nl, self.ny+1, self.nx), dtype=self.dtype)), dtype=float),
-                            nan=0.0, posinf=0.0, neginf=0.0), dtype=self.dtype)
+            adh_layers = self._masked_jax_model_array(
+                adState, adState.var.get(
+                    'h_layers', jnp.zeros((self.nl, self.ny, self.nx), dtype=self.dtype)),
+                dtype=self.dtype)
+            adu_layers = self._masked_jax_model_array(
+                adState, adState.var.get(
+                    'u_layers', jnp.zeros((self.nl, self.ny, self.nx+1), dtype=self.dtype)),
+                dtype=self.dtype)
+            adv_layers = self._masked_jax_model_array(
+                adState, adState.var.get(
+                    'v_layers', jnp.zeros((self.nl, self.ny+1, self.nx), dtype=self.dtype)),
+                dtype=self.dtype)
 
-            # Adjoint of sum: each layer receives the surface SSH adjoint
-            adh_layers = adh_layers + adh_surface[None, :, :]
-            # Adjoint of selecting layer 0 for surface u/v
-            adu_layers = adu_layers.at[0].add(adu_surface)
-            adv_layers = adv_layers.at[0].add(adv_surface)
+            # Adjoint of the public SSH diagnostic.
+            if self._modal_layer_stack:
+                ssh_coeff = (np.cumsum(np.asarray(self.g_prime), axis=0)/self.g).transpose(0, 2, 1)
+                adh_layers = adh_layers + jnp.asarray(ssh_coeff, dtype=self.dtype)*adh_surface[None, :, :]
+            else:
+                adh_layers = adh_layers + adh_surface[None, :, :]
+            # Adjoint of the public U/V diagnostic. In the role-aware
+            # stack the public velocity is the baroclinic BC layer.
+            diagnostic_layer = -1 if (self._modal_layer_stack
+                                      and self.layer_role_boundary_conditions) else 0
+            adu_layers = adu_layers.at[diagnostic_layer].add(adu_surface)
+            adv_layers = adv_layers.at[diagnostic_layer].add(adv_surface)
 
             # Convert to SW convention (1, nl, nx, ny)
             adu = jnp.expand_dims(adu_layers.transpose(0, 2, 1), axis=0)
@@ -5204,9 +6243,14 @@ class Model_qgsw(M):
             adh = jnp.expand_dims(adh_layers.transpose(0, 2, 1), axis=0)
 
             # Forward trajectory from State (per-layer)
-            u_layers = np.nan_to_num(np.asarray(State.var['u_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            v_layers = np.nan_to_num(np.asarray(State.var['v_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            h_layers = np.nan_to_num(np.asarray(State.var['h_layers'], dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+            # Keep the nonlinear layer state on the JAX path: these arrays can
+            # be tracers inside the variational scan and derivative paths.
+            u_layers = self._masked_jax_model_array(
+                State, State.var['u_layers'], dtype=self.dtype)
+            v_layers = self._masked_jax_model_array(
+                State, State.var['v_layers'], dtype=self.dtype)
+            h_layers = self._masked_jax_model_array(
+                State, State.var['h_layers'], dtype=self.dtype)
             u = jnp.expand_dims(u_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
             v = jnp.expand_dims(v_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
             h = jnp.expand_dims(h_layers.astype(self.dtype).transpose(0, 2, 1), axis=0)
@@ -5222,7 +6266,7 @@ class Model_qgsw(M):
         Fu = State.params[self.name_var['U']]
         Fv = State.params[self.name_var['V']]
         Fh = State.params[self.name_var['SSH']]
-        if self._modal_two_layer:
+        if self._modal_multilayer:
             H = self._modal_depth_control(State)
         elif 'H' in self.name_params:
             H = State.params['H']
@@ -5242,8 +6286,9 @@ class Model_qgsw(M):
         adFu = adState.params[self.name_var['U']]
         adFv = adState.params[self.name_var['V']]
         adFh = adState.params[self.name_var['SSH']]
-        if self._modal_two_layer:
-            adH = jnp.zeros((2, self.nx, self.ny), dtype=self.dtype)
+        if self._modal_multilayer:
+            n_depth_controls = (len(self.stack_control_names + self.stack_drag_control_names) if self._modal_layer_stack else 2)
+            adH = jnp.zeros((n_depth_controls, self.nx, self.ny), dtype=self.dtype)
         elif 'H' in self.name_params:
             adH = adState.params['H']
             adH = jnp.expand_dims(adH.astype(self.dtype).T, axis=0)
@@ -5284,14 +6329,9 @@ class Model_qgsw(M):
                  for n in self.tracer_names], axis=0)
             adc_b_acc = None  # Tracer BCs not presently optimised
 
-        # Build chunk schedule
-        chunks = []
-        step_done = 0
-        while step_done < nstep:
-            n_chunk = min(nstep - step_done, self.max_nstep) if self.max_nstep > 0 else (nstep - step_done)
-            t_chunk = t + step_done * self.dt
-            chunks.append((t_chunk, n_chunk))
-            step_done += n_chunk
+        # Build chunk schedule, including every wind-forcing boundary.
+        chunks = [(t + offset*self.dt, n_chunk)
+                  for offset, n_chunk in self._chunk_specs(t, nstep)]
 
         # Forward pass: store boundary states at chunk boundaries
         fwd_states = [(u, v, h, c)] if self.advect_tracer else [(u, v, h)]
@@ -5378,7 +6418,16 @@ class Model_qgsw(M):
             adState.setvar(adv,self.name_var['V'])
             adState.setvar(adh,self.name_var['SSH'])
 
-        if self._modal_two_layer:
+        if self._modal_layer_stack:
+            # ``adH`` contains the VJP of the complete modal control vector:
+            # layer-depth/modal controls followed by positive Ekman dynamical
+            # controls.  Do not drop the latter when exposing the adjoint to
+            # the reduced bases.
+            for index, name in enumerate(
+                    self.stack_control_names + self.stack_drag_control_names):
+                if name in self.name_params:
+                    adState.params[name] = adH[index].T
+        elif self._modal_two_layer:
             if 'H_ml' in self.name_params:
                 adState.params['H_ml'] = adH[0].T
             if 'H_bc1' in self.name_params:

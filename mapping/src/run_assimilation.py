@@ -1492,8 +1492,12 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
             Diag.psd_based_scores(plot=True)
             Diag.movie(framerate=12)
             Diag.Leaderboard()
-        except:
-            print('Unable to compute diags')
+        except Exception as exc:
+            # Keep the multi-window driver running, but expose the concrete
+            # diagnostic failure instead of hiding it behind a bare message.
+            print(f'Unable to compute diags: {type(exc).__name__}: {exc}')
+            import traceback
+            traceback.print_exc()
         
         del State0, config0
 
