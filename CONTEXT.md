@@ -29,8 +29,10 @@ The reference thickness of the active layer in a physical reduced-gravity shallo
 _Avoid_: Equivalent Depth, bathymetry, mixed-layer depth
 
 **Layer-Resolved Depth Controls**:
-Independent, positive controls of the reference depths of the mixed layer and
-the first-baroclinic layer. Their public names are `H_ml` and `H_bc1`.
+Positive controls of the physical Ekman, total mixed-layer, and first-baroclinic
+reference depths. Their public names are `H_ek`, `H_ml`, and `H_bc1`; a distinct
+Ekman layer nested inside the mixed layer uses the bounded fraction `r_ek =
+H_ek/H_ml` instead of controlling two potentially inconsistent depths.
 _Avoid_: One shared depth control, additive depth correction, stacked public H
 
 **Tropical Two-Layer Reference Depths**:
@@ -39,9 +41,10 @@ stack: 40 m for the mixed layer and 80 m for the first-baroclinic layer.
 _Avoid_: Full thermocline depth, fixed global layer depths
 
 **Layer-Resolved State**:
-The six prognostic fields of the two-layer modal reduced-gravity stack:
-`h_ml`, `u_ml`, `v_ml`, `h_bc1`, `u_bc1`, and `v_bc1`. Diagnosed surface
-fields remain separate observational products.
+The prognostic thickness and velocity fields `h_*`, `u_*`, and `v_*` for every
+active physical layer in a Modal Reduced-Gravity Stack. Layer roles are named
+Ekman, mixed layer, shared Ekman–mixed layer, and first baroclinic; diagnosed
+surface SSH/U/V remain separate public products.
 _Avoid_: Layer-zero state, surface-only restart
 
 **Control-Preserving Restart**:
@@ -79,10 +82,35 @@ _Avoid_: SSH scale factor, arbitrary layer split
 
 **Physical Reduced-Gravity Layer Stack**:
 The ordered active-layer representation used by a multilayer physical
-reduced-gravity experiment: mixed layer at the surface, then the
-first-baroclinic layer below. The Ekman response is represented within the
-mixed-layer dynamics, not as a separate prognostic layer.
-_Avoid_: Arbitrary layer numbering, equivalent-depth stack
+reduced-gravity experiment. Supported roles are a wind-driven Ekman layer, a
+tracer-carrying mixed-layer remainder, a shared Ekman–mixed-layer surface
+layer, and a first-baroclinic layer. With distinct Ekman and mixed-layer roles,
+`H_ml` is the total surface-to-ML-base depth and the disjoint model thicknesses
+are `H_ek = r_ek H_ml` and `H_ml,remainder = (1-r_ek) H_ml`.
+_Avoid_: Arbitrary layer numbering, overlapping prognostic thicknesses, equivalent-depth stack
+
+**Fixed-Depth Ekman Slab**:
+A momentum-only surface sublayer with prescribed, time-invariant thickness. It carries horizontal velocity but neither a prognostic thickness nor pressure contribution to SSH.
+_Avoid_: Ekman shallow-water layer, Ekman depth control
+
+**Two-Slab Ekman Closure**:
+The ordered pair of Fixed-Depth Ekman Slabs: an upper wind-forced slab and a lower slab, coupled by interfacial drag; the lower slab is frictionally coupled to the prognostic first-baroclinic velocity.
+_Avoid_: Two Ekman SW layers, two free-surface Ekman layers
+
+
+**Baroclinic-Referenced Ekman Coriolis**:
+The Coriolis tendency of each Fixed-Depth Ekman Slab acts on its velocity departure from the prognostic first-baroclinic velocity. The barocline supplies the pressure-bearing balanced-current reference.
+_Avoid_: Isolated slab Coriolis, diagnosed-geostrophic reference
+
+
+**Terminal Ekman Drag**:
+A non-conservative drag on the lower Fixed-Depth Ekman Slab against a resting unresolved deep reservoir. It is the column momentum sink required where Coriolis cannot balance wind stress.
+_Avoid_: Conservative Ekman–baroclinic drag, horizontal viscosity
+
+
+**Fixed-Slab Ekman Pumping**:
+The conservative transfer of the Ekman transport relative to the first-baroclinic velocity into the first-baroclinic thickness tendency. It closes the column mass budget without counting the baroclinic transport twice or giving the slabs prognostic thicknesses.
+_Avoid_: Ekman slab thickness evolution, absolute slab-transport pumping, drag-only Ekman coupling
 
 **Modal Reduced-Gravity Stack**:
 A multilayer reduced-gravity system that advances slow internal modes and
@@ -90,31 +118,53 @@ diagnoses Sea-Surface Height from them, rather than advancing a fast physical
 free-surface mode.
 _Avoid_: Free-surface stack, barotropic model
 
-**Baroclinic Shear Initialization**:
-The initialization of unobserved lower-layer velocity from observed mixed-layer
-velocity so depth-integrated transport is zero; the two layers carry opposing
-transport in proportion to their reference depths.
-_Avoid_: Zero lower-layer velocity, implicit barotropic current
+**Upper-Layer Tracer Content**:
+The conservative tracer coordinate `Q = T D_upper`, with `D_upper` equal to the
+instantaneous total thickness of the tracer-carrying surface layers. SST is
+vertically uniform across those layers and its flux uses their summed mass
+transport; explicit reduced-basis SST error fluxes are deliberate sources.
+_Avoid_: Layer-zero passive concentration, fixed-depth SST transport
 
-**Surface-Projected Baroclinic Forcing**:
-A single surface correction projected deterministically into both layers: its
-height follows the selected baroclinic mode and its momentum follows
-zero-transport baroclinic shear.
-_Avoid_: Independent lower-layer forcing, surface-only layer correction
+**Unfiltered MLD Reference**:
+The analysis-window mean of daily GLORYS `mlotst`, interpolated to the model
+grid without spatial filtering. Missing-value completion and optional
+area-weighted collapse through `constant_MLD=True` are not spatial smoothing.
+_Avoid_: Smoothed MLD, boundary-condition MLD
 
-**Surface-Projected Boundary Condition**:
-An open-boundary field obtained from SSH and mixed-layer velocity, then lifted
-to both layers using the same modal-height and baroclinic-shear projections as
-initialization.
-_Avoid_: Independent lower-layer boundary condition, layer-zero copy
+**Filtered Boundary Condition Source**:
+The `smooth-10d-10xy` GLORYS product used for SSH, velocity, and SST boundary
+conditions. It is distinct from the unfiltered daily GLORYS source used for SST
+observations and the Unfiltered MLD Reference.
+_Avoid_: Observation source, MLD reference
+
+**Role-Selective Dynamic Initialization**:
+SSH and velocity boundary fields initialize only the first-baroclinic layer;
+Ekman and mixed-layer dynamic anomalies start from zero.
+_Avoid_: Primary-mode initialization, zero-transport shear initialization
+
+**Baroclinic Dynamic Correction**:
+The dynamic error tendencies `Fu`, `Fv`, and `Fh`, which act only on the
+first-baroclinic layer and never directly force Ekman or mixed-layer dynamics.
+_Avoid_: Surface correction, vertically projected correction
+
+**Role-Selective Boundary Condition**:
+SSH and velocity constrain only the first-baroclinic boundary, while SST
+constrains only the upper-layer tracer boundary.
+_Avoid_: Primary-mode boundary condition, identical boundary targets by layer
+
+**Fixed SSH Reference**:
+The time-independent initial SSH boundary field retained as the public
+background when no MDT is prescribed; the layer stack carries its anomaly.
+_Avoid_: Prognostic mean SSH, MDT, barotropic mode
 
 **Diagnosed Sea-Surface Height**:
-The free-surface observable used for boundary and altimetric comparisons. In a
-one-layer reduced-gravity model it can be diagnosed from Interface
-Displacement using a physical-gravity scaling. In the two-layer modal stack it
-is the explicit sum of mixed-layer and first-baroclinic thickness anomalies;
-the individual layer states are unobserved.
-_Avoid_: Model height, interface displacement, top-layer internal pressure
+The free-surface observable used for boundary and altimetric comparisons. For a
+Physical Reduced-Gravity Layer Stack it is diagnosed hydrostatically as
+`p_deep/g`, where deep pressure is obtained from all interface displacements
+and Fixed Reduced Gravity. If no MDT is prescribed the public field and misfit
+coordinate are SSH; with an MDT they are SLA. Individual layer states remain
+unobserved.
+_Avoid_: Sum of layer anomalies, interface displacement, top-layer internal pressure
 
 **Antilles Domain**:
 The regional western tropical Atlantic domain used for eNATL60 Antilles experiments.
