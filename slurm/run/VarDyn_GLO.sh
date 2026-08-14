@@ -61,6 +61,8 @@ fi
 # external config without changing the reusable launcher.
 NUM_MERGE_WORKERS="${NUM_MERGE_WORKERS:-4}"
 NUM_TILES_PER_GPU="${NUM_TILES_PER_GPU:-4}"
+ZARR_OUTPUT="${ZARR_OUTPUT:-false}"
+OUTPUT_FLOAT64="${OUTPUT_FLOAT64:-false}"
 BARRIER_TIMEOUT="${BARRIER_TIMEOUT:-7200}"
 FLAG_INIT_FROM_PREVIOUS="${FLAG_INIT_FROM_PREVIOUS:---flag_init_from_previous}"
 FLAG_INIT="${FLAG_INIT:-false}"
@@ -397,6 +399,10 @@ for TIME_DIR in $TIME_WINDOWS; do
         continue
     fi
 
+    ZARR_OUTPUT_ARG=""
+    OUTPUT_FLOAT64_ARG=""
+    $ZARR_OUTPUT && ZARR_OUTPUT_ARG="--zarr_output"
+    $OUTPUT_FLOAT64 && OUTPUT_FLOAT64_ARG="--output_float64"
     # Spatial merge: every array task processes its share of dates
     echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Spatial merge for time window ${IW} (rank ${ARRAY_ID}/${NUM_ARRAY})"
     python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
@@ -407,7 +413,7 @@ for TIME_DIR in $TIME_WINDOWS; do
         --iw_end "$((IW + 1))" \
         --rank "$ARRAY_ID" \
         --world "$NUM_ARRAY" \
-        $FORCE_MERGE_ARG
+        $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG
     echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Spatial merge done for time window ${IW}"
 
     # Wait for all ranks to finish their date shards before next time window
@@ -418,21 +424,21 @@ done
 
 # Final: merge all time windows (task 0 only)
 if [ $ARRAY_ID -eq 0 ]; then
-    echo "$(date '+%F %T') | Merging all time windows"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | Merging all time windows"
     if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
         --dir_save_pickle "$DIR_SAVE_PICKLE" \
         --name_var_save "$NAME_VAR" \
         --num_workers "$NUM_MERGE_WORKERS" \
         --skip_spatial_merge \
         --merge_time_windows \
-        $FORCE_MERGE_ARG; then
+        $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG; then
         tmp_marker="${FINAL_MARKER}.tmp-${SLURM_JOB_ID:-$$}"
         printf 'Experiment completed: %s\n' "$(date -Is)" > "$tmp_marker"
         mv -f "$tmp_marker" "$FINAL_MARKER"
-        echo "$(date '+%F %T') | All time windows processed"
-        echo "$(date '+%F %T') | Completion marker: $FINAL_MARKER"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') | All time windows processed"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') | Completion marker: $FINAL_MARKER"
     else
-        echo "$(date '+%F %T') | ERROR: final time-window merge failed" >&2
+        echo "$(date '+%Y-%m-%d %H:%M:%S') | ERROR: final time-window merge failed" >&2
         exit 1
     fi
 

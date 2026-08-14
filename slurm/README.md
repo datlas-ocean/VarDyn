@@ -67,6 +67,8 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 | `TIME_WIN`, `TIME_OVERLAP` | Temporal window size and overlap (days) |
 | `FLAG_INIT` / `FLAG_BACKGROUND` / `NAME_EXP` | Initialise from / use background from a previous experiment |
 | `BARRIER_TIMEOUT` | Seconds to wait at each inter-GPU barrier before proceeding (default: 14400 = 4 h) |
+| `ZARR_OUTPUT` | If `true`, convert spatial subwindow outputs to `.zarr` before final merging and remove their `.nc` files (default: false) |
+| `OUTPUT_FLOAT64` | If `true`, save merged floating-point data as float64; otherwise float32 (default: false) |
 
 **CLI flags** (passed after the script name):
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import shutil
 import sys
 import pickle
 import multiprocessing as mp
@@ -28,6 +29,33 @@ from src.run_assimilation import (
 # -------------------- Logging helpers --------------------
 def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+def _convert_subwindow_outputs_to_zarr(config, list_date_start, list_date_middle, list_date_end, output_dtype):
+    """Convert spatially merged subwindow NetCDF files and remove originals."""
+    for middle, start, end in zip(list_date_middle, list_date_start, list_date_end):
+        date = start
+        root = Path(config.EXP.path_save) / f"subwindow_{str(middle)[:10]}"
+        while date <= end:
+            stem = (f"{config.EXP.name_exp_save}_y{date.year}m{date.month:02d}d{date.day:02d}"
+                    f"h{date.hour:02d}m{date.minute:02d}")
+            nc_path = root / f"{stem}.nc"
+            zarr_path = root / f"{stem}.zarr"
+            if nc_path.exists():
+                with xr.open_dataset(nc_path) as source:
+                    dataset = source.load()
+                for name in dataset.data_vars:
+                    if np.issubdtype(dataset[name].dtype, np.floating):
+                        dataset[name] = dataset[name].astype(output_dtype)
+                temporary = root / f".{stem}.zarr.tmp-{os.getpid()}"
+                if temporary.exists():
+                    shutil.rmtree(temporary)
+                dataset.to_zarr(temporary, mode="w")
+                dataset.close()
+                if zarr_path.exists():
+                    shutil.rmtree(zarr_path)
+                os.replace(temporary, zarr_path)
+                nc_path.unlink()
+            date += config.EXP.saveoutput_time_step
 
 def _validate_final_outputs(config, list_date_start, list_date_end):
     """Verify that every expected global output exists and is readable."""
@@ -82,6 +110,8 @@ def merge_outputs(
     force=False,
     rank=0,
     world=1,
+    zarr_output=False,
+    output_float64=False,
 ):
     log(f"Loading configuration from {path_config}")
     with open(path_config, "rb") as f:
@@ -106,6 +136,8 @@ def merge_outputs(
         list_State_all = pickle.load(f)
 
     kernel = Gaussian2DKernel(x_stddev=1, y_stddev=1)
+    output_dtype = np.float64 if output_float64 else np.float32
+    # output_dtype is resolved above so every spatial merge uses the same precision.
 
     # Merge all spatial subwindows per time window
     n_windows = len(list_date_start)
@@ -156,9 +188,15 @@ def merge_outputs(
                     log(f"Skipping time window {iw}: merged outputs already exist")
                     continue
 
-            parallel_merge(dates_window, State0, State_window, name_var_save, kernel, None, weights_space_sum, None, list_tile_paths=list_tile_paths, num_workers=num_workers)
+            parallel_merge(dates_window, State0, State_window, name_var_save, kernel, None, weights_space_sum, None, list_tile_paths=list_tile_paths, num_workers=num_workers, output_dtype=output_dtype)
     else:
         log("Skipping spatial merge (already done)")
+
+    # Convert spatially merged products before the time-window merge.
+    # output_dtype is resolved above so every spatial merge uses the same precision.
+    if zarr_output and merge_time_windows:
+        log("Converting subwindow NetCDF outputs to Zarr")
+        _convert_subwindow_outputs_to_zarr(config, list_date_start, list_date_middle, list_date_end, output_dtype)
 
     # Merge time windows
     time_overlap = (list_date_end[0] - list_date_start[1]).days if len(list_date_start) > 1 else 0
@@ -170,6 +208,8 @@ def merge_outputs(
             list_date_middle,
             list_date_end,
             time_overlap,
+            zarr_output=zarr_output,
+            output_dtype=output_dtype,
         )
     else:
         log("Skipping final time-window merge")
@@ -216,6 +256,8 @@ if __name__ == "__main__":
     parser.add_argument("--force", action="store_true", help="Force recomputing merged outputs even if they already exist")
     parser.add_argument("--rank", type=int, default=0, help="Rank of this task (for date sharding across SLURM array tasks)")
     parser.add_argument("--world", type=int, default=1, help="Total number of tasks sharing the merge")
+    parser.add_argument("--zarr_output", action="store_true", help="Use Zarr for merged outputs and remove intermediate NetCDF files")
+    parser.add_argument("--output_float64", action="store_true", help="Save merged floating-point data as float64 (default: float32)")
 
     args = parser.parse_args()
 
@@ -234,5 +276,7 @@ if __name__ == "__main__":
         force=args.force,
         rank=args.rank,
         world=args.world,
+        zarr_output=args.zarr_output,
+        output_float64=args.output_float64,
     )
     log("Merge finished successfully")

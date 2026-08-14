@@ -11,6 +11,8 @@ INIT_DATE="2023-12-15"
 FINAL_DATE="2025-01-15"
 
 NAME_VAR="sla,SSH_tot,ug,vg"
+ZARR_OUTPUT=false       # Store merged outputs as Zarr and remove subwindow NetCDF files
+OUTPUT_FLOAT64=false     # Save floating-point outputs as float64 (default: float32)
 
 # Spatial subwindow grid
 GRID_TYPE="GRID_CAR"
@@ -35,6 +37,10 @@ TIME_WIN=50
 TIME_OVERLAP=10
 
 # Orchestration settings
+# Output storage
+# ZARR_OUTPUT=true converts subwindow NetCDF files to Zarr before final merge and deletes .nc files.
+# OUTPUT_FLOAT64=true stores merged floating-point variables as float64 (default: float32).
+
 NUM_MERGE_WORKERS=4
 NUM_TILES_PER_GPU=4
 BARRIER_TIMEOUT=7200

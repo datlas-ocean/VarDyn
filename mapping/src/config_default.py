@@ -21,6 +21,8 @@ EXP = dict(
 
     saveoutputs = True, # save outputs flag (True or False)
 
+    saveoutputs_zarr = False, # save all state outputs in one experiment-level Zarr archive
+
     name_exp_save = 'my_output_name', # name of output files
 
     path_save = 'outputs', # path of output files

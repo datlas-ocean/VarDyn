@@ -13,9 +13,11 @@ import pandas as pd
 from copy import deepcopy
 import matplotlib.pyplot as plt
 import glob
+import shutil
 import pyinterp 
 
 from . import tools as grid
+from .config import USE_FLOAT64
 
 
 def _is_jax_array(value):
@@ -363,14 +365,18 @@ class State:
         
         self.mask += (np.isnan(self.lon) + np.isnan(self.lat)).astype(bool)
             
-    def save_output(self,date,name_var=None,grid_type=None):
-        
-        filename = os.path.join(self.path_save,f'{self.name_exp_save}'\
-            f'_y{date.year}'\
-            f'm{str(date.month).zfill(2)}'\
-            f'd{str(date.day).zfill(2)}'\
-            f'h{str(date.hour).zfill(2)}'\
-            f'm{str(date.minute).zfill(2)}.nc')
+    def save_output(self,date,name_var=None,grid_type=None,dtype=None):
+        save_zarr = bool(getattr(self.config.EXP, 'saveoutputs_zarr', False))
+        if save_zarr:
+            filename = os.path.join(self.path_save, f'{self.name_exp_save}.zarr')
+            dtype = np.float64 if USE_FLOAT64 else np.float32
+        else:
+            filename = os.path.join(self.path_save,f'{self.name_exp_save}'\
+                f'_y{date.year}'\
+                f'm{str(date.month).zfill(2)}'\
+                f'd{str(date.day).zfill(2)}'\
+                f'h{str(date.hour).zfill(2)}'\
+                f'm{str(date.minute).zfill(2)}.nc')
         
         coords = {}
         coords[self.name_time] = ((self.name_time), [pd.to_datetime(date)],)
@@ -402,6 +408,8 @@ class State:
         for name in name_var:
 
             var_to_save = +np.array(self.var[name])
+            if dtype is not None and np.issubdtype(var_to_save.dtype, np.floating):
+                var_to_save = var_to_save.astype(dtype, copy=False)
 
             # Apply Mask
             try:
@@ -437,6 +445,16 @@ class State:
             else:
                 coords[lon_name] = (('y' + suffix, 'x' + suffix), _lon)
                 coords[lat_name] = (('y' + suffix, 'x' + suffix), _lat)
+
+        if save_zarr:
+            for key, value in coords.items():
+                if key != self.name_time and isinstance(value, tuple):
+                    coord_values = value[-1]
+                    if np.issubdtype(np.asarray(coord_values).dtype, np.floating):
+                        coords[key] = (*value[:-1], np.asarray(coord_values).astype(dtype))
+            ds = xr.Dataset(var, coords=coords)
+            self._save_zarr_record(ds, filename, date)
+            return
 
         def _write_fresh():
             ds = xr.Dataset(var, coords=coords)
@@ -481,7 +499,45 @@ class State:
         
         return 
 
+    @staticmethod
+    def _save_zarr_record(record, filename, date):
+        """Write one time record into the experiment's single Zarr archive."""
+        record_time = pd.Timestamp(date)
+        if not os.path.exists(filename):
+            record.to_zarr(filename, mode='w')
+            record.close()
+            return
+        with xr.open_zarr(filename) as existing_open:
+            existing = existing_open.load()
+        times = pd.to_datetime(existing.time.values)
+        if record_time > times.max() and record_time not in times:
+            record.to_zarr(filename, mode='a', append_dim='time')
+            existing.close()
+            record.close()
+            return
+        if record_time in times:
+            existing = existing.drop_sel(time=record_time)
+        combined = xr.concat([existing, record], dim='time').sortby('time')
+        temporary = f'{filename}.tmp-{os.getpid()}'
+        if os.path.exists(temporary):
+            shutil.rmtree(temporary)
+        combined.to_zarr(temporary, mode='w')
+        combined.close()
+        existing.close()
+        record.close()
+        if os.path.exists(filename):
+            shutil.rmtree(filename)
+        os.replace(temporary, filename)
+
     def load_output(self, date, name_var=None):
+        zarr_filename = os.path.join(self.path_save, f'{self.name_exp_save}.zarr')
+        if bool(getattr(self.config.EXP, 'saveoutputs_zarr', False)) and os.path.exists(zarr_filename):
+            with xr.open_zarr(zarr_filename) as ds:
+                ds1 = ds.sel(time=pd.Timestamp(date)).load().squeeze()
+            if name_var is None:
+                return ds1
+            return np.array([ds1[name].values for name in name_var])
+
         
 
         filename = os.path.join(

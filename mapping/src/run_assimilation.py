@@ -12,6 +12,7 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 import sys
 import glob
 import copy as _copy
+import shutil
 import pickle
 import numpy as np
 import multiprocessing as mp
@@ -1071,7 +1072,24 @@ def _fill_nans_nearest(arr):
     return arr[tuple(idx)]
 
 
-def merge_output_date(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=None, plot=False, save=True):
+def _discover_merge_variables(date, list_State, requested):
+    """Return requested variables plus fields present in any tile output."""
+    names = list(dict.fromkeys(requested))
+    seen = set(names)
+    for tile_state in list_State:
+        try:
+            ds = tile_state.load_output(date)
+            for name in ds.data_vars:
+                if name not in seen:
+                    names.append(name)
+                    seen.add(name)
+            ds.close()
+        except Exception as exc:
+            print(f'[merge] Warning: could not inspect tile variables for {date}: {exc}')
+    return names
+
+
+def merge_output_date(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=None, plot=False, save=True, output_dtype=None):
 
     """Merge outputs from subprocesses for a given date.
     
@@ -1089,6 +1107,7 @@ def merge_output_date(date, State, list_State, name_var_save, kernel, weights_sp
     # fresh `var` dict so setvar() does not mutate the caller's State.
     State0 = _copy.copy(State)
     State0.var = dict(State.var)
+    name_var_save = _discover_merge_variables(date, list_State, name_var_save)
     ny, nx = State0.ny, State0.nx
 
     # Cells not covered by any tile (weights_space_sum == 0) must be flagged as
@@ -1099,6 +1118,7 @@ def merge_output_date(date, State, list_State, name_var_save, kernel, weights_sp
     inv_wsum[~no_coverage] = 1.0 / weights_space_sum[~no_coverage]
 
     dict_var = {name: np.zeros((ny, nx)) for name in name_var_save}
+    coverage_var = {name: np.zeros((ny, nx)) for name in name_var_save}
         
     for i, _State in enumerate(list_State):
 
@@ -1120,6 +1140,8 @@ def merge_output_date(date, State, list_State, name_var_save, kernel, weights_sp
                 lon, lat = np.meshgrid(lon, lat)
 
             for name in name_var_save:
+                if name not in _ds.data_vars:
+                    continue
 
                 _var = _ds[name].values
                 
@@ -1144,7 +1166,9 @@ def merge_output_date(date, State, list_State, name_var_save, kernel, weights_sp
 
                 # Merge (safe division: 0 where no coverage)
                 ind = ~np.isnan(_var_interp)
-                dict_var[name][ind] += (_weights_space * _var_interp * inv_wsum)[ind]
+                weighted_coverage = (_weights_space * inv_wsum)
+                dict_var[name][ind] += (weighted_coverage * _var_interp)[ind]
+                coverage_var[name][ind] += weighted_coverage[ind]
             
             _ds.close()
             del _ds
@@ -1154,7 +1178,7 @@ def merge_output_date(date, State, list_State, name_var_save, kernel, weights_sp
 
     for name in name_var_save:
         # Cells not covered by any tile -> NaN (avoid propagating 0)
-        dict_var[name][no_coverage] = np.nan
+        dict_var[name][(coverage_var[name] <= 0) | no_coverage] = np.nan
         # Mask
         if State0.mask is not None and np.any(State0.mask):
             dict_var[name][State0.mask] = np.nan
@@ -1168,7 +1192,7 @@ def merge_output_date(date, State, list_State, name_var_save, kernel, weights_sp
         State0.setvar(dict_var[name], name)
     
     if save:
-        State0.save_output(date, name_var=name_var_save)
+        State0.save_output(date, name_var=name_var_save, dtype=output_dtype)
     
 def generate_dates(start_date, end_date, delta):
     """Generate a list of dates between start_date and end_date with a given timedelta."""
@@ -1179,7 +1203,7 @@ def generate_dates(start_date, end_date, delta):
         current_date += delta
     return dates
 
-def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=None, num_workers=4):
+def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=None, num_workers=4, output_dtype=None):
     """Merge outputs from subprocesses in parallel for a list of dates.
 
     When ``list_tile_paths`` is provided, uses a tile-partitioned worker pool:
@@ -1190,9 +1214,12 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
     silently and makes the pool hang).
     """
 
+    if dates:
+        name_var_save = _discover_merge_variables(dates[0], list_State, name_var_save)
+
     if num_workers <= 1:
         for date in dates:
-            merge_output_date(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=list_tile_paths)
+            merge_output_date(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=list_tile_paths, output_dtype=output_dtype)
         return
 
     # Fall back to old per-date pool when tiles are kept in memory (no pickle path).
@@ -1200,7 +1227,7 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
         with mp.Pool(processes=num_workers) as pool:
             pool.starmap(
                 merge_output_date,
-                [(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, None) for date in dates]
+                [(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, None, False, True, output_dtype) for date in dates]
             )
         return
 
@@ -1268,7 +1295,7 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
                     if State0.mask is not None and np.any(State0.mask):
                         dict_var[n][State0.mask] = np.nan
                     State0.setvar(dict_var[n], n)
-                State0.save_output(date, name_var=name_var_save)
+                State0.save_output(date, name_var=name_var_save, dtype=output_dtype)
                 print(f'[parallel_merge] {date} done', flush=True)
             except Exception as e:
                 print(f'[parallel_merge] WARNING: failed to save output for {date}: {e}', flush=True)
@@ -1336,6 +1363,9 @@ def _merge_worker_loop(tile_paths, states, name_var_save, ny, nx,
             try:
                 for name in name_var_save:
                     try:
+                        if name not in _ds.data_vars:
+                            missing_weight[name] += _weights_space * inv_wsum
+                            continue
                         _var = _ds[name].values
                         if _var.shape == (_State.ny, _State.nx + 1):
                             _var = 0.5 * (_var[:, :-1] + _var[:, 1:])
@@ -1489,7 +1519,7 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
         
         del State0, config0
 
-def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_date_end, time_overlap):
+def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_date_end, time_overlap, zarr_output=False, output_dtype=np.float32):
     
     """
     Merge outputs from different time windows.
@@ -1514,23 +1544,20 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
 
     n_windows = len(list_date_start)
 
+    def _filename(prefix, date):
+        return (f"{prefix}_y{date.year}m{date.month:02d}d{date.day:02d}"
+                f"h{date.hour:02d}m{date.minute:02d}"
+                + (".zarr" if zarr_output else ".nc"))
+
     def _build_path(subwindow_middle, date):
-        return (f'{config.EXP.path_save}/subwindow_{str(subwindow_middle)[:10]}/'
-                f'{config.EXP.name_experiment}'
-                f'_y{date.year}'
-                f'm{str(date.month).zfill(2)}'
-                f'd{str(date.day).zfill(2)}'
-                f'h{str(date.hour).zfill(2)}'
-                f'm{str(date.minute).zfill(2)}.nc')
-    
+        root = f"{config.EXP.path_save}/subwindow_{str(subwindow_middle)[:10]}"
+        return f"{root}/{_filename(config.EXP.name_exp_save, date)}"
+
     def _build_output_path(date):
-        return (f'{config.EXP.path_save}/'
-                f'{config.EXP.name_experiment}'
-                f'_y{date.year}'
-                f'm{str(date.month).zfill(2)}'
-                f'd{str(date.day).zfill(2)}'
-                f'h{str(date.hour).zfill(2)}'
-                f'm{str(date.minute).zfill(2)}.nc')
+        return f"{config.EXP.path_save}/{_filename(config.EXP.name_exp_save, date)}"
+
+    def _open(path):
+        return xr.open_zarr(path) if zarr_output else xr.open_dataset(path)
 
     # Collect all unique dates across all windows
     all_dates = set()
@@ -1550,7 +1577,7 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
             if len(active) == 1:
                 # No overlap: use the single window directly
                 i = active[0]
-                dsout = xr.open_dataset(_build_path(list_date_middle[i], date)).load()
+                dsout = _open(_build_path(list_date_middle[i], date)).load()
 
             elif len(active) >= 2:
                 # Overlap region: blend the two closest consecutive windows
@@ -1559,8 +1586,8 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
                 overlap_end = list_date_end[i]
                 overlap_duration = (overlap_end - overlap_start).total_seconds()
 
-                ds1 = xr.open_dataset(_build_path(list_date_middle[i], date)).load()
-                ds2 = xr.open_dataset(_build_path(list_date_middle[j], date)).load()
+                ds1 = _open(_build_path(list_date_middle[i], date)).load()
+                ds2 = _open(_build_path(list_date_middle[j], date)).load()
 
                 if overlap_duration > 0:
                     # alpha goes from 0 (at overlap_start) to 1 (at overlap_end)
@@ -1573,11 +1600,14 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
                     W1, W2 = 0.5, 0.5
 
                 dsout = ds1.copy()
-                for var in ds1.data_vars:
-                    if var in ds2.data_vars:
+                # Preserve the union: equatorial and non-equatorial windows
+                # can expose different diagnostic variables.
+                for var in ds2.data_vars:
+                    if var not in dsout.data_vars:
+                        dsout[var] = ds2[var]
+                for var in dsout.data_vars:
+                    if var in ds1.data_vars and var in ds2.data_vars:
                         dsout[var] = W1 * ds1[var] + W2 * ds2[var]
-                    else:
-                        dsout[var] = ds1[var]
                 ds1.close()
                 ds2.close()
             else:
@@ -1587,16 +1617,26 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
             # Write beside the destination and publish atomically. A direct
             # to_netcdf(output_path) can leave a truncated HDF5 file when a
             # merge job is interrupted or a reader opens it mid-write.
+            for name in dsout.data_vars:
+                if np.issubdtype(dsout[name].dtype, np.floating):
+                    dsout[name] = dsout[name].astype(output_dtype)
             temporary_path = f'{output_path}.tmp-{os.getpid()}'
             try:
-                dsout.to_netcdf(temporary_path, mode='w')
+                if zarr_output:
+                    dsout.to_zarr(temporary_path, mode='w')
+                else:
+                    dsout.to_netcdf(temporary_path, mode='w')
                 dsout.close()
+                if zarr_output and os.path.exists(output_path):
+                    shutil.rmtree(output_path)
                 os.replace(temporary_path, output_path)
             except Exception:
                 try:
                     dsout.close()
                 finally:
-                    if os.path.exists(temporary_path):
+                    if os.path.isdir(temporary_path):
+                        shutil.rmtree(temporary_path)
+                    elif os.path.exists(temporary_path):
                         os.remove(temporary_path)
                 raise
         except Exception as e:
