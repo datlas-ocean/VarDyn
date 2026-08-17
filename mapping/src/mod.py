@@ -783,7 +783,7 @@ class Model_diffusion(M):
 
         # Initialization 
         if (config.GRID.super == 'GRID_FROM_FILE') and (config.MOD.name_init_var is not None):
-            dsin = xr.open_dataset(config.GRID.path_init_grid)
+            dsin = grid.open_grid_restart(config)
             for name in self.name_var:
                 if name in config.MOD.name_init_var:
                     var_init = dsin[config.MOD.name_init_var[name]]
@@ -1115,10 +1115,7 @@ class Model_qg1l(M):
             
         # Initialize model state
         if (config.GRID.super == 'GRID_FROM_FILE') and (config.MOD.name_init_var is not None):
-            try:
-                dsin = xr.open_dataset(config.GRID.path_init_grid, group='variables')
-            except:
-                dsin = xr.open_dataset(config.GRID.path_init_grid)
+            dsin = grid.open_grid_restart(config, group='variables')
             for name in self.name_var:
                 if name in config.MOD.name_init_var:
                     var_init = dsin[config.MOD.name_init_var[name]]
@@ -1236,7 +1233,7 @@ class Model_qg1l(M):
             # variable saved in the init file (same pattern as 'H' in
             # Model_qgsw). Fall back to dc=0 when the variable is absent.
             if config.GRID.super == 'GRID_FROM_FILE':
-                dsin = xr.open_dataset(config.GRID.path_init_grid)
+                dsin = grid.open_grid_restart(config)
                 if 'c_anomaly' in dsin:
                     _dc_init = dsin['c_anomaly'].values.squeeze()
                     _dc_init[np.isnan(_dc_init)] = 0.
@@ -1888,7 +1885,7 @@ class Model_csw1l(_ITOpenBoundaryExtensionMixin, M):
         self.var_to_save = [self.name_var['SSH']] # ssh
 
         if (config.GRID.super == 'GRID_FROM_FILE') and (config.MOD.name_init_var is not None):
-            dsin = xr.open_dataset(config.GRID.path_init_grid)
+            dsin = grid.open_grid_restart(config)
             for name in self.name_var:
                 if name in config.MOD.name_init_var:
                     var_init = dsin[config.MOD.name_init_var[name]]
@@ -3212,7 +3209,7 @@ class Model_qgsw(M):
     
         # Initialize model state
         if (config.GRID.super == 'GRID_FROM_FILE'):
-            dsin = xr.open_dataset(config.GRID.path_init_grid)
+            dsin = grid.open_grid_restart(config)
             for name in self.name_var:
                 if config.MOD.name_init_var is not None and name in config.MOD.name_init_var:
                     name_init_var = config.MOD.name_init_var[name]
@@ -3509,7 +3506,7 @@ class Model_qgsw(M):
         self.name_params = self._configured_name_params
         if 'H' in self.name_params:
             if (config.GRID.super == 'GRID_FROM_FILE'):
-                dsin = xr.open_dataset(config.GRID.path_init_grid)
+                dsin = grid.open_grid_restart(config)
                 if self._H_from_init_file_used:
                     # Saved H is already the total equivalent depth from the
                     # previous run. Start new increments from zero around it.
@@ -3532,7 +3529,7 @@ class Model_qgsw(M):
         if 'h_wind' in self.name_params:
             self.h_wind = getattr(config.MOD, 'h_wind', None)
             if (config.GRID.super == 'GRID_FROM_FILE'):
-                dsin = xr.open_dataset(config.GRID.path_init_grid)
+                dsin = grid.open_grid_restart(config)
                 if 'h_wind' in dsin:
                     State.params['h_wind'] = dsin['h_wind'].values.squeeze()
                     State.params['h_wind'][np.isnan(State.params['h_wind'])] = 0.
@@ -3545,7 +3542,7 @@ class Model_qgsw(M):
 
         if 'wind_strength' in self.name_params:
             if (config.GRID.super == 'GRID_FROM_FILE'):
-                dsin = xr.open_dataset(config.GRID.path_init_grid)
+                dsin = grid.open_grid_restart(config)
                 if 'wind_strength' in dsin:
                     State.params['wind_strength'] = dsin['wind_strength'].values.squeeze()
                     State.params['wind_strength'][np.isnan(State.params['wind_strength'])] = 0.
@@ -3579,7 +3576,10 @@ class Model_qgsw(M):
         if config.GRID.super != 'GRID_FROM_FILE':
             return None
         path_init = getattr(config.GRID, 'path_init_grid', None)
-        if path_init is None or not os.path.exists(path_init):
+        if path_init is None:
+            return None
+        if (not os.path.exists(path_init)
+                and not getattr(config.EXP, 'saveoutputs_zarr', False)):
             return None
 
         candidate_names = []
@@ -3587,7 +3587,7 @@ class Model_qgsw(M):
             candidate_names.append(config.MOD.name_init_var['H'])
         candidate_names.append('H')
 
-        dsin = xr.open_dataset(path_init)
+        dsin = grid.open_grid_restart(config)
         try:
             for name in candidate_names:
                 if name not in dsin:
@@ -5565,7 +5565,7 @@ class Model_bmit(_ITOpenBoundaryExtensionMixin, M):
         self.name_var = config.MOD.name_var
         self.var_to_save = [self.name_var['SSH']] # ssh
         if (config.GRID.super == 'GRID_FROM_FILE') and (config.MOD.name_init_var is not None):
-            dsin = xr.open_dataset(config.GRID.path_init_grid)
+            dsin = grid.open_grid_restart(config)
             for name in self.name_var:
                 if name in config.MOD.name_init_var:
                     var_init = dsin[config.MOD.name_init_var[name]]

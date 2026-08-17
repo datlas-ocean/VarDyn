@@ -223,8 +223,7 @@ class State:
                 config (module): configuration module
         """
         
-        dsin = xr.open_dataset(config.path_init_grid)
-
+        dsin = grid.open_grid_restart(self.config, config)
         lon = dsin[config.name_init_lon].values
         lat = dsin[config.name_init_lat].values
 

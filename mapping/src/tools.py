@@ -6,11 +6,48 @@ Created by Florian Le Guillou on June 2026.
 Provides shared numerical, interpolation, and filtering utilities.
 """
 import numpy as np 
+import os
 import xarray as xr
+import pandas as pd
 import scipy.linalg as spl
 from scipy import interpolate, spatial
 import scipy
 
+
+
+def open_grid_restart(config, grid_config=None, group=None):
+    """Open a GRID_FROM_FILE restart from NetCDF or an experiment Zarr archive.
+
+    Zarr state archives contain all output times in one store, so the
+    experiment initialization time is selected before the caller reads
+    variables.  A stale pickled NetCDF path is also mapped to the sibling
+    experiment archive when Zarr state output is enabled.
+    """
+    grid_config = config.GRID if grid_config is None else grid_config
+    path = grid_config.path_init_grid
+    if (not os.path.exists(path)
+            and getattr(config.EXP, 'saveoutputs_zarr', False)):
+        path = os.path.join(
+            os.path.dirname(path),
+            f'{config.EXP.name_exp_save}.zarr',
+        )
+
+    is_zarr = str(path).endswith('.zarr') or os.path.isdir(path)
+    if is_zarr:
+        ds = xr.open_zarr(path)
+    elif group is not None:
+        try:
+            ds = xr.open_dataset(path, group=group)
+        except (OSError, ValueError):
+            ds = xr.open_dataset(path)
+    else:
+        ds = xr.open_dataset(path)
+
+    time_name = getattr(config.EXP, 'name_time', 'time')
+    init_date = getattr(config.EXP, 'init_date', None)
+    if time_name in ds.dims and init_date is not None:
+        ds = ds.sel({time_name: pd.Timestamp(init_date)})
+    return ds
 
 
 def gaspari_cohn(r,c=1):

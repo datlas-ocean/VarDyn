@@ -535,14 +535,19 @@ def prepare_process(config, config_eq, State,
                 name_prev_subwindow = (
                     f'subwindow_{str(list_date_middle[-2])[:10]}/{tpl["geom_name"]}')
                 path_output = config.EXP.path_save + f'/{name_prev_subwindow}/'
-                filename = os.path.join(
-                    path_output,
-                    f'{State.name_exp_save}'
-                    f'_y{date0.year}'
-                    f'm{str(date0.month).zfill(2)}'
-                    f'd{str(date0.day).zfill(2)}'
-                    f'h{str(date0.hour).zfill(2)}'
-                    f'm{str(date0.minute).zfill(2)}.nc')
+                if getattr(_config.EXP, 'saveoutputs_zarr', False):
+                    filename = os.path.join(
+                        path_output,
+                        f'{State.name_exp_save}.zarr')
+                else:
+                    filename = os.path.join(
+                        path_output,
+                        f'{State.name_exp_save}'
+                        f'_y{date0.year}'
+                        f'm{str(date0.month).zfill(2)}'
+                        f'd{str(date0.day).zfill(2)}'
+                        f'h{str(date0.hour).zfill(2)}'
+                        f'm{str(date0.minute).zfill(2)}.nc')
                 _base_config = tpl['parent_config']
                 _config.GRID = exp.Config({
                     'super': 'GRID_FROM_FILE',
