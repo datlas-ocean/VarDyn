@@ -14,6 +14,7 @@ from copy import deepcopy
 import matplotlib.pyplot as plt
 import glob
 import shutil
+import fcntl
 import pyinterp 
 
 from . import tools as grid
@@ -500,6 +501,18 @@ class State:
 
     @staticmethod
     def _save_zarr_record(record, filename, date):
+        # Serialize the complete read/modify/write transaction. Slurm array
+        # ranks shard dates but intentionally share one experiment archive.
+        lock_filename = f'{filename}.lock'
+        with open(lock_filename, 'w') as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                State._save_zarr_record_unlocked(record, filename, date)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _save_zarr_record_unlocked(record, filename, date):
         # Write partial model records into one consistent Zarr archive.
         record_time = pd.Timestamp(date)
         if not os.path.exists(filename):

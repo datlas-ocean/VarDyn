@@ -889,6 +889,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     State0 = State.copy()
     Model.init(State0)
     date = config.EXP.init_date
+    print(f'[4DVAR SAVE] date={date.isoformat()} t=0 dt={Model.dt} save_step={config.EXP.saveoutput_time_step}', flush=True)
     Model.save_output(State0, date, name_var=Model.var_to_save, t=0) 
     
     nstep = min(nstep_check, int(config.EXP.saveoutput_time_step.total_seconds()//Model.dt))
@@ -910,6 +911,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         if (((date - config.EXP.init_date).total_seconds()
             /config.EXP.saveoutput_time_step.total_seconds())%1 == 0)\
             & (date>=config.EXP.init_date) & (date<=config.EXP.final_date) :
+            print(f'[4DVAR SAVE] date={date.isoformat()} t={t} nstep={nstep} dt={Model.dt}', flush=True)
             Model.save_output(State0, date, name_var=Model.var_to_save, t=t) 
         
     del State, State0, Xa, dict_obs, B, R, Model, Basis, var, Xopt, Xres, checkpoints, time_checkpoints, t_checkpoints
