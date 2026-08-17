@@ -501,23 +501,82 @@ class State:
 
     @staticmethod
     def _save_zarr_record(record, filename, date):
-        """Write one time record into the experiment's single Zarr archive."""
+        # Write partial model records into one consistent Zarr archive.
         record_time = pd.Timestamp(date)
         if not os.path.exists(filename):
             record.to_zarr(filename, mode='w')
             record.close()
             return
+
         with xr.open_zarr(filename) as existing_open:
             existing = existing_open.load()
+
         times = pd.to_datetime(existing.time.values)
-        if record_time > times.max() and record_time not in times:
-            record.to_zarr(filename, mode='a', append_dim='time')
+        existing_names = set(existing.data_vars)
+        record_names = set(record.data_vars)
+        output_dtype = np.float64 if USE_FLOAT64 else np.float32
+
+        if record_time in times and record_names <= existing_names:
+            time_index = int(np.flatnonzero(times == record_time)[0])
+            region_record = record[list(record.data_vars)]
+            region_record = region_record.drop_vars(
+                [name for name in region_record.coords if name != 'time'],
+                errors='ignore',
+            )
+            region_record.to_zarr(
+                filename,
+                mode='r+',
+                region={'time': slice(time_index, time_index + 1)},
+            )
+            region_record.close()
             existing.close()
             record.close()
             return
+
+        if record_time not in times and record_names <= existing_names:
+            missing = {}
+            for name in existing_names - record_names:
+                template = existing[name].isel(time=slice(0, 1))
+                fill = xr.zeros_like(template, dtype=output_dtype) * np.nan
+                fill = fill.assign_coords(time=record.time)
+                missing[name] = fill
+            full_record = xr.merge(
+                [record, xr.Dataset(missing)],
+                compat='override',
+                join='outer',
+            )
+            full_record.to_zarr(filename, mode='a', append_dim='time')
+            full_record.close()
+            existing.close()
+            record.close()
+            return
+
         if record_time in times:
-            existing = existing.drop_sel(time=record_time)
-        combined = xr.concat([existing, record], dim='time').sortby('time')
+            time_index = int(np.flatnonzero(times == record_time)[0])
+            current = existing.isel(time=slice(time_index, time_index + 1)).copy()
+            for name in record.data_vars:
+                current[name] = record[name]
+            existing_without = existing.drop_sel(time=record_time)
+            combined = xr.concat(
+                [existing_without, current],
+                dim='time',
+                join='outer',
+                fill_value=np.nan,
+                data_vars='all',
+                coords='minimal',
+                compat='override',
+            ).sortby('time')
+        else:
+            combined = xr.concat(
+                [existing, record],
+                dim='time',
+                join='outer',
+                fill_value=np.nan,
+                data_vars='all',
+                coords='minimal',
+                compat='override',
+            ).sortby('time')
+
         temporary = f'{filename}.tmp-{os.getpid()}'
         if os.path.exists(temporary):
             shutil.rmtree(temporary)
