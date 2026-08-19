@@ -852,7 +852,7 @@ class Model_diffusion(M):
         State0 = State.copy()
         State0.save_output(present_date, name_var=self.name_var.values())
 
-    def set_bc(self, time_bc, var_bc=None, **kwargs):
+    def set_bc(self, time_bc, var_bc=None, t_bc=None, **kwargs):
         # If var_bc not provided but we have loaded BC fields, interpolate them
         if var_bc is None and self._bc_fields is not None:
             var_bc = self._bc_fields.interp(time_bc)
@@ -860,10 +860,14 @@ class Model_diffusion(M):
         if var_bc is None:
             return
         
+        # init() and step() address boundary conditions with model time in
+        # seconds. Using datetime64 keys here silently left init_from_bc
+        # diffusion components at their zero initial state.
+        time_keys = t_bc if t_bc is not None else time_bc
         for _name_var_bc in var_bc:
             for _name_var_mod in self.name_var:
                 if _name_var_bc==_name_var_mod:
-                    for i,t in enumerate(time_bc):
+                    for i,t in enumerate(time_keys):
                         self.bc[_name_var_mod][t] = var_bc[_name_var_bc][i]
 
 

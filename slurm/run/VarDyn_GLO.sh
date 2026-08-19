@@ -129,33 +129,46 @@ BASE_DIR="${DIR_SAVE_PICKLE}/${EXP_NAME}"
 CONFIG_PATH="${BASE_DIR}/config.pkl"
 
 # -------------------- TIME-LIMIT CONTINUATION --------------------
-# Slurm sends TERM 300 seconds before the wall-time limit. Array task 0
-# submits a dependent continuation array; completed tiles and merges are
+# Slurm sends TERM 300 seconds before the wall-time limit. The first task
+# obtaining the submission lock creates a continuation; completed work is
 # skipped through their existing completion markers.
 CONTINUATION_SCRIPT="${MASH_DIR}/slurm/run/VarDyn_GLO.sh"
 FINAL_MARKER="${BASE_DIR}/experiment_complete.ok"
 CONTINUATION_SUBMITTED=false
+OWNED_STAGE_LOCK=""
 
 submit_continuation() {
-    [ "${ARRAY_ID}" -ne 0 ] && return 0
-    [ -f "${FINAL_MARKER}" ] && return 0
+    local submit_lock="${BASE_DIR}/.continuation_${JOB_ID}.lock"
+    mkdir "$submit_lock" 2>/dev/null || return 0
+    [ -f "${FINAL_MARKER}" ] && [ -z "$RESTART" ] \
+        && ! $FORCE_MERGE && ! $MERGE_ONLY && return 0
     [ "${CONTINUATION_SUBMITTED}" = true ] && return 0
     CONTINUATION_SUBMITTED=true
 
     local dependency="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"
     local next_job
     local continuation_args=(--config "${CONFIG_FILE}" --skip-prepare)
+    $FORCE_MERGE && continuation_args+=(--force-merge)
+    $MERGE_ONLY && continuation_args+=(--merge-only)
     [ -n "${NAME_EXP_OVERRIDE}" ] && continuation_args+=(--name_exp "${NAME_EXP_OVERRIDE}")
     if next_job=$(sbatch --parsable \
         --dependency="afterany:${dependency}" \
         "${CONTINUATION_SCRIPT}" "${continuation_args[@]}"); then
         echo "$(date '+%F %T') | Submitted continuation array ${next_job}"
     else
+        rmdir "$submit_lock" 2>/dev/null || true
         echo "$(date '+%F %T') | ERROR: failed to submit continuation array" >&2
     fi
 }
 
-trap 'submit_continuation; exit 0' TERM
+handle_term() {
+    if [ -n "$OWNED_STAGE_LOCK" ]; then
+        rmdir "$OWNED_STAGE_LOCK" 2>/dev/null || true
+    fi
+    submit_continuation
+    exit 0
+}
+trap handle_term TERM
 
 INIT_BG_ARGS=""
 $FLAG_INIT       && INIT_BG_ARGS+=" --flag_init"
@@ -199,11 +212,6 @@ exec > >(tee -a "$MAIN_LOGFILE") 2>&1
 
 # -------------------- BARRIER DIR --------------------
 BARRIER_DIR="${DIR_SAVE_PICKLE}/.barriers_${JOB_ID}"
-# Task 0 cleans up stale barriers before starting
-if [ $ARRAY_ID -eq 0 ]; then
-    rm -rf "$BARRIER_DIR" 2>/dev/null || true
-    sleep 2  # Allow Lustre/GPFS to propagate the deletion to other nodes
-fi
 # Retry mkdir to handle Lustre propagation delays and stale NFS handles
 for _attempt in 1 2 3 4 5; do
     mkdir -p "$BARRIER_DIR" 2>/dev/null
@@ -216,6 +224,7 @@ if [ ! -d "$BARRIER_DIR" ]; then
     exit 1
 fi
 
+
 # -------------------- HEADER --------------------
 echo "=========================================="
 echo " Job ${JOB_ID} | GPU task ${ARRAY_ID}/${NUM_ARRAY}"
@@ -225,8 +234,17 @@ echo " Python: $(which python)"
 echo " CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo " Memory: $(ulimit -v 2>/dev/null || echo N/A)"
 echo "=========================================="
+if [ -n "$RESTART" ] && [ -f "$FINAL_MARKER" ]; then
+    rm -f "$FINAL_MARKER"
+    echo "$(date '+%F %T') | Removed stale completion marker for explicit restart"
+fi
+if [ -f "$FINAL_MARKER" ] && ! $FORCE_MERGE && ! $MERGE_ONLY; then
+    echo "$(date '+%F %T') | Experiment already complete; exiting late array task"
+    exit 0
+fi
 
-# -------------------- PREPARE SUBWINDOWS (task 0 only) --------------------
+
+# -------------------- PREPARE SUBWINDOWS (one atomic owner) --------------------
 # Pickles alone are not sufficient for a continuation: scratch directories
 # may have been deleted between jobs. Validate every tile config before
 # honoring --skip-prepare.
@@ -255,7 +273,8 @@ raise SystemExit(0)
 PY_CHECK
 }
 
-if [ $ARRAY_ID -eq 0 ]; then
+if mkdir "${BARRIER_DIR}/prepare.lock" 2>/dev/null; then
+    OWNED_STAGE_LOCK="${BARRIER_DIR}/prepare.lock"
     if $SKIP_PREPARE && preparation_state_is_complete; then
         echo "$(date '+%F %T') | Skipping preparation (--skip-prepare, pickles and tile scratch directories exist)"
     else
@@ -266,19 +285,22 @@ if [ $ARRAY_ID -eq 0 ]; then
         MPLBACKEND=Agg python -u "${SRC_DIR}/prepare_VarDyn.py" "$PATH_CONFIG" "$PATH_CONFIG_EQ" $PREPARE_ARGS
         if [ $? -ne 0 ]; then
             echo "$(date '+%F %T') | ERROR: Preparation failed!"
+            OWNED_STAGE_LOCK=""
+            rmdir "${BARRIER_DIR}/prepare.lock" 2>/dev/null || true
             touch "${BARRIER_DIR}/prepare_failed"
             exit 1
         fi
     fi
     echo "$(date '+%F %T') | Preparation complete"
     touch "${BARRIER_DIR}/prepared"
+    OWNED_STAGE_LOCK=""
 else
     echo "$(date '+%F %T') | Waiting for preparation to complete..."
     while [ ! -f "${BARRIER_DIR}/prepared" ] && [ ! -f "${BARRIER_DIR}/prepare_failed" ]; do
         sleep 5
     done
     if [ -f "${BARRIER_DIR}/prepare_failed" ]; then
-        echo "$(date '+%F %T') | ERROR: Preparation failed on task 0, aborting"
+        echo "$(date '+%F %T') | ERROR: Preparation failed on the stage owner, aborting"
         exit 1
     fi
     echo "$(date '+%F %T') | Preparation detected, proceeding"
@@ -292,29 +314,38 @@ try_claim_tile() {
     mkdir "$lock_dir" 2>/dev/null
 }
 
-# -------------------- BARRIER: wait for all array tasks --------------------
-barrier_wait() {
-    local tag="$1"
-    # Retry touch in case BARRIER_DIR has a stale handle or needs to be recreated
-    local _t
-    for _t in 1 2 3 4 5; do
-        mkdir -p "$BARRIER_DIR" 2>/dev/null
-        touch "${BARRIER_DIR}/${tag}_${ARRAY_ID}" 2>/dev/null && break
-        echo "$(date '+%F %T') | WARNING: barrier touch ${tag}_${ARRAY_ID} failed (attempt ${_t}), retrying..." >&2
-        sleep $(( _t * 3 ))
-    done
-    if [ ! -f "${BARRIER_DIR}/${tag}_${ARRAY_ID}" ]; then
-        echo "$(date '+%F %T') | FATAL: Could not write barrier file ${tag}_${ARRAY_ID}" >&2
-        exit 1
-    fi
+# Wait on completed work rather than SLURM_ARRAY_TASK_COUNT: Slurm may start
+# fewer array elements than requested, while every running element scans the
+# same dynamically claimed queue.
+wait_for_window_tiles() {
+    local tile_list="$1"
     local waited=0
-    while [ $(ls "${BARRIER_DIR}/${tag}_"* 2>/dev/null | wc -l) -lt $NUM_ARRAY ]; do
-        sleep 5
-        waited=$(( waited + 5 ))
-        if [ $waited -ge $BARRIER_TIMEOUT ]; then
-            echo "$(date '+%F %T') | WARNING: barrier_wait timeout (${BARRIER_TIMEOUT}s) for ${tag} — proceeding without all tasks" >&2
-            break
+    while true; do
+        local missing=0
+        while IFS= read -r tile; do
+            [ -z "$tile" ] && continue
+            [ -f "${tile}/.tile_complete.ok" ] || missing=$((missing + 1))
+        done < "$tile_list"
+        [ "$missing" -eq 0 ] && return 0
+        if [ "$waited" -ge "$BARRIER_TIMEOUT" ]; then
+            echo "$(date '+%F %T') | Window incomplete: ${missing} tile(s) missing" >&2
+            return 1
         fi
+        sleep 10
+        waited=$((waited + 10))
+    done
+}
+
+wait_for_marker() {
+    local marker="$1"
+    local waited=0
+    while [ ! -f "$marker" ]; do
+        if [ "$waited" -ge "$BARRIER_TIMEOUT" ]; then
+            echo "$(date '+%F %T') | Timed out waiting for ${marker}" >&2
+            return 1
+        fi
+        sleep 10
+        waited=$((waited + 10))
     done
 }
 
@@ -354,13 +385,22 @@ IW=0
 for TIME_DIR in $TIME_WINDOWS; do
     echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Time window ${IW}: $TIME_DIR"
 
-    # Task 0 creates the tile list
+    # One actually-running task publishes the tile list atomically.
     TILE_LIST="${BARRIER_DIR}/tiles_iw${IW}"
-    if [ $ARRAY_ID -eq 0 ]; then
-        find "$TIME_DIR" -mindepth 1 -maxdepth 1 -type d -name "subwindow_*" | sort > "$TILE_LIST"
+    if mkdir "${BARRIER_DIR}/queue_iw${IW}.lock" 2>/dev/null; then
+        OWNED_STAGE_LOCK="${BARRIER_DIR}/queue_iw${IW}.lock"
+        find "$TIME_DIR" -mindepth 1 -maxdepth 1 -type d -name "subwindow_*" | sort > "${TILE_LIST}.tmp"
+        mv "${TILE_LIST}.tmp" "$TILE_LIST"
         TOTAL_TILES=$(wc -l < "$TILE_LIST")
         echo "$(date '+%F %T') | Found ${TOTAL_TILES} tiles for time window ${IW}"
+        if [ -n "$RESTART" ]; then
+            while IFS= read -r tile; do
+                [ -z "$tile" ] && continue
+                rm -f "${tile}/.tile_complete.ok"
+            done < "$TILE_LIST"
+        fi
         touch "${BARRIER_DIR}/queue_ready_iw${IW}"
+        OWNED_STAGE_LOCK=""
     fi
     while [ ! -f "${BARRIER_DIR}/queue_ready_iw${IW}" ]; do sleep 1; done
 
@@ -389,41 +429,50 @@ for TIME_DIR in $TIME_WINDOWS; do
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Skipping assimilation (--merge-only)"
     fi
 
-    # Barrier: wait for all GPUs to finish this time window
-    barrier_wait "tw${IW}"
-
-    if ! $FORCE_MERGE && ! compgen -G "${BARRIER_DIR}/computed_iw${IW}_"'*' > /dev/null; then
-        echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Skipping spatial merge for time window ${IW}: no tile computed and --force-merge not set"
-        barrier_wait "merge${IW}"
-        ((IW++))
-        continue
+    if ! $MERGE_ONLY && ! wait_for_window_tiles "$TILE_LIST"; then
+        submit_continuation
+        exit 1
     fi
+
 
     ZARR_OUTPUT_ARG=""
     OUTPUT_FLOAT64_ARG=""
     $ZARR_OUTPUT && ZARR_OUTPUT_ARG="--zarr_output"
     $OUTPUT_FLOAT64 && OUTPUT_FLOAT64_ARG="--output_float64"
-    # Spatial merge: every array task processes its share of dates
-    echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Spatial merge for time window ${IW} (rank ${ARRAY_ID}/${NUM_ARRAY})"
-    python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
-        --dir_save_pickle "$DIR_SAVE_PICKLE" \
-        --name_var_save "$NAME_VAR" \
-        --num_workers "$NUM_MERGE_WORKERS" \
-        --iw_start "$IW" \
-        --iw_end "$((IW + 1))" \
-        --rank "$ARRAY_ID" \
-        --world "$NUM_ARRAY" \
-        $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG
-    echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Spatial merge done for time window ${IW}"
-
-    # Wait for all ranks to finish their date shards before next time window
-    barrier_wait "merge${IW}"
+    MERGE_MARKER="${BARRIER_DIR}/spatial_merge_iw${IW}.ok"
+    if mkdir "${BARRIER_DIR}/merge_iw${IW}.lock" 2>/dev/null; then
+        OWNED_STAGE_LOCK="${BARRIER_DIR}/merge_iw${IW}.lock"
+        echo "$(date '+%F %T') | Spatial merge for time window ${IW}"
+        if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+            --dir_save_pickle "$DIR_SAVE_PICKLE" \
+            --name_var_save "$NAME_VAR" \
+            --num_workers "$NUM_MERGE_WORKERS" \
+            --iw_start "$IW" \
+            --iw_end "$((IW + 1))" \
+            --rank 0 \
+            --world 1 \
+            $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG; then
+            touch "$MERGE_MARKER"
+            OWNED_STAGE_LOCK=""
+            echo "$(date '+%F %T') | Spatial merge done for time window ${IW}"
+        else
+            echo "$(date '+%F %T') | Spatial merge failed for time window ${IW}" >&2
+            OWNED_STAGE_LOCK=""
+            rmdir "${BARRIER_DIR}/merge_iw${IW}.lock" 2>/dev/null || true
+            submit_continuation
+            exit 1
+        fi
+    elif ! wait_for_marker "$MERGE_MARKER"; then
+        submit_continuation
+        exit 1
+    fi
 
     ((IW++))
 done
 
-# Final: merge all time windows (task 0 only)
-if [ $ARRAY_ID -eq 0 ]; then
+# Final: exactly one running task merges all time windows.
+if mkdir "${BARRIER_DIR}/final_merge.lock" 2>/dev/null; then
+    OWNED_STAGE_LOCK="${BARRIER_DIR}/final_merge.lock"
     echo "$(date '+%Y-%m-%d %H:%M:%S') | Merging all time windows"
     if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
         --dir_save_pickle "$DIR_SAVE_PICKLE" \
@@ -435,10 +484,14 @@ if [ $ARRAY_ID -eq 0 ]; then
         tmp_marker="${FINAL_MARKER}.tmp-${SLURM_JOB_ID:-$$}"
         printf 'Experiment completed: %s\n' "$(date -Is)" > "$tmp_marker"
         mv -f "$tmp_marker" "$FINAL_MARKER"
+        OWNED_STAGE_LOCK=""
         echo "$(date '+%Y-%m-%d %H:%M:%S') | All time windows processed"
         echo "$(date '+%Y-%m-%d %H:%M:%S') | Completion marker: $FINAL_MARKER"
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') | ERROR: final time-window merge failed" >&2
+        OWNED_STAGE_LOCK=""
+        rmdir "${BARRIER_DIR}/final_merge.lock" 2>/dev/null || true
+        submit_continuation
         exit 1
     fi
 

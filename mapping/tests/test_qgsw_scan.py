@@ -182,3 +182,25 @@ def test_diffusion_adjoint_is_traceable_with_identity_configuration():
     expected = np.array([[1.0, 0.0], [2.0, 3.0]], dtype=np.float32)
     np.testing.assert_allclose(state_adjoint, expected)
     np.testing.assert_allclose(parameter_adjoint, expected * 0.25)
+
+
+def test_diffusion_boundary_conditions_use_model_time_keys():
+    model = Model_diffusion.__new__(Model_diffusion)
+    model._bc_fields = SimpleNamespace(
+        interp=lambda dates: {
+            'SSH': np.stack([
+                np.full((2, 2), 3.0),
+                np.full((2, 2), 4.0),
+            ])
+        })
+    model.name_var = {'SSH': 'sla'}
+    model.bc = {'SSH': {}}
+    model.init_from_bc = True
+    model._set_land_nan = lambda state: None
+
+    dates = np.array(['2024-01-01', '2024-01-02'], dtype='datetime64[D]')
+    model.set_bc(dates, t_bc=np.array([0, 86400]))
+
+    state = _TraceState({'sla': np.zeros((2, 2))}, {})
+    model.init(state, t0=0)
+    np.testing.assert_allclose(state.var['sla'], 3.0)

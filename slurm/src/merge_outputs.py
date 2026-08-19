@@ -96,6 +96,40 @@ def _validate_final_outputs(config, list_date_start, list_date_end):
 
     log(f'Validated {len(expected)} final global output files')
 
+def _validate_dated_outputs(config, dates, root, zarr_output=False):
+    """Fail when any expected per-date product is missing or unreadable."""
+    missing = []
+    unreadable = []
+    suffix = '.zarr' if zarr_output else '.nc'
+    for date in dates:
+        filename = (
+            f'{config.EXP.name_exp_save}'
+            f'_y{date.year}m{date.month:02d}d{date.day:02d}'
+            f'h{date.hour:02d}m{date.minute:02d}{suffix}'
+        )
+        path = os.path.join(root, filename)
+        if not os.path.exists(path):
+            missing.append(path)
+            continue
+        try:
+            opener = xr.open_zarr if zarr_output else xr.open_dataset
+            with opener(path) as dataset:
+                _ = dataset.sizes
+        except Exception as exc:
+            unreadable.append(f'{path}: {exc}')
+
+    if missing or unreadable:
+        details = []
+        if missing:
+            details.append(f'missing={len(missing)} (first: {missing[0]})')
+        if unreadable:
+            details.append(
+                f'unreadable={len(unreadable)} (first: {unreadable[0]})')
+        raise RuntimeError('Output validation failed: ' + '; '.join(details))
+
+    log(f'Validated {len(dates)} dated outputs in {root}')
+
+
 # -------------------- Main merge workflow --------------------
 def merge_outputs(
     path_config,
@@ -163,6 +197,11 @@ def merge_outputs(
             config0.EXP = config0.EXP.copy()
             config0.EXP.tmp_DA_path += f'/subwindow_{str(date_middle)[:10]}'
             config0.EXP.path_save += f'/subwindow_{str(date_middle)[:10]}'
+            # Tile archives may use one Zarr store per tile, but the spatial
+            # merge must remain one product per date: the time-window merge
+            # consumes those date-addressable intermediates (NetCDF first,
+            # optionally converted to Zarr below).
+            config0.EXP.saveoutputs_zarr = False
             State0 = state.State(config0)
             dates_window = generate_dates(date_start, date_end, config0.EXP.saveoutput_time_step)
 
@@ -175,7 +214,7 @@ def merge_outputs(
                 expected_outputs = [
                     os.path.join(
                         config0.EXP.path_save,
-                        f'{config0.EXP.name_experiment}'
+                        f'{config0.EXP.name_exp_save}'
                         f'_y{date.year}'
                         f'm{str(date.month).zfill(2)}'
                         f'd{str(date.day).zfill(2)}'
@@ -186,9 +225,13 @@ def merge_outputs(
                 ]
                 if expected_outputs and all(os.path.exists(path) for path in expected_outputs):
                     log(f"Skipping time window {iw}: merged outputs already exist")
+                    _validate_dated_outputs(
+                        config0, dates_window, config0.EXP.path_save)
                     continue
 
             parallel_merge(dates_window, State0, State_window, name_var_save, kernel, None, weights_space_sum, None, list_tile_paths=list_tile_paths, num_workers=num_workers, output_dtype=output_dtype)
+            _validate_dated_outputs(
+                config0, dates_window, config0.EXP.path_save)
     else:
         log("Skipping spatial merge (already done)")
 
@@ -211,6 +254,15 @@ def merge_outputs(
             zarr_output=zarr_output,
             output_dtype=output_dtype,
         )
+        final_dates = sorted({
+            date
+            for start, end in zip(list_date_start, list_date_end)
+            for date in generate_dates(
+                start, end, config.EXP.saveoutput_time_step)
+        })
+        _validate_dated_outputs(
+            config, final_dates, config.EXP.path_save,
+            zarr_output=zarr_output)
     else:
         log("Skipping final time-window merge")
 

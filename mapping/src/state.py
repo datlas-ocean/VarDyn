@@ -453,7 +453,13 @@ class State:
                     if np.issubdtype(np.asarray(coord_values).dtype, np.floating):
                         coords[key] = (*value[:-1], np.asarray(coord_values).astype(dtype))
             ds = xr.Dataset(var, coords=coords)
-            self._save_zarr_record(ds, filename, date)
+            self._save_zarr_record(
+                ds,
+                filename,
+                date,
+                window_start=self.config.EXP.init_date,
+                window_end=self.config.EXP.final_date,
+            )
             return
 
         def _write_fresh():
@@ -500,21 +506,32 @@ class State:
         return 
 
     @staticmethod
-    def _save_zarr_record(record, filename, date):
+    def _save_zarr_record(record, filename, date, window_start=None, window_end=None):
         # Serialize the complete read/modify/write transaction. Slurm array
         # ranks shard dates but intentionally share one experiment archive.
         lock_filename = f'{filename}.lock'
         with open(lock_filename, 'w') as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
-                State._save_zarr_record_unlocked(record, filename, date)
+                State._save_zarr_record_unlocked(
+                    record, filename, date,
+                    window_start=window_start, window_end=window_end)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
-    def _save_zarr_record_unlocked(record, filename, date):
+    def _save_zarr_record_unlocked(record, filename, date,
+                                   window_start=None, window_end=None):
         # Write partial model records into one consistent Zarr archive.
         record_time = pd.Timestamp(date)
+        start = pd.Timestamp(window_start) if window_start is not None else None
+        end = pd.Timestamp(window_end) if window_end is not None else None
+        if ((start is not None and record_time < start)
+                or (end is not None and record_time > end)):
+            record.close()
+            raise ValueError(
+                f'Refusing to save {record_time} outside Zarr window '
+                f'[{start}, {end}]')
         if not os.path.exists(filename):
             record.to_zarr(filename, mode='w')
             record.close()
@@ -523,12 +540,26 @@ class State:
         with xr.open_zarr(filename) as existing_open:
             existing = existing_open.load()
 
+        # A tile archive belongs to exactly one temporal subwindow. Prune
+        # records left by an older/badly-routed run before updating it.
+        pruned = False
+        if start is not None or end is not None:
+            keep = np.ones(existing.sizes.get('time', 0), dtype=bool)
+            existing_times = pd.to_datetime(existing.time.values)
+            if start is not None:
+                keep &= existing_times >= start
+            if end is not None:
+                keep &= existing_times <= end
+            if not np.all(keep):
+                existing = existing.isel(time=np.flatnonzero(keep))
+                pruned = True
+
         times = pd.to_datetime(existing.time.values)
         existing_names = set(existing.data_vars)
         record_names = set(record.data_vars)
         output_dtype = np.float64 if USE_FLOAT64 else np.float32
 
-        if record_time in times and record_names <= existing_names:
+        if not pruned and record_time in times and record_names <= existing_names:
             time_index = int(np.flatnonzero(times == record_time)[0])
             region_record = record[list(record.data_vars)]
             region_record = region_record.drop_vars(
@@ -545,7 +576,7 @@ class State:
             record.close()
             return
 
-        if record_time not in times and record_names <= existing_names:
+        if not pruned and record_time not in times and record_names <= existing_names:
             missing = {}
             for name in existing_names - record_names:
                 template = existing[name].isel(time=slice(0, 1))
