@@ -129,6 +129,31 @@ sbatch VarDyn_GLO.sh --skip-prepare --restart
 sbatch VarDyn_GLO.sh --name_exp my_custom_name
 ```
 
+## Stopping a job without triggering another continuation
+
+`VarDyn_GLO.sh` traps `TERM` near the wall-time limit and submits a
+continuation job. A normal `scancel` also sends `TERM`, so it can
+unintentionally trigger the same continuation mechanism.
+
+To stop one job or array without running the `TERM` trap, send `KILL`:
+
+```bash
+scancel --signal=KILL --full <JOB_ID>
+```
+
+If continuation jobs have already been submitted, first inspect all jobs with
+the experiment's SLURM name, then cancel the whole chain:
+
+```bash
+squeue --user="$USER" --name=VarDyn_GLO
+scancel --signal=KILL --full --user="$USER" --name=VarDyn_GLO
+```
+
+The second command cancels every job owned by the current user whose name is
+`VarDyn_GLO`. Check the `squeue` output first if several unrelated
+experiments share that job name. Do not use a normal `scancel` when the goal
+is to stop the continuation loop.
+
 ## Requirements
 
 - SLURM with GPU support (`--gpus=v100_32g:1` or similar)
