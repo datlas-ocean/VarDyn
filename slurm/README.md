@@ -133,46 +133,25 @@ sbatch VarDyn_GLO.sh --name_exp my_custom_name
 
 ## Stopping a job without triggering another continuation
 
-`VarDyn_GLO.sh` traps `TERM` near the wall-time limit and submits a
-continuation job. A normal `scancel` also sends `TERM`, so it can
-unintentionally trigger the same continuation mechanism.
+`VarDyn_GLO.sh` uses `USR1` exclusively for the warning sent five minutes
+before the wall-time limit. Only this signal submits an automatic
+continuation. The regular `TERM` signal sent by `scancel` exits without a
+continuation.
 
-To stop one job or array without running the `TERM` trap, send `KILL`:
-
-```bash
-scancel --signal=KILL --full <JOB_ID>
-```
-
-To stop an entire continuation chain reliably, first create the persistent
-stop marker for the experiment, then cancel every matching job:
+Stop a job or a complete array with the standard command:
 
 ```bash
-BASE_DIR="<DIR_SAVE_PICKLE>/<EXP_NAME>"
-touch "$BASE_DIR/stop_continuations"
-scancel --signal=KILL --full --user="$USER" --name=VarDyn_GLO
+scancel <JOB_ID>
 ```
 
-The marker prevents running tasks, pending array elements, and cancellation
-handlers from submitting another continuation. Before intentionally starting
-the experiment again, remove it explicitly:
+No experiment name, VarDyn path, stop marker, or custom shell function is
+required. If a continuation was already visible in `squeue` before the
+cancellation, it is an independent Slurm job and its numeric ID must also be
+cancelled:
 
 ```bash
-rm -f "$BASE_DIR/stop_continuations"
-sbatch VarDyn_GLO.sh --config <config.sh> --restart
+scancel <JOB_ID> <CONTINUATION_JOB_ID>
 ```
-
-If continuation jobs have already been submitted, first inspect all jobs with
-the experiment's SLURM name, then cancel the whole chain:
-
-```bash
-squeue --user="$USER" --name=VarDyn_GLO
-scancel --signal=KILL --full --user="$USER" --name=VarDyn_GLO
-```
-
-The second command cancels every job owned by the current user whose name is
-`VarDyn_GLO`. Check the `squeue` output first if several unrelated
-experiments share that job name. Do not use a normal `scancel` when the goal
-is to stop the continuation loop.
 
 ## Requirements
 

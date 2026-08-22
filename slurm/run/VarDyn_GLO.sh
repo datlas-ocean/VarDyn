@@ -12,7 +12,7 @@
 #SBATCH --qos=gpu_max
 #SBATCH --partition=gpu_std
 #SBATCH --time=48:00:00
-#SBATCH --signal=B:TERM@300
+#SBATCH --signal=B:USR1@300
 #SBATCH --mem=120G
 #SBATCH --account=swot_duacs
 #SBATCH --export=none
@@ -129,27 +129,17 @@ BASE_DIR="${DIR_SAVE_PICKLE}/${EXP_NAME}"
 CONFIG_PATH="${BASE_DIR}/config.pkl"
 
 # -------------------- TIME-LIMIT CONTINUATION --------------------
-# Slurm sends TERM 300 seconds before the wall-time limit. The first task
+# Slurm sends USR1 300 seconds before the wall-time limit. The first task
 # obtaining the submission lock creates a continuation; completed work is
 # skipped through their existing completion markers.
 CONTINUATION_SCRIPT="${MASH_DIR}/slurm/run/VarDyn_GLO.sh"
 FINAL_MARKER="${BASE_DIR}/experiment_complete.ok"
-STOP_CONTINUATIONS_MARKER="${BASE_DIR}/stop_continuations"
 CONTINUATION_SUBMITTED=false
 OWNED_STAGE_LOCK=""
 
 submit_continuation() {
-    if [ -f "$STOP_CONTINUATIONS_MARKER" ]; then
-        echo "$(date '+%F %T') | Continuation disabled by ${STOP_CONTINUATIONS_MARKER}"
-        return 0
-    fi
     local submit_lock="${BASE_DIR}/.continuation_${JOB_ID}.lock"
     mkdir "$submit_lock" 2>/dev/null || return 0
-    if [ -f "$STOP_CONTINUATIONS_MARKER" ]; then
-        rmdir "$submit_lock" 2>/dev/null || true
-        echo "$(date '+%F %T') | Continuation disabled by ${STOP_CONTINUATIONS_MARKER}"
-        return 0
-    fi
     [ -f "${FINAL_MARKER}" ] && [ -z "$RESTART" ] \
         && ! $FORCE_MERGE && ! $MERGE_ONLY && return 0
     [ "${CONTINUATION_SUBMITTED}" = true ] && return 0
@@ -170,14 +160,27 @@ submit_continuation() {
     fi
 }
 
-handle_term() {
+release_stage_lock() {
     if [ -n "$OWNED_STAGE_LOCK" ]; then
         rmdir "$OWNED_STAGE_LOCK" 2>/dev/null || true
     fi
+}
+
+handle_timeout() {
+    release_stage_lock
+    echo "$(date '+%F %T') | Slurm wall-time signal received; requesting continuation"
     submit_continuation
     exit 0
 }
-trap handle_term TERM
+
+handle_cancel() {
+    release_stage_lock
+    echo "$(date '+%F %T') | Cancellation signal received; no continuation will be submitted"
+    exit 0
+}
+
+trap handle_timeout USR1
+trap handle_cancel TERM
 
 INIT_BG_ARGS=""
 $FLAG_INIT       && INIT_BG_ARGS+=" --flag_init"
@@ -243,10 +246,6 @@ echo " Python: $(which python)"
 echo " CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo " Memory: $(ulimit -v 2>/dev/null || echo N/A)"
 echo "=========================================="
-if [ -f "$STOP_CONTINUATIONS_MARKER" ]; then
-    echo "$(date '+%F %T') | Continuations are disabled; exiting late array task"
-    exit 0
-fi
 if [ -n "$RESTART" ] && [ -f "$FINAL_MARKER" ]; then
     rm -f "$FINAL_MARKER"
     echo "$(date '+%F %T') | Removed stale completion marker for explicit restart"
