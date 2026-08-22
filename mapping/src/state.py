@@ -555,6 +555,17 @@ class State:
                 pruned = True
 
         times = pd.to_datetime(existing.time.values)
+        duplicate_times = pd.Index(times).duplicated(keep='last')
+        if np.any(duplicate_times):
+            duplicate_count = int(np.count_nonzero(duplicate_times))
+            print(
+                f'Warning: repairing {duplicate_count} duplicate time records '
+                f'in {filename}')
+            existing = existing.isel(
+                time=np.flatnonzero(~duplicate_times))
+            times = pd.to_datetime(existing.time.values)
+            # Force one atomic rewrite of the fully deduplicated archive.
+            pruned = True
         existing_names = set(existing.data_vars)
         record_names = set(record.data_vars)
         matching_record_indexes = np.flatnonzero(times == record_time)
@@ -598,11 +609,15 @@ class State:
             return
 
         if record_time in times:
-            time_index = int(np.flatnonzero(times == record_time)[0])
+            # Keep the most recently written matching record as the template,
+            # then remove every duplicate positionally. ``drop_sel`` cannot be
+            # used here because pandas rejects selection on a non-unique index.
+            time_index = int(matching_record_indexes[-1])
             current = existing.isel(time=slice(time_index, time_index + 1)).copy()
             for name in record.data_vars:
                 current[name] = record[name]
-            existing_without = existing.drop_sel(time=record_time)
+            existing_without = existing.isel(
+                time=np.flatnonzero(times != record_time))
             combined = xr.concat(
                 [existing_without, current],
                 dim='time',
