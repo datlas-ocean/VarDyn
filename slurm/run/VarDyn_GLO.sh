@@ -134,12 +134,22 @@ CONFIG_PATH="${BASE_DIR}/config.pkl"
 # skipped through their existing completion markers.
 CONTINUATION_SCRIPT="${MASH_DIR}/slurm/run/VarDyn_GLO.sh"
 FINAL_MARKER="${BASE_DIR}/experiment_complete.ok"
+STOP_CONTINUATIONS_MARKER="${BASE_DIR}/stop_continuations"
 CONTINUATION_SUBMITTED=false
 OWNED_STAGE_LOCK=""
 
 submit_continuation() {
+    if [ -f "$STOP_CONTINUATIONS_MARKER" ]; then
+        echo "$(date '+%F %T') | Continuation disabled by ${STOP_CONTINUATIONS_MARKER}"
+        return 0
+    fi
     local submit_lock="${BASE_DIR}/.continuation_${JOB_ID}.lock"
     mkdir "$submit_lock" 2>/dev/null || return 0
+    if [ -f "$STOP_CONTINUATIONS_MARKER" ]; then
+        rmdir "$submit_lock" 2>/dev/null || true
+        echo "$(date '+%F %T') | Continuation disabled by ${STOP_CONTINUATIONS_MARKER}"
+        return 0
+    fi
     [ -f "${FINAL_MARKER}" ] && [ -z "$RESTART" ] \
         && ! $FORCE_MERGE && ! $MERGE_ONLY && return 0
     [ "${CONTINUATION_SUBMITTED}" = true ] && return 0
@@ -233,6 +243,10 @@ echo " Python: $(which python)"
 echo " CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo " Memory: $(ulimit -v 2>/dev/null || echo N/A)"
 echo "=========================================="
+if [ -f "$STOP_CONTINUATIONS_MARKER" ]; then
+    echo "$(date '+%F %T') | Continuations are disabled; exiting late array task"
+    exit 0
+fi
 if [ -n "$RESTART" ] && [ -f "$FINAL_MARKER" ]; then
     rm -f "$FINAL_MARKER"
     echo "$(date '+%F %T') | Removed stale completion marker for explicit restart"

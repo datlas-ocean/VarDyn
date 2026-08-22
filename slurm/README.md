@@ -143,6 +143,24 @@ To stop one job or array without running the `TERM` trap, send `KILL`:
 scancel --signal=KILL --full <JOB_ID>
 ```
 
+To stop an entire continuation chain reliably, first create the persistent
+stop marker for the experiment, then cancel every matching job:
+
+```bash
+BASE_DIR="<DIR_SAVE_PICKLE>/<EXP_NAME>"
+touch "$BASE_DIR/stop_continuations"
+scancel --signal=KILL --full --user="$USER" --name=VarDyn_GLO
+```
+
+The marker prevents running tasks, pending array elements, and cancellation
+handlers from submitting another continuation. Before intentionally starting
+the experiment again, remove it explicitly:
+
+```bash
+rm -f "$BASE_DIR/stop_continuations"
+sbatch VarDyn_GLO.sh --config <config.sh> --restart
+```
+
 If continuation jobs have already been submitted, first inspect all jobs with
 the experiment's SLURM name, then cancel the whole chain:
 
