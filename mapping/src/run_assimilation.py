@@ -1078,20 +1078,13 @@ def _fill_nans_nearest(arr):
 
 
 def _discover_merge_variables(date, list_State, requested):
-    """Return requested variables plus fields present in any tile output."""
-    names = list(dict.fromkeys(requested))
-    seen = set(names)
-    for tile_state in list_State:
-        try:
-            ds = tile_state.load_output(date)
-            for name in ds.data_vars:
-                if name not in seen:
-                    names.append(name)
-                    seen.add(name)
-            ds.close()
-        except Exception as exc:
-            print(f'[merge] Warning: could not inspect tile variables for {date}: {exc}')
-    return names
+    """Return only the explicitly requested output variables.
+
+    Diagnosed tile fields can have staggered or temporal dimensions that are
+    not part of the configured spatial product. Auto-discovering them made a
+    merge depend on whichever tile was inspected first.
+    """
+    return list(dict.fromkeys(requested))
 
 
 def merge_output_date(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=None, plot=False, save=True, output_dtype=None):

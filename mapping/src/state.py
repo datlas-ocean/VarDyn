@@ -557,10 +557,13 @@ class State:
         times = pd.to_datetime(existing.time.values)
         existing_names = set(existing.data_vars)
         record_names = set(record.data_vars)
+        matching_record_indexes = np.flatnonzero(times == record_time)
+        has_duplicate_record = matching_record_indexes.size > 1
         output_dtype = np.float64 if USE_FLOAT64 else np.float32
 
-        if not pruned and record_time in times and record_names <= existing_names:
-            time_index = int(np.flatnonzero(times == record_time)[0])
+        if (not pruned and not has_duplicate_record
+                and record_time in times and record_names <= existing_names):
+            time_index = int(matching_record_indexes[0])
             region_record = record[list(record.data_vars)]
             region_record = region_record.drop_vars(
                 [name for name in region_record.coords if name != 'time'],
@@ -635,7 +638,15 @@ class State:
         zarr_filename = os.path.join(self.path_save, f'{self.name_exp_save}.zarr')
         if bool(getattr(self.config.EXP, 'saveoutputs_zarr', False)) and os.path.exists(zarr_filename):
             with xr.open_zarr(zarr_filename) as ds:
-                ds1 = ds.sel(time=pd.Timestamp(date)).load().squeeze()
+                selected = ds.sel(time=pd.Timestamp(date))
+                if 'time' in selected.dims:
+                    duplicate_count = selected.sizes['time']
+                    if duplicate_count > 1:
+                        print(
+                            f'Warning: {zarr_filename} contains {duplicate_count} '
+                            f'records for {pd.Timestamp(date)}; using the latest one')
+                    selected = selected.isel(time=-1)
+                ds1 = selected.load().squeeze(drop=True)
             if name_var is None:
                 return ds1
             return np.array([ds1[name].values for name in name_var])

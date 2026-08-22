@@ -148,7 +148,6 @@ submit_continuation() {
     local dependency="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"
     local next_job
     local continuation_args=(--config "${CONFIG_FILE}" --skip-prepare)
-    $FORCE_MERGE && continuation_args+=(--force-merge)
     $MERGE_ONLY && continuation_args+=(--merge-only)
     [ -n "${NAME_EXP_OVERRIDE}" ] && continuation_args+=(--name_exp "${NAME_EXP_OVERRIDE}")
     if next_job=$(sbatch --parsable \
@@ -336,18 +335,6 @@ wait_for_window_tiles() {
     done
 }
 
-wait_for_marker() {
-    local marker="$1"
-    local waited=0
-    while [ ! -f "$marker" ]; do
-        if [ "$waited" -ge "$BARRIER_TIMEOUT" ]; then
-            echo "$(date '+%F %T') | Timed out waiting for ${marker}" >&2
-            return 1
-        fi
-        sleep 10
-        waited=$((waited + 10))
-    done
-}
 
 # -------------------- TILE WORKER --------------------
 run_single_tile() {
@@ -458,13 +445,22 @@ for TIME_DIR in $TIME_WINDOWS; do
         else
             echo "$(date '+%F %T') | Spatial merge failed for time window ${IW}" >&2
             OWNED_STAGE_LOCK=""
+            touch "${BARRIER_DIR}/spatial_merge_iw${IW}.failed"
             rmdir "${BARRIER_DIR}/merge_iw${IW}.lock" 2>/dev/null || true
             submit_continuation
             exit 1
         fi
-    elif ! wait_for_marker "$MERGE_MARKER"; then
-        submit_continuation
-        exit 1
+    else
+        MERGE_FAILED="${BARRIER_DIR}/spatial_merge_iw${IW}.failed"
+        echo "$(date '+%F %T') | Waiting for spatial merge ${IW} to complete"
+        while [ ! -f "$MERGE_MARKER" ] && [ ! -f "$MERGE_FAILED" ]; do
+            sleep 10
+        done
+        if [ -f "$MERGE_FAILED" ]; then
+            echo "$(date '+%F %T') | Spatial merge ${IW} failed on the stage owner" >&2
+            submit_continuation
+            exit 1
+        fi
     fi
 
     ((IW++))

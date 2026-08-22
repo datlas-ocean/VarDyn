@@ -30,32 +30,38 @@ from src.run_assimilation import (
 def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
+def _convert_dated_outputs_to_zarr(config, dates, root, output_dtype):
+    """Convert per-date NetCDF products to Zarr atomically."""
+    root = Path(root)
+    for date in dates:
+        stem = (f"{config.EXP.name_exp_save}_y{date.year}m{date.month:02d}d{date.day:02d}"
+                f"h{date.hour:02d}m{date.minute:02d}")
+        nc_path = root / f"{stem}.nc"
+        zarr_path = root / f"{stem}.zarr"
+        if not nc_path.exists():
+            continue
+        with xr.open_dataset(nc_path) as source:
+            dataset = source.load()
+        for name in dataset.data_vars:
+            if np.issubdtype(dataset[name].dtype, np.floating):
+                dataset[name] = dataset[name].astype(output_dtype)
+        temporary = root / f".{stem}.zarr.tmp-{os.getpid()}"
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        dataset.to_zarr(temporary, mode="w")
+        dataset.close()
+        if zarr_path.exists():
+            shutil.rmtree(zarr_path)
+        os.replace(temporary, zarr_path)
+        nc_path.unlink()
+
 def _convert_subwindow_outputs_to_zarr(config, list_date_start, list_date_middle, list_date_end, output_dtype):
     """Convert spatially merged subwindow NetCDF files and remove originals."""
     for middle, start, end in zip(list_date_middle, list_date_start, list_date_end):
-        date = start
         root = Path(config.EXP.path_save) / f"subwindow_{str(middle)[:10]}"
-        while date <= end:
-            stem = (f"{config.EXP.name_exp_save}_y{date.year}m{date.month:02d}d{date.day:02d}"
-                    f"h{date.hour:02d}m{date.minute:02d}")
-            nc_path = root / f"{stem}.nc"
-            zarr_path = root / f"{stem}.zarr"
-            if nc_path.exists():
-                with xr.open_dataset(nc_path) as source:
-                    dataset = source.load()
-                for name in dataset.data_vars:
-                    if np.issubdtype(dataset[name].dtype, np.floating):
-                        dataset[name] = dataset[name].astype(output_dtype)
-                temporary = root / f".{stem}.zarr.tmp-{os.getpid()}"
-                if temporary.exists():
-                    shutil.rmtree(temporary)
-                dataset.to_zarr(temporary, mode="w")
-                dataset.close()
-                if zarr_path.exists():
-                    shutil.rmtree(zarr_path)
-                os.replace(temporary, zarr_path)
-                nc_path.unlink()
-            date += config.EXP.saveoutput_time_step
+        dates = generate_dates(start, end, config.EXP.saveoutput_time_step)
+        _convert_dated_outputs_to_zarr(
+            config, dates, root, output_dtype)
 
 def _validate_final_outputs(config, list_date_start, list_date_end):
     """Verify that every expected global output exists and is readable."""
@@ -151,6 +157,11 @@ def merge_outputs(
     with open(path_config, "rb") as f:
         config = pickle.load(f)
 
+    config_requests_zarr = bool(
+        getattr(config.EXP, 'saveoutputs_zarr', False))
+    zarr_output = zarr_output or config_requests_zarr
+    log(f"Merged output format: {'Zarr' if zarr_output else 'NetCDF'}")
+
     if dir_save_pickle is None:
         raise ValueError(
             "dir_save_pickle must be provided (root directory where prepare_VarDyn.py wrote its pickles)"
@@ -219,19 +230,31 @@ def merge_outputs(
                         f'm{str(date.month).zfill(2)}'
                         f'd{str(date.day).zfill(2)}'
                         f'h{str(date.hour).zfill(2)}'
-                        f'm{str(date.minute).zfill(2)}.nc'
+                        f'm{str(date.minute).zfill(2)}'
+                        f'{".zarr" if zarr_output else ".nc"}'
                     )
                     for date in dates_window
                 ]
                 if expected_outputs and all(os.path.exists(path) for path in expected_outputs):
                     log(f"Skipping time window {iw}: merged outputs already exist")
                     _validate_dated_outputs(
-                        config0, dates_window, config0.EXP.path_save)
+                        config0, dates_window, config0.EXP.path_save,
+                        zarr_output=zarr_output)
                     continue
 
             parallel_merge(dates_window, State0, State_window, name_var_save, kernel, None, weights_space_sum, None, list_tile_paths=list_tile_paths, num_workers=num_workers, output_dtype=output_dtype)
             _validate_dated_outputs(
                 config0, dates_window, config0.EXP.path_save)
+            if zarr_output:
+                log(
+                    f"Converting {len(dates_window)} merged outputs from "
+                    f"time window {iw} to Zarr")
+                _convert_dated_outputs_to_zarr(
+                    config0, dates_window, config0.EXP.path_save,
+                    output_dtype)
+                _validate_dated_outputs(
+                    config0, dates_window, config0.EXP.path_save,
+                    zarr_output=True)
     else:
         log("Skipping spatial merge (already done)")
 
