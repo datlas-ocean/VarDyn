@@ -791,12 +791,14 @@ class Model_diffusion(M):
                         var_init = var_init[0,:,:]
                     if config.GRID.subsampling is not None:
                         var_init = var_init[::config.GRID.subsampling,::config.GRID.subsampling]
-                    dsin.close()
-                    del dsin
-                    var_init.data[np.isnan(var_init)] = 0.
-                    State.var[self.name_var[name]] = var_init.values
+                    # Keep the backing dataset open until the lazy array has
+                    # been computed. Boolean assignment on Dask arrays uses
+                    # advanced indexing and fails for these restart grids.
+                    State.var[self.name_var[name]] = var_init.fillna(0).values
                 else:
                     State.var[self.name_var[name]] = np.zeros((State.ny,State.nx))
+            dsin.close()
+            del dsin
         else:
             for name in self.name_var:  
                 State.var[self.name_var[name]] = np.zeros((State.ny,State.nx))

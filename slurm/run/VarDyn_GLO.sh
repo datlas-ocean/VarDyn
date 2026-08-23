@@ -334,14 +334,20 @@ wait_for_window_tiles() {
     local waited=0
     while true; do
         local missing=0
+        local failed=0
         while IFS= read -r tile; do
             [ -z "$tile" ] && continue
             [ -f "${tile}/.tile_complete.ok" ] || missing=$((missing + 1))
+            [ -f "${tile}/.tile_failed" ] && failed=$((failed + 1))
         done < "$tile_list"
+        if [ "$failed" -gt 0 ]; then
+            echo "$(date '+%F %T') | Window failed: ${failed} tile(s) reported an error" >&2
+            return 1
+        fi
         [ "$missing" -eq 0 ] && return 0
         if [ "$waited" -ge "$BARRIER_TIMEOUT" ]; then
             echo "$(date '+%F %T') | Window incomplete: ${missing} tile(s) missing" >&2
-            return 1
+            return 2
         fi
         sleep 10
         waited=$((waited + 10))
@@ -360,16 +366,20 @@ run_single_tile() {
     local TILE_LOG="${LOG_SUBDIR}/${TILE_BASENAME}_gpu${ARRAY_ID}.log"
 
     echo "$(date '+%F %T') | GPU ${ARRAY_ID} | START tile ${TILE}" >> "$TILE_LOG"
+    rm -f "${TILE}/.tile_failed"
     OMP_NUM_THREADS=1 python "${SRC_DIR}/run_tile.py" "$TILE" $RESTART >> "$TILE_LOG" 2>&1
     local status=$?
     if [ $status -eq 0 ]; then
+        rm -f "${TILE}/.tile_failed"
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | DONE  tile ${TILE}" >> "$TILE_LOG"
         if grep -Fq "Finished tile:" "$TILE_LOG"; then
             touch "${BARRIER_DIR}/computed_iw${IW}_${ARRAY_ID}"
         fi
     elif [ $status -eq 137 ]; then
+        touch "${TILE}/.tile_failed"
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | KILLED (OOM?) tile ${TILE}" >> "$TILE_LOG"
     else
+        touch "${TILE}/.tile_failed"
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | ERROR exit=${status} tile ${TILE}" >> "$TILE_LOG"
         # Echo the tail of the tile log to the main log so the error is visible
         # without having to dig into individual tile log files.
@@ -397,6 +407,7 @@ for TIME_DIR in $TIME_WINDOWS; do
             while IFS= read -r tile; do
                 [ -z "$tile" ] && continue
                 rm -f "${tile}/.tile_complete.ok"
+                rm -f "${tile}/.tile_failed"
             done < "$TILE_LIST"
         fi
         touch "${BARRIER_DIR}/queue_ready_iw${IW}"
@@ -429,9 +440,15 @@ for TIME_DIR in $TIME_WINDOWS; do
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Skipping assimilation (--merge-only)"
     fi
 
-    if ! $MERGE_ONLY && ! wait_for_window_tiles "$TILE_LIST"; then
-        submit_continuation
-        exit 1
+    if ! $MERGE_ONLY; then
+        wait_for_window_tiles "$TILE_LIST"
+        window_status=$?
+        if [ "$window_status" -ne 0 ]; then
+            # A timeout can benefit from a continuation; a deterministic tile
+            # failure must be fixed instead of creating a relaunch loop.
+            [ "$window_status" -eq 2 ] && submit_continuation
+            exit 1
+        fi
     fi
 
 
