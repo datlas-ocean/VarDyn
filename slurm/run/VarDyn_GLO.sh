@@ -355,6 +355,25 @@ wait_for_window_tiles() {
 }
 
 
+
+wait_for_spatial_merge_parts() {
+    local iw="$1"
+    local rank_count="$2"
+    while true; do
+        if [ -f "${BARRIER_DIR}/spatial_merge_iw${iw}.failed" ]; then
+            return 1
+        fi
+        local complete=0
+        local merge_rank
+        for ((merge_rank = 0; merge_rank < rank_count; merge_rank++)); do
+            [ -f "${BARRIER_DIR}/spatial_merge_iw${iw}_rank${merge_rank}.ok" ] \
+                && complete=$((complete + 1))
+        done
+        [ "$complete" -eq "$rank_count" ] && return 0
+        sleep 10
+    done
+}
+
 # -------------------- TILE WORKER --------------------
 run_single_tile() {
     local TILE="$1"
@@ -457,39 +476,104 @@ for TIME_DIR in $TIME_WINDOWS; do
     $ZARR_OUTPUT && ZARR_OUTPUT_ARG="--zarr_output"
     $OUTPUT_FLOAT64 && OUTPUT_FLOAT64_ARG="--output_float64"
     MERGE_MARKER="${BARRIER_DIR}/spatial_merge_iw${IW}.ok"
-    if mkdir "${BARRIER_DIR}/merge_iw${IW}.lock" 2>/dev/null; then
-        OWNED_STAGE_LOCK="${BARRIER_DIR}/merge_iw${IW}.lock"
-        echo "$(date '+%F %T') | Spatial merge for time window ${IW}"
-        if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
-            --dir_save_pickle "$DIR_SAVE_PICKLE" \
-            --name_var_save "$NAME_VAR" \
-            --num_workers "$NUM_MERGE_WORKERS" \
-            --iw_start "$IW" \
-            --iw_end "$((IW + 1))" \
-            --rank 0 \
-            --world 1 \
-            $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG; then
-            touch "$MERGE_MARKER"
-            OWNED_STAGE_LOCK=""
-            echo "$(date '+%F %T') | Spatial merge done for time window ${IW}"
-        else
-            echo "$(date '+%F %T') | Spatial merge failed for time window ${IW}" >&2
-            OWNED_STAGE_LOCK=""
-            touch "${BARRIER_DIR}/spatial_merge_iw${IW}.failed"
-            rmdir "${BARRIER_DIR}/merge_iw${IW}.lock" 2>/dev/null || true
-            submit_continuation
+    MERGE_FAILED="${BARRIER_DIR}/spatial_merge_iw${IW}.failed"
+
+    if $ZARR_OUTPUT; then
+        # Merge ranks are dynamically claimed, just like assimilation tiles.
+        # If fewer array tasks start, each running task processes more ranks;
+        # with all tasks running, every rank uses its own CPU allocation.
+        for ((MERGE_RANK = 0; MERGE_RANK < NUM_ARRAY; MERGE_RANK++)); do
+            PART_MARKER="${BARRIER_DIR}/spatial_merge_iw${IW}_rank${MERGE_RANK}.ok"
+            [ -f "$PART_MARKER" ] && continue
+            [ -f "$MERGE_FAILED" ] && break
+            PART_LOCK="${BARRIER_DIR}/merge_iw${IW}_rank${MERGE_RANK}.lock"
+            if mkdir "$PART_LOCK" 2>/dev/null; then
+                OWNED_STAGE_LOCK="$PART_LOCK"
+                echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Spatial merge part ${MERGE_RANK}/${NUM_ARRAY} for window ${IW}"
+                if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+                    --dir_save_pickle "$DIR_SAVE_PICKLE" \
+                    --name_var_save "$NAME_VAR" \
+                    --num_workers "$NUM_MERGE_WORKERS" \
+                    --iw_start "$IW" \
+                    --iw_end "$((IW + 1))" \
+                    --rank "$MERGE_RANK" \
+                    --world "$NUM_ARRAY" \
+                    --zarr_parts \
+                    $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG; then
+                    touch "$PART_MARKER"
+                    OWNED_STAGE_LOCK=""
+                    echo "$(date '+%F %T') | Spatial merge part ${MERGE_RANK}/${NUM_ARRAY} done"
+                else
+                    echo "$(date '+%F %T') | Spatial merge part ${MERGE_RANK}/${NUM_ARRAY} failed" >&2
+                    touch "$MERGE_FAILED"
+                    OWNED_STAGE_LOCK=""
+                    exit 1
+                fi
+            fi
+        done
+
+        wait_for_spatial_merge_parts "$IW" "$NUM_ARRAY"
+        merge_parts_status=$?
+        if [ "$merge_parts_status" -ne 0 ]; then
             exit 1
         fi
+
+        FINALIZE_LOCK="${BARRIER_DIR}/merge_iw${IW}_finalize.lock"
+        if mkdir "$FINALIZE_LOCK" 2>/dev/null; then
+            OWNED_STAGE_LOCK="$FINALIZE_LOCK"
+            echo "$(date '+%F %T') | Finalizing ${NUM_ARRAY} Zarr parts for time window ${IW}"
+            if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+                --dir_save_pickle "$DIR_SAVE_PICKLE" \
+                --name_var_save "$NAME_VAR" \
+                --num_workers "$NUM_MERGE_WORKERS" \
+                --iw_start "$IW" \
+                --iw_end "$((IW + 1))" \
+                --rank 0 \
+                --world "$NUM_ARRAY" \
+                --finalize_spatial_parts \
+                $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG; then
+                touch "$MERGE_MARKER"
+                OWNED_STAGE_LOCK=""
+                echo "$(date '+%F %T') | Spatial merge done for time window ${IW}"
+            else
+                echo "$(date '+%F %T') | Spatial merge finalization failed for time window ${IW}" >&2
+                touch "$MERGE_FAILED"
+                OWNED_STAGE_LOCK=""
+                exit 1
+            fi
+        else
+            echo "$(date '+%F %T') | Waiting for spatial merge finalization ${IW}"
+            while [ ! -f "$MERGE_MARKER" ] && [ ! -f "$MERGE_FAILED" ]; do
+                sleep 10
+            done
+            [ -f "$MERGE_FAILED" ] && exit 1
+        fi
     else
-        MERGE_FAILED="${BARRIER_DIR}/spatial_merge_iw${IW}.failed"
-        echo "$(date '+%F %T') | Waiting for spatial merge ${IW} to complete"
-        while [ ! -f "$MERGE_MARKER" ] && [ ! -f "$MERGE_FAILED" ]; do
-            sleep 10
-        done
-        if [ -f "$MERGE_FAILED" ]; then
-            echo "$(date '+%F %T') | Spatial merge ${IW} failed on the stage owner" >&2
-            submit_continuation
-            exit 1
+        # NetCDF files are independent per date; retain the single-owner path.
+        if mkdir "${BARRIER_DIR}/merge_iw${IW}.lock" 2>/dev/null; then
+            OWNED_STAGE_LOCK="${BARRIER_DIR}/merge_iw${IW}.lock"
+            echo "$(date '+%F %T') | Spatial NetCDF merge for time window ${IW}"
+            if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+                --dir_save_pickle "$DIR_SAVE_PICKLE" \
+                --name_var_save "$NAME_VAR" \
+                --num_workers "$NUM_MERGE_WORKERS" \
+                --iw_start "$IW" \
+                --iw_end "$((IW + 1))" \
+                --rank 0 \
+                --world 1 \
+                $FORCE_MERGE_ARG $OUTPUT_FLOAT64_ARG; then
+                touch "$MERGE_MARKER"
+                OWNED_STAGE_LOCK=""
+            else
+                touch "$MERGE_FAILED"
+                OWNED_STAGE_LOCK=""
+                exit 1
+            fi
+        else
+            while [ ! -f "$MERGE_MARKER" ] && [ ! -f "$MERGE_FAILED" ]; do
+                sleep 10
+            done
+            [ -f "$MERGE_FAILED" ] && exit 1
         fi
     fi
 

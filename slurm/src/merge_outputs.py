@@ -36,6 +36,16 @@ def _zarr_archive_path(config, root):
     return Path(root) / f"{config.EXP.name_exp_save}.zarr"
 
 
+def _zarr_parts_root(config, root, world):
+    name = config.EXP.name_exp_save
+    return Path(root) / f'.{name}.spatial-parts-{world}'
+
+
+def _zarr_part_root(config, root, rank, world):
+    return _zarr_parts_root(config, root, world) / f'rank-{rank:04d}'
+
+
+
 def _consolidate_zarr_metadata(archive_path):
     """Publish an up-to-date consolidated view after all appends."""
     zarr.consolidate_metadata(str(archive_path))
@@ -148,7 +158,8 @@ def _validate_final_outputs(config, list_date_start, list_date_end):
 
     log(f'Validated {len(expected)} final global output files')
 
-def _validate_dated_outputs(config, dates, root, zarr_output=False):
+def _validate_dated_outputs(
+        config, dates, root, zarr_output=False, consolidate_zarr=True):
     """Fail when expected dates are missing or outputs are unreadable."""
     if zarr_output:
         archive_path = _zarr_archive_path(config, root)
@@ -176,7 +187,8 @@ def _validate_dated_outputs(config, dates, root, zarr_output=False):
             raise RuntimeError(
                 f'Output archive is missing {len(missing_times)} timestamps: '
                 f'{archive_path} (first: {missing_times[0]})')
-        _consolidate_zarr_metadata(archive_path)
+        if consolidate_zarr:
+            _consolidate_zarr_metadata(archive_path)
         log(
             f'Validated {len(expected_times)} timestamps in Zarr archive '
             f'{archive_path}')
@@ -212,6 +224,102 @@ def _validate_dated_outputs(config, dates, root, zarr_output=False):
     log(f'Validated {len(dates)} dated outputs in {root}')
 
 
+
+def _finalize_spatial_zarr_parts(
+        config, dates, root, rank_count, output_dtype, force=False):
+    """Assemble rank archives into one atomically published window archive."""
+    root = Path(root)
+    canonical_archive = _zarr_archive_path(config, root)
+
+    if canonical_archive.exists() and not force:
+        try:
+            _validate_dated_outputs(
+                config, dates, root, zarr_output=True)
+        except RuntimeError as exc:
+            log(f'Canonical window archive is incomplete: {exc}')
+        else:
+            parts_root = _zarr_parts_root(config, root, rank_count)
+            if parts_root.exists():
+                shutil.rmtree(parts_root)
+            log(f'Canonical window archive is already complete: {canonical_archive}')
+            return
+
+    part_datasets = {}
+    try:
+        for rank in range(rank_count):
+            rank_dates = dates[rank::rank_count]
+            if not rank_dates:
+                continue
+            part_root = _zarr_part_root(
+                config, root, rank, rank_count)
+            _validate_dated_outputs(
+                config, rank_dates, part_root, zarr_output=True)
+            part_archive = _zarr_archive_path(config, part_root)
+            part_datasets[rank] = xr.open_zarr(
+                part_archive, consolidated=False)
+
+        temporary_root = root / (
+            f'.{config.EXP.name_exp_save}.spatial-finalize-{os.getpid()}')
+        temporary_archive = _zarr_archive_path(config, temporary_root)
+        if temporary_root.exists():
+            shutil.rmtree(temporary_root)
+        temporary_root.mkdir(parents=True)
+
+        for index, date in enumerate(dates):
+            source = part_datasets[index % rank_count]
+            record = source.sel(time=pd.Timestamp(date))
+            if 'time' in record.dims:
+                record = record.isel(time=-1)
+            record = record.load()
+            if 'time' in record.coords and 'time' not in record.dims:
+                record = record.drop_vars('time')
+            record = record.expand_dims(time=[pd.Timestamp(date)])
+            for name in record.data_vars:
+                if np.issubdtype(record[name].dtype, np.floating):
+                    record[name] = record[name].astype(output_dtype)
+            state.State._save_zarr_record(
+                record, str(temporary_archive), date,
+                window_start=dates[0], window_end=dates[-1])
+
+        _validate_dated_outputs(
+            config, dates, temporary_root, zarr_output=True)
+
+        backup_archive = root / (
+            f'.{config.EXP.name_exp_save}.zarr.backup-{os.getpid()}')
+        if backup_archive.exists():
+            shutil.rmtree(backup_archive)
+        had_canonical = canonical_archive.exists()
+        if had_canonical:
+            os.replace(canonical_archive, backup_archive)
+        try:
+            os.replace(temporary_archive, canonical_archive)
+        except Exception:
+            if had_canonical and not canonical_archive.exists():
+                os.replace(backup_archive, canonical_archive)
+            raise
+        else:
+            if backup_archive.exists():
+                shutil.rmtree(backup_archive)
+        finally:
+            if temporary_root.exists():
+                shutil.rmtree(temporary_root)
+
+        _validate_dated_outputs(
+            config, dates, root, zarr_output=True)
+        _remove_legacy_dated_outputs(config, dates, root)
+        for dataset in part_datasets.values():
+            dataset.close()
+        part_datasets.clear()
+        parts_root = _zarr_parts_root(config, root, rank_count)
+        if parts_root.exists():
+            shutil.rmtree(parts_root)
+        log(
+            f'Published spatial window archive from {rank_count} rank parts: '
+            f'{canonical_archive}')
+    finally:
+        for dataset in part_datasets.values():
+            dataset.close()
+
 # -------------------- Main merge workflow --------------------
 def merge_outputs(
     path_config,
@@ -226,6 +334,8 @@ def merge_outputs(
     force=False,
     rank=0,
     world=1,
+    zarr_parts=False,
+    finalize_spatial_parts=False,
     zarr_output=False,
     output_float64=False,
 ):
@@ -269,33 +379,75 @@ def merge_outputs(
     if iw_start < 0 or iw_start >= iw_end:
         raise ValueError(f"Invalid time window range: [{iw_start}, {iw_end})")
     
+    if (zarr_parts or finalize_spatial_parts) and not zarr_output:
+        raise ValueError('Distributed Zarr merge requires --zarr_output')
+    if world < 1 or rank < 0 or rank >= world:
+        raise ValueError(f'Invalid merge rank/world: {rank}/{world}')
+
     if not skip_spatial_merge:
         log(f"Spatial merge for time windows {iw_start} → {iw_end}")
-        
+
         for iw in range(iw_start, iw_end):
-            date_start  = list_date_start[iw]
+            date_start = list_date_start[iw]
             date_middle = list_date_middle[iw]
-            date_end    = list_date_end[iw]
+            date_end = list_date_end[iw]
             State_window = list_State_all[iw]
-            
+
             log(f"Processing time window {iw}: {date_start} → {date_end}")
-            
+
             config0 = config.copy()
             config0.EXP = config0.EXP.copy()
             config0.EXP.tmp_DA_path += f'/subwindow_{str(date_middle)[:10]}'
             config0.EXP.path_save += f'/subwindow_{str(date_middle)[:10]}'
             config0.EXP.init_date = date_start
             config0.EXP.final_date = date_end
-            # A spatially merged time window is stored in one archive whose
-            # time dimension contains every dated output from that window.
             config0.EXP.saveoutputs_zarr = zarr_output
-            State0 = state.State(config0)
-            dates_window = generate_dates(date_start, date_end, config0.EXP.saveoutput_time_step)
+            canonical_root = config0.EXP.path_save
+            all_window_dates = generate_dates(
+                date_start, date_end, config0.EXP.saveoutput_time_step)
 
-            # Shard dates across array tasks
-            if world > 1:
-                dates_window = dates_window[rank::world]
+            if finalize_spatial_parts:
+                _finalize_spatial_zarr_parts(
+                    config0, all_window_dates, canonical_root, world,
+                    output_dtype, force=force)
+                continue
+
+            dates_window = all_window_dates
+            if zarr_parts:
+                canonical_archive = _zarr_archive_path(
+                    config0, canonical_root)
+                if canonical_archive.exists() and not force:
+                    try:
+                        _validate_dated_outputs(
+                            config0, all_window_dates, canonical_root,
+                            zarr_output=True,
+                            consolidate_zarr=False)
+                    except RuntimeError as exc:
+                        log(f"Time window {iw} is incomplete: {exc}")
+                    else:
+                        log(
+                            f"Skipping rank {rank}: canonical Zarr archive "
+                            f"for time window {iw} is complete")
+                        continue
+
+                part_root = _zarr_part_root(
+                    config0, canonical_root, rank, world)
+                if force and part_root.exists():
+                    shutil.rmtree(part_root)
+                config0.EXP.path_save = str(part_root)
+                dates_window = all_window_dates[rank::world]
+                log(
+                    f"  Zarr part rank {rank}/{world}: "
+                    f"{len(dates_window)} dates assigned")
+            elif world > 1:
+                dates_window = all_window_dates[rank::world]
                 log(f"  rank {rank}/{world}: {len(dates_window)} dates assigned")
+
+            if not dates_window:
+                log(f"  rank {rank}/{world}: no date assigned")
+                continue
+
+            State0 = state.State(config0)
 
             if not force:
                 if zarr_output:
@@ -309,10 +461,13 @@ def merge_outputs(
                         except RuntimeError as exc:
                             log(f"Time window {iw} is incomplete: {exc}")
                         else:
-                            log(f"Skipping time window {iw}: Zarr archive is complete")
-                            _remove_legacy_dated_outputs(
-                                config0, dates_window,
-                                config0.EXP.path_save)
+                            log(
+                                f"Skipping time window {iw}: "
+                                f"Zarr archive is complete")
+                            if not zarr_parts:
+                                _remove_legacy_dated_outputs(
+                                    config0, dates_window,
+                                    config0.EXP.path_save)
                             continue
                 else:
                     expected_outputs = [
@@ -325,16 +480,22 @@ def merge_outputs(
                     ]
                     if expected_outputs and all(
                             os.path.exists(path) for path in expected_outputs):
-                        log(f"Skipping time window {iw}: merged outputs already exist")
+                        log(
+                            f"Skipping time window {iw}: "
+                            f"merged outputs already exist")
                         _validate_dated_outputs(
                             config0, dates_window, config0.EXP.path_save)
                         continue
 
-            parallel_merge(dates_window, State0, State_window, name_var_save, kernel, None, weights_space_sum, None, list_tile_paths=list_tile_paths, num_workers=num_workers, output_dtype=output_dtype)
+            parallel_merge(
+                dates_window, State0, State_window, name_var_save, kernel,
+                None, weights_space_sum, None,
+                list_tile_paths=list_tile_paths,
+                num_workers=num_workers, output_dtype=output_dtype)
             _validate_dated_outputs(
                 config0, dates_window, config0.EXP.path_save,
                 zarr_output=zarr_output)
-            if zarr_output:
+            if zarr_output and not zarr_parts:
                 _remove_legacy_dated_outputs(
                     config0, dates_window, config0.EXP.path_save)
     else:
@@ -416,6 +577,16 @@ if __name__ == "__main__":
     parser.add_argument("--force", action="store_true", help="Force recomputing merged outputs even if they already exist")
     parser.add_argument("--rank", type=int, default=0, help="Rank of this task (for date sharding across SLURM array tasks)")
     parser.add_argument("--world", type=int, default=1, help="Total number of tasks sharing the merge")
+    parser.add_argument(
+        "--zarr_parts",
+        action="store_true",
+        help="Write this rank's date shard to an independent Zarr archive",
+    )
+    parser.add_argument(
+        "--finalize_spatial_parts",
+        action="store_true",
+        help="Assemble all spatial rank archives into the window archive",
+    )
     parser.add_argument("--zarr_output", action="store_true", help="Use Zarr for merged outputs and remove intermediate NetCDF files")
     parser.add_argument("--output_float64", action="store_true", help="Save merged floating-point data as float64 (default: float32)")
 
@@ -436,6 +607,8 @@ if __name__ == "__main__":
         force=args.force,
         rank=args.rank,
         world=args.world,
+        zarr_parts=args.zarr_parts,
+        finalize_spatial_parts=args.finalize_spatial_parts,
         zarr_output=args.zarr_output,
         output_float64=args.output_float64,
     )

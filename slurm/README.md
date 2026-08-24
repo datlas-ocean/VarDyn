@@ -8,7 +8,7 @@ Large-scale SSH mapping with MASSH (e.g. global VarDyn runs) is parallelised ove
 - **Space** — the domain is split into overlapping spatial tiles
 - **Time** — the time period is split into overlapping time windows
 
-Each running SLURM array task (one GPU) claims a dynamic subset of tiles. One task then merges each spatial window while the others wait without starting a premature continuation. Finally, one task merges all time windows into the full output.
+Each running SLURM array task (one GPU) claims a dynamic subset of tiles. For Zarr output, spatial-merge date shards are also dynamically claimed: each active task uses its own CPU allocation to create an independent rank archive. One task then assembles the validated rank archives into the single archive for that temporal window. Finally, one task merges all temporal windows into the full output.
 
 ```
 sbatch slurm/run/VarDyn_GLO.sh [--skip-prepare] [--restart] [--force-merge] [--name_exp <name>]
@@ -30,21 +30,24 @@ slurm/
 
 ## Workflow
 
-```
-Task 0                              Tasks 1…N-1
-──────────────────────────────────  ──────────────────────────
-prepare_VarDyn.py  ──── barrier ──► wait for "prepared" file
-        │
-        ▼
-  for each time window:
-    write tile list  ──── signal ──► read tile list
-                                     claim & run tiles (atomic mkdir)
-    barrier tw{i}   ◄──────────────  barrier tw{i}
-    merge spatial window             wait for merge marker
-    merge marker     ──────────────► continue to next window
-        │                              │
-        ▼                              ▼
-  merge_time_windows (one task only)  exit after all windows
+```text
+prepare_VarDyn.py (one dynamic owner)
+                 │
+                 ▼
+for each temporal window:
+  dynamic assimilation-tile queue across active GPU tasks
+                 │
+                 ▼
+  dynamic spatial-merge rank queue
+  ├── rank 0 → timestamps[0::N] → rank-0000/<name>.zarr
+  ├── rank 1 → timestamps[1::N] → rank-0001/<name>.zarr
+  └── ...
+                 │
+                 ▼
+  validate + atomically publish one window <name>.zarr
+                 │
+                 ▼
+merge_time_windows (one task) → final <name>.zarr
 ```
 
 ## Scripts
@@ -57,6 +60,7 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 |---|---|
 | `MASH_DIR` | **Absolute path to the MASSH repo root** — required because SLURM copies the script to a spool directory before execution, making `$0`-relative paths unreliable |
 | `NUM_GPUS` | Number of GPU array tasks (also update `#SBATCH --array`) |
+| `NUM_MERGE_WORKERS` | CPU workers used by each active merge rank; normally keep this at or below `--cpus-per-task` |
 | `DIR_SAVE_PICKLE` | Root directory for all pickle/output files |
 | `PATH_CONFIG` | Path to the main MASSH config `.py` |
 | `PATH_CONFIG_EQ` | Path to the equatorial MASSH config `.py` |
@@ -66,7 +70,7 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 | `SPACE_WIN_X/Y`, `SPACE_OVERLAP_X/Y` | Spatial window size and overlap (degrees) |
 | `TIME_WIN`, `TIME_OVERLAP` | Temporal window size and overlap (days) |
 | `FLAG_INIT` / `FLAG_BACKGROUND` / `NAME_EXP` | Initialise from / use background from a previous experiment |
-| `BARRIER_TIMEOUT` | Seconds to wait for incomplete assimilation tiles. Spatial merges wait until completion or the Slurm time limit. |
+| `BARRIER_TIMEOUT` | Seconds to wait for incomplete assimilation tiles |
 | `ZARR_OUTPUT` | If this shell option or `EXP.saveoutputs_zarr` is `true`, store each merged temporal window in one Zarr archive and the final experiment in one global Zarr archive |
 | `OUTPUT_FLOAT64` | If `true`, save merged floating-point data as float64; otherwise float32 (default: false) |
 
@@ -89,7 +93,7 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 - `mkdir -p` for the barrier directory is retried up to 5 times with backoff
 - `touch` inside `barrier_wait` is similarly retried
 - `BARRIER_TIMEOUT` detects missing assimilation tiles
-- A spatial merge does not submit a continuation merely because it takes longer than this timeout; continuation is reserved for an explicit failure or the Slurm wall-time signal
+- Spatial merge ranks and finalization wait until an explicit failure or the Slurm wall-time signal
 - `--force-merge` applies to the submitted run only and is not propagated to automatic continuations, so completed windows are not repeatedly recomputed
 
 ### `prepare_VarDyn.py`
@@ -112,7 +116,7 @@ Loads one `subwindow_<space>` pickle directory and runs the full MASSH assimilat
 ### `merge_outputs.py`
 
 Two-stage merge:
-1. **Spatial merge**: blends overlapping tiles with Gaussian-tapered weights. With `ZARR_OUTPUT=true`, all timestamps of a temporal window are written and validated in one `<name_exp>.zarr` archive.
+1. **Spatial merge**: distributes timestamp shards over dynamically claimed ranks. Each rank uses `NUM_MERGE_WORKERS` CPU processes and writes an independent temporary Zarr archive; the validated parts are then atomically assembled into one `<name_exp>.zarr` archive for the temporal window.
 2. **Time-window merge** (one task only): combines spatial merges across all time windows and validates every expected timestamp.
 
 ## Usage example
