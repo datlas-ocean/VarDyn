@@ -67,7 +67,7 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 | `TIME_WIN`, `TIME_OVERLAP` | Temporal window size and overlap (days) |
 | `FLAG_INIT` / `FLAG_BACKGROUND` / `NAME_EXP` | Initialise from / use background from a previous experiment |
 | `BARRIER_TIMEOUT` | Seconds to wait for incomplete assimilation tiles. Spatial merges wait until completion or the Slurm time limit. |
-| `ZARR_OUTPUT` | If this shell option or `EXP.saveoutputs_zarr` is `true`, convert every spatial-window product to `.zarr` immediately, remove its `.nc`, and write final outputs as Zarr |
+| `ZARR_OUTPUT` | If this shell option or `EXP.saveoutputs_zarr` is `true`, store each merged temporal window in one Zarr archive and the final experiment in one global Zarr archive |
 | `OUTPUT_FLOAT64` | If `true`, save merged floating-point data as float64; otherwise float32 (default: false) |
 
 **CLI flags** (passed after the script name):
@@ -112,7 +112,7 @@ Loads one `subwindow_<space>` pickle directory and runs the full MASSH assimilat
 ### `merge_outputs.py`
 
 Two-stage merge:
-1. **Spatial merge**: blends overlapping tiles with Gaussian-tapered weights. With `ZARR_OUTPUT=true`, each dated product is converted and validated as Zarr immediately.
+1. **Spatial merge**: blends overlapping tiles with Gaussian-tapered weights. With `ZARR_OUTPUT=true`, all timestamps of a temporal window are written and validated in one `<name_exp>.zarr` archive.
 2. **Time-window merge** (one task only): combines spatial merges across all time windows and validates every expected timestamp.
 
 ## Usage example

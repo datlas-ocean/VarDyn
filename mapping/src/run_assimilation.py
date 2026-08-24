@@ -15,6 +15,7 @@ import copy as _copy
 import shutil
 import pickle
 import numpy as np
+import pandas as pd
 import multiprocessing as mp
 from scipy.interpolate import LinearNDInterpolator, RegularGridInterpolator
 from scipy.ndimage import distance_transform_edt
@@ -1544,18 +1545,30 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
 
     def _filename(prefix, date):
         return (f"{prefix}_y{date.year}m{date.month:02d}d{date.day:02d}"
-                f"h{date.hour:02d}m{date.minute:02d}"
-                + (".zarr" if zarr_output else ".nc"))
+                f"h{date.hour:02d}m{date.minute:02d}.nc")
 
     def _build_path(subwindow_middle, date):
         root = f"{config.EXP.path_save}/subwindow_{str(subwindow_middle)[:10]}"
+        if zarr_output:
+            return f"{root}/{config.EXP.name_exp_save}.zarr"
         return f"{root}/{_filename(config.EXP.name_exp_save, date)}"
 
     def _build_output_path(date):
+        if zarr_output:
+            return f"{config.EXP.path_save}/{config.EXP.name_exp_save}.zarr"
         return f"{config.EXP.path_save}/{_filename(config.EXP.name_exp_save, date)}"
 
-    def _open(path):
-        return xr.open_zarr(path) if zarr_output else xr.open_dataset(path)
+    def _load_date(path, date):
+        opener = xr.open_zarr if zarr_output else xr.open_dataset
+        with opener(path) as dataset:
+            selected = dataset
+            if zarr_output:
+                selected = dataset.sel(time=pd.Timestamp(date))
+                if 'time' in selected.dims:
+                    # Defensive fallback for a legacy archive containing the
+                    # same timestamp more than once.
+                    selected = selected.isel(time=-1)
+            return selected.load()
 
     # Collect all unique dates across all windows
     all_dates = set()
@@ -1575,7 +1588,7 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
             if len(active) == 1:
                 # No overlap: use the single window directly
                 i = active[0]
-                dsout = _open(_build_path(list_date_middle[i], date)).load()
+                dsout = _load_date(_build_path(list_date_middle[i], date), date)
 
             elif len(active) >= 2:
                 # Overlap region: blend the two closest consecutive windows
@@ -1584,8 +1597,10 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
                 overlap_end = list_date_end[i]
                 overlap_duration = (overlap_end - overlap_start).total_seconds()
 
-                ds1 = _open(_build_path(list_date_middle[i], date)).load()
-                ds2 = _open(_build_path(list_date_middle[j], date)).load()
+                ds1 = _load_date(
+                    _build_path(list_date_middle[i], date), date)
+                ds2 = _load_date(
+                    _build_path(list_date_middle[j], date), date)
 
                 if overlap_duration > 0:
                     # alpha goes from 0 (at overlap_start) to 1 (at overlap_end)
@@ -1612,30 +1627,36 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
                 continue
 
             output_path = _build_output_path(date)
-            # Write beside the destination and publish atomically. A direct
-            # to_netcdf(output_path) can leave a truncated HDF5 file when a
-            # merge job is interrupted or a reader opens it mid-write.
             for name in dsout.data_vars:
                 if np.issubdtype(dsout[name].dtype, np.floating):
                     dsout[name] = dsout[name].astype(output_dtype)
-            temporary_path = f'{output_path}.tmp-{os.getpid()}'
-            try:
-                if zarr_output:
-                    dsout.to_zarr(temporary_path, mode='w')
+
+            if zarr_output:
+                if 'time' in dsout.coords and 'time' not in dsout.dims:
+                    dsout = dsout.drop_vars('time')
+                if 'time' not in dsout.dims:
+                    dsout = dsout.expand_dims(time=[pd.Timestamp(date)])
                 else:
-                    dsout.to_netcdf(temporary_path, mode='w')
-                dsout.close()
-                if zarr_output and os.path.exists(output_path):
-                    shutil.rmtree(output_path)
-                os.replace(temporary_path, output_path)
-            except Exception:
+                    dsout = dsout.assign_coords(time=[pd.Timestamp(date)])
+                state.State._save_zarr_record(
+                    dsout, output_path, date,
+                    window_start=min(list_date_start),
+                    window_end=max(list_date_end))
+            else:
+                # Write beside the destination and publish atomically. A
+                # direct write can leave a truncated HDF5 file when a merge
+                # job is interrupted or a reader opens it mid-write.
+                temporary_path = f'{output_path}.tmp-{os.getpid()}'
                 try:
+                    dsout.to_netcdf(temporary_path, mode='w')
                     dsout.close()
-                finally:
-                    if os.path.isdir(temporary_path):
-                        shutil.rmtree(temporary_path)
-                    elif os.path.exists(temporary_path):
-                        os.remove(temporary_path)
-                raise
+                    os.replace(temporary_path, output_path)
+                except Exception:
+                    try:
+                        dsout.close()
+                    finally:
+                        if os.path.exists(temporary_path):
+                            os.remove(temporary_path)
+                    raise
         except Exception as e:
             print(f'[merge_time_windows_outputs] WARNING: failed for {date}: {e}', flush=True)

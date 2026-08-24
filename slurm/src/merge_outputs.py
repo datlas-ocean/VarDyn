@@ -9,6 +9,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import numpy as np
+import pandas as pd
 from astropy.convolution import Gaussian2DKernel, interpolate_replace_nans
 
 import xarray as xr
@@ -30,38 +31,74 @@ from src.run_assimilation import (
 def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
-def _convert_dated_outputs_to_zarr(config, dates, root, output_dtype):
-    """Convert per-date NetCDF products to Zarr atomically."""
+def _zarr_archive_path(config, root):
+    return Path(root) / f"{config.EXP.name_exp_save}.zarr"
+
+
+def _remove_legacy_dated_outputs(config, dates, root):
+    """Remove former one-file-per-date products after archive validation."""
     root = Path(root)
+    for date in dates:
+        stem = (
+            f"{config.EXP.name_exp_save}_y{date.year}m{date.month:02d}"
+            f"d{date.day:02d}h{date.hour:02d}m{date.minute:02d}")
+        nc_path = root / f"{stem}.nc"
+        dated_zarr_path = root / f"{stem}.zarr"
+        if dated_zarr_path.exists():
+            shutil.rmtree(dated_zarr_path)
+        if nc_path.exists():
+            nc_path.unlink()
+
+
+def _consolidate_dated_outputs_to_zarr(
+        config, dates, root, output_dtype, window_start, window_end):
+    """Move legacy per-date products into one time-window Zarr archive."""
+    root = Path(root)
+    archive_path = _zarr_archive_path(config, root)
     for date in dates:
         stem = (f"{config.EXP.name_exp_save}_y{date.year}m{date.month:02d}d{date.day:02d}"
                 f"h{date.hour:02d}m{date.minute:02d}")
         nc_path = root / f"{stem}.nc"
-        zarr_path = root / f"{stem}.zarr"
-        if not nc_path.exists():
+        dated_zarr_path = root / f"{stem}.zarr"
+        source_path = dated_zarr_path if dated_zarr_path.exists() else nc_path
+        if not source_path.exists():
             continue
-        with xr.open_dataset(nc_path) as source:
-            dataset = source.load()
-        for name in dataset.data_vars:
-            if np.issubdtype(dataset[name].dtype, np.floating):
-                dataset[name] = dataset[name].astype(output_dtype)
-        temporary = root / f".{stem}.zarr.tmp-{os.getpid()}"
-        if temporary.exists():
-            shutil.rmtree(temporary)
-        dataset.to_zarr(temporary, mode="w")
-        dataset.close()
-        if zarr_path.exists():
-            shutil.rmtree(zarr_path)
-        os.replace(temporary, zarr_path)
-        nc_path.unlink()
+        opener = xr.open_zarr if source_path == dated_zarr_path else xr.open_dataset
+        with opener(source_path) as source:
+            record = source.load()
+        if 'time' in record.dims and record.sizes['time'] > 1:
+            selected = record.sel(time=pd.Timestamp(date))
+            if 'time' in selected.dims:
+                selected = selected.isel(time=-1)
+            record = selected
+        if 'time' in record.coords and 'time' not in record.dims:
+            record = record.drop_vars('time')
+        if 'time' not in record.dims:
+            record = record.expand_dims(time=[pd.Timestamp(date)])
+        else:
+            record = record.assign_coords(time=[pd.Timestamp(date)])
+        for name in record.data_vars:
+            if np.issubdtype(record[name].dtype, np.floating):
+                record[name] = record[name].astype(output_dtype)
+        state.State._save_zarr_record(
+            record, str(archive_path), date,
+            window_start=window_start, window_end=window_end)
+        if dated_zarr_path.exists():
+            shutil.rmtree(dated_zarr_path)
+        if nc_path.exists():
+            nc_path.unlink()
 
-def _convert_subwindow_outputs_to_zarr(config, list_date_start, list_date_middle, list_date_end, output_dtype):
-    """Convert spatially merged subwindow NetCDF files and remove originals."""
-    for middle, start, end in zip(list_date_middle, list_date_start, list_date_end):
+
+def _convert_subwindow_outputs_to_zarr(
+        config, list_date_start, list_date_middle, list_date_end,
+        output_dtype):
+    """Consolidate legacy files into one Zarr archive per time window."""
+    for middle, start, end in zip(
+            list_date_middle, list_date_start, list_date_end):
         root = Path(config.EXP.path_save) / f"subwindow_{str(middle)[:10]}"
         dates = generate_dates(start, end, config.EXP.saveoutput_time_step)
-        _convert_dated_outputs_to_zarr(
-            config, dates, root, output_dtype)
+        _consolidate_dated_outputs_to_zarr(
+            config, dates, root, output_dtype, start, end)
 
 def _validate_final_outputs(config, list_date_start, list_date_end):
     """Verify that every expected global output exists and is readable."""
@@ -103,23 +140,49 @@ def _validate_final_outputs(config, list_date_start, list_date_end):
     log(f'Validated {len(expected)} final global output files')
 
 def _validate_dated_outputs(config, dates, root, zarr_output=False):
-    """Fail when any expected per-date product is missing or unreadable."""
+    """Fail when expected dates are missing or outputs are unreadable."""
+    if zarr_output:
+        archive_path = _zarr_archive_path(config, root)
+        if not archive_path.exists():
+            raise RuntimeError(f'Output archive is missing: {archive_path}')
+        try:
+            with xr.open_zarr(archive_path) as dataset:
+                actual_times = pd.DatetimeIndex(
+                    pd.to_datetime(dataset.time.values))
+                _ = dataset.sizes
+        except Exception as exc:
+            raise RuntimeError(
+                f'Output archive is unreadable: {archive_path}: {exc}') from exc
+        duplicate_times = actual_times[actual_times.duplicated()].unique()
+        if len(duplicate_times):
+            raise RuntimeError(
+                f'Output archive contains duplicate timestamps: '
+                f'{archive_path} (first: {duplicate_times[0]})')
+        expected_times = pd.DatetimeIndex(pd.to_datetime(dates))
+        missing_times = expected_times.difference(actual_times)
+        if len(missing_times):
+            raise RuntimeError(
+                f'Output archive is missing {len(missing_times)} timestamps: '
+                f'{archive_path} (first: {missing_times[0]})')
+        log(
+            f'Validated {len(expected_times)} timestamps in Zarr archive '
+            f'{archive_path}')
+        return
+
     missing = []
     unreadable = []
-    suffix = '.zarr' if zarr_output else '.nc'
     for date in dates:
         filename = (
             f'{config.EXP.name_exp_save}'
             f'_y{date.year}m{date.month:02d}d{date.day:02d}'
-            f'h{date.hour:02d}m{date.minute:02d}{suffix}'
+            f'h{date.hour:02d}m{date.minute:02d}.nc'
         )
         path = os.path.join(root, filename)
         if not os.path.exists(path):
             missing.append(path)
             continue
         try:
-            opener = xr.open_zarr if zarr_output else xr.open_dataset
-            with opener(path) as dataset:
+            with xr.open_dataset(path) as dataset:
                 _ = dataset.sizes
         except Exception as exc:
             unreadable.append(f'{path}: {exc}')
@@ -208,11 +271,11 @@ def merge_outputs(
             config0.EXP = config0.EXP.copy()
             config0.EXP.tmp_DA_path += f'/subwindow_{str(date_middle)[:10]}'
             config0.EXP.path_save += f'/subwindow_{str(date_middle)[:10]}'
-            # Tile archives may use one Zarr store per tile, but the spatial
-            # merge must remain one product per date: the time-window merge
-            # consumes those date-addressable intermediates (NetCDF first,
-            # optionally converted to Zarr below).
-            config0.EXP.saveoutputs_zarr = False
+            config0.EXP.init_date = date_start
+            config0.EXP.final_date = date_end
+            # A spatially merged time window is stored in one archive whose
+            # time dimension contains every dated output from that window.
+            config0.EXP.saveoutputs_zarr = zarr_output
             State0 = state.State(config0)
             dates_window = generate_dates(date_start, date_end, config0.EXP.saveoutput_time_step)
 
@@ -222,46 +285,52 @@ def merge_outputs(
                 log(f"  rank {rank}/{world}: {len(dates_window)} dates assigned")
 
             if not force:
-                expected_outputs = [
-                    os.path.join(
-                        config0.EXP.path_save,
-                        f'{config0.EXP.name_exp_save}'
-                        f'_y{date.year}'
-                        f'm{str(date.month).zfill(2)}'
-                        f'd{str(date.day).zfill(2)}'
-                        f'h{str(date.hour).zfill(2)}'
-                        f'm{str(date.minute).zfill(2)}'
-                        f'{".zarr" if zarr_output else ".nc"}'
-                    )
-                    for date in dates_window
-                ]
-                if expected_outputs and all(os.path.exists(path) for path in expected_outputs):
-                    log(f"Skipping time window {iw}: merged outputs already exist")
-                    _validate_dated_outputs(
-                        config0, dates_window, config0.EXP.path_save,
-                        zarr_output=zarr_output)
-                    continue
+                if zarr_output:
+                    archive_path = _zarr_archive_path(
+                        config0, config0.EXP.path_save)
+                    if archive_path.exists():
+                        try:
+                            _validate_dated_outputs(
+                                config0, dates_window,
+                                config0.EXP.path_save, zarr_output=True)
+                        except RuntimeError as exc:
+                            log(f"Time window {iw} is incomplete: {exc}")
+                        else:
+                            log(f"Skipping time window {iw}: Zarr archive is complete")
+                            _remove_legacy_dated_outputs(
+                                config0, dates_window,
+                                config0.EXP.path_save)
+                            continue
+                else:
+                    expected_outputs = [
+                        os.path.join(
+                            config0.EXP.path_save,
+                            f'{config0.EXP.name_exp_save}'
+                            f'_y{date.year}m{date.month:02d}d{date.day:02d}'
+                            f'h{date.hour:02d}m{date.minute:02d}.nc')
+                        for date in dates_window
+                    ]
+                    if expected_outputs and all(
+                            os.path.exists(path) for path in expected_outputs):
+                        log(f"Skipping time window {iw}: merged outputs already exist")
+                        _validate_dated_outputs(
+                            config0, dates_window, config0.EXP.path_save)
+                        continue
 
             parallel_merge(dates_window, State0, State_window, name_var_save, kernel, None, weights_space_sum, None, list_tile_paths=list_tile_paths, num_workers=num_workers, output_dtype=output_dtype)
             _validate_dated_outputs(
-                config0, dates_window, config0.EXP.path_save)
+                config0, dates_window, config0.EXP.path_save,
+                zarr_output=zarr_output)
             if zarr_output:
-                log(
-                    f"Converting {len(dates_window)} merged outputs from "
-                    f"time window {iw} to Zarr")
-                _convert_dated_outputs_to_zarr(
-                    config0, dates_window, config0.EXP.path_save,
-                    output_dtype)
-                _validate_dated_outputs(
-                    config0, dates_window, config0.EXP.path_save,
-                    zarr_output=True)
+                _remove_legacy_dated_outputs(
+                    config0, dates_window, config0.EXP.path_save)
     else:
         log("Skipping spatial merge (already done)")
 
     # Convert spatially merged products before the time-window merge.
     # output_dtype is resolved above so every spatial merge uses the same precision.
     if zarr_output and merge_time_windows:
-        log("Converting subwindow NetCDF outputs to Zarr")
+        log("Consolidating legacy outputs into one Zarr archive per time window")
         _convert_subwindow_outputs_to_zarr(config, list_date_start, list_date_middle, list_date_end, output_dtype)
 
     # Merge time windows
@@ -286,6 +355,9 @@ def merge_outputs(
         _validate_dated_outputs(
             config, final_dates, config.EXP.path_save,
             zarr_output=zarr_output)
+        if zarr_output:
+            _remove_legacy_dated_outputs(
+                config, final_dates, config.EXP.path_save)
     else:
         log("Skipping final time-window merge")
 

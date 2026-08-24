@@ -537,44 +537,46 @@ class State:
             record.close()
             return
 
-        with xr.open_zarr(filename) as existing_open:
-            existing = existing_open.load()
-
-        # A tile archive belongs to exactly one temporal subwindow. Prune
-        # records left by an older/badly-routed run before updating it.
-        pruned = False
-        if start is not None or end is not None:
-            keep = np.ones(existing.sizes.get('time', 0), dtype=bool)
-            existing_times = pd.to_datetime(existing.time.values)
-            if start is not None:
-                keep &= existing_times >= start
-            if end is not None:
-                keep &= existing_times <= end
-            if not np.all(keep):
-                existing = existing.isel(time=np.flatnonzero(keep))
-                pruned = True
-
-        times = pd.to_datetime(existing.time.values)
-        duplicate_times = pd.Index(times).duplicated(keep='last')
-        if np.any(duplicate_times):
-            duplicate_count = int(np.count_nonzero(duplicate_times))
-            print(
-                f'Warning: repairing {duplicate_count} duplicate time records '
-                f'in {filename}')
-            existing = existing.isel(
-                time=np.flatnonzero(~duplicate_times))
-            times = pd.to_datetime(existing.time.values)
-            # Force one atomic rewrite of the fully deduplicated archive.
-            pruned = True
-        existing_names = set(existing.data_vars)
         record_names = set(record.data_vars)
-        matching_record_indexes = np.flatnonzero(times == record_time)
-        has_duplicate_record = matching_record_indexes.size > 1
         output_dtype = np.float64 if USE_FLOAT64 else np.float32
+        fast_region_index = None
+        append_missing = None
 
-        if (not pruned and not has_duplicate_record
-                and record_time in times and record_names <= existing_names):
-            time_index = int(matching_record_indexes[0])
+        with xr.open_zarr(filename) as existing_open:
+            times = pd.to_datetime(existing_open.time.values)
+            existing_names = set(existing_open.data_vars)
+            keep = np.ones(existing_open.sizes.get('time', 0), dtype=bool)
+            if start is not None:
+                keep &= times >= start
+            if end is not None:
+                keep &= times <= end
+            duplicate_times = pd.Index(times).duplicated(keep='last')
+            needs_rewrite = (
+                not np.all(keep)
+                or np.any(duplicate_times)
+                or not record_names <= existing_names
+            )
+
+            if needs_rewrite:
+                # Schema changes and repair operations are rare and require a
+                # complete, atomic archive rewrite.
+                existing = existing_open.load()
+            else:
+                matching_indexes = np.flatnonzero(times == record_time)
+                if matching_indexes.size:
+                    fast_region_index = int(matching_indexes[0])
+                else:
+                    append_missing = {}
+                    for name in existing_names - record_names:
+                        template = existing_open[name].isel(
+                            time=slice(0, 1)).load()
+                        fill = (
+                            xr.zeros_like(template, dtype=output_dtype)
+                            * np.nan)
+                        append_missing[name] = fill.assign_coords(
+                            time=record.time)
+
+        if fast_region_index is not None:
             region_record = record[list(record.data_vars)]
             region_record = region_record.drop_vars(
                 [name for name in region_record.coords if name != 'time'],
@@ -583,30 +585,38 @@ class State:
             region_record.to_zarr(
                 filename,
                 mode='r+',
-                region={'time': slice(time_index, time_index + 1)},
+                region={
+                    'time': slice(
+                        fast_region_index, fast_region_index + 1)},
             )
             region_record.close()
-            existing.close()
             record.close()
             return
 
-        if not pruned and record_time not in times and record_names <= existing_names:
-            missing = {}
-            for name in existing_names - record_names:
-                template = existing[name].isel(time=slice(0, 1))
-                fill = xr.zeros_like(template, dtype=output_dtype) * np.nan
-                fill = fill.assign_coords(time=record.time)
-                missing[name] = fill
+        if append_missing is not None:
             full_record = xr.merge(
-                [record, xr.Dataset(missing)],
+                [record, xr.Dataset(append_missing)],
                 compat='override',
                 join='outer',
             )
             full_record.to_zarr(filename, mode='a', append_dim='time')
             full_record.close()
-            existing.close()
             record.close()
             return
+
+        # A tile/archive belongs to exactly one temporal window. Prune stale
+        # records and repair all duplicate timestamps in the same rewrite.
+        valid = keep & ~duplicate_times
+        pruned = not np.all(valid)
+        if np.any(duplicate_times):
+            duplicate_count = int(np.count_nonzero(duplicate_times))
+            print(
+                f'Warning: repairing {duplicate_count} duplicate time records '
+                f'in {filename}')
+        if pruned:
+            existing = existing.isel(time=np.flatnonzero(valid))
+        times = pd.to_datetime(existing.time.values)
+        matching_record_indexes = np.flatnonzero(times == record_time)
 
         if record_time in times:
             # Keep the most recently written matching record as the template,
