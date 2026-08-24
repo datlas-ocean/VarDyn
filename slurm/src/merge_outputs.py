@@ -10,6 +10,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import numpy as np
 import pandas as pd
+import zarr
 from astropy.convolution import Gaussian2DKernel, interpolate_replace_nans
 
 import xarray as xr
@@ -33,6 +34,11 @@ def log(msg):
 
 def _zarr_archive_path(config, root):
     return Path(root) / f"{config.EXP.name_exp_save}.zarr"
+
+
+def _consolidate_zarr_metadata(archive_path):
+    """Publish an up-to-date consolidated view after all appends."""
+    zarr.consolidate_metadata(str(archive_path))
 
 
 def _remove_legacy_dated_outputs(config, dates, root):
@@ -63,8 +69,11 @@ def _consolidate_dated_outputs_to_zarr(
         source_path = dated_zarr_path if dated_zarr_path.exists() else nc_path
         if not source_path.exists():
             continue
-        opener = xr.open_zarr if source_path == dated_zarr_path else xr.open_dataset
-        with opener(source_path) as source:
+        if source_path == dated_zarr_path:
+            context = xr.open_zarr(source_path, consolidated=False)
+        else:
+            context = xr.open_dataset(source_path)
+        with context as source:
             record = source.load()
         if 'time' in record.dims and record.sizes['time'] > 1:
             selected = record.sel(time=pd.Timestamp(date))
@@ -146,7 +155,10 @@ def _validate_dated_outputs(config, dates, root, zarr_output=False):
         if not archive_path.exists():
             raise RuntimeError(f'Output archive is missing: {archive_path}')
         try:
-            with xr.open_zarr(archive_path) as dataset:
+            # Appends update the live Zarr metadata first. Reading a stale
+            # consolidated view here can falsely report missing timestamps.
+            with xr.open_zarr(
+                    archive_path, consolidated=False) as dataset:
                 actual_times = pd.DatetimeIndex(
                     pd.to_datetime(dataset.time.values))
                 _ = dataset.sizes
@@ -164,6 +176,7 @@ def _validate_dated_outputs(config, dates, root, zarr_output=False):
             raise RuntimeError(
                 f'Output archive is missing {len(missing_times)} timestamps: '
                 f'{archive_path} (first: {missing_times[0]})')
+        _consolidate_zarr_metadata(archive_path)
         log(
             f'Validated {len(expected_times)} timestamps in Zarr archive '
             f'{archive_path}')

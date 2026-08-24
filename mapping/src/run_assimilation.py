@@ -1297,7 +1297,8 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
                 State0.save_output(date, name_var=name_var_save, dtype=output_dtype)
                 print(f'[parallel_merge] {date} done', flush=True)
             except Exception as e:
-                print(f'[parallel_merge] WARNING: failed to save output for {date}: {e}', flush=True)
+                raise RuntimeError(
+                    f'[parallel_merge] failed to save output for {date}') from e
     finally:
         for q in task_qs:
             try:
@@ -1559,8 +1560,11 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
         return f"{config.EXP.path_save}/{_filename(config.EXP.name_exp_save, date)}"
 
     def _load_date(path, date):
-        opener = xr.open_zarr if zarr_output else xr.open_dataset
-        with opener(path) as dataset:
+        if zarr_output:
+            context = xr.open_zarr(path, consolidated=False)
+        else:
+            context = xr.open_dataset(path)
+        with context as dataset:
             selected = dataset
             if zarr_output:
                 selected = dataset.sel(time=pd.Timestamp(date))

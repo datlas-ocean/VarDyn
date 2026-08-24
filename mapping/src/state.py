@@ -21,6 +21,19 @@ from . import tools as grid
 from .config import USE_FLOAT64
 
 
+_ZARR_TIME_UNITS = 'nanoseconds since 1970-01-01'
+
+
+def _set_zarr_time_encoding(dataset):
+    """Use one lossless encoding for sub-daily timestamps across appends."""
+    if 'time' in dataset.coords:
+        dataset.time.encoding.update({
+            'units': _ZARR_TIME_UNITS,
+            'calendar': 'proleptic_gregorian',
+            'dtype': 'int64',
+        })
+
+
 def _is_jax_array(value):
     """Return True without importing JAX in the state/I/O module."""
     module = type(value).__module__
@@ -532,6 +545,7 @@ class State:
             raise ValueError(
                 f'Refusing to save {record_time} outside Zarr window '
                 f'[{start}, {end}]')
+        _set_zarr_time_encoding(record)
         if not os.path.exists(filename):
             record.to_zarr(filename, mode='w')
             record.close()
@@ -542,9 +556,14 @@ class State:
         fast_region_index = None
         append_missing = None
 
-        with xr.open_zarr(filename) as existing_open:
+        # Always read the live array metadata while an archive is being
+        # extended. With Zarr v2, consolidated metadata may still describe
+        # the archive shape from before the latest append.
+        with xr.open_zarr(filename, consolidated=False) as existing_open:
             times = pd.to_datetime(existing_open.time.values)
             existing_names = set(existing_open.data_vars)
+            existing_time_units = existing_open.time.encoding.get('units')
+            existing_time_dtype = existing_open.time.encoding.get('dtype')
             keep = np.ones(existing_open.sizes.get('time', 0), dtype=bool)
             if start is not None:
                 keep &= times >= start
@@ -555,6 +574,8 @@ class State:
                 not np.all(keep)
                 or np.any(duplicate_times)
                 or not record_names <= existing_names
+                or existing_time_units != _ZARR_TIME_UNITS
+                or np.dtype(existing_time_dtype) != np.dtype('int64')
             )
 
             if needs_rewrite:
@@ -582,6 +603,7 @@ class State:
                 [name for name in region_record.coords if name != 'time'],
                 errors='ignore',
             )
+            _set_zarr_time_encoding(region_record)
             region_record.to_zarr(
                 filename,
                 mode='r+',
@@ -599,6 +621,7 @@ class State:
                 compat='override',
                 join='outer',
             )
+            _set_zarr_time_encoding(full_record)
             full_record.to_zarr(filename, mode='a', append_dim='time')
             full_record.close()
             record.close()
@@ -649,6 +672,7 @@ class State:
             ).sortby('time')
 
         temporary = f'{filename}.tmp-{os.getpid()}'
+        _set_zarr_time_encoding(combined)
         if os.path.exists(temporary):
             shutil.rmtree(temporary)
         combined.to_zarr(temporary, mode='w')
@@ -662,7 +686,7 @@ class State:
     def load_output(self, date, name_var=None):
         zarr_filename = os.path.join(self.path_save, f'{self.name_exp_save}.zarr')
         if bool(getattr(self.config.EXP, 'saveoutputs_zarr', False)) and os.path.exists(zarr_filename):
-            with xr.open_zarr(zarr_filename) as ds:
+            with xr.open_zarr(zarr_filename, consolidated=False) as ds:
                 selected = ds.sel(time=pd.Timestamp(date))
                 if 'time' in selected.dims:
                     duplicate_count = selected.sizes['time']
