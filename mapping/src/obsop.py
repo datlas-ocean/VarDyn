@@ -281,7 +281,7 @@ class Obsop_interp_l3(Obsop_interp):
         try:
             row, col = np.where(valid_mask)
             data = weights[row, col]
-            indices = jnp.array([row, ind_closest[row, col]])
+            indices = jnp.array([row, ind_closest[row, col]], dtype=jnp.int32)
             data = jnp.array(data)
         except:
             data = jnp.array([])
@@ -328,7 +328,7 @@ class Obsop_interp_l3(Obsop_interp):
             self.n_obs = jnp.asarray(cached['n_obs'])
             self.data_arr = jnp.asarray(cached['data_arr'])
             self.indices_arr = jnp.asarray(
-                cached['indices_arr'], dtype=int
+                cached['indices_arr'], dtype=jnp.int32
             )
             self.varobs_arr = jnp.asarray(cached['varobs_arr'])
             self.errobs_arr = jnp.asarray(cached['errobs_arr'])
@@ -479,7 +479,7 @@ class Obsop_interp_l3(Obsop_interp):
         
         if self.n_data.size>0:
             self.data_arr = np.zeros((self.t_obs.size, self.n_data.max()))
-            self.indices_arr = np.zeros((self.t_obs.size, 2, self.n_data.max()))
+            self.indices_arr = np.zeros((self.t_obs.size, 2, self.n_data.max()), dtype=np.int32)
             self.varobs_arr = np.zeros((self.t_obs.size, self.n_obs.max()))
             self.errobs_arr = np.ones((self.t_obs.size, self.n_obs.max())) * 1e7
         
@@ -505,7 +505,7 @@ class Obsop_interp_l3(Obsop_interp):
             self.n_data = jnp.array(self.n_data)
             self.n_obs = jnp.array(self.n_obs)
             self.data_arr = jnp.array(self.data_arr)
-            self.indices_arr = jnp.array(self.indices_arr, dtype=int)
+            self.indices_arr = jnp.asarray(self.indices_arr, dtype=jnp.int32)
             self.varobs_arr = jnp.array(self.varobs_arr)
             self.errobs_arr = jnp.array(self.errobs_arr)
         else:
