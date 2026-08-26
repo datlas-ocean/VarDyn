@@ -64,7 +64,7 @@ The gravity-wave speed is $c=\sqrt{gH_e}$. The model can add linear dynamics abo
 \partial_t\mathbf{u}_k
 + (\mathbf{u}_k\cdot\nabla)\mathbf{u}_k
 + f\,\mathbf{k}\times\mathbf{u}_k
-&= -\nabla p_k + \mathbf{F}_k + \nu\nabla^2\mathbf{u}_k,\\
+&= -\nabla p_k + \mathbf{F}_k + \delta_{k,b}\frac{\boldsymbol{\tau}}{\rho_{water}h_{wind}} + \nu\nabla^2\mathbf{u}_k,\\
 \partial_t h_k + \nabla\cdot[(H_k+h_k)\mathbf{u}_k]
 &= \kappa\nabla^2h_k.
 \end{aligned}
@@ -77,7 +77,67 @@ Hydrostatic pressure is built from stacked interfaces,
 \qquad p_k=\sum_{m\leq k}g'_m\eta_m.
 ```
 
+### Variables and parameters in the prognostic equations
+
+For each layer, the prognostic state is the horizontal velocity and the
+layer-thickness anomaly. The total thickness is $H_k+h_k$.
+
+| Symbol | Description |
+| --- | --- |
+| $k$ | Layer index. |
+| $t$ | Time. |
+| $\mathbf{u}_k=(u_k,v_k)$ | Horizontal velocity in layer $k$. |
+| $h_k$ | Prognostic anomaly of the thickness of layer $k$. |
+| $H_k$ | Prescribed undisturbed reference thickness of layer $k$. |
+| $H_k+h_k$ | Total layer thickness transported by the continuity equation. |
+| $f$ | Coriolis parameter. |
+| $\mathbf{k}$ | Upward vertical unit vector; $f\,\mathbf{k}\times\mathbf{u}_k$ is the Coriolis acceleration. |
+| $\nabla$ | Horizontal gradient operator. |
+| $\nabla\cdot$ | Horizontal divergence operator. |
+| $\nabla^2$ | Horizontal Laplacian operator. |
+| $p_k$ | Hydrostatic pressure in layer $k$, diagnosed from the stacked interfaces; it is not an independent prognostic variable. |
+| $\eta_m$ | Displacement of interface $m$, diagnosed from the layer thicknesses. |
+| $g^{\prime}_m$ | Reduced gravity associated with interface $m$; it controls the pressure coupling between layers. |
+| $\mathbf{F}_k$ | Prescribed or modelled non-wind momentum forcing applied to layer $k$. |
+| $\boldsymbol{\tau}$ | Surface wind-stress vector. |
+| $\delta_{k,b}$ | Layer selector: it is one for the wind-forced baroclinic layer $b$ and zero for the other layers. |
+| $\rho_{water}$ | Seawater density used to convert stress into acceleration. |
+| $h_{wind}$ | Effective depth over which the wind stress is distributed; the wind acceleration is $\boldsymbol{\tau}/(\rho_{water}h_{wind})$. |
+| $\nu$ | Horizontal momentum-viscosity coefficient. |
+| $\kappa$ | Horizontal layer-thickness diffusion coefficient. |
+
+The continuity equation conserves layer volume: thickness changes result from
+horizontal transport divergence and diffusion. The wind term changes momentum
+only; it does not directly add or remove layer thickness.
+
 The code uses a vector-invariant momentum form (vortex force, kinetic-energy, and pressure-gradient terms), finite-volume thickness fluxes, and C-grid land masks. Thickness fluxes and vortex-force reconstruction are WENO by default; fixed upwind alternatives are available. Optional terms are top-layer wind stress, bottom linear drag, Laplacian viscosity/diffusion, sponge relaxation to boundary fields, and a barotropic-wave filter. Time integration is SSP-RK3 by default, with RK2 variants available.
+
+### Wind forcing of the baroclinic layer
+
+For the baroclinic configuration (`layer_stack=('baroclinic',)`), the wind
+stress is applied directly to the active baroclinic layer. The model accepts
+`taux`/`tauy` on the C-grid, or computes the stress from `u10`/`v10` in a
+wind NetCDF file using
+
+```math
+\mathbf{\tau}=\rho_{air} C_d |\mathbf{U}_{10}|\mathbf{U}_{10},
+\qquad
+\mathbf{a}_{wind}=\frac{\mathbf{\tau}}{\rho_{water}h_{wind}}.
+```
+
+The resulting acceleration is added to the baroclinic momentum tendency. In the multilayer equation, $b$ denotes the wind-forced baroclinic layer and $\delta_{k,b}$ applies the stress only to that layer. The
+conversion uses the physical forcing depth `h_wind`, which can be a scalar, a
+spatially varying field, or a time-varying perturbation. If `h_wind` is not
+provided, the model reference layer thickness is used. For a one-layer
+reduced-gravity model, `h_wind` should normally be set to the physical mixed-
+layer depth rather than the equivalent dynamical depth `H`.
+
+Wind stress can be updated from a time-dependent wind product at the configured
+`wind_timestep`. The optional `wind_strength` field provides a local
+multiplicative perturbation to the stress. In a multi-layer stack that includes
+an Ekman or mixed layer, the default wind operator acts on the upper active
+layer; the baroclinic-only configuration is the case where that upper layer is
+the baroclinic layer.
 
 ### Single-layer reduced-gravity case (`nl=1`)
 
@@ -88,13 +148,13 @@ With `nl=1`, `model_qgsw` represents one active layer of reference (equivalent) 
 \partial_t\mathbf{u}
 + (\mathbf{u}\cdot\nabla)\mathbf{u}
 + f\,\mathbf{k}\times\mathbf{u}
-&= -g'\nabla\eta + \mathbf{F} + \nu\nabla^2\mathbf{u},\\
+&= -g'\nabla\eta + \mathbf{F} + \frac{\boldsymbol{\tau}}{\rho_{water}h_{wind}} + \nu\nabla^2\mathbf{u},\\
 \partial_t\eta + \nabla\cdot[(H+\eta)\mathbf{u}]
 &= \kappa\nabla^2\eta.
 \end{aligned}
 ```
 
-The associated internal gravity-wave speed and deformation radius are $c=\sqrt{g'H}$ and $R_d=c/|f_0|$. Here $H$ is an equivalent depth: when wind stress is enabled, `h_wind` can be set separately to the physical mixed-layer depth used to convert stress to acceleration.
+The associated internal gravity-wave speed and deformation radius are $c=\sqrt{g'H}$ and $R_d=c/|f_0|$. Here $H$ is an equivalent depth: when wind stress is enabled, ``h_wind`` can be set separately to the physical mixed-layer depth used to convert stress to acceleration.
 
 For `name_class='QG'`, the same `nl=1` setup is projected onto the 1.5-layer QG balance,
 
