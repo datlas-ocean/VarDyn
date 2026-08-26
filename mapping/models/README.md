@@ -2,14 +2,14 @@
 
 This directory contains three JAX implementations used by VarDyn. The equations below describe physical variables; `qgsw` internally uses metric-scaled C-grid variables on non-uniform grids.
 
-Notation: $\eta$ is sea-surface/interface displacement, $h$ a layer-thickness anomaly, $H$ its reference thickness, $\boldsymbol{u}=(u,v)$ horizontal velocity, $f$ the Coriolis parameter, $f_0$ its reference value, $g$ gravity, $g'_k$ reduced gravity, and $\zeta=v_x-u_y$ relative vorticity.
+Notation: $\eta$ is sea-surface/interface displacement, $h$ a layer-thickness anomaly, $H$ its reference thickness, $\mathbf{u}=(u,v)$ horizontal velocity, $f$ the Coriolis parameter, $f_0$ its reference value, $g$ gravity, $g'_k$ reduced gravity, and $\zeta=v_x-u_y$ relative vorticity.
 
 ## `model_qg1l`: one-and-a-half-layer QG
 
 `jqgm.py` advances potential-vorticity (PV) anomalies and diagnoses SSH and geostrophic velocity. With the default `formulation='ssh'`,
 
 $$
-\boldsymbol{u}_g = \frac{g}{f_0}\,\boldsymbol{k}\times\nabla\eta,
+\mathbf{u}_g = \frac{g}{f_0}\,\mathbf{k}\times\nabla\eta,
 \qquad
 q = \frac{g}{f_0}\nabla^2\eta - \frac{g f_0}{c^2}\eta.
 $$
@@ -17,7 +17,7 @@ $$
 Here $c$ is the first baroclinic phase speed, so $R_d=c/|f_0|$. Equivalently, the optional streamfunction formulation, $\psi=g\eta/f$, uses
 
 $$
-\boldsymbol{u}_g=\boldsymbol{k}\times\nabla\psi,
+\mathbf{u}_g=\mathbf{k}\times\nabla\psi,
 \qquad q=\nabla^2\psi-\frac{\psi}{R_d^2}.
 $$
 
@@ -25,9 +25,9 @@ The interior PV tendency is
 
 $$
 \frac{\partial q}{\partial t}
-+ \boldsymbol{u}_g\cdot\nabla q
++ \mathbf{u}_g\cdot\nabla q
 + \beta v
-+ \boldsymbol{u}_g\cdot\nabla q_b
++ \mathbf{u}_g\cdot\nabla q_b
 = K_q\nabla^2q.
 $$
 
@@ -35,11 +35,11 @@ The $\beta v$ term is used with spatially varying Coriolis parameter, and $q_b=f
 
 $$
 \frac{\partial C}{\partial t}
-+ (\boldsymbol{u}_g+\boldsymbol{u}_a)\cdot\nabla C
++ (\mathbf{u}_g+\mathbf{u}_a)\cdot\nabla C
 =K_C\nabla^2C,
 $$
 
-where $\boldsymbol{u}_a$ is included only when ageostrophic velocities are configured. Transport uses a selectable upwind stencil; Euler, RK2, and RK3 are available.
+where $\mathbf{u}_a$ is included only when ageostrophic velocities are configured. Transport uses a selectable upwind stencil; Euler, RK2, and RK3 are available.
 
 ## `model_sw1l`: linear one-layer shallow water
 
@@ -61,11 +61,11 @@ The gravity-wave speed is $c=\sqrt{gH_e}$. The model can add linear dynamics abo
 
 $$
 \begin{aligned}
-\partial_t\boldsymbol{u}_k
-+ (\boldsymbol{u}_k\!\cdot\!\nabla)\boldsymbol{u}_k
-+ f\,\boldsymbol{k}\times\boldsymbol{u}_k
-&= -\nabla p_k + \boldsymbol{F}_k + \nu\nabla^2\boldsymbol{u}_k,\\
-\partial_t h_k + \nabla\!\cdot[(H_k+h_k)\boldsymbol{u}_k]
+\partial_t\mathbf{u}_k
++ (\mathbf{u}_k\cdot\nabla)\mathbf{u}_k
++ f\,\mathbf{k}\times\mathbf{u}_k
+&= -\nabla p_k + \mathbf{F}_k + \nu\nabla^2\mathbf{u}_k,\\
+\partial_t h_k + \nabla\cdot[(H_k+h_k)\mathbf{u}_k]
 &= \kappa\nabla^2h_k.
 \end{aligned}
 $$
@@ -85,11 +85,11 @@ With `nl=1`, `model_qgsw` represents one active layer of reference (equivalent) 
 
 $$
 \begin{aligned}
-\partial_t\boldsymbol{u}
-+ (\boldsymbol{u}\!\cdot\!\nabla)\boldsymbol{u}
-+ f\,\boldsymbol{k}\times\boldsymbol{u}
-&= -g'\nabla\eta + \boldsymbol{F} + \nu\nabla^2\boldsymbol{u},\\
-\partial_t\eta + \nabla\!\cdot[(H+\eta)\boldsymbol{u}]
+\partial_t\mathbf{u}
++ (\mathbf{u}\cdot\nabla)\mathbf{u}
++ f\,\mathbf{k}\times\mathbf{u}
+&= -g'\nabla\eta + \mathbf{F} + \nu\nabla^2\mathbf{u},\\
+\partial_t\eta + \nabla\cdot[(H+\eta)\mathbf{u}]
 &= \kappa\nabla^2\eta.
 \end{aligned}
 $$
@@ -99,7 +99,7 @@ The associated internal gravity-wave speed and deformation radius are $c=\sqrt{g
 For `name_class='QG'`, the same `nl=1` setup is projected onto the 1.5-layer QG balance,
 
 $$
-\boldsymbol{u}=\frac{g'}{f_0}\boldsymbol{k}\times\nabla\eta,
+\mathbf{u}=\frac{g'}{f_0}\mathbf{k}\times\nabla\eta,
 \qquad
 (\nabla^2-R_d^{-2})\,p=q,
 \qquad p=g'\eta.
@@ -110,7 +110,7 @@ This is the reduced-gravity counterpart of the multilayer QG relation below; it 
 Selecting `name_class='QG'` uses `model_qgsw/qg.py`. It advances the same forcing/tendency machinery but projects it onto the multilayer QG manifold at each stage:
 
 $$
-\boldsymbol{u}_k=\frac{1}{f_0}\boldsymbol{k}\times\nabla p_k,
+\mathbf{u}_k=\frac{1}{f_0}\mathbf{k}\times\nabla p_k,
 \qquad h_k=H_k\sum_m A_{km}p_m,
 $$
 
