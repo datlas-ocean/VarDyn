@@ -3620,9 +3620,6 @@ class Model_qgsw(M):
             elif len(H.shape) == 2:
                 H = np.expand_dims(H, axis=0)
         
-        H_from_init = None if self._modal_multilayer else self._H_from_init_file(config, State)
-        if H_from_init is not None:
-            H = H_from_init
 
         self.g_prime = np.asarray(g_prime, dtype=float)
         if self._physical_interface_height:
@@ -3642,7 +3639,6 @@ class Model_qgsw(M):
             self.ssh_observation_scale = 1.
 
         self.H0 = H
-        self._H_from_init_file_used = H_from_init is not None
         if self._modal_two_layer:
             self.H_max_bound = None
             self.H_floor = np.stack((self.H_ml_floor_sw, self.H_bc1_floor_sw), axis=0)
@@ -4147,19 +4143,13 @@ class Model_qgsw(M):
         if 'H' in self.name_params:
             if (config.GRID.super == 'GRID_FROM_FILE'):
                 dsin = xr.open_dataset(config.GRID.path_init_grid)
-                if self._H_from_init_file_used:
-                    # Saved H is already the total equivalent depth from the
-                    # previous run. Start new increments from zero around it.
-                    State.params['H'] = np.zeros((State.ny,State.nx))
-                elif 'H_control' in dsin:
+                if 'H_control' in dsin:
                     State.params['H'] = dsin['H_control'].values.squeeze()
                     State.params['H'][np.isnan(State.params['H'])] = 0.
                 else:
                     dsin.close()
                     raise ValueError(
-                        'Controlled H restarts must provide either H, the total '
-                        'equivalent depth, or H_control, the dimensionless equivalent-depth '
-                        'control.'
+                        'Controlled H restarts require H_control, the dimensionless equivalent-depth control.'
                     )
                 dsin.close()
                 del dsin
@@ -4298,41 +4288,6 @@ class Model_qgsw(M):
         if not np.all(np.isfinite(gp)) or np.any(gp <= 0.) or np.nanmax(np.abs(residual)) >= 1.e-7:
             raise ValueError('Unable to diagnose positive three-layer reduced gravities from the requested modal speeds.')
         return gp
-
-    def _H_from_init_file(self, config, State):
-        if config.GRID.super != 'GRID_FROM_FILE':
-            return None
-        path_init = getattr(config.GRID, 'path_init_grid', None)
-        if path_init is None or not os.path.exists(path_init):
-            return None
-
-        candidate_names = []
-        if config.MOD.name_init_var is not None and 'H' in config.MOD.name_init_var:
-            candidate_names.append(config.MOD.name_init_var['H'])
-        candidate_names.append('H')
-
-        dsin = xr.open_dataset(path_init)
-        try:
-            for name in candidate_names:
-                if name not in dsin:
-                    continue
-                da = dsin[name].squeeze(drop=True)
-                if config.EXP.name_time in da.dims:
-                    da = da.isel({config.EXP.name_time: 0})
-                if getattr(config.GRID, 'subsampling', None) is not None and da.ndim >= 2:
-                    da = da[..., ::config.GRID.subsampling, ::config.GRID.subsampling]
-                arr = np.asarray(da.values, dtype=float)
-                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-                H = self._as_H_model_array(arr, State, name)
-                if self._is_qg_class and not (H.shape == (1, 1, 1) or np.nanstd(H) == 0.):
-                    H = np.array([[[np.nanmean(H)]]])
-                    print(f'H read from {path_init}:{name} and averaged for QG: H = {H[0,0,0]:.4f} m')
-                else:
-                    print(f'H read from {path_init}:{name}')
-                return H
-        finally:
-            dsin.close()
-        return None
 
     def _as_H_model_array(self, value, State, name):
         arr = np.asarray(value)
