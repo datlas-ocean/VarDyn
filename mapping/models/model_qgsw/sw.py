@@ -266,7 +266,8 @@ class SW:
         # reference layer thickness H_ref (the equivalent depth), which is physically
         # correct only for multi-layer models where H represents the true layer depth.
         self.h_wind = param.get('h_wind', None)
-        if self.nl == 1 and self.h_wind is None:
+        self.wind_depth_from_H = param.get('wind_depth_from_H', False)
+        if self.nl == 1 and self.h_wind is None and not self.wind_depth_from_H:
             import warnings
             warnings.warn(
                 "\n[SW model] nl=1 and h_wind is not set.\n"
@@ -1767,6 +1768,7 @@ class SW:
         tauy=None,
         h_wind=None,
         wind_strength=None,
+        g_prime=None,
     ):
         """
         Performs nstep time-integration for (u, v, h) *and* passive tracer c.
@@ -1805,7 +1807,7 @@ class SW:
             H_total = jnp.maximum(H_total, self.H_min)
         if self.H_max is not None:
             H_total = jnp.minimum(H_total, self.H_max)
-        ref_vals = self._compute_ref_values(H_total)
+        ref_vals = self._compute_ref_values(H_total, g_prime=g_prime)
 
         c_concentration = jnp.asarray(c0, dtype=self.dtype)*self.masks.h
         c_boundary = (jnp.asarray(c_b, dtype=self.dtype)*self.masks.h
@@ -1843,7 +1845,8 @@ class SW:
             second diagnostic call per RK3 stage.
             """
             omega, eta, p, U, V, U_m, V_m, k_energy, h_tot_ugrid, h_tot_vgrid = \
-                self.compute_diagnostic_variables(u, v, h, ref_vals[1], ref_vals[2])
+                self.compute_diagnostic_variables(
+                    u, v, h, ref_vals[1], ref_vals[2], g_prime=g_prime)
             dt_h = self.advection_h(U, V, h, ref_vals[0]) + self.add_h_diffusion(h)
             dt_h = self.add_ekman_entrainment(dt_h, h, ref_vals[0])
             dt_u, dt_v = self.advection_momentum(

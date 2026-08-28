@@ -89,9 +89,7 @@ NAME_MOD = 'SW'
 
 SW = dict(
 
-    super = 'MOD_QGSW', # Inherit defaults for the QG/SW model wrapper.
-
-    name_class = 'sw', # Use the Shallow Water core instead of the QG core.
+    super = 'MOD_QGSW', # Inherit defaults for the one-layer baroclinic SW model.
 
     name_params = ['H'], # Control the dimensionless equivalent-depth log-multiplier.
 
@@ -579,5 +577,4 @@ myINV = dict(
 
  
 )
-
 

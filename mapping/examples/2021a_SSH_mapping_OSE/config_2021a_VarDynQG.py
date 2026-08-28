@@ -173,8 +173,6 @@ myINV = dict(
 
     maxiter = 500, # Maximal number of iterations for the minimization process
 
-    opt_method = 'L-BFGS-B', # method for scipy.optimize.minimize
-
     save_minimization = False, # save cost function and its gradient at each iteration 
 
     timestep_checkpoint = timedelta(hours=6), #  timesteps separating two consecutive analysis 

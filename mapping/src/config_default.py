@@ -43,8 +43,6 @@ EXP = dict(
 
     saveoutput_time_step = timedelta(hours=1),  # time step at which the states are saved 
 
-    plot_time_step = timedelta(days=1),  #  time step at which the states are plotted (for debugging),
-
     time_obs_min = None, 
 
     time_obs_max = None,
@@ -196,8 +194,6 @@ MOD_QG1L = dict(
     var_to_save = None, # List of variable names (among of the values of name_var dictionary) to save
 
     save_diagnosed_variables = False, # Whether to save diagnosed variables (e.g. SSH, geostrophic velocies and cyclogeostrophic velocities) in the output netcdf files
-
-    save_params = False, # Whether to save control parameters (e.g. corrective fluxes) in the output netcdf files
 
     upwind = 3, # Order of the upwind scheme for PV advection (either 1,2 or 3) 
 
@@ -393,10 +389,8 @@ MOD_CSW1L = dict(
 
 )
 
-# QG-SW Models
+# One-layer baroclinic shallow-water model
 MOD_QGSW = dict(
-
-    name_class = 'qg', # Name of the model class (either qg or sw)
 
     name_var = {'U':'u', 'V':'v', 'SSH':'ssh'},
 
@@ -404,7 +398,7 @@ MOD_QGSW = dict(
 
     var_to_save = None,
 
-    name_params = None, #['H', 'hbcx', 'hbcy', 'itg'], # list of parameters to control. H denotes dimensionless equivalent-depth log-control.
+    name_params = None, # Controlled parameters. 'H' and 'g_prime' are positive dimensionless log-controls.
 
     nl = 1, # number of layers in the model (for nl>1, set H and g_prime as lists/arrays)
 
@@ -414,7 +408,7 @@ MOD_QGSW = dict(
 
     constant_f = False,
 
-    c0 = 2.7,
+    c0 = 2.7, # Reference phase speed [m s^-1]. Used to diagnose a missing H or g_prime.
 
     filec_aux = None, # if c0==None, auxilliary file to be used as phase velocity field (the spatial interpolation is handled inline)
 
@@ -424,87 +418,30 @@ MOD_QGSW = dict(
 
     cmax = None, # Maximum value of phase velocity to consider
 
-    H = None, # mean layer depth(s) in meters.  Scalar or list, e.g. H=[500., 2500.] for nl=2
+    H = None, # Reference layer depth [m]. With g_prime set, c is diagnosed; otherwise g_prime is diagnosed from c**2/H.
 
     constant_H = False, # if True and H is None (nl=1), use the spatial mean of c to derive a
                         # spatially constant H = mean(c)^2 / g_prime instead of the full 2-D field
 
-    g_prime = None, # reduced gravity(ies).  Scalar or list, e.g. g_prime=[9.81, 0.02] for nl=2
+    g_prime = None, # Reference reduced gravity [m s^-2]. With H set, c is diagnosed; with H unset, H is diagnosed from c**2/g_prime.
 
     # Meaning of the 2-D state field named by name_var['SSH']:
     # 'ssh' keeps the historical direct-height formulation.
     # 'interface_displacement' (nl=1 SW only) stores reduced-gravity interface
     # displacement eta. External SSH is diagnosed as (g_prime / physical_gravity) * eta.
-    # With H set and g_prime=None, g_prime is diagnosed from c1**2 / H.
-    # 'modal_two_layer' (nl=2 SW only) is a physical mixed layer over a first
-    # baroclinic layer. SSH/surface U/V are public diagnosed fields; the
-    # kernel carries h_ml/u_ml/v_ml and h_bc1/u_bc1/v_bc1. Set H_ml/H_bc1 and
-    # include their names in name_params to control the positive log-depths.
-    # 'modal_layer_stack' generalises this contract to an explicit ordered
-    # surface-to-deep layer_stack. Supported physical stacks are baroclinic;
-    # Ekman+baroclinic; mixed-layer+baroclinic; Ekman+mixed-layer+baroclinic;
-    # and a shared Ekman/mixed-layer surface layer over the baroclinic layer.
+    # Parameter closure: H and g_prime are authoritative when both are set;
+    # otherwise c diagnoses the missing member through c**2 = g_prime*H.
+    # Public MOD_QGSW supports only the direct SSH and one-layer physical
+    # interface-displacement representations. Multilayer and Ekman machinery
+    # belongs to the internal SW core and is not publicly configurable here.
     height_representation = 'ssh',
 
     # Restart coordinate for the field mapped to name_init_var['SSH'] in
     # interface_displacement mode. The default is the physical `ssh` written
     # by save_output; use `interface_displacement` only when explicitly
-    # selecting that saved internal field.
+    # selecting the saved physical Interface Displacement field. Controlled
+    # g_prime restarts convert it back to the fixed reference state coordinate.
     restart_height_coordinate = 'physical_ssh',
-
-    H_ml = None,       # modal_two_layer mixed-layer reference depth [m]
-    H_ml_floor = None, # strict lower bound for H_ml [m]
-    H_ml_max = None,   # optional upper bound for H_ml [m]
-    constant_MLD = False, # collapse a prescribed H_ml field to its area-weighted mean
-    H_ek = None,       # legacy Ekman reference depth [m]; prefer q_init with H_total
-    q_init = None,     # initial upper-layer fraction; scalar (2 layers) or [q0,q1] (3 layers)
-    H_total = None,    # fixed total depth for a prognostic Ekman–barocline pair [m]
-    H_ek0 = None,      # fixed_two_slab_ekman upper-slab depth [m]
-    H_ek1 = None,      # fixed_two_slab_ekman lower-slab depth [m]
-    H_ek_floor = None, # strict lower bound for H_ek [m]
-    H_ek_max = None,   # optional upper bound for H_ek [m]
-    H_ek_fraction_min = 0.01, # lower bound for controlled H_ek/(H_ek+H_bc1)
-    H_ek_fraction_max = 0.99, # upper bound for controlled H_ek/(H_ek+H_bc1)
-    r_ek = 0.5,        # H_ek/H_ml for a distinct nested Ekman+mixed-layer stack
-    r_ek_min = 0.1,    # lower logistic bound for controlled r_ek
-    r_ek_max = 0.9,    # upper logistic bound for controlled r_ek
-    H_ek0_floor = 0.01, # lower bound for controlled fixed upper Ekman slab depth [m]
-    H_ek0_max = None,   # upper bound for controlled fixed upper Ekman slab depth [m]
-    H_ek1_floor = 0.01, # lower bound for controlled fixed lower Ekman slab depth [m]
-    H_ek1_max = None,   # upper bound for controlled fixed lower Ekman slab depth [m]
-    H_ek_ratio_min = 0.05, # lower bound for H_ek0/H_ek1 ratio control
-    H_ek_ratio_max = 5.0,  # upper bound for H_ek0/H_ek1 ratio control
-    H_bc1 = None,       # modal_two_layer first-baroclinic-layer reference depth [m]
-    H_bc1_floor = None, # strict lower bound for H_bc1 [m]
-    H_bc1_max = None,   # optional upper bound for H_bc1 [m]
-    c_mode2_ratio = None, # c_mode2/c1 used with g_prime=None; must be below the two-layer admissibility limit
-    c_mode3_ratio = None, # c_mode3/c1 used by a three-layer stack with g_prime=None
-    layer_stack = None, # ordered surface-to-deep list used by modal_layer_stack
-    fixed_ekman_slabs = 0, # 0 or 2: momentum-only fixed-depth Ekman slabs above baroclinic SW
-    ekman_base_drag_coef = 0., # prognostic Ekman/barocline interfacial drag rate [s^-1]
-    ekman_entrainment_timescale = None, # prognostic Ekman/barocline mass-exchange time scale [s]
-    ekman_internal_drag_coef = 0., # upper/lower Ekman slab drag rate [s^-1]
-    ekman_baroclinic_drag_coef = 0., # lower-slab/baroclinic drag rate [s^-1]
-    ekman_deep_drag_coef = 0., # terminal lower-Ekman drag rate to a resting deep reservoir [s^-1]
-    drag_control_log_min = -6., # lower bound for positive fixed-slab drag log controls
-    drag_control_log_max = 6., # upper bound for positive fixed-slab drag log controls
-    fixed_ekman_pumping = True, # fixed-slab transport divergence forces baroclinic thickness
-    fixed_ekman_pumping_relative_to_baroclinic = True, # remove baroclinic transport before pumping
-    ekman_slab_visc_coef = 0., # fixed-slab horizontal velocity viscosity [m^2 s^-1]
-    reference_pressure_gradient = True, # include the static pressure gradient from spatial reference H
-    enforce_positive_ekman_thickness = False, # conservative forward-only Ekman thickness limiter
-    layer_role_boundary_conditions = True, # SSH/U/V→baroclinic; zero dynamic BCs in Ekman/ML
-    init_surface_velocity_from_bc = False, # Also initialize the uppermost layer U/V from BC fields.
-    modal_ssh_reference = 'initial_bc', # fixed internal SSH background; public output remains full SSH
-    anomaly_reference_state = False, # evolve anomalies while using total reference state in SW equations
-    tracer_conservation = 'concentration', # 'concentration' or thickness-weighted 'upper_layer'
-    tracer_upper_layers = None, # number of surface layers sharing a vertically uniform tracer
-    interface_amplification = None, # diagnostic only in modal_two_layer; never a control
-    forcing_vertical_projection = 'surface_baroclinic', # lift surface forcing/BCs into the modal two-layer stack
-    wind_forcing_layer = 'mixed_layer', # modal_two_layer: wind acts only on layer 0 using current H_ml
-    wind_stress_profile = 'top_layer', # 'top_layer' or Stokes quadratic mixed-layer/transition-layer profile
-    sponge_target = 'bc', # sponge target: external boundary fields ('bc') or zero ('zero')
-    save_wind_work_budget = False, # save instantaneous wind-work/TL shear-production maps
 
     physical_gravity = 9.81, # m s^-2, used only for SSH <-> interface-displacement conversion
 
@@ -516,17 +453,9 @@ MOD_QGSW = dict(
 
     slip_coef = 1., # Lateral wall slip coefficient (dimensionless, in [0,1]): 1 = free-slip, 0 = no-slip, in-between = partial slip. Use 1 when use_sponge_on_coast=True so the sponge is the sole near-coast damping mechanism (no double damping).
 
-    taux = 0., # wind stress in N/m^2
-
-    tauy = 0., # wind stress in N/m^2
-
     path_mdt = None, # path of MDT
 
     name_var_mdt = {'lon':'','lat':'','var':''}, # dictionary of MDT coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
-
-    name_var_mdu = {'lon':'','lat':'','var':''}, # dictionary of MDT coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
-
-    name_var_mdv = {'lon':'','lat':'','var':''}, # dictionary of MDT coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
 
     dist_sponge_bc = None,
 
@@ -573,18 +502,25 @@ MOD_QGSW = dict(
     rho_water = 1025.0, # ocean water density (kg/m³) used to convert wind stress [Pa] to acceleration [m²/s²]: tau/(rho_water*H)*dx
 
     # Physical layer depth (m) for the wind-stress denominator:  tau / (rho_water * h_wind) * dx
-    # IMPORTANT for 1-layer QG/SW models: the model equivalent depth H = c²/g ≈ 0.4–1 m is
+    # IMPORTANT for one-layer SW models using equivalent depth: H = c²/g ≈ 0.4–1 m is
     # NOT the physical mixed-layer depth (~50–200 m).  Without setting h_wind, wind forcing
     # is 100–500× too large.  Set h_wind to the actual mixed-layer depth, e.g.:
     #   h_wind = 100.     # 100 m mixed layer
-    # Leave None to use the model's reference layer thickness (correct only for multi-layer
-    # models where H represent the true physical layer depths).
+    # Leave None with a controlled one-layer H to use the Controlled Layer Depth in
+    # the wind-stress denominator. Without a controlled H, this falls back to the
+    # model's reference layer thickness (correct only when H is a physical depth).
     h_wind = None,
 
     # Bounds for the dimensionless logarithmic h_wind control. When h_wind is
     # controlled, VarDyn uses h_wind_total = floor + (h_wind-floor)*exp(alpha).
     h_wind_floor = None, # None means 0
     h_wind_max = None, # None means no upper bound
+
+    # Use the instantaneous top-layer thickness H + eta as the wind-forcing
+    # denominator instead of h_wind/reference thickness. Keep False unless the
+    # top layer represents a physical mixed layer; True couples wind forcing to
+    # layer-thickness anomalies and can amplify thinning feedbacks.
+    wind_use_instantaneous_top_depth = False,
 
     wind_timestep = 3600, # wind update interval in seconds (default: 1 hour). Wind stress is
                           # precomputed at this cadence and held constant between updates.
@@ -775,8 +711,6 @@ OBS_SSH_NADIR = dict(
 
     name_var_err = None, # dictionary of error coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
     
-    nudging_params_ssh = None, # dictionary of nudging parameters on SSH {'sigma':<float>,'K':<float>,'Tau':<datetime.timedelta>}. Note that 'sigma' parameter is useless now, and will be removed soon,
-
     delta_t = None, # Sampling period of the satellite (in s), used for computing geostrophic current 
 
     velocity = None # Velocity of the satellite (in m/s), used for computing geostrophic current 
@@ -815,10 +749,6 @@ OBS_SSH_SWATH = dict(
     path_err = None, # path of error file 
 
     name_var_err = None, # dictionary of error coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
-    
-    nudging_params_ssh = None, # dictionary of nudging parameters on SSH {'sigma':<float>,'K':<float>,'Tau':<datetime.timedelta>}. Note that *sigma* parameter is useless now, and will be removed soon
-
-    nudging_params_relvort = None, # dictionary of nudging parameters on Relative Vorticity {'sigma':<float>,'K':<float>,'Tau':<datetime.timedelta>}. Note that *sigma* parameter is useless now, and will be removed soon
     
 )
 
@@ -998,8 +928,6 @@ BASIS_BMaux = dict(
 
     facQ = 1, # factor to be multiplied to the estimated Q
 
-    facQ_aux_path = None,
-
     l_largescale = 500, # factor to be multiplied to the estimated Q
 
     facQ_largescale = 1, # factor to be multiplied to the estimated Q
@@ -1071,8 +999,6 @@ INV_4DVAR = dict(
     plot_state_during_minimization = False, # Opt in to costly device-to-host state plots from cost evaluations
 
     print_time = False, # Whether to print the time taken for each iteration, split by model, obs operator and gradient computation
-
-    JAX_mem_fraction = None,
 
     cost_float64 = True, # Accumulate cost/control terms in float64 while model kernels may stay float32
 
@@ -1224,10 +1150,6 @@ DIAG_OSE = dict(
 
     name_var_mdt = None,
     
-    delta_t_ref = None, # s
-
-    velocity_ref = None, # km/s
-
     lenght_scale = 1000, # km
 
     nb_min_obs = 10,

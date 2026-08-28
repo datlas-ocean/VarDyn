@@ -25,8 +25,36 @@ The shallow-water layer thickness used by a Balanced Motion component.
 _Avoid_: Bathymetry, ocean depth, topographic depth
 
 **Physical Reduced-Gravity Layer Depth**:
-The reference thickness of the active layer in a physical reduced-gravity shallow-water model; together with Reduced Gravity it determines the first-baroclinic wave speed. For the current one-layer implementation, it is 80 m and Reduced Gravity is diagnosed as c1²/H.
+The reference thickness of the active layer in a physical reduced-gravity shallow-water model; together with Reduced Gravity it determines the first-baroclinic wave speed. It is configured and diagnosed in metres.
 _Avoid_: Equivalent Depth, bathymetry, mixed-layer depth
+
+**Physical Layer-Depth Control**:
+A dimensionless logarithmic Control Vector coordinate that maps a Reference Physical Reduced-Gravity Layer Depth to a positive Controlled Layer Depth in metres.
+_Avoid_: Metre-valued depth correction, additive H anomaly
+
+**Controlled Layer Depth**:
+The positive physical reduced-gravity reference thickness in metres after applying the Physical Layer-Depth Control; it excludes prognostic Interface Displacement.
+_Avoid_: Interface displacement, instantaneous thickness, dimensionless H control
+
+**Instantaneous Layer Thickness**:
+The sum of Controlled Layer Depth and prognostic Interface Displacement, `H_total + eta`, expressed in metres.
+_Avoid_: Controlled layer depth, SSH, mixed-layer depth
+
+**One-Layer Baroclinic QGSW**:
+The public MOD_QGSW representation: one physical reduced-gravity layer advanced by shallow-water dynamics, with no QG, Ekman, MLD, slab, or layer-role configuration.
+_Avoid_: QGSW QG mode, modal layer stack, Ekman–barocline model
+
+**Generic Multilayer SW Core**:
+The internal layer-indexed shallow-water implementation retained for future extensions; it supports multiple physical layers and passive tracers without exposing Ekman, MLD, or layer-role semantics through MOD_QGSW.
+_Avoid_: Public multilayer MOD_QGSW configuration, physical layer-role stack
+
+**Wind-Forcing Depth**:
+The positive depth used to convert wind stress to acceleration: Controlled Layer Depth, a prescribed `h_wind`, or Instantaneous Layer Thickness according to one exclusive configuration choice.
+_Avoid_: Implicit wind-depth fallback, mixed-layer depth by assumption
+
+**Layer-Resolved Passive Tracer Content**:
+The conservative tracer coordinate `Q_k = (H_total,k + eta_k) C_k` advanced independently in each Generic Multilayer SW Core layer.
+_Avoid_: Bare concentration tendency, upper-layer MLD aggregate
 
 **Layer-Resolved Depth Controls**:
 Positive controls of the physical Ekman, total mixed-layer, and first-baroclinic
@@ -62,6 +90,19 @@ _Avoid_: Barotropic speed, arbitrary constant wave speed
 The reference reduced-gravity field remains fixed while Layer-Resolved Depth
 Controls change the layer depths and therefore the modal dynamics.
 _Avoid_: Gravity compensation, fixed wave speed under depth control
+
+**Reduced-Gravity Control**:
+A dimensionless logarithmic Control Vector coordinate that maps Reference
+Reduced Gravity to a positive spatially varying Controlled Reduced Gravity.
+It is static during a forward integration; phase speed is diagnosed as
+`sqrt(Controlled Reduced Gravity * Controlled Layer Depth)`.
+_Avoid_: Advected density, additive reduced-gravity anomaly, independent phase-speed control
+
+**Reference Reduced Gravity**:
+The positive reduced-gravity field before inversion. It is configured directly
+or diagnosed from Reference First-Baroclinic Speed and Reference Physical
+Reduced-Gravity Layer Depth through `g_prime = c1**2 / H`.
+_Avoid_: Physical gravity, time-evolving density, controlled reduced gravity
 
 **Diagnosed Modal Fields**:
 The derived Interface Amplification Factor and the two modal wave-speed fields

@@ -1106,7 +1106,6 @@ class _Basis_bmaux:
         self.tdecmax = config.BASIS.tdecmax
         self.factdec = config.BASIS.factdec
         self.facQ = config.BASIS.facQ
-        self.facQ_aux_path = config.BASIS.facQ_aux_path
         self.l_largescale = config.BASIS.l_largescale
         self.facQ_largescale = config.BASIS.facQ_largescale
         self.name_mod_var = config.BASIS.name_mod_var
@@ -2875,4 +2874,3 @@ def test_operg(Basis,t=0):
     ps2 = np.inner(Basis.operg(psi,t).flatten(),phi.flatten())
         
     print(f'test G[{t}]:', ps1/ps2)
-
