@@ -210,6 +210,11 @@ PREPARE_ARGS="\
 # -------------------- ENVIRONMENT --------------------
 source /home/il/${USER}/.bashrc
 conda activate MASSHv2
+
+# Configure GPU allocation before any Python process imports JAX/XLA.
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export TF_GPU_ALLOCATOR=cuda_malloc_async
+
 # Derive source and library paths from MASH_DIR (set in USER SETTINGS above).
 # readlink -f "$0" is intentionally avoided: SLURM copies the script to
 # /var/spool/slurmd/jobXXX/slurm_script before execution, making $0 useless.
