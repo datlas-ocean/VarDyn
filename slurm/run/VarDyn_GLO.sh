@@ -69,6 +69,15 @@ FLAG_INIT="${FLAG_INIT:-false}"
 FLAG_BACKGROUND="${FLAG_BACKGROUND:-false}"
 NAME_EXP="${NAME_EXP:-}"
 
+if ! [[ "$NUM_MERGE_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NUM_MERGE_WORKERS must be a positive integer (got '$NUM_MERGE_WORKERS')" >&2
+    exit 1
+fi
+if ! [[ "$NUM_TILES_PER_GPU" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NUM_TILES_PER_GPU must be a positive integer (got '$NUM_TILES_PER_GPU')" >&2
+    exit 1
+fi
+
 # -------------------- USER INPUT (optional CLI flags) --------------------
 # Parse optional flags
 SKIP_PREPARE=false
@@ -250,6 +259,10 @@ echo " Start time: $(date)"
 echo " Python: $(which python)"
 echo " CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo " Memory: $(ulimit -v 2>/dev/null || echo N/A)"
+echo " SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-N/A}"
+echo " SLURM_CPUS_ON_NODE=${SLURM_CPUS_ON_NODE:-N/A}"
+echo " NUM_MERGE_WORKERS=${NUM_MERGE_WORKERS}"
+echo " NUM_TILES_PER_GPU=${NUM_TILES_PER_GPU}"
 echo "=========================================="
 if [ -n "$RESTART" ] && [ -f "$FINAL_MARKER" ]; then
     rm -f "$FINAL_MARKER"
@@ -441,8 +454,8 @@ for TIME_DIR in $TIME_WINDOWS; do
 
     # Each task dynamically claims tiles (first to mkdir wins)
     if ! $MERGE_ONLY; then
-        running=0
         tiles_done=0
+        tile_pids=()
         while IFS= read -r TILE; do
             [ -z "$TILE" ] && continue
 
@@ -450,15 +463,21 @@ for TIME_DIR in $TIME_WINDOWS; do
             try_claim_tile "$TILE" || continue
 
             run_single_tile "$TILE" "$IW" &
-            ((running++))
+            tile_pids+=("$!")
             ((tiles_done++))
+            echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Active tiles: ${#tile_pids[@]}/${NUM_TILES_PER_GPU}"
 
-            if (( running >= NUM_TILES_PER_GPU )); then
-                wait -n
-                ((running--))
+            # Wait for a PID that belongs to this tile queue.  An unscoped
+            # `wait -n` can be satisfied by another child of the launcher and
+            # decrement the counter while every tile is still running.
+            if (( ${#tile_pids[@]} >= NUM_TILES_PER_GPU )); then
+                wait "${tile_pids[0]}"
+                tile_pids=("${tile_pids[@]:1}")
             fi
         done < "$TILE_LIST"
-        wait
+        for tile_pid in "${tile_pids[@]}"; do
+            wait "$tile_pid"
+        done
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Processed ${tiles_done} tiles in time window ${IW}"
     else
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Skipping assimilation (--merge-only)"
