@@ -37,7 +37,9 @@ dependencies = [
     "jaxparrow", 
     "ipykernel",
     "joblib", 
-    "numpy_groupies"
+    "numpy_groupies",
+    "zarr<3",
+    "numcodecs"
 ]
 dynamic = ["version"]
 

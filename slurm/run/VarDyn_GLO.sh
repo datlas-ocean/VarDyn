@@ -63,6 +63,10 @@ NUM_MERGE_WORKERS="${NUM_MERGE_WORKERS:-4}"
 NUM_TILES_PER_GPU="${NUM_TILES_PER_GPU:-4}"
 ZARR_OUTPUT="${ZARR_OUTPUT:-false}"
 OUTPUT_FLOAT64="${OUTPUT_FLOAT64:-false}"
+CLEANUP_TILE_ZARR="${CLEANUP_TILE_ZARR:-true}"
+ZARR_TIME_CHUNK="${ZARR_TIME_CHUNK:-4}"
+ZARR_SPATIAL_CHUNK="${ZARR_SPATIAL_CHUNK:-256}"
+ZARR_COMPRESSION_LEVEL="${ZARR_COMPRESSION_LEVEL:-3}"
 BARRIER_TIMEOUT="${BARRIER_TIMEOUT:-7200}"
 FLAG_INIT_FROM_PREVIOUS="${FLAG_INIT_FROM_PREVIOUS:---flag_init_from_previous}"
 FLAG_INIT="${FLAG_INIT:-false}"
@@ -77,6 +81,20 @@ if ! [[ "$NUM_TILES_PER_GPU" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: NUM_TILES_PER_GPU must be a positive integer (got '$NUM_TILES_PER_GPU')" >&2
     exit 1
 fi
+if [ "$CLEANUP_TILE_ZARR" != "true" ] && \
+   [ "$CLEANUP_TILE_ZARR" != "false" ]; then
+    echo "ERROR: CLEANUP_TILE_ZARR must be true or false (got '$CLEANUP_TILE_ZARR')" >&2
+    exit 1
+fi
+if ! [[ "$ZARR_TIME_CHUNK" =~ ^[1-9][0-9]*$ ]] || \
+   ! [[ "$ZARR_SPATIAL_CHUNK" =~ ^[1-9][0-9]*$ ]] || \
+   ! [[ "$ZARR_COMPRESSION_LEVEL" =~ ^[0-9]$ ]]; then
+    echo "ERROR: invalid Zarr chunk/compression settings" >&2
+    exit 1
+fi
+export VARDYN_ZARR_TIME_CHUNK="$ZARR_TIME_CHUNK"
+export VARDYN_ZARR_SPATIAL_CHUNK="$ZARR_SPATIAL_CHUNK"
+export VARDYN_ZARR_COMPRESSION_LEVEL="$ZARR_COMPRESSION_LEVEL"
 
 # -------------------- USER INPUT (optional CLI flags) --------------------
 # Parse optional flags
@@ -263,6 +281,8 @@ echo " SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-N/A}"
 echo " SLURM_CPUS_ON_NODE=${SLURM_CPUS_ON_NODE:-N/A}"
 echo " NUM_MERGE_WORKERS=${NUM_MERGE_WORKERS}"
 echo " NUM_TILES_PER_GPU=${NUM_TILES_PER_GPU}"
+echo " CLEANUP_TILE_ZARR=${CLEANUP_TILE_ZARR}"
+echo " ZARR chunks=${ZARR_TIME_CHUNK}x${ZARR_SPATIAL_CHUNK}x${ZARR_SPATIAL_CHUNK}, zstd level=${ZARR_COMPRESSION_LEVEL}"
 echo "=========================================="
 if [ -n "$RESTART" ] && [ -f "$FINAL_MARKER" ]; then
     rm -f "$FINAL_MARKER"
@@ -497,8 +517,10 @@ for TIME_DIR in $TIME_WINDOWS; do
 
     ZARR_OUTPUT_ARG=""
     OUTPUT_FLOAT64_ARG=""
+    CLEANUP_TILE_ZARR_ARG=""
     $ZARR_OUTPUT && ZARR_OUTPUT_ARG="--zarr_output"
     $OUTPUT_FLOAT64 && OUTPUT_FLOAT64_ARG="--output_float64"
+    $CLEANUP_TILE_ZARR && CLEANUP_TILE_ZARR_ARG="--cleanup_tile_zarr"
     MERGE_MARKER="${BARRIER_DIR}/spatial_merge_iw${IW}.ok"
     MERGE_FAILED="${BARRIER_DIR}/spatial_merge_iw${IW}.failed"
 
@@ -555,7 +577,7 @@ for TIME_DIR in $TIME_WINDOWS; do
                 --rank 0 \
                 --world "$NUM_ARRAY" \
                 --finalize_spatial_parts \
-                $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG; then
+                $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG $CLEANUP_TILE_ZARR_ARG; then
                 touch "$MERGE_MARKER"
                 OWNED_STAGE_LOCK=""
                 echo "$(date '+%F %T') | Spatial merge done for time window ${IW}"
@@ -614,7 +636,7 @@ if mkdir "${BARRIER_DIR}/final_merge.lock" 2>/dev/null; then
         --num_workers "$NUM_MERGE_WORKERS" \
         --skip_spatial_merge \
         --merge_time_windows \
-        $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG; then
+        $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG $CLEANUP_TILE_ZARR_ARG; then
         tmp_marker="${FINAL_MARKER}.tmp-${SLURM_JOB_ID:-$$}"
         printf 'Experiment completed: %s\n' "$(date -Is)" > "$tmp_marker"
         mv -f "$tmp_marker" "$FINAL_MARKER"

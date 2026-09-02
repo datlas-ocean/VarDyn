@@ -73,6 +73,10 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 | `BARRIER_TIMEOUT` | Seconds to wait for incomplete assimilation tiles |
 | `ZARR_OUTPUT` | If this shell option or `EXP.saveoutputs_zarr` is `true`, store each merged temporal window in one Zarr archive and the final experiment in one global Zarr archive |
 | `OUTPUT_FLOAT64` | If `true`, save merged floating-point data as float64; otherwise float32 (default: false) |
+| `CLEANUP_TILE_ZARR` | If `true` (default), compact validated tile trajectories to the single record needed to restart the following window |
+| `ZARR_TIME_CHUNK` | Number of time records per Zarr chunk (default: 4) |
+| `ZARR_SPATIAL_CHUNK` | Maximum size of each spatial Zarr chunk dimension (default: 256) |
+| `ZARR_COMPRESSION_LEVEL` | Zstd compression level from 0 to 9 (default: 3); bitshuffle is always enabled |
 
 **CLI flags** (passed after the script name):
 
@@ -118,6 +122,12 @@ Loads one `subwindow_<space>` pickle directory and runs the full MASSH assimilat
 Two-stage merge:
 1. **Spatial merge**: distributes timestamp shards over dynamically claimed ranks. Each rank uses `NUM_MERGE_WORKERS` CPU processes and writes an independent temporary Zarr archive; the validated parts are then atomically assembled into one `<name_exp>.zarr` archive for the temporal window.
 2. **Time-window merge** (one task only): combines spatial merges across all time windows and validates every expected timestamp.
+
+New Zarr stores use explicit Zstd/bitshuffle compression and configurable
+time/spatial chunks. After the next window has completed and the current
+spatial merge is validated, complete per-tile trajectories from the previous
+window are atomically replaced by one-record restart checkpoints. The final
+window is compacted after validation of the global archive.
 
 ## Usage example
 

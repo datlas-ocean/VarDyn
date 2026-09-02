@@ -66,6 +66,95 @@ def _remove_legacy_dated_outputs(config, dates, root):
             nc_path.unlink()
 
 
+def _compact_tile_zarr_trajectories(
+        config, window_middle, checkpoint_date, list_tile_paths):
+    """Replace each tile trajectory with its one-record restart checkpoint.
+
+    Spatial merging needs the complete trajectory, while the following time
+    window only needs its start date. Compaction therefore happens only after
+    the spatial window has been validated and its successor has completed.
+    """
+    if not list_tile_paths:
+        log('No tile paths available; skipping tile trajectory compaction')
+        return
+
+    window_root = (
+        Path(config.EXP.path_save) /
+        f'subwindow_{str(window_middle)[:10]}')
+    checkpoint_time = pd.Timestamp(checkpoint_date)
+    compacted = 0
+    already_compact = 0
+    missing = 0
+
+    for tile_pickle_path in list_tile_paths:
+        tile_name = Path(tile_pickle_path).name
+        tile_root = window_root / tile_name
+        archive = tile_root / f'{config.EXP.name_exp_save}.zarr'
+        if not archive.exists():
+            # All-land tiles legitimately produce no trajectory.
+            missing += 1
+            continue
+
+        temporary = tile_root / (
+            f'.{config.EXP.name_exp_save}.checkpoint-{os.getpid()}.zarr')
+        temporary_lock = Path(f'{temporary}.lock')
+        backup = tile_root / (
+            f'.{config.EXP.name_exp_save}.trajectory-{os.getpid()}.zarr')
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        if backup.exists():
+            shutil.rmtree(backup)
+
+        with xr.open_zarr(archive, consolidated=False) as dataset:
+            times = pd.DatetimeIndex(pd.to_datetime(dataset.time.values))
+            indexes = np.flatnonzero(times == checkpoint_time)
+            if indexes.size == 0:
+                raise RuntimeError(
+                    f'Tile restart checkpoint {checkpoint_time} is missing '
+                    f'from {archive}')
+            if dataset.sizes.get('time', 0) == 1:
+                already_compact += 1
+                continue
+            record = dataset.isel(
+                time=slice(int(indexes[-1]), int(indexes[-1]) + 1)).load()
+
+        try:
+            state.State._save_zarr_record(
+                record, str(temporary), checkpoint_time,
+                window_start=checkpoint_time, window_end=checkpoint_time)
+            with xr.open_zarr(temporary, consolidated=False) as checkpoint:
+                checkpoint_times = pd.DatetimeIndex(
+                    pd.to_datetime(checkpoint.time.values))
+                if (checkpoint.sizes.get('time', 0) != 1
+                        or checkpoint_times[0] != checkpoint_time):
+                    raise RuntimeError(
+                        f'Invalid compacted tile checkpoint: {temporary}')
+            _consolidate_zarr_metadata(temporary)
+
+            os.replace(archive, backup)
+            try:
+                os.replace(temporary, archive)
+            except Exception:
+                if not archive.exists():
+                    os.replace(backup, archive)
+                raise
+            else:
+                shutil.rmtree(backup)
+                compacted += 1
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            if temporary_lock.exists():
+                temporary_lock.unlink()
+            if backup.exists() and archive.exists():
+                shutil.rmtree(backup)
+
+    log(
+        f'Compacted tile trajectories for window {window_middle}: '
+        f'{compacted} compacted, {already_compact} already compact, '
+        f'{missing} absent/all-land')
+
+
 def _consolidate_dated_outputs_to_zarr(
         config, dates, root, output_dtype, window_start, window_end):
     """Move legacy per-date products into one time-window Zarr archive."""
@@ -338,6 +427,7 @@ def merge_outputs(
     finalize_spatial_parts=False,
     zarr_output=False,
     output_float64=False,
+    cleanup_tile_zarr=False,
 ):
     log(f"Loading configuration from {path_config}")
     with open(path_config, "rb") as f:
@@ -410,6 +500,13 @@ def merge_outputs(
                 _finalize_spatial_zarr_parts(
                     config0, all_window_dates, canonical_root, world,
                     output_dtype, force=force)
+                if cleanup_tile_zarr and iw > 0:
+                    _compact_tile_zarr_trajectories(
+                        config,
+                        list_date_middle[iw - 1],
+                        list_date_start[iw],
+                        list_tile_paths,
+                    )
                 continue
 
             dates_window = all_window_dates
@@ -532,6 +629,16 @@ def merge_outputs(
         if zarr_output:
             _remove_legacy_dated_outputs(
                 config, final_dates, config.EXP.path_save)
+            if cleanup_tile_zarr:
+                # Make the operation idempotent and cover merge-only/recovery
+                # runs where progressive compaction may not have happened.
+                for iw, middle in enumerate(list_date_middle):
+                    checkpoint_date = (
+                        list_date_start[iw + 1]
+                        if iw + 1 < len(list_date_start)
+                        else list_date_end[iw])
+                    _compact_tile_zarr_trajectories(
+                        config, middle, checkpoint_date, list_tile_paths)
     else:
         log("Skipping final time-window merge")
 
@@ -589,6 +696,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--zarr_output", action="store_true", help="Use Zarr for merged outputs and remove intermediate NetCDF files")
     parser.add_argument("--output_float64", action="store_true", help="Save merged floating-point data as float64 (default: float32)")
+    parser.add_argument(
+        "--cleanup_tile_zarr",
+        action="store_true",
+        help=("After validated merges, replace complete tile Zarr trajectories "
+              "with one-record restart checkpoints"),
+    )
 
     args = parser.parse_args()
 
@@ -611,5 +724,6 @@ if __name__ == "__main__":
         finalize_spatial_parts=args.finalize_spatial_parts,
         zarr_output=args.zarr_output,
         output_float64=args.output_float64,
+        cleanup_tile_zarr=args.cleanup_tile_zarr,
     )
     log("Merge finished successfully")

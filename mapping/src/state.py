@@ -22,6 +22,11 @@ from .config import USE_FLOAT64
 
 
 _ZARR_TIME_UNITS = 'nanoseconds since 1970-01-01'
+_ZARR_TIME_CHUNK = max(1, int(os.environ.get('VARDYN_ZARR_TIME_CHUNK', '4')))
+_ZARR_SPATIAL_CHUNK = max(
+    1, int(os.environ.get('VARDYN_ZARR_SPATIAL_CHUNK', '256')))
+_ZARR_COMPRESSION_LEVEL = min(
+    9, max(0, int(os.environ.get('VARDYN_ZARR_COMPRESSION_LEVEL', '3'))))
 
 
 def _set_zarr_time_encoding(dataset):
@@ -32,6 +37,50 @@ def _set_zarr_time_encoding(dataset):
             'calendar': 'proleptic_gregorian',
             'dtype': 'int64',
         })
+
+
+def _zarr_encoding(dataset):
+    """Return one explicit, space-efficient encoding for new Zarr v2 stores."""
+    try:
+        from numcodecs import Blosc
+    except ImportError as exc:
+        raise RuntimeError(
+            'Zarr output compression requires the numcodecs package') from exc
+
+    compressor = Blosc(
+        cname='zstd',
+        clevel=_ZARR_COMPRESSION_LEVEL,
+        shuffle=Blosc.BITSHUFFLE,
+    )
+    encoding = {}
+    for name, variable in dataset.variables.items():
+        if variable.ndim == 0:
+            continue
+        chunks = []
+        for dim, size in zip(variable.dims, variable.shape):
+            if dim == 'time':
+                # A new archive initially contains one record. Keeping the
+                # configured chunk larger than that lets later appends share
+                # chunks and exploit temporal coherence.
+                chunks.append(_ZARR_TIME_CHUNK)
+            else:
+                chunks.append(max(
+                    1, min(int(size), _ZARR_SPATIAL_CHUNK)))
+        item = {'chunks': tuple(chunks)}
+        if variable.dtype.kind not in {'O', 'U'}:
+            item['compressor'] = compressor
+        encoding[name] = item
+    return encoding
+
+
+def _write_new_zarr(dataset, filename):
+    """Create a compressed Zarr v2 store with deterministic chunk sizes."""
+    dataset.to_zarr(
+        filename,
+        mode='w',
+        encoding=_zarr_encoding(dataset),
+        zarr_version=2,
+    )
 
 
 def _is_jax_array(value):
@@ -382,7 +431,8 @@ class State:
         save_zarr = bool(getattr(self.config.EXP, 'saveoutputs_zarr', False))
         if save_zarr:
             filename = os.path.join(self.path_save, f'{self.name_exp_save}.zarr')
-            dtype = np.float64 if USE_FLOAT64 else np.float32
+            if dtype is None:
+                dtype = np.float64 if USE_FLOAT64 else np.float32
         else:
             filename = os.path.join(self.path_save,f'{self.name_exp_save}'\
                 f'_y{date.year}'\
@@ -547,7 +597,7 @@ class State:
                 f'[{start}, {end}]')
         _set_zarr_time_encoding(record)
         if not os.path.exists(filename):
-            record.to_zarr(filename, mode='w')
+            _write_new_zarr(record, filename)
             record.close()
             return
 
@@ -675,7 +725,7 @@ class State:
         _set_zarr_time_encoding(combined)
         if os.path.exists(temporary):
             shutil.rmtree(temporary)
-        combined.to_zarr(temporary, mode='w')
+        _write_new_zarr(combined, temporary)
         combined.close()
         existing.close()
         record.close()
