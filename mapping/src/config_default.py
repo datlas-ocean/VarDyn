@@ -810,6 +810,8 @@ BASIS_OFFSET = dict(
 
     name_mod_var = None, # String or list of model parameter names sharing this basis
 
+    use_state_background = False, # Add this parameter's State.params restart field as a constant background
+
     sigma_B = None, 
 
 )
@@ -820,6 +822,8 @@ BASIS_GAUSS2D = dict(
     super = 'BASIS_GAUSS2D',
 
     name_mod_var = '', # String or list of related model parameter names
+
+    use_state_background = False, # Add this parameter's State.params restart field as a constant background
 
     c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 
@@ -852,6 +856,8 @@ BASIS_GAUSS2D = dict(
 BASIS_GAUSS3D = dict(
 
     name_mod_var = '', # String or list of related model parameter names 
+
+    use_state_background = False, # Add this parameter's State.params restart field as a constant background
 
     c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 
@@ -895,6 +901,8 @@ BASIS_GAUSS3D = dict(
 BASIS_BMaux = dict(
 
     name_mod_var = None, # String or list of related model parameter names 
+
+    use_state_background = False, # Add this parameter's State.params restart field as a constant background
 
     c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 

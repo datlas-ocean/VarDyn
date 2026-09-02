@@ -36,9 +36,65 @@ def _primary_name(name_mod_var):
 def _assign_to_state_names(obj, State, value):
     for name in _as_name_list(obj.name_mod_var):
         if not obj.multi_mode:
-            State[name] = value
+            background = getattr(obj, 'parameter_background', {}).get(name)
+            State[name] = value if background is None else background + value
         else:
             State[name] += value
+
+
+def _controlled_model_parameter_names(config):
+    """Return controlled model-parameter names for simple or nested models."""
+    mod_config = getattr(config, 'MOD', None)
+    controlled = set()
+    if mod_config is None:
+        return controlled
+    if 'super' in mod_config:
+        controlled.update(getattr(mod_config, 'name_params', None) or [])
+    else:
+        for model_name in mod_config:
+            model_config = mod_config[model_name]
+            controlled.update(getattr(model_config, 'name_params', None) or [])
+    return controlled
+
+
+def _configure_state_background(obj, config):
+    """Attach the per-basis state-background policy to a basis component."""
+    obj.use_state_background = bool(
+        getattr(config.BASIS, 'use_state_background', False))
+    obj.parameter_background = {}
+    if not obj.use_state_background:
+        return obj
+    if not hasattr(obj, 'name_mod_var') or obj.name_mod_var is None:
+        raise ValueError(
+            'use_state_background=True requires a basis with name_mod_var.')
+    names = set(_as_name_list(obj.name_mod_var))
+    unknown = names - _controlled_model_parameter_names(config)
+    if unknown:
+        raise ValueError(
+            'use_state_background=True is valid only for controlled model '
+            f'parameters; got {sorted(unknown)}.')
+    return obj
+
+
+class _StateBackgroundMixin:
+    """Capture a constant control-space background for a direct basis."""
+
+    def capture_state_background(self, State):
+        if not getattr(self, 'use_state_background', False):
+            self.parameter_background = {}
+            return
+        if State is None:
+            raise ValueError(
+                'State is required when use_state_background=True.')
+        names = _as_name_list(self.name_mod_var)
+        missing = [name for name in names if name not in State.params]
+        if missing:
+            raise ValueError(
+                'State backgrounds are missing from State.params: '
+                f'{missing}.')
+        self.parameter_background = {
+            name: jnp.asarray(State.params[name]).copy() for name in names
+        }
 
 
 def _ensure_adstate_names(obj, adState, zero):
@@ -82,22 +138,24 @@ def Basis(config, State, verbose=True, multi_mode=False, *args, **kwargs):
             print(config.BASIS)
 
         if config.BASIS.super=='BASIS_GAUSS3D':
-            return Basis_gauss3d(config,State,multi_mode=multi_mode)
+            basis_obj = Basis_gauss3d(config,State,multi_mode=multi_mode)
 
         elif config.BASIS.super=='BASIS_GAUSS2D':
-            return Basis_gauss2d(config,State,multi_mode=multi_mode)
+            basis_obj = Basis_gauss2d(config,State,multi_mode=multi_mode)
 
         elif config.BASIS.super=='BASIS_BMaux':
-            return Basis_bmaux(config,State,multi_mode=multi_mode)
+            basis_obj = Basis_bmaux(config,State,multi_mode=multi_mode)
 
         elif config.BASIS.super == 'BASIS_OFFSET':
-            return Basis_offset(config,State,multi_mode=multi_mode)
+            basis_obj = Basis_offset(config,State,multi_mode=multi_mode)
         
         elif config.BASIS.super == 'BASIS_HBC':
-            return Basis_hbc(config,State)
+            basis_obj = Basis_hbc(config,State)
 
         else:
             sys.exit(config.BASIS.super + ' not implemented yet')
+
+        return _configure_state_background(basis_obj, config)
 
  
 ###############################################################################
@@ -505,7 +563,7 @@ class _Basis_gauss3d:
 
         return adX
  
-class Basis_gauss3d(_Basis_gauss3d):
+class Basis_gauss3d(_StateBackgroundMixin, _Basis_gauss3d):
 
     def __init__(self,config, State, multi_mode=False):
         super().__init__(config, State,multi_mode=multi_mode)
@@ -516,6 +574,7 @@ class Basis_gauss3d(_Basis_gauss3d):
         self._ssh2uv_jit = jit(self._ssh2uv)
         
     def set_basis(self,time,return_q=False,**kwargs):
+        self.capture_state_background(kwargs.get('State'))
         res = super().set_basis(time,return_q=return_q,**kwargs)
 
         self.time = time
@@ -983,7 +1042,7 @@ class _Basis_gauss2d:
 
         return adX
 
-class Basis_gauss2d(_Basis_gauss2d):
+class Basis_gauss2d(_StateBackgroundMixin, _Basis_gauss2d):
     """JAX-differentiable version of :class:`Basis_gauss2d`."""
 
     def __init__(self, config, State, multi_mode=False):
@@ -994,6 +1053,7 @@ class Basis_gauss2d(_Basis_gauss2d):
         self._ssh2uv_jit = jit(self._ssh2uv)
 
     def set_basis(self, time, return_q=False, **kwargs):
+        self.capture_state_background(kwargs.get('State'))
         res = super().set_basis(time, return_q=return_q, **kwargs)
         self.zero_basis = jnp.zeros((self.nbasis,))
         self.zero_phys = jnp.zeros((self.nphys,))
@@ -1801,7 +1861,7 @@ class _Basis_bmaux:
         
         return adX
 
-class Basis_bmaux(_Basis_bmaux):
+class Basis_bmaux(_StateBackgroundMixin, _Basis_bmaux):
 
     def __init__(self, config, State, multi_mode=False):
         super().__init__(config, State, multi_mode=multi_mode)
@@ -1814,6 +1874,7 @@ class Basis_bmaux(_Basis_bmaux):
 
 
     def set_basis(self,time,return_q=False,**kwargs):
+        self.capture_state_background(kwargs.get('State'))
         res = super().set_basis(time,return_q=return_q,**kwargs)
         self.time = time
         self.vect_time = jnp.eye(time.size)
@@ -2719,11 +2780,15 @@ class _Basis_offset:
         
         return adX
 
-class Basis_offset(_Basis_offset):
+class Basis_offset(_StateBackgroundMixin, _Basis_offset):
    
     def __init__(self,config, State, multi_mode=False):
 
         super().__init__(config, State,multi_mode=multi_mode)
+
+    def set_basis(self, time, return_q=False, **kwargs):
+        self.capture_state_background(kwargs.get('State'))
+        return super().set_basis(time, return_q=return_q, **kwargs)
     
     def operg(self,t,X,State=None):
 
@@ -2787,8 +2852,45 @@ class Basis_multi:
                     if 'name_mod_v' in _config.BASIS and _config.BASIS.name_mod_v is not None and _config.BASIS.name_mod_v not in self.name_mod_var:
                         self.name_mod_var.append(_config.BASIS.name_mod_v)
 
-        
-    def set_basis(self,time,return_q=False,**kwargs):
+        background_policy = {}
+        for component in self.Basis:
+            targets = (_as_name_list(component.name_mod_var)
+                       if hasattr(component, 'name_mod_var')
+                       and component.name_mod_var is not None else [])
+            for name in targets:
+                enabled = bool(getattr(
+                    component, 'use_state_background', False))
+                if name in background_policy and background_policy[name] != enabled:
+                    raise ValueError(
+                        'All basis components targeting the same variable must '
+                        'use the same use_state_background value; conflicting '
+                        f'configuration for {name!r}.')
+                background_policy[name] = enabled
+        self.state_background_names = tuple(
+            name for name, enabled in background_policy.items() if enabled)
+        self.parameter_background = {}
+
+
+    def set_basis(self,time,return_q=False,State=None,**kwargs):
+
+        if self.state_background_names:
+            if State is None:
+                raise ValueError(
+                    'State is required when a basis uses its state background.')
+            missing_state = [
+                name for name in self.state_background_names
+                if name not in State.params
+            ]
+            if missing_state:
+                raise ValueError(
+                    'Persistent parameter backgrounds are missing from '
+                    f'State.params: {missing_state}.')
+            # Snapshot once, before any basis projection.  These arrays are
+            # constants for the current variational window: p = p_b + G x.
+            self.parameter_background = {
+                name: jnp.asarray(State.params[name]).copy()
+                for name in self.state_background_names
+            }
 
         self.nbasis = 0
         self.slice_basis = []
@@ -2798,7 +2900,8 @@ class Basis_multi:
             Q = np.array([])
 
         results = [
-            component.set_basis(time, return_q=return_q, **kwargs)
+            component.set_basis(
+                time, return_q=return_q, State=State, **kwargs)
             for component in self.Basis
         ]
 
@@ -2826,7 +2929,10 @@ class Basis_multi:
 
         if State is not None:
             for name_mod_var in self.name_mod_var:
-                State[name_mod_var] *= 0.
+                if name_mod_var in self.parameter_background:
+                    State[name_mod_var] = self.parameter_background[name_mod_var]
+                else:
+                    State[name_mod_var] = jnp.zeros_like(State[name_mod_var])
 
         for i,B in enumerate(self.Basis):
             _X = X[self.slice_basis[i]]
