@@ -17,16 +17,43 @@ import numpy as np
 from src import tools as grid
 import pickle
 import matplotlib.pylab as plt
-from scipy.interpolate import griddata
-from scipy.sparse import csc_matrix
+from scipy.interpolate import CloughTocher2DInterpolator, griddata
+from scipy.sparse import csc_matrix, csr_matrix
 from scipy.spatial.distance import cdist
-from scipy.spatial import KDTree
+from scipy.spatial import cKDTree, Delaunay, KDTree
 import pyinterp
 import jax.numpy as jnp 
 from jax import jit
 import jax
 
 jax.config.update("jax_enable_x64", USE_FLOAT64)
+
+
+def _linear_barycentric_weights(source_coords, target_coords):
+    """Return a sparse linear-interpolation operator for fixed 2-D grids."""
+    triangulation = Delaunay(source_coords)
+    simplex = triangulation.find_simplex(target_coords)
+    inside = simplex >= 0
+
+    target_inside = target_coords[inside]
+    simplex_inside = simplex[inside]
+    transforms = triangulation.transform[simplex_inside]
+    first_weights = np.einsum(
+        'nij,nj->ni',
+        transforms[:, :2, :],
+        target_inside - transforms[:, 2, :],
+    )
+    barycentric = np.column_stack(
+        (first_weights, 1.0 - first_weights.sum(axis=1))
+    )
+
+    rows = np.repeat(np.flatnonzero(inside), 3)
+    columns = triangulation.simplices[simplex_inside].ravel()
+    weights = csr_matrix(
+        (barycentric.ravel(), (rows, columns)),
+        shape=(target_coords.shape[0], source_coords.shape[0]),
+    )
+    return weights, ~inside
 
 
 def _open_obs_file(path, _retries=4, _sleep=0.5):
@@ -678,6 +705,17 @@ class Obsop_interp_l4(Obsop_interp):
         self._misfit_reduced_jit = jit(self._misfit_reduced)
         self._misfit_jit = jit(self._misfit)
 
+        # Filled from the first processed date. Source coordinates are checked
+        # exactly at runtime before any geometry-dependent mapping is reused.
+        self._interp_source_coords = None
+        self._linear_weights = None
+        self._linear_outside_hull = None
+        self._nearest_source_indices = None
+        self._cubic_triangulation = None
+        self._block_source_cells = None
+        self._block_coord_valid = None
+        self._block_target_tree = None
+
         self.flag_plot = config.EXP.flag_plot
 
     def process_obs(self, var_bc=None):
@@ -865,19 +903,39 @@ class Obsop_interp_l4(Obsop_interp):
                 # Grid interpolation: performing spatial interpolation now
                 # Loop on different obs for this date and this variable name
                 _coords_obs = np.column_stack((lon_obs, lat_obs))
+                same_source_grid = (
+                    self._interp_source_coords is not None
+                    and self._interp_source_coords.shape == _coords_obs.shape
+                    and np.array_equal(
+                        self._interp_source_coords,
+                        _coords_obs,
+                        equal_nan=True,
+                    )
+                )
+                if not same_source_grid:
+                    self._interp_source_coords = _coords_obs.copy()
 
                 if self.interp_method=='hybrid':
-                    # We perform first nearest, then linear, and then cubic interpolations
-                    _var_obs_interp = griddata(_coords_obs, var_obs, self.coords_geo, method='nearest')
-                    _err_obs_interp = griddata(_coords_obs, err_obs, self.coords_geo, method='nearest')
-                    _var_obs_interp_linear = griddata(_coords_obs, var_obs, self.coords_geo, method='linear')
-                    _err_obs_interp_linear = griddata(_coords_obs, err_obs, self.coords_geo, method='linear')
-                    _var_obs_interp[~np.isnan(_var_obs_interp_linear)] = _var_obs_interp_linear[~np.isnan(_var_obs_interp_linear)]
-                    _err_obs_interp[~np.isnan(_err_obs_interp_linear)] = _err_obs_interp_linear[~np.isnan(_err_obs_interp_linear)]
-                    _var_obs_interp_cubic = griddata(_coords_obs, var_obs, self.coords_geo, method='cubic')
-                    _err_obs_interp_cubic = griddata(_coords_obs, err_obs, self.coords_geo, method='cubic')
-                    _var_obs_interp[~np.isnan(_var_obs_interp_cubic)] = _var_obs_interp_linear[~np.isnan(_var_obs_interp_cubic)]
-                    _err_obs_interp[~np.isnan(_err_obs_interp_cubic)] = _err_obs_interp_linear[~np.isnan(_err_obs_interp_cubic)]
+                    if not same_source_grid:
+                        self._nearest_source_indices = cKDTree(
+                            _coords_obs
+                        ).query(self.coords_geo)[1]
+                        self._linear_weights, self._linear_outside_hull = (
+                            _linear_barycentric_weights(
+                                _coords_obs, self.coords_geo
+                            )
+                        )
+
+                    source_values = np.column_stack((var_obs, err_obs))
+                    interpolated = source_values[
+                        self._nearest_source_indices
+                    ].copy()
+                    interpolated_linear = self._linear_weights @ source_values
+                    interpolated_linear[self._linear_outside_hull] = np.nan
+                    valid_linear = ~np.isnan(interpolated_linear)
+                    interpolated[valid_linear] = interpolated_linear[valid_linear]
+                    _var_obs_interp = interpolated[:, 0]
+                    _err_obs_interp = interpolated[:, 1]
                 
                 elif self.interp_method == 'block_mean':
                     # Proper L4 swath -> grid projection: assign each obs
@@ -886,11 +944,22 @@ class Obsop_interp_l4(Obsop_interp):
                     # for a constant input (e.g. flat noise field).
                     # Cell-wise error: obs error / sqrt(N_in_cell), assuming
                     # decorrelated per-pixel noise.
-                    _tree = KDTree(self.coords_geo)
-                    _coords_obs = np.column_stack((lon_obs, lat_obs))
-                    _valid = ~(np.isnan(lon_obs) | np.isnan(lat_obs)
-                               | np.isnan(var_obs))
-                    _, _idx = _tree.query(_coords_obs[_valid])
+                    if self._block_target_tree is None:
+                        self._block_target_tree = KDTree(self.coords_geo)
+                    if not same_source_grid:
+                        self._block_coord_valid = ~(
+                            np.isnan(lon_obs) | np.isnan(lat_obs)
+                        )
+                        self._block_source_cells = np.full(
+                            lon_obs.size, -1, dtype=np.intp
+                        )
+                        self._block_source_cells[self._block_coord_valid] = (
+                            self._block_target_tree.query(
+                                _coords_obs[self._block_coord_valid]
+                            )[1]
+                        )
+                    _valid = self._block_coord_valid & ~np.isnan(var_obs)
+                    _idx = self._block_source_cells[_valid]
                     _ncell = self.coords_geo.shape[0]
                     _sum_var = np.bincount(_idx, weights=var_obs[_valid],
                                            minlength=_ncell)
@@ -940,6 +1009,42 @@ class Obsop_interp_l4(Obsop_interp):
 
                     _var_obs_interp = _regrid_unstructured(lon_target_grid,lat_target_grid,lon_obs,lat_obs,var_obs) 
                     _err_obs_interp = _regrid_unstructured(lon_target_grid,lat_target_grid,lon_obs,lat_obs,err_obs) 
+
+                elif self.interp_method == 'nearest':
+                    if not same_source_grid:
+                        self._nearest_source_indices = cKDTree(
+                            _coords_obs
+                        ).query(self.coords_geo)[1]
+                    interpolated = np.column_stack(
+                        (var_obs, err_obs)
+                    )[self._nearest_source_indices]
+                    _var_obs_interp = interpolated[:, 0]
+                    _err_obs_interp = interpolated[:, 1]
+
+                elif self.interp_method == 'linear':
+                    if not same_source_grid:
+                        self._linear_weights, self._linear_outside_hull = (
+                            _linear_barycentric_weights(
+                                _coords_obs, self.coords_geo
+                            )
+                        )
+
+                    interpolated = self._linear_weights @ np.column_stack(
+                        (var_obs, err_obs)
+                    )
+                    interpolated[self._linear_outside_hull] = np.nan
+                    _var_obs_interp = interpolated[:, 0]
+                    _err_obs_interp = interpolated[:, 1]
+
+                elif self.interp_method == 'cubic':
+                    if not same_source_grid:
+                        self._cubic_triangulation = Delaunay(_coords_obs)
+                    interpolated = CloughTocher2DInterpolator(
+                        self._cubic_triangulation,
+                        np.column_stack((var_obs, err_obs)),
+                    )(self.coords_geo)
+                    _var_obs_interp = interpolated[:, 0]
+                    _err_obs_interp = interpolated[:, 1]
 
                 else:
                     _var_obs_interp = griddata(_coords_obs, var_obs, self.coords_geo, method=self.interp_method)
