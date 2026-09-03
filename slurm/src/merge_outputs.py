@@ -334,6 +334,8 @@ def _finalize_spatial_zarr_parts(
             return
 
     part_datasets = {}
+    combined = None
+    temporary_root = None
     try:
         for rank in range(rank_count):
             rank_dates = dates[rank::rank_count]
@@ -354,21 +356,39 @@ def _finalize_spatial_zarr_parts(
             shutil.rmtree(temporary_root)
         temporary_root.mkdir(parents=True)
 
-        for index, date in enumerate(dates):
-            source = part_datasets[index % rank_count]
-            record = source.sel(time=pd.Timestamp(date))
-            if 'time' in record.dims:
-                record = record.isel(time=-1)
-            record = record.load()
-            if 'time' in record.coords and 'time' not in record.dims:
-                record = record.drop_vars('time')
-            record = record.expand_dims(time=[pd.Timestamp(date)])
-            for name in record.data_vars:
-                if np.issubdtype(record[name].dtype, np.floating):
-                    record[name] = record[name].astype(output_dtype)
-            state.State._save_zarr_record(
-                record, str(temporary_archive), date,
-                window_start=dates[0], window_end=dates[-1])
+        # Keep rank arrays lazy and publish all temporal chunks in one write.
+        # The former record loop reopened metadata and rewrote partially filled
+        # time chunks hundreds of times on Lustre.
+        combined = xr.concat(
+            [part_datasets[rank] for rank in sorted(part_datasets)],
+            dim='time',
+            data_vars='all',
+            coords='minimal',
+            compat='override',
+            join='outer',
+        ).sortby('time')
+        actual_times = pd.DatetimeIndex(pd.to_datetime(combined.time.values))
+        duplicate_times = actual_times[actual_times.duplicated()].unique()
+        if len(duplicate_times):
+            raise RuntimeError(
+                'Spatial rank parts contain duplicate timestamps '
+                f'(first: {duplicate_times[0]})')
+        expected_times = pd.DatetimeIndex(pd.to_datetime(dates))
+        missing_times = expected_times.difference(actual_times)
+        unexpected_times = actual_times.difference(expected_times)
+        if len(missing_times) or len(unexpected_times):
+            raise RuntimeError(
+                'Spatial rank timestamps do not match the Analysis Window: '
+                f'missing={len(missing_times)}, '
+                f'unexpected={len(unexpected_times)}')
+        combined = combined.sel(time=expected_times)
+        for name in combined.data_vars:
+            if np.issubdtype(combined[name].dtype, np.floating):
+                combined[name] = combined[name].astype(output_dtype)
+        state._set_zarr_time_encoding(combined)
+        state._write_new_zarr(combined, str(temporary_archive))
+        combined.close()
+        combined = None
 
         _validate_dated_outputs(
             config, dates, temporary_root, zarr_output=True)
@@ -406,8 +426,12 @@ def _finalize_spatial_zarr_parts(
             f'Published spatial window archive from {rank_count} rank parts: '
             f'{canonical_archive}')
     finally:
+        if combined is not None:
+            combined.close()
         for dataset in part_datasets.values():
             dataset.close()
+        if temporary_root is not None and temporary_root.exists():
+            shutil.rmtree(temporary_root)
 
 # -------------------- Main merge workflow --------------------
 def merge_outputs(

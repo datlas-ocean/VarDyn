@@ -5,7 +5,7 @@
 
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=3
 #SBATCH --gpus=v100_32g:1
 
 #SBATCH --array=0-5          # Keep in sync with NUM_GPUS below: 0-$((NUM_GPUS-1))
@@ -13,14 +13,14 @@
 #SBATCH --partition=gpu_std
 #SBATCH --time=48:00:00
 #SBATCH --signal=B:USR1@300
-#SBATCH --mem=120G
+#SBATCH --mem=90G
 #SBATCH --account=swot_duacs
 #SBATCH --export=none
 
 # -------------------- SLURM --------------------
 NUM_GPUS=6                   # Number of GPU array tasks — also update #SBATCH --array above
-NUM_MERGE_WORKERS=4
-NUM_TILES_PER_GPU=4
+NUM_MERGE_WORKERS=3
+NUM_TILES_PER_GPU=3
 ARRAY_ID=${SLURM_ARRAY_TASK_ID:-0}
 NUM_ARRAY=${SLURM_ARRAY_TASK_COUNT:-$NUM_GPUS}
 # Use SLURM_ARRAY_JOB_ID (common to all array tasks), fall back to SLURM_JOB_ID

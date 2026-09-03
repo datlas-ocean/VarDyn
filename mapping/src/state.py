@@ -79,7 +79,8 @@ def _write_new_zarr(dataset, filename):
         filename,
         mode='w',
         encoding=_zarr_encoding(dataset),
-        zarr_version=2,
+        zarr_format=2,
+        safe_chunks=False,
     )
 
 
