@@ -771,6 +771,13 @@ class M:
 ###############################################################################
          
 class Model_diffusion(M):
+
+    @staticmethod
+    def _sponge_is_configured(distance, coefficient):
+        return (
+            distance is not None and distance > 0
+            and coefficient is not None and coefficient > 0
+        )
     
     def __init__(self,config,State):
 
@@ -780,6 +787,8 @@ class Model_diffusion(M):
         self.SIC_mod = config.MOD.SIC_mod
         self.dx = State.DX
         self.dy = State.DY
+        self.land_mask_device = (
+            None if State.mask is None else jnp.asarray(State.mask, dtype=bool))
 
         # Initialization 
         if (config.GRID.super == 'GRID_FROM_FILE') and (config.MOD.name_init_var is not None):
@@ -812,22 +821,23 @@ class Model_diffusion(M):
         for _name_var_mod in self.name_var:
             self.bc[_name_var_mod] = {}
         self.init_from_bc = config.MOD.init_from_bc
-        
+
+        # A diffusion-model sponge is active only when both its spatial width
+        # and its per-step relaxation coefficient are explicitly positive.
+        self.sponge_coef = getattr(config.MOD, 'sponge_coef', None)
+        self.sponge_active = self._sponge_is_configured(
+            config.MOD.dist_sponge_bc, self.sponge_coef)
+
         # Weight map to apply BC in a smoothed way
-        if config.MOD.dist_sponge_bc is not None:
-            Wbc = grid.compute_weight_map(State.lon, State.lat, +State.mask, config.MOD.dist_sponge_bc)
+        if self.sponge_active:
+            mask = (np.zeros((State.ny, State.nx), dtype=bool)
+                    if State.mask is None else np.asarray(State.mask, dtype=bool))
+            Wbc = grid.compute_weight_map(
+                State.lon, State.lat, mask, config.MOD.dist_sponge_bc)
         else:
-            Wbc = np.zeros((State.ny,State.nx)) 
-            if State.mask is not None:
-                for i,j in np.argwhere(State.mask):
-                    for p1 in [-1,0,1]:
-                        for p2 in [-1,0,1]:
-                            itest=i+p1
-                            jtest=j+p2
-                            if ((itest>=0) & (itest<=State.ny-1) & (jtest>=0) & (jtest<=State.nx-1)):
-                                if Wbc[itest,jtest]==0:
-                                    Wbc[itest,jtest] = 1
+            Wbc = np.zeros((State.ny,State.nx))
         self.Wbc = Wbc
+        self.Wbc_device = jnp.asarray(Wbc)
         
         if config.INV is not None and config.INV.super=='INV_4DVAR' and config.INV.compute_test:
             print('Tangent test:')
@@ -841,12 +851,13 @@ class Model_diffusion(M):
 
         if type(self.init_from_bc)==dict:
             for name in self.init_from_bc:
-                if self.init_from_bc[name] and name in self.bc and t0 in self.bc[name]:
-                    State.setvar(self.bc[name][t0], self.name_var[name])
+                if self.init_from_bc[name] and name in self.name_var:
+                    boundary = self._apply_bc(t0, names=(name,))
+                    if name in boundary:
+                        State.setvar(boundary[name], self.name_var[name])
         elif self.init_from_bc:
-            for name in self.name_var: 
-                if t0 in self.bc[name]:
-                     State.setvar(self.bc[name][t0], self.name_var[name])
+            for name, boundary in self._apply_bc(t0).items():
+                State.setvar(boundary, self.name_var[name])
         self._set_land_nan(State)
 
     def save_output(self,State,present_date,name_var=None,t=None):
@@ -862,21 +873,109 @@ class Model_diffusion(M):
         if var_bc is None:
             return
         
-        # init() and step() address boundary conditions with model time in
-        # seconds. Using datetime64 keys here silently left init_from_bc
-        # diffusion components at their zero initial state.
         time_keys = t_bc if t_bc is not None else time_bc
-        for _name_var_bc in var_bc:
-            for _name_var_mod in self.name_var:
-                if _name_var_bc==_name_var_mod:
-                    for i,t in enumerate(time_keys):
-                        self.bc[_name_var_mod][t] = var_bc[_name_var_bc][i]
+        for name in self.name_var:
+            if name not in var_bc:
+                continue
+            for i, t in enumerate(time_keys):
+                self.bc[name][t] = _fill_nan_nearest(var_bc[name][i])
+
+    def _nearest_bc_key(self, name, time):
+        keys = list(self.bc.get(name, {}).keys())
+        if not keys:
+            return None
+        if time in self.bc[name]:
+            return time
+        key_array = np.asarray(keys)
+        target = time
+        time_is_datetime = np.issubdtype(np.asarray(time).dtype, np.datetime64)
+        if np.issubdtype(key_array.dtype, np.datetime64) and not time_is_datetime:
+            target = np.datetime64(self.timestamps[0]) + np.timedelta64(int(time), 's')
+        elif not np.issubdtype(key_array.dtype, np.datetime64) and time_is_datetime:
+            target = (np.datetime64(time) - np.datetime64(self.timestamps[0])) / np.timedelta64(1, 's')
+        return keys[int(np.argmin(np.abs(key_array - target)))]
+
+    def _apply_bc(self, time, names=None):
+        """Return the nearest available BC for each requested model variable."""
+        if names is None:
+            names = self.name_var.keys()
+        boundary = {}
+        for name in names:
+            key = self._nearest_bc_key(name, time)
+            if key is not None:
+                boundary[name] = jnp.asarray(self.bc[name][key])
+        return boundary
+
+    def _stack_bc(self, time):
+        boundary = self._apply_bc(time)
+        values = []
+        available = []
+        for name in self.name_var:
+            if name in boundary:
+                values.append(boundary[name])
+                available.append(True)
+            else:
+                values.append(jnp.zeros((self.ny, self.nx)))
+                available.append(False)
+        return jnp.stack(values), jnp.asarray(available)
+
+    def prepare_scan_boundary_conditions(self, times, nstep):
+        """Prepare end-of-interval BC targets for a device-side scan."""
+        if not getattr(self, 'sponge_active', False):
+            nt = len(times)
+            return (
+                jnp.zeros((nt, 0), dtype=self.Wbc_device.dtype),
+                jnp.zeros((nt, 0), dtype=bool),
+            )
+        fields = [self._stack_bc(t + nstep * self.dt) for t in np.asarray(times)]
+        values, available = zip(*fields)
+        return jnp.stack(values), jnp.stack(available)
+
+    def _sponge_boundary(self, t, nstep, Xb):
+        if Xb is not None:
+            return Xb
+        if not getattr(self, 'sponge_active', False) or t is None:
+            return None
+        return self._stack_bc(t + nstep * self.dt)
+
+    def _apply_sponge(self, value, boundary, available, index):
+        if not getattr(self, 'sponge_active', False) or boundary is None:
+            return value
+        target = boundary[index]
+        relaxed = value + self.sponge_coef * self.Wbc_device * (target - value)
+        return jnp.where(available[index], relaxed, value)
+
+    def _diffuse_once(self, value):
+        """Apply one diffusion step with zero normal flux across land."""
+        if self.Kdiffus <= 0:
+            return value
+        center = value[1:-1, 1:-1]
+        east = value[1:-1, 2:]
+        west = value[1:-1, :-2]
+        north = value[2:, 1:-1]
+        south = value[:-2, 1:-1]
+        land = getattr(self, 'land_mask_device', None)
+        if land is not None:
+            east = jnp.where(land[1:-1, 2:], center, east)
+            west = jnp.where(land[1:-1, :-2], center, west)
+            north = jnp.where(land[2:, 1:-1], center, north)
+            south = jnp.where(land[:-2, 1:-1], center, south)
+        tendency = self.dt * self.Kdiffus * (
+            (east + west - 2 * center) / self.dx[1:-1, 1:-1]**2
+            + (north + south - 2 * center) / self.dy[1:-1, 1:-1]**2
+        )
+        if land is not None:
+            tendency = jnp.where(land[1:-1, 1:-1], 0.0, tendency)
+        return value.at[1:-1, 1:-1].add(tendency)
 
 
-    def step(self,State,nstep=1,t=None):
+    def step(self,State,nstep=1,t=None,Xb=None):
+
+        sponge = self._sponge_boundary(t, nstep, Xb)
+        boundary, available = sponge if sponge is not None else (None, None)
 
         # Loop on model variables
-        for name in self.name_var:
+        for index, name in enumerate(self.name_var):
 
             # Get state variable
             var0 = jnp.asarray(State.getvar(self.name_var[name]))
@@ -885,12 +984,9 @@ class Model_diffusion(M):
             var1 = +var0
 
             # Time propagation
-            if self.Kdiffus>0:
-                for _ in range(nstep):
-                    tendency = self.dt*self.Kdiffus*(\
-                        (var1[1:-1,2:]+var1[1:-1,:-2]-2*var1[1:-1,1:-1])/(self.dx[1:-1,1:-1]**2) +\
-                        (var1[2:,1:-1]+var1[:-2,1:-1]-2*var1[1:-1,1:-1])/(self.dy[1:-1,1:-1]**2))
-                    var1 = var1.at[1:-1,1:-1].add(tendency)
+            for _ in range(nstep):
+                var1 = self._diffuse_once(var1)
+                var1 = self._apply_sponge(var1, boundary, available, index)
             
             # Update state
             if self.name_var[name] in State.params:
@@ -901,10 +997,13 @@ class Model_diffusion(M):
         
 
 
-    def step_tgl(self,dState,State,nstep=1,t=None):
+    def step_tgl(self,dState,State,nstep=1,t=None,Xb=None):
+
+        sponge = self._sponge_boundary(t, nstep, Xb)
+        boundary, available = sponge if sponge is not None else (None, None)
 
         # Loop on model variables
-        for name in self.name_var:
+        for index, name in enumerate(self.name_var):
 
             # Get state variable
             var0 = jnp.asarray(dState.getvar(self.name_var[name]))
@@ -913,12 +1012,11 @@ class Model_diffusion(M):
             var1 = +var0
             
             # Time propagation
-            if self.Kdiffus>0:
-                for _ in range(nstep):
-                    tendency = self.dt*self.Kdiffus*(\
-                        (var1[1:-1,2:]+var1[1:-1,:-2]-2*var1[1:-1,1:-1])/(self.dx[1:-1,1:-1]**2) +\
-                        (var1[2:,1:-1]+var1[:-2,1:-1]-2*var1[1:-1,1:-1])/(self.dy[1:-1,1:-1]**2))
-                    var1 = var1.at[1:-1,1:-1].add(tendency)
+            for _ in range(nstep):
+                var1 = self._diffuse_once(var1)
+                if getattr(self, 'sponge_active', False) and boundary is not None:
+                    factor = 1.0 - self.sponge_coef * self.Wbc_device
+                    var1 = jnp.where(available[index], factor * var1, var1)
             
 
             # Update state
@@ -928,10 +1026,13 @@ class Model_diffusion(M):
 
             dState.setvar(var1,self.name_var[name])
         
-    def step_adj(self,adState,State,nstep=1,t=None):
+    def step_adj(self,adState,State,nstep=1,t=None,Xb=None):
+
+        sponge = self._sponge_boundary(t, nstep, Xb)
+        boundary, available = sponge if sponge is not None else (None, None)
 
         # Loop on model variables
-        for name in self.name_var:
+        for index, name in enumerate(self.name_var):
 
             # Get state variable
             ad_output = jnp.asarray(adState.getvar(self.name_var[name]))
@@ -939,17 +1040,17 @@ class Model_diffusion(M):
             advar1 = ad_output
 
             # Time propagation
-            if self.Kdiffus>0:
-                for _ in range(nstep):
-                    advar0 = advar1
-                    x_weight = self.dt*self.Kdiffus/(self.dx[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    y_weight = self.dt*self.Kdiffus/(self.dy[1:-1,1:-1]**2) * advar0[1:-1,1:-1]
-                    advar1 = advar0.at[1:-1,2:].add(x_weight)
-                    advar1 = advar1.at[1:-1,:-2].add(x_weight)
-                    advar1 = advar1.at[1:-1,1:-1].add(-2*x_weight)
-                    advar1 = advar1.at[2:,1:-1].add(y_weight)
-                    advar1 = advar1.at[:-2,1:-1].add(y_weight)
-                    advar1 = advar1.at[1:-1,1:-1].add(-2*y_weight)
+            for _ in range(nstep):
+                advar0 = advar1
+                if getattr(self, 'sponge_active', False) and boundary is not None:
+                    factor = 1.0 - self.sponge_coef * self.Wbc_device
+                    advar0 = jnp.where(available[index], factor * advar0, advar0)
+                if self.Kdiffus>0:
+                    zero = jnp.zeros_like(advar0)
+                    advar1 = jax.linear_transpose(
+                        self._diffuse_once, zero)(advar0)[0]
+                else:
+                    advar1 = advar0
                     
                 
 

@@ -165,6 +165,8 @@ MOD_DIFF = dict(
 
     dist_sponge_bc = None,  # distance (in km) for which boundary fields are spatially spread close to the borders
 
+    sponge_coef = 0.,  # Dimensionless relaxation coefficient applied at each model step in the sponge layer
+
     bc_file = None,  # Path to NetCDF file containing boundary conditions
 
     bc_files = None,  # Optional dict mapping model variable names to BC files or per-variable BC source dicts
