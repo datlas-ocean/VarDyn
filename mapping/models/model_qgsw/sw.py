@@ -4,6 +4,7 @@ Louis Thiry, Nov 2023 for IFREMER.
 """
 import sys 
 sys.path.insert(0, '../../src') # add src to path to import modules
+import warnings
 from src.config import USE_FLOAT64
 import numpy as np
 import jax.numpy as jnp 
@@ -455,10 +456,26 @@ class SW:
             if not (1 <= self.tracer_upper_layers <= self.nl):
                 raise ValueError('tracer_upper_layers must be between 1 and nl.')
 
-        # Momentum forcing mode: 'direct' uses Fu/Fv as given,
-        # 'mass_consistent' derives Fu/Fv from Fh so that velocity is
-        # conserved when mass is added:  Fu = -u/h * Fh, Fv = -v/h * Fh.
-        self.forcing_momentum = param.get('forcing_momentum', 'direct')
+        # External mass-source treatment. Fu/Fv remain independent velocity
+        # tendencies in both modes. ``zero_momentum_mass_source`` additionally
+        # dilutes velocity so that adding/removing mass through Fh carries no
+        # horizontal momentum and therefore preserves h*u and h*v.
+        forcing_momentum = param.get('forcing_momentum', 'direct')
+        if forcing_momentum == 'mass_consistent':
+            warnings.warn(
+                "forcing_momentum='mass_consistent' is deprecated; use "
+                "'zero_momentum_mass_source'.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            forcing_momentum = 'zero_momentum_mass_source'
+        valid_forcing_momentum = {'direct', 'zero_momentum_mass_source'}
+        if forcing_momentum not in valid_forcing_momentum:
+            raise ValueError(
+                'forcing_momentum must be one of '
+                f'{sorted(valid_forcing_momentum)}, got {forcing_momentum!r}.'
+            )
+        self.forcing_momentum = forcing_momentum
 
         # Adjoint checkpoint strategy for lax.scan body:
         #   'full'       – checkpoint entire single_step (current default, low memory)
@@ -555,6 +572,41 @@ class SW:
         h = h_.astype(self.dtype) * self.area
 
         return u, v, h
+
+    def _apply_external_forcing(self, u, v, h, Fu, Fv, Fh, ref_vals):
+        """Apply split external forcing over one model timestep.
+
+        ``Fu`` and ``Fv`` are direct velocity tendencies. In
+        ``zero_momentum_mass_source`` mode, the velocity is first rescaled by
+        the old/new face thickness ratio. This is the exact finite-step update
+        for a mass source carrying zero horizontal momentum; away from the
+        positivity clamp it preserves face ``h*u`` and ``h*v`` to roundoff.
+        """
+        if self.forcing_momentum == 'zero_momentum_mass_source':
+            h_ = replicate_pad(h, self.masks.h)
+            h_ugrid = 0.5 * (h_[..., 1:, 1:-1] + h_[..., :-1, 1:-1])
+            h_vgrid = 0.5 * (h_[..., 1:-1, 1:] + h_[..., 1:-1, :-1])
+            Fh_ = replicate_pad(Fh, self.masks.h)
+            Fh_u = 0.5 * (Fh_[..., 1:, 1:-1] + Fh_[..., :-1, 1:-1])
+            Fh_v = 0.5 * (Fh_[..., 1:-1, 1:] + Fh_[..., 1:-1, :-1])
+
+            old_h_u = smooth_clamp(
+                (ref_vals[1] + h_ugrid) / self.area_ugrid,
+                self.h_min, self.h_min_sharpness) * self.area_ugrid
+            old_h_v = smooth_clamp(
+                (ref_vals[2] + h_vgrid) / self.area_vgrid,
+                self.h_min, self.h_min_sharpness) * self.area_vgrid
+            new_h_u = smooth_clamp(
+                (ref_vals[1] + h_ugrid + self.dt * Fh_u) / self.area_ugrid,
+                self.h_min, self.h_min_sharpness) * self.area_ugrid
+            new_h_v = smooth_clamp(
+                (ref_vals[2] + h_vgrid + self.dt * Fh_v) / self.area_vgrid,
+                self.h_min, self.h_min_sharpness) * self.area_vgrid
+
+            u = u * (old_h_u / new_h_u)
+            v = v * (old_h_v / new_h_v)
+
+        return u + self.dt * Fu, v + self.dt * Fv, h + self.dt * Fh
         
     def get_print_info(self, u, v, h):
         """
@@ -1656,29 +1708,8 @@ class SW:
                 h = h + (self.dt / 12.0) * (8.0 * dt2_h - dt1_h - dt0_h)
 
             # ---- External forcing ----
-            if self.forcing_momentum == 'mass_consistent':
-                # Derive momentum forcing from mass forcing so that
-                # velocity is conserved:  Fu = -u/h_tot * Fh
-                h_ = replicate_pad(h, self.masks.h)
-                h_ugrid = 0.5 * (h_[..., 1:, 1:-1] + h_[..., :-1, 1:-1])
-                h_vgrid = 0.5 * (h_[..., 1:-1, 1:] + h_[..., 1:-1, :-1])
-                # Clamp in PHYSICAL units; result stays area-scaled for the
-                # mass-consistent forcing ratio u/h_tot * Fh.
-                h_tot_u = smooth_clamp((ref_vals[1] + h_ugrid) / self.area_ugrid,
-                                       self.h_min,
-                                       self.h_min_sharpness) * self.area_ugrid
-                h_tot_v = smooth_clamp((ref_vals[2] + h_vgrid) / self.area_vgrid,
-                                       self.h_min,
-                                       self.h_min_sharpness) * self.area_vgrid
-                Fh_ = replicate_pad(_Fh, self.masks.h)
-                Fh_u = 0.5 * (Fh_[..., 1:, 1:-1] + Fh_[..., :-1, 1:-1])
-                Fh_v = 0.5 * (Fh_[..., 1:-1, 1:] + Fh_[..., 1:-1, :-1])
-                u = u + self.dt * (-u / h_tot_u * Fh_u)
-                v = v + self.dt * (-v / h_tot_v * Fh_v)
-            
-            u = u + self.dt * _Fu
-            v = v + self.dt * _Fv
-            h = h + self.dt * _Fh
+            u, v, h = self._apply_external_forcing(
+                u, v, h, _Fu, _Fv, _Fh, ref_vals)
             if self.fixed_ekman_slabs in (1, 2):
                 # Enforce the mechanical-slab contract exactly, including if
                 # a generic forcing array accidentally contains upper-layer h.
@@ -1935,24 +1966,8 @@ class SW:
                 c = c + (self.dt / 12.0) * (8.0 * dt2_c - dt1_c - dt0_c)
 
             # ---- External forcing (after RK stages) ----
-            if self.forcing_momentum == 'mass_consistent':
-                h_ = replicate_pad(h, self.masks.h)
-                h_ugrid = 0.5 * (h_[..., 1:, 1:-1] + h_[..., :-1, 1:-1])
-                h_vgrid = 0.5 * (h_[..., 1:-1, 1:] + h_[..., 1:-1, :-1])
-                # Clamp in PHYSICAL units; result stays area-scaled.
-                h_tot_u = smooth_clamp((ref_vals[1] + h_ugrid) / self.area_ugrid,
-                                       self.h_min, self.h_min_sharpness) * self.area_ugrid
-                h_tot_v = smooth_clamp((ref_vals[2] + h_vgrid) / self.area_vgrid,
-                                       self.h_min, self.h_min_sharpness) * self.area_vgrid
-                Fh_ = replicate_pad(_Fh, self.masks.h)
-                Fh_u = 0.5 * (Fh_[..., 1:, 1:-1] + Fh_[..., :-1, 1:-1])
-                Fh_v = 0.5 * (Fh_[..., 1:-1, 1:] + Fh_[..., 1:-1, :-1])
-                u = u + self.dt * (-u / h_tot_u * Fh_u)
-                v = v + self.dt * (-v / h_tot_v * Fh_v)
-
-            u = u + self.dt * _Fu
-            v = v + self.dt * _Fv
-            h = h + self.dt * _Fh
+            u, v, h = self._apply_external_forcing(
+                u, v, h, _Fu, _Fv, _Fh, ref_vals)
             if self.tracer_conservation == 'upper_layer':
                 c = c + self.dt*_Fc*_upper_depth_area(h)
             else:

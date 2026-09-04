@@ -532,10 +532,12 @@ MOD_QGSW = dict(
                      # split into chunks of max_nstep to limit GPU memory usage.
                      # Decrease if running out of GPU memory.
 
-    # Momentum forcing mode for external forcing (Fu, Fv, Fh).
-    # 'direct'          : use Fu, Fv as provided (default).
-    # 'mass_consistent' : derive Fu, Fv from Fh so that velocity is conserved
-    #                     when mass is added:  Fu = -u/h * Fh,  Fv = -v/h * Fh.
+    # Momentum treatment for external forcing (Fu, Fv, Fh).
+    # 'direct'                    : apply Fu, Fv and Fh independently (default).
+    # 'zero_momentum_mass_source' : additionally rescale velocity so that Fh
+    #                               adds/removes mass carrying zero horizontal
+    #                               momentum; Fu and Fv remain independent.
+    # 'mass_consistent' is accepted as a deprecated compatibility alias.
     forcing_momentum = 'direct',
 
     bc_file = None,  # Path to NetCDF file containing boundary conditions
