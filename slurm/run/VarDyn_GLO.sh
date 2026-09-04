@@ -251,7 +251,14 @@ export MASSH_PATH="${MASH_DIR}/mapping"
 # -------------------- LOG --------------------
 LOGDIR="./logs/${EXP_NAME}_job-${JOB_ID}"
 mkdir -p "$LOGDIR"
-MAIN_LOGFILE="${LOGDIR}/gpu${ARRAY_ID}.log"
+# GPU indices are local to each node (several nodes can each expose GPU 0).
+# Include the Slurm array task, node, and allocated CUDA device in every log
+# name so that all workers remain unambiguous in a multi-node allocation.
+GPU_NODE="${SLURMD_NODENAME:-$(hostname -s)}"
+GPU_DEVICE="${CUDA_VISIBLE_DEVICES:-${SLURM_JOB_GPUS:-unassigned}}"
+GPU_DEVICE_SAFE="${GPU_DEVICE//,/+}"
+GPU_LOG_ID="task${ARRAY_ID}_${GPU_NODE}_cuda${GPU_DEVICE_SAFE}"
+MAIN_LOGFILE="${LOGDIR}/${GPU_LOG_ID}.log"
 exec > >(tee -a "$MAIN_LOGFILE") 2>&1
 
 # -------------------- BARRIER DIR --------------------
@@ -276,6 +283,17 @@ echo " Host: $(hostname)"
 echo " Start time: $(date)"
 echo " Python: $(which python)"
 echo " CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo " SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-N/A}"
+echo " SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-N/A}"
+echo " GPU log identity=${GPU_LOG_ID}"
+if command -v nvidia-smi >/dev/null 2>&1 && [ "$GPU_DEVICE" != "unassigned" ]; then
+    echo " Allocated GPU status:"
+    nvidia-smi -i "$GPU_DEVICE" \
+        --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total \
+        --format=csv,noheader || echo " WARNING: nvidia-smi failed" >&2
+else
+    echo " WARNING: no allocated GPU can be queried with nvidia-smi" >&2
+fi
 echo " Memory: $(ulimit -v 2>/dev/null || echo N/A)"
 echo " SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-N/A}"
 echo " SLURM_CPUS_ON_NODE=${SLURM_CPUS_ON_NODE:-N/A}"
@@ -420,7 +438,7 @@ run_single_tile() {
     local TILE_PARENT=$(basename "$(dirname "$TILE")")
     local LOG_SUBDIR="${LOGDIR}/${TILE_PARENT}"
     mkdir -p "$LOG_SUBDIR"
-    local TILE_LOG="${LOG_SUBDIR}/${TILE_BASENAME}_gpu${ARRAY_ID}.log"
+    local TILE_LOG="${LOG_SUBDIR}/${TILE_BASENAME}_${GPU_LOG_ID}.log"
 
     echo "$(date '+%F %T') | GPU ${ARRAY_ID} | START tile ${TILE}" >> "$TILE_LOG"
     rm -f "${TILE}/.tile_failed"
