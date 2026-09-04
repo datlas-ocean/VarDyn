@@ -25,6 +25,7 @@ def _params(forcing_momentum):
         g_prime=jnp.array([0.01]),
         f=jnp.zeros((nx + 1, ny + 1)),
         taux=0., tauy=0., bottom_drag_coef=0., rho_water=1025.,
+        h_wind=100.,
         dtype=jnp.float32, mask=np.ones((nx, ny), dtype=int), compile=False,
         slip_coef=1., visc_coef=0., diff_coef=0., dt=900.,
         barotropic_filter=False, sponge_coef=0.,

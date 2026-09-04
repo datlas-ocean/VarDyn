@@ -269,7 +269,6 @@ class SW:
         self.h_wind = param.get('h_wind', None)
         self.wind_depth_from_H = param.get('wind_depth_from_H', False)
         if self.nl == 1 and self.h_wind is None and not self.wind_depth_from_H:
-            import warnings
             warnings.warn(
                 "\n[SW model] nl=1 and h_wind is not set.\n"
                 "  The model's equivalent depth H = c²/g ≈ {:.2f} m is used as the\n"
