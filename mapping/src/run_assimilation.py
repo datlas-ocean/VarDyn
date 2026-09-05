@@ -1745,9 +1745,14 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
     all_dates = sorted(all_dates)
 
     if zarr_output:
-        # Open every Analysis Window once. All selections below remain lazy;
-        # the destination chunks are materialized exactly once by the final
-        # to_zarr call.
+        # Open every Analysis Window once.  Keep the merge block-based rather
+        # than selecting one timestamp at a time: a long experiment otherwise
+        # builds a Dask graph with one independent Zarr read per timestamp.
+        # Besides its scheduler overhead, that prevents neighbouring output
+        # times from sharing their source time chunks (normally four records).
+        # Each block below has one active-window combination, so non-overlap
+        # regions are copied as contiguous slices and overlap regions are
+        # blended vectorially.
         window_datasets = []
         combined = None
         temporary_path = None
@@ -1758,38 +1763,55 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
                     _build_path(middle, all_dates[0]),
                     consolidated=False))
 
-            records = []
+            blocks = []
+            block_dates = []
+            block_active = None
             for date in all_dates:
-                active = [
+                active = tuple(
                     i for i in range(n_windows)
-                    if list_date_start[i] <= date <= list_date_end[i]]
+                    if list_date_start[i] <= date <= list_date_end[i])
                 if not active:
                     continue
+                if block_active is not None and active != block_active:
+                    blocks.append((block_active, block_dates))
+                    block_dates = []
+                block_active = active
+                block_dates.append(pd.Timestamp(date))
+            if block_active is not None:
+                blocks.append((block_active, block_dates))
 
-                ds1 = window_datasets[active[0]].sel(
-                    time=pd.Timestamp(date))
-                if 'time' in ds1.dims:
-                    ds1 = ds1.isel(time=-1)
+            if not blocks:
+                return
+
+            records = []
+            for active, dates in blocks:
+                # ``slice`` preserves the source time-chunk layout.  Every
+                # block spans consecutive output timestamps by construction.
+                time_slice = slice(dates[0], dates[-1])
+                ds1 = window_datasets[active[0]].sel(time=time_slice)
                 dsout = ds1.copy()
 
                 if len(active) >= 2:
                     i, j = active[0], active[1]
-                    ds2 = window_datasets[j].sel(time=pd.Timestamp(date))
-                    if 'time' in ds2.dims:
-                        ds2 = ds2.isel(time=-1)
+                    ds2 = window_datasets[j].sel(time=time_slice)
                     overlap_start = list_date_start[j]
                     overlap_end = list_date_end[i]
                     duration = (
                         overlap_end - overlap_start).total_seconds()
                     if duration > 0:
-                        alpha = (
-                            (date - overlap_start).total_seconds()
-                            / duration)
-                        alpha = min(max(alpha, 0.0), 1.0)
-                        weight2 = 0.5 * (1.0 - np.cos(np.pi * alpha))
+                        alpha = np.asarray([
+                            (date - overlap_start).total_seconds() / duration
+                            for date in dates
+                        ])
+                        alpha = np.clip(alpha, 0.0, 1.0)
+                        weight2 = xr.DataArray(
+                            0.5 * (1.0 - np.cos(np.pi * alpha)),
+                            dims=('time',), coords={'time': dates})
                         weight1 = 1.0 - weight2
                     else:
                         weight1, weight2 = 0.5, 0.5
+                    # Preserve the union: equatorial and non-equatorial
+                    # windows can expose different diagnostic variables.
                     for name in ds2.data_vars:
                         if name not in dsout.data_vars:
                             dsout[name] = ds2[name]
@@ -1797,14 +1819,11 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
                         if name in ds1.data_vars and name in ds2.data_vars:
                             dsout[name] = (
                                 weight1 * ds1[name] + weight2 * ds2[name])
-
-                if 'time' in dsout.coords and 'time' not in dsout.dims:
-                    dsout = dsout.drop_vars('time')
-                dsout = dsout.expand_dims(time=[pd.Timestamp(date)])
                 records.append(dsout)
 
-            if not records:
-                return
+            log(
+                f'Building final Zarr archive from {len(records)} contiguous '
+                f'time blocks ({len(all_dates)} timestamps)')
             combined = xr.concat(
                 records,
                 dim='time',

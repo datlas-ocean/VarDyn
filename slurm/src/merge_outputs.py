@@ -66,6 +66,32 @@ def _remove_legacy_dated_outputs(config, dates, root):
             nc_path.unlink()
 
 
+def _remove_subwindow_merged_outputs(
+        config, list_date_start, list_date_middle, list_date_end):
+    """Remove validated spatial-merge products without touching tile output.
+
+    A subwindow directory also contains one directory per tile.  Those tile
+    trajectories are deliberately retained as restart checkpoints, so cleanup
+    is limited to the archive and dated files at the subwindow root.
+    """
+    archives_removed = 0
+    for start, middle, end in zip(
+            list_date_start, list_date_middle, list_date_end):
+        root = Path(config.EXP.path_save) / f'subwindow_{str(middle)[:10]}'
+        dates = generate_dates(start, end, config.EXP.saveoutput_time_step)
+        _remove_legacy_dated_outputs(config, dates, root)
+        archive = _zarr_archive_path(config, root)
+        if archive.exists():
+            shutil.rmtree(archive)
+            archives_removed += 1
+        lock = Path(f'{archive}.lock')
+        if lock.exists():
+            lock.unlink()
+    log(
+        f'Removed merged outputs from {len(list_date_middle)} subwindows '
+        f'({archives_removed} Zarr archives); tile checkpoints retained')
+
+
 def _compact_tile_zarr_trajectories(
         config, window_middle, checkpoint_date, list_tile_paths):
     """Replace each tile trajectory with its one-record restart checkpoint.
@@ -663,6 +689,11 @@ def merge_outputs(
                         else list_date_end[iw])
                     _compact_tile_zarr_trajectories(
                         config, middle, checkpoint_date, list_tile_paths)
+        # This runs only after the final global products have passed
+        # validation.  Do not remove tile directories: their compacted Zarr
+        # checkpoints remain the restart source for a later continuation.
+        _remove_subwindow_merged_outputs(
+            config, list_date_start, list_date_middle, list_date_end)
     else:
         log("Skipping final time-window merge")
 
