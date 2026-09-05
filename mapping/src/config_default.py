@@ -201,6 +201,8 @@ MOD_QG1L = dict(
 
     save_diagnosed_variables = False, # Whether to save diagnosed variables (e.g. SSH, geostrophic velocies and cyclogeostrophic velocities) in the output netcdf files
 
+    use_jaxparrow = True, # Whether to use jaxparrow for diagnosed velocities; if False, save only QG geostrophic velocities
+
     save_params = False, # Whether to save control parameters (e.g. corrective fluxes) in the output netcdf files
 
     upwind = 3, # Order of the upwind scheme for PV advection (either 1,2 or 3) 

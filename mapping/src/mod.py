@@ -1293,6 +1293,7 @@ class Model_qg1l(M):
         
         # Save SSH, geostrophic velocities and cyclogeostrophic velocities
         self.save_diagnosed_variables = config.MOD.save_diagnosed_variables
+        self.use_jaxparrow = config.MOD.use_jaxparrow
         # Save control parameters, i.e. corrective fluxes
         self.save_params = config.MOD.save_params
 
@@ -1404,18 +1405,11 @@ class Model_qg1l(M):
             else:
                 ssh = State0.getvar(name_var=self.name_var['SSH'])
             
-            # Current velocities
-            # Geostrophy. Recent jaxparrow versions return velocities on T points.
-            try:
-                ug_t, vg_t = jaxparrow.geostrophy(
-                    ssh, State0.lat, State0.lon, land_mask=State0.mask
-                )
-            except Exception as exc:
-                warnings.warn(
-                    'jaxparrow geostrophy failed; falling back to Qgm.h2uv: '
-                    f'{exc}'
-                )
-                ug, vg = self.qgm.h2uv(jnp.asarray(ssh))
+            # Current velocities. Recent jaxparrow versions return velocities
+            # on T points. The QG model returns velocities on its h-grid, so
+            # average adjacent faces to the interior T points for diagnostics.
+            def qg_geostrophy_on_t(ssh_field):
+                ug, vg = self.qgm.h2uv(jnp.asarray(ssh_field))
                 ug_t = np.zeros((State0.ny, State0.nx))
                 vg_t = np.zeros((State0.ny, State0.nx))
                 ug_t[1:-1, 1:-1] = np.array(
@@ -1427,23 +1421,42 @@ class Model_qg1l(M):
                 if State0.mask is not None:
                     ug_t[State0.mask] = np.nan
                     vg_t[State0.mask] = np.nan
-            # Cyclogeostrophy. New jaxparrow exposes algorithms such as fixed_point.
-            try:
-                if hasattr(jaxparrow, 'fixed_point'):
-                    result = jaxparrow.fixed_point(
-                        State0.lat, State0.lon, ssh_t=ssh, land_mask=State0.mask
+                return ug_t, vg_t
+
+            if self.use_jaxparrow:
+                try:
+                    ug_t, vg_t = jaxparrow.geostrophy(
+                        ssh, State0.lat, State0.lon, land_mask=State0.mask
                     )
-                else:
-                    result = jaxparrow.cyclogeostrophy(
-                        ssh, State0.lat, State0.lon, State0.mask
+                except Exception as exc:
+                    warnings.warn(
+                        'jaxparrow geostrophy failed; falling back to Qgm.h2uv: '
+                        f'{exc}'
                     )
-                uc_t = result.ucg if hasattr(result, 'ucg') else result[0]
-                vc_t = result.vcg if hasattr(result, 'vcg') else result[1]
-            except Exception as exc:
-                warnings.warn(
-                    'jaxparrow cyclogeostrophy failed; skipping '
-                    f'cyclogeostrophic velocity diagnostics: {exc}'
-                )
+                    ug_t, vg_t = qg_geostrophy_on_t(ssh)
+
+                # Cyclogeostrophy. New jaxparrow exposes algorithms such as
+                # fixed_point.
+                try:
+                    if hasattr(jaxparrow, 'fixed_point'):
+                        result = jaxparrow.fixed_point(
+                            State0.lat, State0.lon, ssh_t=ssh, land_mask=State0.mask
+                        )
+                    else:
+                        result = jaxparrow.cyclogeostrophy(
+                            ssh, State0.lat, State0.lon, State0.mask
+                        )
+                    uc_t = result.ucg if hasattr(result, 'ucg') else result[0]
+                    vc_t = result.vcg if hasattr(result, 'vcg') else result[1]
+                except Exception as exc:
+                    warnings.warn(
+                        'jaxparrow cyclogeostrophy failed; skipping '
+                        f'cyclogeostrophic velocity diagnostics: {exc}'
+                    )
+                    uc_t = None
+                    vc_t = None
+            else:
+                ug_t, vg_t = qg_geostrophy_on_t(ssh)
                 uc_t = None
                 vc_t = None
             # Set geostrophic velocities
