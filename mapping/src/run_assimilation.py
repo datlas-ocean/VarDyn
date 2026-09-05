@@ -688,7 +688,7 @@ def compute_weights_map(State, list_State, path_save_pickle=None,
                         taper_factor=1.0):
 
     """Compute weights maps and precomputed interpolation operators for merging outputs from subprocesses.
-    
+
     Weights use smootherstep tapering based on per-row (longitude) and per-column
     (latitude) distance from tile edges. This correctly handles GRID_CAR tiles whose 
     shape is trapezoidal in lon/lat space. No tapering is applied on sides that lie
@@ -1553,6 +1553,20 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
                 p.terminate()
 
 
+def _add_diagnosed_output_names(config, name_var_save):
+    """Keep QG1L diagnosed fields when merging tiled output files."""
+    configured_models = config.MOD.values() if isinstance(config.MOD, dict) \
+        and 'super' not in config.MOD else [config.MOD]
+    names = list(name_var_save)
+    for model_config in configured_models:
+        if (getattr(model_config, 'super', None) == 'MOD_QG1L'
+                and getattr(model_config, 'save_diagnosed_variables', False)):
+            for name in ('ug', 'vg'):
+                if name not in names:
+                    names.append(name)
+    return names
+
+
 def run_assimilation_time_window(config, date_start, date_middle, date_end, list_State, processes, 
                                  weights_space=None, weights_space_sum=None, interpolators=None,
                                  name_var_save=['sla'], 
@@ -1570,6 +1584,7 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
     they are loaded from '{path_pickle}/weights.pkl'.
     """
 
+    name_var_save = _add_diagnosed_output_names(config, name_var_save)
     list_tile_paths = None
 
     # Load weights and interpolators from pickle if not provided
