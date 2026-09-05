@@ -34,7 +34,11 @@ def open_grid_restart(config, grid_config=None, group=None):
 
     is_zarr = str(path).endswith('.zarr') or os.path.isdir(path)
     if is_zarr:
-        ds = xr.open_zarr(path)
+        # Tile trajectories are extended record by record.  Their live Zarr
+        # metadata is authoritative; consolidated metadata can still expose
+        # an older time-axis shape and hide the checkpoint needed by the next
+        # Analysis Window.
+        ds = xr.open_zarr(path, consolidated=False)
     elif group is not None:
         try:
             ds = xr.open_dataset(path, group=group)
@@ -518,4 +522,3 @@ def _masked_edge(var, xac):
             var[:, ind_gap] = np.nan
 
     return var
-

@@ -7048,11 +7048,33 @@ class Model_multi:
             M.set_bc(time_bc, var_bc, **kwargs)
 
     def save_output(self,State,present_date,name_var=None,t=None):
+        # Component models may add diagnosed variables in their save methods.
+        # Collect those fields in memory so all components and totals are
+        # committed in one archive transaction for this timestamp.
+        collected = {}
+        previous_collector = getattr(
+            State, '_output_var_collector', None)
+        State._output_var_collector = collected
+        try:
+            for M in self.Models:
+                M.save_output(State, present_date, t=t)
+        finally:
+            State._output_var_collector = previous_collector
 
-        for M in self.Models:
-            M.save_output(State,present_date)
-        
-        State.save_output(present_date,name_var=self.var_to_save)
+        # Totals are maintained by Model_multi.step() on the original state
+        # and were historically written by this final save call.
+        for name in self.var_to_save:
+            collected[name] = State.var[name]
+
+        if previous_collector is not None:
+            previous_collector.update(collected)
+            return
+
+        output_state = State.copy()
+        output_state._output_var_collector = None
+        output_state.var.update(collected)
+        output_state.save_output(
+            present_date, name_var=list(collected.keys()))
 
     def prepare_scan_boundary_conditions(self, times, nstep):
         """Prepare one scan-forcing pytree entry per component model.

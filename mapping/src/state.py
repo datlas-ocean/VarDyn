@@ -108,6 +108,10 @@ class State:
             config.INV is not None
             and getattr(config.INV, 'jit_cost_and_grad', False)
         )
+        # Model_multi temporarily shares this mapping with component-state
+        # copies.  Component save methods can then contribute physical and
+        # diagnosed fields without each opening the output archive.
+        self._output_var_collector = None
         
         # Parameters
         self.name_time = config.EXP.name_time
@@ -429,6 +433,16 @@ class State:
         self.mask += (np.isnan(self.lon) + np.isnan(self.lat)).astype(bool)
             
     def save_output(self,date,name_var=None,grid_type=None,dtype=None):
+        output_var_collector = getattr(
+            self, '_output_var_collector', None)
+        if output_var_collector is not None:
+            selected_names = self.var.keys() if name_var is None else name_var
+            for name in selected_names:
+                # Keep device arrays lazy here.  The single assembled write
+                # below performs the host transfer exactly once per field.
+                output_var_collector[name] = self.var[name]
+            return
+
         save_zarr = bool(getattr(self.config.EXP, 'saveoutputs_zarr', False))
         if save_zarr:
             filename = os.path.join(self.path_save, f'{self.name_exp_save}.zarr')
@@ -821,6 +835,8 @@ class State:
         other.lat_v = self.lat_v
         other.geo_grid = self.geo_grid
         other.preserve_device_arrays = self.preserve_device_arrays
+        other._output_var_collector = getattr(
+            self, '_output_var_collector', None)
 
         def _copy_array(v):
             # JAX arrays are immutable: each step() replaces the reference rather than

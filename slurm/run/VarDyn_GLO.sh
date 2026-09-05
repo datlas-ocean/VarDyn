@@ -661,6 +661,22 @@ if mkdir "${BARRIER_DIR}/final_merge.lock" 2>/dev/null; then
         OWNED_STAGE_LOCK=""
         echo "$(date '+%Y-%m-%d %H:%M:%S') | All time windows processed"
         echo "$(date '+%Y-%m-%d %H:%M:%S') | Completion marker: $FINAL_MARKER"
+
+        # Delete subwindow merge products only after the durable completion
+        # marker exists. If this cleanup is interrupted, a continuation sees
+        # a completed experiment instead of trying to reconstruct full
+        # windows from compacted one-record tile checkpoints.
+        if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+            --dir_save_pickle "$DIR_SAVE_PICKLE" \
+            --name_var_save "$NAME_VAR" \
+            --num_workers "$NUM_MERGE_WORKERS" \
+            --skip_spatial_merge \
+            --cleanup_subwindow_outputs \
+            $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') | Subwindow merged outputs removed"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') | WARNING: post-completion subwindow cleanup failed" >&2
+        fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') | ERROR: final time-window merge failed" >&2
         OWNED_STAGE_LOCK=""

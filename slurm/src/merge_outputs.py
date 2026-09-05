@@ -478,6 +478,7 @@ def merge_outputs(
     zarr_output=False,
     output_float64=False,
     cleanup_tile_zarr=False,
+    cleanup_subwindow_outputs=False,
 ):
     log(f"Loading configuration from {path_config}")
     with open(path_config, "rb") as f:
@@ -505,6 +506,27 @@ def merge_outputs(
         list_date_start, list_date_middle, list_date_end = pickle.load(f)
     with open(f'{path_save_pickle}/list_State.pkl', "rb") as f:
         list_State_all = pickle.load(f)
+
+    if cleanup_subwindow_outputs:
+        if merge_time_windows or not skip_spatial_merge:
+            raise ValueError(
+                '--cleanup_subwindow_outputs must be used with '
+                '--skip_spatial_merge and without --merge_time_windows')
+        final_dates = sorted({
+            date
+            for start, end in zip(list_date_start, list_date_end)
+            for date in generate_dates(
+                start, end, config.EXP.saveoutput_time_step)
+        })
+        # This mode is invoked only after the shell has atomically published
+        # experiment_complete.ok.  Revalidate the durable global product
+        # before performing the destructive, idempotent cleanup.
+        _validate_dated_outputs(
+            config, final_dates, config.EXP.path_save,
+            zarr_output=zarr_output)
+        _remove_subwindow_merged_outputs(
+            config, list_date_start, list_date_middle, list_date_end)
+        return
 
     kernel = Gaussian2DKernel(x_stddev=1, y_stddev=1)
     output_dtype = np.float64 if output_float64 else np.float32
@@ -689,11 +711,6 @@ def merge_outputs(
                         else list_date_end[iw])
                     _compact_tile_zarr_trajectories(
                         config, middle, checkpoint_date, list_tile_paths)
-        # This runs only after the final global products have passed
-        # validation.  Do not remove tile directories: their compacted Zarr
-        # checkpoints remain the restart source for a later continuation.
-        _remove_subwindow_merged_outputs(
-            config, list_date_start, list_date_middle, list_date_end)
     else:
         log("Skipping final time-window merge")
 
@@ -757,6 +774,12 @@ if __name__ == "__main__":
         help=("After validated merges, replace complete tile Zarr trajectories "
               "with one-record restart checkpoints"),
     )
+    parser.add_argument(
+        "--cleanup_subwindow_outputs",
+        action="store_true",
+        help=("After final completion is published, validate the global "
+              "output and remove root-level subwindow merge products"),
+    )
 
     args = parser.parse_args()
 
@@ -780,5 +803,6 @@ if __name__ == "__main__":
         zarr_output=args.zarr_output,
         output_float64=args.output_float64,
         cleanup_tile_zarr=args.cleanup_tile_zarr,
+        cleanup_subwindow_outputs=args.cleanup_subwindow_outputs,
     )
     log("Merge finished successfully")
