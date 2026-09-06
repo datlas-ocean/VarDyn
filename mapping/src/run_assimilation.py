@@ -10,6 +10,9 @@ import os
 # raise "NetCDF: Not a valid ID" otherwise.
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 import sys
+import json
+import queue
+import time
 import glob
 import copy as _copy
 import shutil
@@ -26,6 +29,7 @@ from datetime import timedelta
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import traceback
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -54,7 +58,10 @@ def prepare_process(config, config_eq, State,
                     gpu_devices=['0'],
                     obs_max_workers=None,
                     read_obs=False,
-                    dir_save_pickle=None):
+                    dir_save_pickle=None,
+                    zarr_time_chunk=4,
+                    zarr_spatial_chunk=256,
+                    zarr_compression_level=3):
     """
     Prepare subprocesses for assimilation in subwindows in time and space.
     The subprocesses can then be run in parallel using multiprocessing. 
@@ -181,6 +188,11 @@ def prepare_process(config, config_eq, State,
     interpolators : list of callable
         Precomputed interpolation operators mapping each subwindow grid to the target grid.
     """
+
+    for current_config in (config, config_eq):
+        current_config.EXP.zarr_time_chunk = zarr_time_chunk
+        current_config.EXP.zarr_spatial_chunk = zarr_spatial_chunk
+        current_config.EXP.zarr_compression_level = zarr_compression_level
 
     # Split full experimental time window in sub windows
     list_processes = []
@@ -1434,8 +1446,111 @@ def generate_dates(start_date, end_date, delta):
     return dates
 
 
+def cleanup_tile_zarr_window(
+        config, checkpoint_date, states, zarr_time_chunk=4,
+        zarr_spatial_chunk=256, zarr_compression_level=3):
+    """Compact one temporal window's tile archives to a restart checkpoint."""
+    if not getattr(config.EXP, 'saveoutputs_zarr', False):
+        raise ValueError('Tile Zarr cleanup requires EXP.saveoutputs_zarr=True')
+
+    compacted = 0
+    already_compact = 0
+    missing = 0
+    checkpoint_time = pd.Timestamp(checkpoint_date)
+
+    for tile_state in states:
+        archive = os.path.join(
+            tile_state.path_save, f'{config.EXP.name_exp_save}.zarr')
+        if not os.path.exists(archive):
+            # All-land or skipped tiles legitimately have no trajectory.
+            missing += 1
+            continue
+
+        temporary = f'{archive}.checkpoint-{os.getpid()}'
+        backup = f'{archive}.trajectory-{os.getpid()}'
+        lock_filename = f'{temporary}.lock'
+        for stale in (temporary, backup):
+            if os.path.exists(stale):
+                shutil.rmtree(stale)
+
+        with xr.open_zarr(archive, consolidated=False) as dataset:
+            times = pd.DatetimeIndex(pd.to_datetime(dataset.time.values))
+            indexes = np.flatnonzero(times == checkpoint_time)
+            if indexes.size == 0:
+                raise RuntimeError(
+                    f'Tile restart checkpoint {checkpoint_time} is '
+                    f'missing from {archive}')
+            if dataset.sizes.get('time', 0) == 1:
+                already_compact += 1
+                continue
+            record = dataset.isel(
+                time=slice(int(indexes[-1]), int(indexes[-1]) + 1)
+            ).load()
+
+        try:
+            state.State._save_zarr_record(
+                record, temporary, checkpoint_time,
+                window_start=checkpoint_time,
+                window_end=checkpoint_time,
+                zarr_time_chunk=zarr_time_chunk,
+                zarr_spatial_chunk=zarr_spatial_chunk,
+                zarr_compression_level=zarr_compression_level)
+            with xr.open_zarr(temporary, consolidated=False) as checkpoint:
+                checkpoint_times = pd.DatetimeIndex(
+                    pd.to_datetime(checkpoint.time.values))
+                if (checkpoint.sizes.get('time', 0) != 1
+                        or checkpoint_times[0] != checkpoint_time):
+                    raise RuntimeError(
+                        f'Invalid compacted tile checkpoint: {temporary}')
+
+            os.replace(archive, backup)
+            try:
+                os.replace(temporary, archive)
+            except Exception:
+                if not os.path.exists(archive):
+                    os.replace(backup, archive)
+                raise
+            else:
+                shutil.rmtree(backup)
+                compacted += 1
+        finally:
+            if os.path.exists(temporary):
+                shutil.rmtree(temporary)
+            if os.path.exists(lock_filename):
+                os.remove(lock_filename)
+            if os.path.exists(backup) and os.path.exists(archive):
+                shutil.rmtree(backup)
+
+    print(
+        f'Tile Zarr cleanup at {checkpoint_time}: '
+        f'{compacted} compacted, {already_compact} already compact, '
+        f'{missing} absent/all-land',
+        flush=True)
+
+
+def cleanup_tile_zarr_trajectories(
+        config, list_date_start, list_date_middle, list_date_end,
+        list_State, zarr_time_chunk=4, zarr_spatial_chunk=256,
+        zarr_compression_level=3):
+    """Compact all temporal windows; retained for batch/backward use."""
+    if not (len(list_date_start) == len(list_date_middle)
+            == len(list_date_end) == len(list_State)):
+        raise ValueError('Time-window and State lists must have the same length')
+    for iw, states in enumerate(list_State):
+        checkpoint_date = (
+            list_date_start[iw + 1]
+            if iw + 1 < len(list_date_start)
+            else list_date_end[iw])
+        cleanup_tile_zarr_window(
+            config, checkpoint_date, states,
+            zarr_time_chunk=zarr_time_chunk,
+            zarr_spatial_chunk=zarr_spatial_chunk,
+            zarr_compression_level=zarr_compression_level)
+
+
 def _merge_dates_worker(worker_index, dates, State, list_State,
-                        name_var_save, tile_paths, weights_space_sum,
+                        name_var_save, tile_paths, weights_space,
+                        interpolators, weights_space_sum,
                         output_dtype, result_q,
                         direct_copy_single_tile=False):
     """Own complete dates, including reduction and persistence."""
@@ -1448,7 +1563,7 @@ def _merge_dates_worker(worker_index, dates, State, list_State,
             weights_space_sum, dtype=accumulation_dtype)
         inv_wsum[~no_coverage] = 1.0 / weights_space_sum[~no_coverage]
         runtime_tiles = _prepare_runtime_tiles(
-            tile_paths, None, None, inv_wsum,
+            tile_paths, weights_space, interpolators, inv_wsum,
             weight_dtype=accumulation_dtype)
         if direct_copy_single_tile:
             runtime_tiles = [(
@@ -1467,17 +1582,24 @@ def _merge_dates_worker(worker_index, dates, State, list_State,
             output_state.save_output(
                 date, name_var=name_var_save, dtype=output_dtype)
             print(f'[parallel_merge] {date} done', flush=True)
+            result_q.put({
+                'kind': 'progress', 'worker': worker_index,
+                'date': str(date), 'error': None})
         result_q.put({
-            'worker': worker_index, 'count': len(dates), 'error': None})
-    except Exception as exc:
+            'kind': 'result', 'worker': worker_index,
+            'count': len(dates), 'error': None})
+    except BaseException as exc:
         result_q.put({
-            'worker': worker_index,
+            'kind': 'result', 'worker': worker_index,
             'count': 0,
             'error': f'{type(exc).__name__}: {exc}',
         })
 
 
-def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=None, num_workers=4, output_dtype=None):
+def parallel_merge(dates, State, list_State, name_var_save, kernel,
+                   weights_space, weights_space_sum, interpolators,
+                   list_tile_paths=None, num_workers=4, output_dtype=None,
+                   worker_stall_timeout=900):
     """Merge outputs from subprocesses in parallel for a list of dates.
 
     With on-disk compact tile projections, workers own contiguous date shards.
@@ -1495,18 +1617,10 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
             merge_output_date(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=list_tile_paths, output_dtype=output_dtype)
         return
 
-    # Fall back to old per-date pool when tiles are kept in memory (no pickle path).
-    if list_tile_paths is None:
-        with mp.Pool(processes=num_workers) as pool:
-            pool.starmap(
-                merge_output_date,
-                [(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, None, False, True, output_dtype) for date in dates]
-            )
-        return
-
-    # Compact projections let workers own complete dates. This removes the
-    # former transfer of twelve global arrays per worker and per date.
-    n_tiles = len(list_tile_paths)
+    # Workers own contiguous date shards.  In particular, do not use a forked
+    # multiprocessing.Pool after JAX has run: forking a multithreaded JAX/XLA
+    # process can deadlock before the first merged record is written.
+    n_tiles = len(list_tile_paths) if list_tile_paths is not None else len(list_State)
     direct_copy_single_tile = (
         n_tiles == 1
         and len(list_State) == 1
@@ -1532,7 +1646,8 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
         p = ctx.Process(
             target=_merge_dates_worker,
             args=(worker_index, worker_dates, State, list_State,
-                  name_var_save, list_tile_paths, weights_space_sum,
+                  name_var_save, list_tile_paths, weights_space,
+                  interpolators, weights_space_sum,
                   output_dtype, result_q, direct_copy_single_tile),
             daemon=False,
         )
@@ -1540,7 +1655,26 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
         procs.append(p)
 
     try:
-        results = [result_q.get() for _ in procs]
+        results = []
+        last_progress = time.monotonic()
+        while len(results) < len(procs):
+            try:
+                item = result_q.get(timeout=5)
+            except queue.Empty:
+                failed = [p for p in procs
+                          if not p.is_alive() and p.exitcode not in (0, None)]
+                if failed:
+                    raise RuntimeError(
+                        'merge worker exited without reporting a result: '
+                        + ', '.join(
+                            f'pid={p.pid}, exitcode={p.exitcode}' for p in failed))
+                if time.monotonic() - last_progress > worker_stall_timeout:
+                    raise TimeoutError(
+                        f'no merge-worker progress for {worker_stall_timeout} s')
+                continue
+            last_progress = time.monotonic()
+            if item.get('kind') == 'result':
+                results.append(item)
         failures = [item for item in results if item['error'] is not None]
         if failures:
             first = failures[0]
@@ -1551,6 +1685,7 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
             p.join(timeout=30)
             if p.is_alive():
                 p.terminate()
+                p.join(timeout=30)
 
 
 def _add_diagnosed_output_names(config, name_var_save):
@@ -1567,13 +1702,61 @@ def _add_diagnosed_output_names(config, name_var_save):
     return names
 
 
+def _run_assimilation_worker(worker, gpu_id):
+    """Run one tile and exit without a potentially blocking Python teardown."""
+    exitcode = 0
+    try:
+        worker(gpu_device=gpu_id)
+    except BaseException:
+        traceback.print_exc()
+        exitcode = 1
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            # JAX/XLA teardown has occasionally blocked after the final Zarr
+            # record.  All useful state is persisted before the worker returns.
+            os._exit(exitcode)
+
+
+def _zarr_time_size(archive):
+    """Read a Zarr v2 time length without opening every chunk in the store."""
+    metadata = os.path.join(archive, 'time', '.zarray')
+    if not os.path.isfile(metadata):
+        return None
+    with open(metadata, encoding='utf-8') as stream:
+        shape = json.load(stream).get('shape', [])
+    return int(shape[0]) if shape else None
+
+
+def _tile_trajectories_complete(list_State, expected_count):
+    """Whether every non-land tile still contains a complete trajectory."""
+    incomplete = []
+    for tile_state in list_State:
+        if (tile_state.mask is not None
+                and np.asarray(tile_state.mask).all()):
+            continue
+        archive = os.path.join(
+            tile_state.path_save, f'{tile_state.name_exp_save}.zarr')
+        count = _zarr_time_size(archive)
+        if count != expected_count:
+            incomplete.append((archive, count))
+    return not incomplete, incomplete
+
+
 def run_assimilation_time_window(config, date_start, date_middle, date_end, list_State, processes, 
                                  weights_space=None, weights_space_sum=None, interpolators=None,
                                  name_var_save=['sla'], 
                                  flag_assim=True, flag_merge_outputs=True, flag_diag=True, flag_overwrite_outputs=True,
                                  nprocs=4, nprocs_output=None,
                                  path_pickle=None,
-                                 gpu_devices=None):
+                                 gpu_devices=None,
+                                 zarr_time_chunk=4,
+                                 zarr_spatial_chunk=256,
+                                 zarr_compression_level=3,
+                                 cleanup_tile_zarr=False,
+                                 tile_checkpoint_date=None):
     
     """
     Run assimilation in a given time window using subprocesses.
@@ -1599,10 +1782,8 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
     # Run subprocesses
     ############################
     if flag_assim:
-        print('Run subprocesses')
+        print(f'Run subprocesses ({len(processes)} pending tiles)', flush=True)
         try:
-            old_stdout = sys.stdout # backup current stdout
-            sys.stdout = open(os.devnull, "w") # prevent printoing outputs
             _gpu_devices = gpu_devices if gpu_devices is not None else ['0']
             gpu_load = {g: 0 for g in _gpu_devices}
             active_processes = set()  # set of (process, gpu_id)
@@ -1610,7 +1791,9 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
             for worker in processes[:nprocs]:  # Start initial nprocs processes
                 gpu_id = str(min(gpu_load, key=gpu_load.get))
                 os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
-                p = mp.get_context("spawn").Process(target=worker, kwargs={'gpu_device': gpu_id})
+                p = mp.get_context("spawn").Process(
+                    target=_run_assimilation_worker,
+                    args=(worker, gpu_id))
                 p.start()
                 active_processes.add((p, gpu_id))
                 gpu_load[gpu_id] += 1
@@ -1622,11 +1805,19 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
                             p.join()
                             active_processes.discard((p, g))
                             gpu_load[g] -= 1
+                            if p.exitcode != 0:
+                                raise RuntimeError(
+                                    f'assimilation worker pid={p.pid} failed '
+                                    f'with exit code {p.exitcode}')
                             break
+                    else:
+                        time.sleep(1)
 
                 gpu_id = str(min(gpu_load, key=gpu_load.get))
                 os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
-                p = mp.get_context("spawn").Process(target=worker, kwargs={'gpu_device': gpu_id})
+                p = mp.get_context("spawn").Process(
+                    target=_run_assimilation_worker,
+                    args=(worker, gpu_id))
                 p.start()
                 active_processes.add((p, gpu_id))
                 gpu_load[gpu_id] += 1
@@ -1634,10 +1825,14 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
             # Wait for remaining processes to finish
             for p, g in list(active_processes):
                 p.join()
-            sys.stdout = old_stdout
-        except:
-            sys.stdout = old_stdout
-            print('Unable to run subprocesses')
+                if p.exitcode != 0:
+                    raise RuntimeError(
+                        f'assimilation worker pid={p.pid} failed '
+                        f'with exit code {p.exitcode}')
+        except Exception:
+            print('Unable to run subprocesses', flush=True)
+            traceback.print_exc()
+            raise
 
     
     ############################
@@ -1647,6 +1842,9 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
     config0.EXP = config0.EXP.copy()
     config0.EXP.init_date = date_start
     config0.EXP.final_date = date_end
+    config0.EXP.zarr_time_chunk = zarr_time_chunk
+    config0.EXP.zarr_spatial_chunk = zarr_spatial_chunk
+    config0.EXP.zarr_compression_level = zarr_compression_level
     config0.EXP.tmp_DA_path += f'/subwindow_{str(date_middle)[:10]}'
     config0.EXP.path_save += f'/subwindow_{str(date_middle)[:10]}'
     if flag_diag and config.DIAG is not None:
@@ -1667,21 +1865,64 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
     ############################
     # Merge outputs
     ############################
-    if flag_merge_outputs and ((flag_overwrite_outputs) or (len(glob.glob(f'{config0.EXP.path_save}/*.nc'))==0) or (flag_assim and len(processes)>0)): 
+    merge_succeeded = False
+    list_dates = generate_dates(
+        date_start, date_end, config.EXP.saveoutput_time_step)
+    merged_zarr = os.path.join(
+        config0.EXP.path_save, f'{config0.EXP.name_exp_save}.zarr')
+    merged_exists = (
+        os.path.isdir(merged_zarr)
+        if getattr(config0.EXP, 'saveoutputs_zarr', False)
+        else bool(glob.glob(f'{config0.EXP.path_save}/*.nc')))
+    sources_complete, incomplete_sources = _tile_trajectories_complete(
+        list_State, len(list_dates))
+    skip_protected_merge = (
+        flag_merge_outputs and merged_exists and not processes
+        and not sources_complete)
+    if skip_protected_merge:
+        print(
+            'Skip merge: the existing temporal-window product is preserved '
+            'because its tile trajectories have already been compacted. ',
+            f'Incomplete sources: {len(incomplete_sources)}',
+            flush=True)
+
+    should_merge = (
+        flag_merge_outputs and not skip_protected_merge
+        and (flag_overwrite_outputs or not merged_exists
+             or (flag_assim and len(processes) > 0)))
+    if should_merge:
+        if not sources_complete:
+            details = ', '.join(
+                f'{path} (time={count})'
+                for path, count in incomplete_sources[:3])
+            raise RuntimeError(
+                'Cannot rebuild the merged temporal-window output: tile '
+                f'trajectories are incomplete. Examples: {details}')
         try:
-            print('Merge outputs')
+            print('Merge outputs', flush=True)
             kernel = Gaussian2DKernel(x_stddev=1, y_stddev=1)  # Kernel to convolve output maps to replace NaN pixels close to the coast for interpolation
-            list_dates = generate_dates(date_start, date_end, config.EXP.saveoutput_time_step)
             num_workers = nprocs_output if nprocs_output is not None else nprocs
             parallel_merge(list_dates, State0, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=list_tile_paths, num_workers=num_workers)
+            merge_succeeded = True
 
-        except:
-            print('Unable to merge outputs')
+        except Exception as exc:
+            print(f'Unable to merge outputs: {exc}')
+
+    if cleanup_tile_zarr and merge_succeeded:
+        if tile_checkpoint_date is None:
+            raise ValueError(
+                'tile_checkpoint_date is required when '
+                'cleanup_tile_zarr=True')
+        cleanup_tile_zarr_window(
+            config, tile_checkpoint_date, list_State,
+            zarr_time_chunk=zarr_time_chunk,
+            zarr_spatial_chunk=zarr_spatial_chunk,
+            zarr_compression_level=zarr_compression_level)
     
     ############################
     # Diagnostics
     ############################
-    if flag_diag:
+    if flag_diag and (merge_succeeded or not flag_merge_outputs):
         try:
             print('Run Diagnostics')
             Diag = diag.Diag(config0,State0)
@@ -1690,12 +1931,18 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
             Diag.psd_based_scores(plot=True)
             Diag.movie(framerate=12)
             Diag.Leaderboard()
-        except:
+        except Exception:
             print('Unable to compute diags')
+            traceback.print_exc()
         
         del State0, config0
 
-def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_date_end, time_overlap, zarr_output=False, output_dtype=np.float32):
+    return merge_succeeded
+
+def merge_time_windows_outputs(
+        config, list_date_start, list_date_middle, list_date_end, time_overlap,
+        zarr_output=False, output_dtype=np.float32, zarr_time_chunk=4,
+        zarr_spatial_chunk=256, zarr_compression_level=3):
     
     """
     Merge outputs from different time windows.
@@ -1859,7 +2106,11 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
             if os.path.exists(backup_path):
                 shutil.rmtree(backup_path)
             state._set_zarr_time_encoding(combined)
-            state._write_new_zarr(combined, temporary_path)
+            state._write_new_zarr(
+                combined, temporary_path,
+                zarr_time_chunk=zarr_time_chunk,
+                zarr_spatial_chunk=zarr_spatial_chunk,
+                zarr_compression_level=zarr_compression_level)
 
             with xr.open_zarr(
                     temporary_path, consolidated=False) as candidate:
@@ -1958,7 +2209,10 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
                 state.State._save_zarr_record(
                     dsout, output_path, date,
                     window_start=min(list_date_start),
-                    window_end=max(list_date_end))
+                    window_end=max(list_date_end),
+                    zarr_time_chunk=zarr_time_chunk,
+                    zarr_spatial_chunk=zarr_spatial_chunk,
+                    zarr_compression_level=zarr_compression_level)
             else:
                 # Write beside the destination and publish atomically. A
                 # direct write can leave a truncated HDF5 file when a merge

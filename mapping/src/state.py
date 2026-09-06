@@ -22,11 +22,6 @@ from .config import USE_FLOAT64
 
 
 _ZARR_TIME_UNITS = 'nanoseconds since 1970-01-01'
-_ZARR_TIME_CHUNK = max(1, int(os.environ.get('VARDYN_ZARR_TIME_CHUNK', '4')))
-_ZARR_SPATIAL_CHUNK = max(
-    1, int(os.environ.get('VARDYN_ZARR_SPATIAL_CHUNK', '256')))
-_ZARR_COMPRESSION_LEVEL = min(
-    9, max(0, int(os.environ.get('VARDYN_ZARR_COMPRESSION_LEVEL', '3'))))
 
 
 def _set_zarr_time_encoding(dataset):
@@ -39,8 +34,17 @@ def _set_zarr_time_encoding(dataset):
         })
 
 
-def _zarr_encoding(dataset):
+def _zarr_encoding(
+        dataset, zarr_time_chunk=4, zarr_spatial_chunk=256,
+        zarr_compression_level=3):
     """Return one explicit, space-efficient encoding for new Zarr v2 stores."""
+    zarr_time_chunk = int(zarr_time_chunk)
+    zarr_spatial_chunk = int(zarr_spatial_chunk)
+    zarr_compression_level = int(zarr_compression_level)
+    if zarr_time_chunk < 1 or zarr_spatial_chunk < 1:
+        raise ValueError('Zarr chunk sizes must be positive integers')
+    if not 0 <= zarr_compression_level <= 9:
+        raise ValueError('Zarr compression level must be between 0 and 9')
     try:
         from numcodecs import Blosc
     except ImportError as exc:
@@ -49,7 +53,7 @@ def _zarr_encoding(dataset):
 
     compressor = Blosc(
         cname='zstd',
-        clevel=_ZARR_COMPRESSION_LEVEL,
+        clevel=zarr_compression_level,
         shuffle=Blosc.BITSHUFFLE,
     )
     encoding = {}
@@ -62,10 +66,10 @@ def _zarr_encoding(dataset):
                 # A new archive initially contains one record. Keeping the
                 # configured chunk larger than that lets later appends share
                 # chunks and exploit temporal coherence.
-                chunks.append(_ZARR_TIME_CHUNK)
+                chunks.append(zarr_time_chunk)
             else:
                 chunks.append(max(
-                    1, min(int(size), _ZARR_SPATIAL_CHUNK)))
+                    1, min(int(size), zarr_spatial_chunk)))
         item = {'chunks': tuple(chunks)}
         if variable.dtype.kind not in {'O', 'U'}:
             item['compressor'] = compressor
@@ -73,12 +77,18 @@ def _zarr_encoding(dataset):
     return encoding
 
 
-def _write_new_zarr(dataset, filename):
+def _write_new_zarr(
+        dataset, filename, zarr_time_chunk=4, zarr_spatial_chunk=256,
+        zarr_compression_level=3):
     """Create a compressed Zarr v2 store with deterministic chunk sizes."""
     dataset.to_zarr(
         filename,
         mode='w',
-        encoding=_zarr_encoding(dataset),
+        encoding=_zarr_encoding(
+            dataset,
+            zarr_time_chunk=zarr_time_chunk,
+            zarr_spatial_chunk=zarr_spatial_chunk,
+            zarr_compression_level=zarr_compression_level),
         zarr_format=2,
         safe_chunks=False,
     )
@@ -537,6 +547,11 @@ class State:
                 date,
                 window_start=self.config.EXP.init_date,
                 window_end=self.config.EXP.final_date,
+                zarr_time_chunk=self.config.EXP.get('zarr_time_chunk', 4),
+                zarr_spatial_chunk=self.config.EXP.get(
+                    'zarr_spatial_chunk', 256),
+                zarr_compression_level=(
+                    self.config.EXP.get('zarr_compression_level', 3)),
             )
             return
 
@@ -584,7 +599,10 @@ class State:
         return 
 
     @staticmethod
-    def _save_zarr_record(record, filename, date, window_start=None, window_end=None):
+    def _save_zarr_record(
+            record, filename, date, window_start=None, window_end=None,
+            zarr_time_chunk=4, zarr_spatial_chunk=256,
+            zarr_compression_level=3):
         # Serialize the complete read/modify/write transaction. Slurm array
         # ranks shard dates but intentionally share one experiment archive.
         lock_filename = f'{filename}.lock'
@@ -593,13 +611,19 @@ class State:
             try:
                 State._save_zarr_record_unlocked(
                     record, filename, date,
-                    window_start=window_start, window_end=window_end)
+                    window_start=window_start, window_end=window_end,
+                    zarr_time_chunk=zarr_time_chunk,
+                    zarr_spatial_chunk=zarr_spatial_chunk,
+                    zarr_compression_level=zarr_compression_level)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _save_zarr_record_unlocked(record, filename, date,
-                                   window_start=None, window_end=None):
+                                   window_start=None, window_end=None,
+                                   zarr_time_chunk=4,
+                                   zarr_spatial_chunk=256,
+                                   zarr_compression_level=3):
         # Write partial model records into one consistent Zarr archive.
         record_time = pd.Timestamp(date)
         start = pd.Timestamp(window_start) if window_start is not None else None
@@ -612,7 +636,11 @@ class State:
                 f'[{start}, {end}]')
         _set_zarr_time_encoding(record)
         if not os.path.exists(filename):
-            _write_new_zarr(record, filename)
+            _write_new_zarr(
+                record, filename,
+                zarr_time_chunk=zarr_time_chunk,
+                zarr_spatial_chunk=zarr_spatial_chunk,
+                zarr_compression_level=zarr_compression_level)
             record.close()
             return
 
@@ -740,7 +768,11 @@ class State:
         _set_zarr_time_encoding(combined)
         if os.path.exists(temporary):
             shutil.rmtree(temporary)
-        _write_new_zarr(combined, temporary)
+        _write_new_zarr(
+            combined, temporary,
+            zarr_time_chunk=zarr_time_chunk,
+            zarr_spatial_chunk=zarr_spatial_chunk,
+            zarr_compression_level=zarr_compression_level)
         combined.close()
         existing.close()
         record.close()

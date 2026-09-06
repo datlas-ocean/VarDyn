@@ -147,7 +147,10 @@ def _compact_tile_zarr_trajectories(
         try:
             state.State._save_zarr_record(
                 record, str(temporary), checkpoint_time,
-                window_start=checkpoint_time, window_end=checkpoint_time)
+                window_start=checkpoint_time, window_end=checkpoint_time,
+                zarr_time_chunk=config.EXP.zarr_time_chunk,
+                zarr_spatial_chunk=config.EXP.zarr_spatial_chunk,
+                zarr_compression_level=config.EXP.zarr_compression_level)
             with xr.open_zarr(temporary, consolidated=False) as checkpoint:
                 checkpoint_times = pd.DatetimeIndex(
                     pd.to_datetime(checkpoint.time.values))
@@ -216,7 +219,10 @@ def _consolidate_dated_outputs_to_zarr(
                 record[name] = record[name].astype(output_dtype)
         state.State._save_zarr_record(
             record, str(archive_path), date,
-            window_start=window_start, window_end=window_end)
+            window_start=window_start, window_end=window_end,
+            zarr_time_chunk=config.EXP.zarr_time_chunk,
+            zarr_spatial_chunk=config.EXP.zarr_spatial_chunk,
+            zarr_compression_level=config.EXP.zarr_compression_level)
         if dated_zarr_path.exists():
             shutil.rmtree(dated_zarr_path)
         if nc_path.exists():
@@ -412,7 +418,11 @@ def _finalize_spatial_zarr_parts(
             if np.issubdtype(combined[name].dtype, np.floating):
                 combined[name] = combined[name].astype(output_dtype)
         state._set_zarr_time_encoding(combined)
-        state._write_new_zarr(combined, str(temporary_archive))
+        state._write_new_zarr(
+            combined, str(temporary_archive),
+            zarr_time_chunk=config.EXP.zarr_time_chunk,
+            zarr_spatial_chunk=config.EXP.zarr_spatial_chunk,
+            zarr_compression_level=config.EXP.zarr_compression_level)
         combined.close()
         combined = None
 
@@ -479,10 +489,17 @@ def merge_outputs(
     output_float64=False,
     cleanup_tile_zarr=False,
     cleanup_subwindow_outputs=False,
+    zarr_time_chunk=4,
+    zarr_spatial_chunk=256,
+    zarr_compression_level=3,
 ):
     log(f"Loading configuration from {path_config}")
     with open(path_config, "rb") as f:
         config = pickle.load(f)
+
+    config.EXP.zarr_time_chunk = zarr_time_chunk
+    config.EXP.zarr_spatial_chunk = zarr_spatial_chunk
+    config.EXP.zarr_compression_level = zarr_compression_level
 
     config_requests_zarr = bool(
         getattr(config.EXP, 'saveoutputs_zarr', False))
@@ -688,6 +705,9 @@ def merge_outputs(
             time_overlap,
             zarr_output=zarr_output,
             output_dtype=output_dtype,
+            zarr_time_chunk=zarr_time_chunk,
+            zarr_spatial_chunk=zarr_spatial_chunk,
+            zarr_compression_level=zarr_compression_level,
         )
         final_dates = sorted({
             date
@@ -768,6 +788,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--zarr_output", action="store_true", help="Use Zarr for merged outputs and remove intermediate NetCDF files")
     parser.add_argument("--output_float64", action="store_true", help="Save merged floating-point data as float64 (default: float32)")
+    parser.add_argument("--zarr_time_chunk", type=int, default=4)
+    parser.add_argument("--zarr_spatial_chunk", type=int, default=256)
+    parser.add_argument("--zarr_compression_level", type=int, default=3)
     parser.add_argument(
         "--cleanup_tile_zarr",
         action="store_true",
@@ -804,5 +827,8 @@ if __name__ == "__main__":
         output_float64=args.output_float64,
         cleanup_tile_zarr=args.cleanup_tile_zarr,
         cleanup_subwindow_outputs=args.cleanup_subwindow_outputs,
+        zarr_time_chunk=args.zarr_time_chunk,
+        zarr_spatial_chunk=args.zarr_spatial_chunk,
+        zarr_compression_level=args.zarr_compression_level,
     )
     log("Merge finished successfully")

@@ -915,8 +915,11 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             Model.save_output(State0, date, name_var=Model.var_to_save, t=t) 
         
     del State, State0, Xa, dict_obs, B, R, Model, Basis, var, Xopt, Xres, checkpoints, time_checkpoints, t_checkpoints
-    gc.collect()
-    print()
+    # This routine normally runs in a short-lived spawned process.  Forcing a
+    # full cyclic collection here can stall indefinitely while JAX/XLA still
+    # owns device-backed objects, even though the complete trajectory is
+    # already on disk.  Let normal process teardown reclaim those objects.
+    print(flush=True)
 
 
 # =============================================================================

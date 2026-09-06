@@ -70,6 +70,11 @@ def main():
     parser.add_argument("--time_window_size_proc", type=float, default=50)
     parser.add_argument("--time_overlap", type=float, default=10)
 
+    # Zarr storage
+    parser.add_argument("--zarr_time_chunk", type=int, default=4)
+    parser.add_argument("--zarr_spatial_chunk", type=int, default=256)
+    parser.add_argument("--zarr_compression_level", type=int, default=3)
+
     # Flags
     parser.add_argument("--flag_init_from_previous", action="store_true", default=True)
     parser.add_argument("--no_flag_init_from_previous", action="store_false", dest="flag_init_from_previous")
@@ -136,6 +141,9 @@ def main():
         gpu_devices=gpu_devices,
         obs_max_workers=args.obs_max_workers,
         dir_save_pickle=args.dir_save_pickle,
+        zarr_time_chunk=args.zarr_time_chunk,
+        zarr_spatial_chunk=args.zarr_spatial_chunk,
+        zarr_compression_level=args.zarr_compression_level,
     )
 
     print("Preparation complete.")

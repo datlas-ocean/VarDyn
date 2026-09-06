@@ -92,10 +92,6 @@ if ! [[ "$ZARR_TIME_CHUNK" =~ ^[1-9][0-9]*$ ]] || \
     echo "ERROR: invalid Zarr chunk/compression settings" >&2
     exit 1
 fi
-export VARDYN_ZARR_TIME_CHUNK="$ZARR_TIME_CHUNK"
-export VARDYN_ZARR_SPATIAL_CHUNK="$ZARR_SPATIAL_CHUNK"
-export VARDYN_ZARR_COMPRESSION_LEVEL="$ZARR_COMPRESSION_LEVEL"
-
 # -------------------- USER INPUT (optional CLI flags) --------------------
 # Parse optional flags
 SKIP_PREPARE=false
@@ -231,6 +227,9 @@ PREPARE_ARGS="\
     --space_window_size_proc_y_eq $SPACE_WIN_Y_EQ \
     --space_overlap_x $SPACE_OVERLAP_X --space_overlap_y $SPACE_OVERLAP_Y \
     --time_window_size_proc $TIME_WIN --time_overlap $TIME_OVERLAP \
+    --zarr_time_chunk $ZARR_TIME_CHUNK \
+    --zarr_spatial_chunk $ZARR_SPATIAL_CHUNK \
+    --zarr_compression_level $ZARR_COMPRESSION_LEVEL \
     $FLAG_INIT_FROM_PREVIOUS \
     $INIT_BG_ARGS"
 
@@ -533,10 +532,10 @@ for TIME_DIR in $TIME_WINDOWS; do
     fi
 
 
-    ZARR_OUTPUT_ARG=""
+    ZARR_OUTPUT_ARG="--zarr_time_chunk $ZARR_TIME_CHUNK --zarr_spatial_chunk $ZARR_SPATIAL_CHUNK --zarr_compression_level $ZARR_COMPRESSION_LEVEL"
     OUTPUT_FLOAT64_ARG=""
     CLEANUP_TILE_ZARR_ARG=""
-    $ZARR_OUTPUT && ZARR_OUTPUT_ARG="--zarr_output"
+    $ZARR_OUTPUT && ZARR_OUTPUT_ARG="--zarr_output $ZARR_OUTPUT_ARG"
     $OUTPUT_FLOAT64 && OUTPUT_FLOAT64_ARG="--output_float64"
     $CLEANUP_TILE_ZARR && CLEANUP_TILE_ZARR_ARG="--cleanup_tile_zarr"
     MERGE_MARKER="${BARRIER_DIR}/spatial_merge_iw${IW}.ok"
