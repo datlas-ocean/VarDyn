@@ -1990,18 +1990,23 @@ That could be due to non regular grid or bad written netcdf file')
         sourcefolder = self.dir_output
         moviename = 'movie.mp4'
         frame_pattern = 'frame_*.png'
-        ffmpeg_options="-c:v libx264 -preset veryslow -crf 15 -pix_fmt yuv420p"
+        command = [
+            'ffmpeg', '-f', 'image2', '-r', str(framerate),
+            '-pattern_type', 'glob',
+            '-i', os.path.join(sourcefolder, frame_pattern),
+            '-y',
+            '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2',
+            '-c:v', 'libx264', '-preset', 'veryslow', '-crf', '15',
+            '-pix_fmt', 'yuv420p', '-r', str(framerate),
+            os.path.join(self.dir_output, moviename),
+        ]
+        print(' '.join(command))
 
-        command = 'ffmpeg -f image2 -r %i -pattern_type glob -i %s -y %s -r %i %s' % (
-                framerate,
-                os.path.join(sourcefolder, frame_pattern),
-                ffmpeg_options,
-                framerate,
-                os.path.join(self.dir_output, moviename),
-            )
-        print(command)
-
-        _ = subprocess.run(command.split(' '),stdout=subprocess.PIPE)
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f'FFmpeg failed while creating {moviename}:\n{result.stderr}')
 
         ## Delete frames
         #os.system(f'rm {os.path.join(sourcefolder, frame_pattern)}')

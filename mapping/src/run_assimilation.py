@@ -1737,11 +1737,18 @@ def _tile_trajectories_complete(list_State, expected_count):
         if (tile_state.mask is not None
                 and np.asarray(tile_state.mask).all()):
             continue
-        archive = os.path.join(
-            tile_state.path_save, f'{tile_state.name_exp_save}.zarr')
-        count = _zarr_time_size(archive)
+        save_zarr = bool(getattr(
+            tile_state.config.EXP, 'saveoutputs_zarr', False))
+        if save_zarr:
+            source = os.path.join(
+                tile_state.path_save, f'{tile_state.name_exp_save}.zarr')
+            count = _zarr_time_size(source)
+        else:
+            source = os.path.join(
+                tile_state.path_save, f'{tile_state.name_exp_save}_*.nc')
+            count = len(glob.glob(source))
         if count != expected_count:
-            incomplete.append((archive, count))
+            incomplete.append((source, count))
     return not incomplete, incomplete
 
 
@@ -2083,9 +2090,10 @@ def merge_time_windows_outputs(
                                 weight1 * ds1[name] + weight2 * ds2[name])
                 records.append(dsout)
 
-            log(
+            print(
                 f'Building final Zarr archive from {len(records)} contiguous '
-                f'time blocks ({len(all_dates)} timestamps)')
+                f'time blocks ({len(all_dates)} timestamps)',
+                flush=True)
             combined = xr.concat(
                 records,
                 dim='time',
