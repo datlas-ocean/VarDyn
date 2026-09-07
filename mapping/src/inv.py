@@ -557,7 +557,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     if config.INV.path_init_4Dvar is None:
         Xopt = np.zeros((Xb.size,))
     elif not os.path.exists(config.INV.path_init_4Dvar):
-        sys.exit(f"File {config.INV.path_init_4Dvar} does not exist. We take the default initialization.")
+        print(f"File {config.INV.path_init_4Dvar} does not exist. We take the default initialization.")
         Xopt = np.zeros((Xb.size,))
     else:
         # Read previous minimum 
