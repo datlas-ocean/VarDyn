@@ -28,6 +28,48 @@ from . import tools as switchvar
 import cmocean
 
 
+def _create_mp4_from_frames(sourcefolder, framerate, moviename='movie.mp4'):
+    """Encode diagnostic PNG frames as an H.264 movie.
+
+    ``yuv420p`` requires even frame dimensions.  Matplotlib can produce odd
+    dimensions depending on the figure layout, so pad at most one pixel on
+    the right and bottom before encoding.
+    """
+    frame_pattern = 'frame_*.png'
+    frames = sorted(glob.glob(os.path.join(sourcefolder, frame_pattern)))
+    if not frames:
+        raise FileNotFoundError(
+            f'No diagnostic frames found in {sourcefolder!r}')
+
+    movie_path = os.path.join(sourcefolder, moviename)
+    command = [
+        'ffmpeg', '-f', 'image2', '-r', str(framerate),
+        '-pattern_type', 'glob',
+        '-i', os.path.join(sourcefolder, frame_pattern),
+        '-y',
+        '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2',
+        '-c:v', 'libx264', '-preset', 'veryslow', '-crf', '15',
+        '-pix_fmt', 'yuv420p', '-r', str(framerate),
+        movie_path,
+    ]
+    print(' '.join(command))
+
+    try:
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            'FFmpeg executable not found; diagnostic frames were kept.') \
+            from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'FFmpeg failed while creating {moviename}; diagnostic frames '
+            f'were kept:\n{result.stderr}')
+
+    return movie_path, frames
+
+
 def _open_experiment_output(config, variables):
     """Open model outputs from the configured Zarr or legacy NetCDF layout."""
     variables = [variables] if isinstance(variables, str) else list(variables)
@@ -808,14 +850,10 @@ That could be due to non regular grid or bad written netcdf file')
         # Run in parallel using all available cores (or specify n_jobs=4, n_jobs=8, etc.)
         results = Parallel(n_jobs=-1, verbose=10)(delayed(_save_single_frame)(ds.load(), tt) for tt in range(ds[self.name_ref_time].size))
 
-        # Create movie
-        if self.path_images2mp4  is not None and os.path.exists(self.path_images2mp4):
-            command = f'{self.path_images2mp4} -i {self.dir_output}/frame -f {framerate} -D {self.dir_output}'
-            print(command)
-            os.system(command)
-
-        # Delete frames
-        os.system(f'rm {os.path.join(self.dir_output, "frame_*.png")}')
+        # Create movie.  Delete source frames only after successful encoding.
+        _, frames = _create_mp4_from_frames(self.dir_output, framerate)
+        for frame in frames:
+            os.remove(frame)
         
         # Display movie
         if Display:
@@ -1987,33 +2025,14 @@ That could be due to non regular grid or bad written netcdf file')
         results = Parallel(n_jobs=-1, verbose=10)(delayed(_save_single_frame)(tt) for tt in range(self.exp[self.name_exp_time].size))
 
         # Create movie
-        sourcefolder = self.dir_output
-        moviename = 'movie.mp4'
-        frame_pattern = 'frame_*.png'
-        command = [
-            'ffmpeg', '-f', 'image2', '-r', str(framerate),
-            '-pattern_type', 'glob',
-            '-i', os.path.join(sourcefolder, frame_pattern),
-            '-y',
-            '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2',
-            '-c:v', 'libx264', '-preset', 'veryslow', '-crf', '15',
-            '-pix_fmt', 'yuv420p', '-r', str(framerate),
-            os.path.join(self.dir_output, moviename),
-        ]
-        print(' '.join(command))
-
-        result = subprocess.run(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f'FFmpeg failed while creating {moviename}:\n{result.stderr}')
+        _create_mp4_from_frames(self.dir_output, framerate)
 
         ## Delete frames
         #os.system(f'rm {os.path.join(sourcefolder, frame_pattern)}')
 
         # Display movie
         if Display:
-            Video(os.path.join(self.dir_output, moviename),embed=True)
+            Video(os.path.join(self.dir_output, 'movie.mp4'),embed=True)
         return 
     
     def Leaderboard(self):
