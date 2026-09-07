@@ -11,7 +11,7 @@ Large-scale SSH mapping with MASSH (e.g. global VarDyn runs) is parallelised ove
 Each running SLURM array task (one GPU) claims a dynamic subset of tiles. For Zarr output, spatial-merge date shards are also dynamically claimed: each active task uses its own CPU allocation to create an independent rank archive. One task then assembles the validated rank archives into the single archive for that temporal window. Finally, one task merges all temporal windows into the full output.
 
 ```
-sbatch slurm/run/VarDyn_GLO.sh [--skip-prepare] [--restart] [--force-merge] [--name_exp <name>]
+sbatch slurm/run/VarDyn_GLO.sh [--skip-prepare] [--restart] [--force-merge] [--tile-scope all|equatorial] [--name_exp <name>]
 ```
 
 ## Repository structure
@@ -86,6 +86,7 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 | `--restart` | Pass `--restart` to `run_tile.py` (resume from checkpoint) |
 | `--force-merge` | Force re-merge even if output files already exist |
 | `--merge-only` | Skip preparation and assimilation, only run spatial and time-window merges |
+| `--tile-scope all\|equatorial` | Restrict assimilation dispatch to all tiles (default) or only tiles crossing latitude 0; spatial and temporal merges still use every tile output |
 | `--name_exp <name>` | Override experiment name (default: read from config or filename) |
 
 **`EXP_NAME` resolution order:**
@@ -140,6 +141,9 @@ sbatch VarDyn_GLO.sh --skip-prepare
 
 # Resume a crashed run
 sbatch VarDyn_GLO.sh --skip-prepare --restart
+
+# Re-run only equatorial 4DVar tiles and rebuild merged outputs
+sbatch VarDyn_GLO.sh --skip-prepare --restart --force-merge --tile-scope equatorial
 
 # Override experiment name
 sbatch VarDyn_GLO.sh --name_exp my_custom_name

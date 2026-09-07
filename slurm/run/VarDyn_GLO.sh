@@ -98,6 +98,7 @@ SKIP_PREPARE=false
 RESTART_ARGS=""
 FORCE_MERGE=false
 MERGE_ONLY=false
+TILE_SCOPE="all"
 NAME_EXP_OVERRIDE=""
 NAME_EXP_BACKGROUND_OVERRIDE=""
 args=("$@")
@@ -110,6 +111,8 @@ while [ $i -lt ${#args[@]} ]; do
         --restart)       RESTART_ARGS="--restart" ;;
         --force-merge)   FORCE_MERGE=true ;;
         --merge-only)    MERGE_ONLY=true; SKIP_PREPARE=true ;;
+        --tile-scope)    i=$(( i + 1 )); TILE_SCOPE="${args[$i]}" ;;
+        --tile-scope=*)  TILE_SCOPE="${args[$i]#--tile-scope=}" ;;
         --name_exp)      i=$(( i + 1 )); NAME_EXP_OVERRIDE="${args[$i]}" ;;
         --name_exp=*)    NAME_EXP_OVERRIDE="${args[$i]#--name_exp=}" ;;
         --name_exp_background) i=$(( i + 1 )); NAME_EXP_BACKGROUND_OVERRIDE="${args[$i]}" ;;
@@ -117,6 +120,11 @@ while [ $i -lt ${#args[@]} ]; do
     esac
     i=$(( i + 1 ))
 done
+
+if [ "$TILE_SCOPE" != "all" ] && [ "$TILE_SCOPE" != "equatorial" ]; then
+    echo "ERROR: --tile-scope must be 'all' or 'equatorial' (got '$TILE_SCOPE')" >&2
+    exit 1
+fi
 
 # A dedicated background experiment necessarily requires background mode.
 if [ -n "$NAME_EXP_BACKGROUND_OVERRIDE" ]; then
@@ -172,6 +180,7 @@ submit_continuation() {
     local next_job
     local continuation_args=(--config "${CONFIG_FILE}" --skip-prepare)
     $MERGE_ONLY && continuation_args+=(--merge-only)
+    [ "$TILE_SCOPE" != "all" ] && continuation_args+=(--tile-scope "$TILE_SCOPE")
     [ -n "${NAME_EXP_OVERRIDE}" ] && continuation_args+=(--name_exp "${NAME_EXP_OVERRIDE}")
     if next_job=$(sbatch --parsable \
         --dependency="afterany:${dependency}" \
@@ -298,6 +307,7 @@ echo " SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-N/A}"
 echo " SLURM_CPUS_ON_NODE=${SLURM_CPUS_ON_NODE:-N/A}"
 echo " NUM_MERGE_WORKERS=${NUM_MERGE_WORKERS}"
 echo " NUM_TILES_PER_GPU=${NUM_TILES_PER_GPU}"
+echo " TILE_SCOPE=${TILE_SCOPE}"
 echo " CLEANUP_TILE_ZARR=${CLEANUP_TILE_ZARR}"
 echo " ZARR chunks=${ZARR_TIME_CHUNK}x${ZARR_SPATIAL_CHUNK}x${ZARR_SPATIAL_CHUNK}, zstd level=${ZARR_COMPRESSION_LEVEL}"
 echo "=========================================="
@@ -473,10 +483,43 @@ for TIME_DIR in $TIME_WINDOWS; do
     TILE_LIST="${BARRIER_DIR}/tiles_iw${IW}"
     if mkdir "${BARRIER_DIR}/queue_iw${IW}.lock" 2>/dev/null; then
         OWNED_STAGE_LOCK="${BARRIER_DIR}/queue_iw${IW}.lock"
-        find "$TIME_DIR" -mindepth 1 -maxdepth 1 -type d -name "subwindow_*" | sort > "${TILE_LIST}.tmp"
+        if [ "$TILE_SCOPE" = "equatorial" ]; then
+            if ! python3 - "$TIME_DIR" > "${TILE_LIST}.tmp" <<'PY_TILE_SCOPE'
+import pickle
+import sys
+from pathlib import Path
+
+time_dir = Path(sys.argv[1])
+for tile in sorted(time_dir.glob("subwindow_*")):
+    if not tile.is_dir():
+        continue
+    config_path = tile / "config.pkl"
+    try:
+        with config_path.open("rb") as stream:
+            config = pickle.load(stream)
+        lat_min = float(config.GRID.lat_min)
+        lat_max = float(config.GRID.lat_max)
+    except Exception as exc:
+        print(f"ERROR: cannot inspect tile config {config_path}: {exc}",
+              file=sys.stderr)
+        raise SystemExit(1)
+    if lat_min < 0.0 < lat_max:
+        print(tile)
+PY_TILE_SCOPE
+            then
+                echo "$(date '+%F %T') | ERROR: failed to select equatorial tiles in $TIME_DIR" >&2
+                rm -f "${TILE_LIST}.tmp"
+                touch "${BARRIER_DIR}/queue_failed_iw${IW}"
+                OWNED_STAGE_LOCK=""
+                rmdir "${BARRIER_DIR}/queue_iw${IW}.lock" 2>/dev/null || true
+                exit 1
+            fi
+        else
+            find "$TIME_DIR" -mindepth 1 -maxdepth 1 -type d -name "subwindow_*" | sort > "${TILE_LIST}.tmp"
+        fi
         mv "${TILE_LIST}.tmp" "$TILE_LIST"
         TOTAL_TILES=$(wc -l < "$TILE_LIST")
-        echo "$(date '+%F %T') | Found ${TOTAL_TILES} tiles for time window ${IW}"
+        echo "$(date '+%F %T') | Found ${TOTAL_TILES} ${TILE_SCOPE} tiles for time window ${IW}"
         if [ -n "$RESTART" ]; then
             while IFS= read -r tile; do
                 [ -z "$tile" ] && continue
@@ -487,7 +530,15 @@ for TIME_DIR in $TIME_WINDOWS; do
         touch "${BARRIER_DIR}/queue_ready_iw${IW}"
         OWNED_STAGE_LOCK=""
     fi
-    while [ ! -f "${BARRIER_DIR}/queue_ready_iw${IW}" ]; do sleep 1; done
+    while [ ! -f "${BARRIER_DIR}/queue_ready_iw${IW}" ] && \
+          [ ! -f "${BARRIER_DIR}/queue_failed_iw${IW}" ]; do sleep 1; done
+    if [ -f "${BARRIER_DIR}/queue_failed_iw${IW}" ]; then
+        exit 1
+    fi
+    if [ ! -s "$TILE_LIST" ]; then
+        echo "$(date '+%F %T') | ERROR: no ${TILE_SCOPE} tiles found in $TIME_DIR" >&2
+        exit 1
+    fi
 
     # Each task dynamically claims tiles (first to mkdir wins)
     if ! $MERGE_ONLY; then
