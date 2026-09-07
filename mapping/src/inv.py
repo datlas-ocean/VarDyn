@@ -887,6 +887,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
 
     # Init
     State0 = State.copy()
+    State0.enable_output_batching()
     Model.init(State0)
     date = config.EXP.init_date
     print(f'[4DVAR SAVE] date={date.isoformat()} t=0 dt={Model.dt} save_step={config.EXP.saveoutput_time_step}', flush=True)
@@ -913,6 +914,10 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             & (date>=config.EXP.init_date) & (date<=config.EXP.final_date) :
             print(f'[4DVAR SAVE] date={date.isoformat()} t={t} nstep={nstep} dt={Model.dt}', flush=True)
             Model.save_output(State0, date, name_var=Model.var_to_save, t=t) 
+
+    # Flush the last, possibly incomplete, time chunk before publishing the
+    # tile completion marker in the Slurm worker.
+    State0.flush_output_batch()
         
     del State, State0, Xa, dict_obs, B, R, Model, Basis, var, Xopt, Xres, checkpoints, time_checkpoints, t_checkpoints
     # This routine normally runs in a short-lived spawned process.  Forcing a

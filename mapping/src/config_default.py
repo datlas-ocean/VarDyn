@@ -23,6 +23,14 @@ EXP = dict(
 
     saveoutputs_zarr = False, # save all state outputs in one experiment-level Zarr archive
 
+    zarr_time_chunk = 1, # number of output timestamps per Zarr chunk
+
+    zarr_spatial_chunk = 256, # maximum Zarr chunk size along each spatial dimension
+
+    zarr_compression_level = 3, # Zstd compression level (0 to 9)
+
+    zarr_write_batch_size = None, # 4DVar output records per Zarr transaction; None uses zarr_time_chunk
+
     name_exp_save = 'my_output_name', # name of output files
 
     path_save = 'outputs', # path of output files
