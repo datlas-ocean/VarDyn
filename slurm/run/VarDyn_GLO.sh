@@ -327,12 +327,17 @@ fi
 # honoring --skip-prepare.
 preparation_state_is_complete() {
     [ -f "$CONFIG_PATH" ] || return 1
-    python3 - "$BASE_DIR" <<'PY_CHECK'
+    python3 - "$BASE_DIR" "$TILE_SCOPE" <<'PY_CHECK'
+import os
 import pickle
 import sys
 from pathlib import Path
 
 base = Path(sys.argv[1])
+tile_scope = sys.argv[2]
+massh_path = os.environ.get('MASSH_PATH')
+if massh_path:
+    sys.path.insert(0, massh_path)
 tile_configs = [p for p in base.glob('subwindow_*/subwindow_*/config.pkl')]
 if not tile_configs:
     raise SystemExit(1)
@@ -340,8 +345,14 @@ for path in tile_configs:
     try:
         with path.open('rb') as stream:
             config = pickle.load(stream)
+        if tile_scope == 'equatorial':
+            lat_min = float(config.GRID.lat_min)
+            lat_max = float(config.GRID.lat_max)
+            if not lat_min < 0.0 < lat_max:
+                continue
         scratch = Path(config.EXP.tmp_DA_path)
-    except Exception:
+    except Exception as exc:
+        print(f"cannot inspect tile config {path}: {exc}", file=sys.stderr)
         raise SystemExit(1)
     if not scratch.is_dir():
         print(f"missing tile scratch directory: {scratch}", file=sys.stderr)
@@ -485,11 +496,15 @@ for TIME_DIR in $TIME_WINDOWS; do
         OWNED_STAGE_LOCK="${BARRIER_DIR}/queue_iw${IW}.lock"
         if [ "$TILE_SCOPE" = "equatorial" ]; then
             if ! python3 - "$TIME_DIR" > "${TILE_LIST}.tmp" <<'PY_TILE_SCOPE'
+import os
 import pickle
 import sys
 from pathlib import Path
 
 time_dir = Path(sys.argv[1])
+massh_path = os.environ.get('MASSH_PATH')
+if massh_path:
+    sys.path.insert(0, massh_path)
 for tile in sorted(time_dir.glob("subwindow_*")):
     if not tile.is_dir():
         continue
