@@ -108,6 +108,8 @@ def _open_obs_dataset(name_obs, OBS, date_start=None, date_end=None):
 
     def preprocess(ds):
         name_var = [OBS.name_time, OBS.name_lon, OBS.name_lat]
+        if OBS.path == OBS.path_err:
+            name_var = [OBS.name_time, OBS.name_lon, OBS.name_lat, OBS.name_var_err['var']]
         for key in OBS.name_var:
             if isinstance(OBS.name_var[key], list):
                 for name in OBS.name_var[key]:
@@ -137,7 +139,7 @@ def _open_obs_dataset(name_obs, OBS, date_start=None, date_end=None):
     # Filter by filename date pattern (e.g. "20250603" or "202506") so we
     # don't open files that fall entirely outside the experiment period.
     n_total = len(files)
-    files = _filter_files_by_date(files, date_start, date_end)
+    #files = _filter_files_by_date(files, date_start, date_end)
     if len(files) == 0:
         print(f'[{name_obs}] Warning: no files in date range '
               f'[{date_start}, {date_end}] (out of {n_total} candidates)')
@@ -524,9 +526,15 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
         finterpmdt = None
     
     # Error file
+    var_obs_err = False
     if obs_attr.path_err is not None:
         print('READ AUX DATA FOR OBS ERROR VARIANCES ================================',obs_name)
-        finterperr = read_auxdata(obs_attr.path_err, obs_attr.name_var_err, lon_unit)
+        if obs_attr.path_err == obs_attr.path:
+            print('var_obs_err = True')
+            var_obs_err = True
+            finterperr = None
+        else:
+            finterperr = read_auxdata(obs_attr.path_err, obs_attr.name_var_err, lon_unit)
     else:
         finterperr = None
 
@@ -567,6 +575,10 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
                     varobs[name] = _var
                 else:
                     varobs[name] = _ds[obs_attr.name_var[name]]
+
+                if var_obs_err: 
+                    varobs[name + '_err'] = varobs[name].copy()
+                    varobs[name + '_err'].data = _ds[obs_attr.name_var_err['var']]
 
                 # Add/Remove MDT
                 if finterpmdt is not None:

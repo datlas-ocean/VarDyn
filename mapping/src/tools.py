@@ -10,6 +10,8 @@ import xarray as xr
 import scipy.linalg as spl
 from scipy import interpolate, spatial
 import scipy
+from scipy.spatial.distance import cdist
+import pandas as pd
 
 
 
@@ -158,7 +160,7 @@ def interp2d(ds,name_vars,lon_out,lat_out):
     return var_out
 
 
-def compute_weight_map(lon2d,lat2d,mask,dist_scale,bc=True,slope=10):
+def compute_weight_map_old(lon2d,lat2d,mask,dist_scale,bc=True,slope=10):
 
     coords = np.column_stack((lon2d.ravel(), lat2d.ravel()))
     coords_cart = geo2cart(coords)
@@ -187,6 +189,86 @@ def compute_weight_map(lon2d,lat2d,mask,dist_scale,bc=True,slope=10):
     bc_weight = bc_weight.reshape(lon2d.shape)
 
     return bc_weight
+
+
+
+def compute_weight_map(lon2d,lat2d,mask,dist_scale,bc=True,slope=10, lon_min=None, lat_min=None, lon_max=None, lat_max=None):
+    
+    #####################
+    # Compute weights map
+    #####################
+    coords = np.column_stack((lon2d.ravel(), lat2d.ravel()))
+    # construct KD-tree
+    ground_pixel_tree = spatial.cKDTree(geo2cart(coords))
+    subdomain = geo2cart(coords)[:100]
+    eucl_dist = cdist(subdomain, subdomain, metric="euclidean")
+    dist_threshold = np.min(eucl_dist[np.nonzero(eucl_dist)])
+    # Add boundary pixels to mask
+    if bc:
+        if lon_min is not None:
+            geo_boundary = (
+                (lat2d <= lat_min) | (lat2d >= lat_max) |
+                (lon2d <= lon_min) | (lon2d >= lon_max)
+            )
+            # Thin boundary points - keep every Nth point
+            boundary_indices = np.where(geo_boundary.ravel())[0]
+            thinned = boundary_indices[::5]  # adjust thinning factor
+            thinned_mask = np.zeros(lon2d.size, dtype=bool)
+            thinned_mask[thinned] = True
+            mask = mask | thinned_mask.reshape(lon2d.shape) 
+        else:
+            mask[0,:] = True
+            mask[-1,:] = True
+            mask[:,0] = True
+            mask[:,-1] = True
+    
+    # get boundary coordinates
+    lon_bc = lon2d[mask]
+    lat_bc = lat2d[mask]
+    coords_bc = np.column_stack((lon_bc, lat_bc))
+    bc_tree = spatial.cKDTree(geo2cart(coords_bc))
+    
+    # Compute distance between model pixels and boundary pixels
+    dist_mx = ground_pixel_tree.sparse_distance_matrix(bc_tree,2*dist_scale)
+    
+    # Initialize weight map
+    bc_weight = np.zeros(lon2d.size)
+    keys = np.array(list(dist_mx.keys()))
+    if len(keys.shape)>1:
+        ind_mod = keys[:, 0]
+        dist = np.array(list(dist_mx.values()))
+        dist = np.maximum(dist-0.5*dist_threshold, 0)
+        # Dataframe initialized without nan values in var
+        df = pd.DataFrame({'ind_mod': ind_mod,
+                           'dist': dist,
+                           'weight':np.ones_like(dist)})
+        # Remove external values in the boundary pixels
+        ind_dist = (df.dist == 0)
+        df = df[np.logical_or(ind_dist,
+                              np.isin(df.ind_mod,
+                                      df[ind_dist].ind_mod,
+                                      invert=True))]
+        # Remove external values in the boundary pixels
+        ind_dist = (df.dist == 0)
+        df = df[np.logical_or(ind_dist,
+                            np.isin(df.ind_mod,
+                                    df[ind_dist].ind_mod,
+                                    invert=True))]
+        # Compute tapering
+        df['tapering'] = np.exp(-(df['dist']**2/(2*(0.5*dist_scale)**2)))
+        # Nudge values out of pixels
+        df.loc[df.dist > 0, "weight"] *= df.loc[df.dist > 0, "tapering"]
+        # Compute weight average and save it
+        df['tapering'] = df['tapering']**slope
+        wa = lambda x: np.average(x, weights=df.loc[x.index, "tapering"])
+        dfg = df.groupby('ind_mod')
+        weights = dfg['weight'].apply(wa)
+        bc_weight[weights.index] = np.array(weights)
+    bc_weight = bc_weight.reshape(lon2d.shape)
+    
+    return bc_weight
+
+    
 
 
 def compute_sponge_components(lon2d, lat2d, mask, dist_scale):

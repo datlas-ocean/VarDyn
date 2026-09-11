@@ -82,7 +82,8 @@ class State:
                 self.lon_unit = '0_360'
 
             # Mask
-            if config.GRID.super != 'GRID_FROM_FILE' or config.GRID.var_name_mask is None:
+            # if config.GRID.super != 'GRID_FROM_FILE' or config.GRID.var_name_mask is None:     MODIF SAM
+            if config.GRID.super != 'GRID_FROM_FILE' :
                 self.ini_mask(config.GRID)
 
             # Compute cartesian grid 
@@ -240,6 +241,14 @@ class State:
 
         dsin.close()
         del dsin
+
+        if config.name_init_mask is not None and os.path.exists(config.name_init_mask):
+            dsmask = xr.open_dataset(config.name_init_mask)
+            dsmask = dsmask.where((dsmask[config.name_var_mask['lat']] >= config.lat_min) & (dsmask[config.name_var_mask['lat']] <= config.lat_max), drop=True)
+            dsmask = dsmask.where((dsmask[config.name_var_mask['lon']] >= config.lon_min) & (dsmask[config.name_var_mask['lon']] <= config.lon_max), drop=True)
+            self.mask = np.isnan(dsmask[config.name_var_mask['var']][0].values)
+            dsmask.close()
+            del dsmask
         
     def ini_grid_restart(self):
         # Look for last output
@@ -642,6 +651,21 @@ class State:
                 else:
                     self.var[name_var] = _store_value(var)
     
+    def to_device(self, device=None):
+        """Place model variables and controls on a JAX device once."""
+        import jax
+
+        self.preserve_device_arrays = True
+        self.var = jax.tree_util.tree_map(
+            lambda value: jax.device_put(value, device=device),
+            self.var,
+        )
+        self.params = jax.tree_util.tree_map(
+            lambda value: jax.device_put(value, device=device),
+            self.params,
+        )
+        return self
+
     def scalar(self,coeff,copy=False):
         if copy:
             State1 = self.copy()

@@ -86,6 +86,8 @@ GRID_FROM_FILE = dict(
 
     name_var_mask = {'lon':'','lat':'','var':''},
 
+    var_name_mask = None
+
 )
 
 # Regular geodetic grid
@@ -176,6 +178,41 @@ MOD_DIFF = dict(
     bc_name_var = {},  # Dict mapping variable names to names in BC file
 
     bc_c_grid = False,  # Whether BC grid is C-grid (True) or A-grid (False)
+)
+
+MOD_drift_initflux = dict(
+
+    name_var = {'SSH':"ssh"},
+
+    name_params = ["param_init", "param_fluxes"],
+
+    var_to_save = None,
+
+    name_init_var = {},
+
+    file_drift = None,  # netcdf file(s) in whihch the boundary conditions fields are stored
+
+    name_var_drift = {'lon':'','lat':'','var':''},
+
+    cutoff_km = 0, # drift resolution cutoff in km (no cutoff if cutoff_km set to 0)
+
+    dtmodel = 300, # model timestep
+
+    Kdiffus = 0, # coefficient of diffusion. Set to 0 for Identity model
+
+    SIC_mod = False, # flag to activate variable limits [0,100] (i.e., for sea ice concentration)
+
+    init_from_bc = False,
+
+    dist_sponge_bc = None,  # distance (in km) for which boundary fields are spatially spread close to the borders
+
+    scheme = 'upwind', 
+
+    smoothuv = 0,
+
+    refreeze = 0, 
+
+    clip_flag = True
 )
 
 # 1.5-layer Quasi-Geostrophic models
@@ -937,6 +974,52 @@ BASIS_BMaux = dict(
 
 )
 
+
+# Wavelet 3D
+BASIS_WAVELET3D = dict(
+
+    name_mod_var = None, # Name of the related model variable 
+
+    flux = False,
+
+    facnst = 1., #factor for wavelet spacing in space and time 
+
+    npsp = 3.5, # Defines the wavelet shape, both in space and time 
+
+    facpsp_s = 1.5, # factor to fix df between wavelets, both in space and time 
+
+    facpsp_t = 1.5, # factor to fix df between wavelets, both in space and time 
+
+    lmin = 80, # minimal wavelength (in km)
+
+    lmax = 970., # maximal wavelength (in km)
+
+    tmin = 2, # minimum time of decorrelation 
+
+    tmax = 20., # maximum time of decorrelation 
+
+    sigma_Q = 1e-1, # Maximim Q, such as lambda>lmax => Q=Qmax where lamda is the wavelength
+
+    path_background = None, # path netcdf file of a basis vector (e.g. coming from a previous run) to use as background
+
+    var_background = None, # name of the variable of the basis vector
+
+    t_min_bkg = None,
+
+
+    lmeso = 800, # Largest mesoscale wavelenght 
+
+    facnlt = 1, # factor for wavelet spacing= time
+
+    Qmax = 1, # Maximim Q, such as lambda>lmax => Q=Qmax where lamda is the wavelength
+
+    slopQ = -1, # Slope such as Q = lambda^slope where lamda is the wavelength
+
+    slop_Q_time = 0 # Slope for Q in time 
+
+)
+
+
 # Internal Tides boundary conditions basis (i.e. a set of basis vectors with values at the open boundaries)
 BASIS_HBC = dict(
 
@@ -1015,7 +1098,14 @@ INV_4DVAR = dict(
 
     path_background = None, # Path of a control vector from another experiment to use as the background 
 
-    anomaly_from_bc = False # Whether to perform the minimization with anomalies from boundary condition field(s)
+    anomaly_from_bc = False, # Whether to perform the minimization with anomalies from boundary condition field(s)
+
+    minimizer = 'scipy',
+
+    jit_cost_and_grad = False, # Compile one complete forward/misfit/adjoint cost-gradient evaluation on GPU.
+
+    cost_and_grad_schedule = 'scan', # Roll monthly forward/adjoint checkpoint loops with lax.scan; use 'python' for the previous formulation.
+ 
  
 )
 

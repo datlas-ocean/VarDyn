@@ -481,6 +481,29 @@ class Obsop_interp_l3(Obsop_interp):
 
         return self._misfit_jit(t, X)
     
+    def scan_misfit_size(self):
+        return int(self.varobs_arr.shape[1])
+
+    def scan_misfit(self, t, State_var):
+        """Return a fixed-size, zero-masked L3 misfit for every checkpoint."""
+        if self.varobs_arr.shape[0] == 0:
+            # Observation-free tiles still execute the forecast scan, but
+            # have no observation cost contribution.
+            return jnp.zeros((0,), dtype=jnp.asarray(t).dtype)
+        raw = self.misfit_jax(t, State_var)
+        return jnp.where(self.is_obs_time_jax(t), raw, jnp.zeros_like(raw))
+
+    def scan_adj(self, t, adState_var, State_var, misfit):
+        """Pure-pytree L3 adjoint used inside ``lax.scan``."""
+        if self.varobs_arr.shape[0] == 0:
+            return adState_var
+        name = self.name_mod_var[self.name_var]
+        var = State_var[name]
+        adX = self._misfit_reduced_jit(t, misfit, var.ravel())
+        result = dict(adState_var)
+        result[name] = result[name] + adX.reshape(result[name].shape)
+        return result
+    
     def adj(self, t, adState, State, misfit):
 
         # Read adjoint variable
@@ -569,7 +592,7 @@ class Obsop_interp_l4(Obsop_interp):
             print(f"Processing observations at date {date} for variable {self.name_var}...")
 
             sat_info_list = self.dict_obs[date]['attributes']
-            obs_file_list = self.dict_obs[date]['obs_path']
+            obs_file_list = self.dict_obs[date]['obs_path'] 
             obs_name_list = self.dict_obs[date]['obs_name']
 
             # Concatenate obs from different sensors
@@ -585,6 +608,7 @@ class Obsop_interp_l4(Obsop_interp):
 
                 if obs_name not in self.name_obs:
                     continue
+ 
 
                 try:
                 
@@ -621,11 +645,14 @@ class Obsop_interp_l4(Obsop_interp):
                         # Skip when obs are coarser than the grid: the same
                         # obs is reused across neighbouring cells, so the
                         # per-cell noise stays at the sensor noise (spatial
-                        # correlation between cells is not represented here).
-                        dx, dy = grid.lonlat2dxdy(lon,lat)
-                        _err_res = np.nanmean(dx * dy) / np.nanmean(self.DX * self.DY)
-                        if _err_res>1:
-                            err *= np.sqrt(_err_res)
+                        # correlation between cells is not represented here). 
+                        try : 
+                            dx, dy = tools.lonlat2dxdy(lon,lat)
+                            _err_res = np.nanmean(dx * dy) / np.nanmean(self.DX * self.DY)
+                            if _err_res>1:
+                                err *= np.sqrt(_err_res)
+                        except: 
+                            pass
                                         
                         # Append to lists
                         var_obs.append(+var.flatten())
