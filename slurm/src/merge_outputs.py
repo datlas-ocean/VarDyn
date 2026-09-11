@@ -29,6 +29,45 @@ from src.run_assimilation import (
 def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
+def _validate_final_outputs(config, list_date_start, list_date_end):
+    """Verify that every expected global output exists and is readable."""
+    expected = set()
+    step = config.EXP.saveoutput_time_step
+    for start, end in zip(list_date_start, list_date_end):
+        date = start
+        while date <= end:
+            expected.add(date)
+            date += step
+
+    missing = []
+    unreadable = []
+    for date in sorted(expected):
+        path = os.path.join(
+            config.EXP.path_save,
+            f'{config.EXP.name_exp_save}'
+            f'_y{date.year}m{date.month:02d}d{date.day:02d}'
+            f'h{date.hour:02d}m{date.minute:02d}.nc',
+        )
+        if not os.path.exists(path):
+            missing.append(path)
+            continue
+        try:
+            with xr.open_dataset(path) as dataset:
+                # Opening the HDF5 container catches truncated/corrupt files.
+                _ = dataset.sizes
+        except Exception as exc:
+            unreadable.append(f'{path}: {exc}')
+
+    if missing or unreadable:
+        details = []
+        if missing:
+            details.append(f'missing={len(missing)} (first: {missing[0]})')
+        if unreadable:
+            details.append(f'unreadable={len(unreadable)} (first: {unreadable[0]})')
+        raise RuntimeError('Final output validation failed: ' + '; '.join(details))
+
+    log(f'Validated {len(expected)} final global output files')
+
 # -------------------- Main merge workflow --------------------
 def merge_outputs(
     path_config,

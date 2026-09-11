@@ -121,10 +121,10 @@ class _Basis_gauss3d:
         self.sigma_D = config.BASIS.sigma_D
         self.sigma_T = config.BASIS.sigma_T
         self.sigma_Q = config.BASIS.sigma_Q
+        self.facQ = config.BASIS.facQ
         self.normalize_fact = config.BASIS.normalize_fact
         self.name_mod_var = config.BASIS.name_mod_var
         self.time_spinup = config.BASIS.time_spinup
-        self.fcor = config.BASIS.fcor
         self.flag_variable_Q = config.BASIS.flag_variable_Q
         self.path_sad = config.BASIS.path_sad
         self.name_var_sad = config.BASIS.name_var_sad
@@ -302,12 +302,12 @@ class _Basis_gauss3d:
                 std_tmp_values = sad.interp({self.name_var_sad['lon']:elon2.ravel(), 
                                             self.name_var_sad['lat']:elat2.ravel()}).values
                 std_tmp = np.nanmean(std_tmp_values) if not np.all(np.isnan(std_tmp_values)) else 10**-10
-                Q_tmp = std_tmp / ((self.facns*self.facnlt))**.5 
+                Q_tmp = self.facQ * std_tmp / ((self.facns*self.facnlt))**.5
                 Q.append(Q_tmp) 
             # Repeat for all time centers
             Q = np.tile(Q, len(self.ENST))
         else:
-            Q = self.sigma_Q / ((self.facns*self.facnlt))**.5 * np.ones((self.nbasis))
+            Q = self.facQ * self.sigma_Q / ((self.facns*self.facnlt))**.5 * np.ones((self.nbasis))
 
 
         
@@ -532,9 +532,15 @@ class Basis_gauss3d(_Basis_gauss3d):
         return res
     
     def _compute_component_space(self):
-        """
-            Gaussian functions in space
-        """
+        """Gaussian functions in space, shared by equivalent blocks."""
+        cache = getattr(self, '_space_component_cache', None)
+        cache_key = (
+            'gauss3d', self.c_grid_var, float(self.sigma_D),
+            float(self.facns), tuple(self.shape_phys),
+        )
+        if cache is not None and cache_key in cache:
+            self.Gauss_xy_T, gauss_xy = cache[cache_key]
+            return gauss_xy
 
         Gauss_2d = np.zeros((self.ENSLAT.size,self.lon1d.size))
         for i,(lat0,lon0) in enumerate(zip(self.ENSLAT,self.ENSLON)):
@@ -552,7 +558,10 @@ class Basis_gauss3d(_Basis_gauss3d):
             Gauss_2d[i,indphys] = mywindow(xx / self.sigma_D) * mywindow(yy / self.sigma_D)
         Gauss_2d = jnp.array(Gauss_2d)
         self.Gauss_xy_T = sparse.CSR.fromdense(Gauss_2d)
-        return sparse.CSR.fromdense(Gauss_2d.T)  
+        gauss_xy = sparse.CSR.fromdense(Gauss_2d.T)
+        if cache is not None:
+            cache[cache_key] = (self.Gauss_xy_T, gauss_xy)
+        return gauss_xy
 
     def _compute_component_time(self, time):
 
@@ -701,6 +710,7 @@ class _Basis_gauss2d:
         self.facns = config.BASIS.facns
         self.sigma_D = config.BASIS.sigma_D
         self.sigma_Q = config.BASIS.sigma_Q
+        self.facQ = config.BASIS.facQ
         self.name_mod_var = config.BASIS.name_mod_var
         self.flag_variable_Q = config.BASIS.flag_variable_Q
         self.path_sad = config.BASIS.path_sad
@@ -855,10 +865,10 @@ class _Basis_gauss2d:
                 std_tmp_values = sad.interp({self.name_var_sad['lon']: elon2.ravel(),
                                              self.name_var_sad['lat']: elat2.ravel()}).values
                 std_tmp = np.nanmean(std_tmp_values) if not np.all(np.isnan(std_tmp_values)) else 10**-10
-                Q.append(std_tmp / self.facns**.5)
+                Q.append(self.facQ * std_tmp / self.facns**.5)
             Q = np.array(Q)
         else:
-            Q = self.sigma_Q / self.facns**.5 * np.ones((self.nbasis,))
+            Q = self.facQ * self.sigma_Q / self.facns**.5 * np.ones((self.nbasis,))
 
         Xb = np.zeros_like(Q)
         if self.path_background is not None and os.path.exists(self.path_background):
@@ -1821,6 +1831,20 @@ class Basis_bmaux(_Basis_bmaux):
 
     def _compute_component_space(self):
 
+        cache = getattr(self, '_space_component_cache', None)
+        cache_key = (
+            'bmaux', self.c_grid_var,
+            tuple(np.asarray(self.ff, dtype=float)),
+            tuple(np.asarray(self.DX, dtype=float)),
+            tuple(np.asarray(self.NP, dtype=int)),
+            tuple(tuple(np.asarray(values, dtype=float)) for values in self.ENSLON),
+            tuple(tuple(np.asarray(values, dtype=float)) for values in self.ENSLAT),
+        )
+        if cache is not None and cache_key in cache:
+            gx, gx_t, nx = cache[cache_key]
+            self.GxT = gx_t
+            return gx, nx
+
         Gx = [None,]*self.nf
         GxT = [None,]*self.nf
         Nx = [None,]*self.nf
@@ -1892,6 +1916,8 @@ class Basis_bmaux(_Basis_bmaux):
                         
 
         self.GxT = GxT
+        if cache is not None:
+            cache[cache_key] = (Gx, GxT, Nx)
         return Gx, Nx
 
     def _compute_component_time(self, time):
@@ -3179,12 +3205,20 @@ class Basis_multi:
 
         self.Basis = []
         _config = config.copy()
+        # Identical basis blocks often target different model variables.  Their
+        # immutable spatial operators depend only on the shared State/grid and
+        # spatial parameters, so compute them once per Basis_multi instance.
+        shared_space_cache = {}
 
         self.name_mod_var = []
         for _BASIS in config.BASIS:
             _config.BASIS = config.BASIS[_BASIS]
 
-            self.Basis.append(Basis(_config,State,verbose=verbose, multi_mode=True))
+            basis_component = Basis(
+                _config, State, verbose=verbose, multi_mode=True
+            )
+            basis_component._space_component_cache = shared_space_cache
+            self.Basis.append(basis_component)
             if 'name_mod_var' in _config.BASIS and _config.BASIS.name_mod_var is not None:
                 for _name_mod_var in _as_name_list(_config.BASIS.name_mod_var):
                     if _name_mod_var not in self.name_mod_var:
@@ -3205,14 +3239,20 @@ class Basis_multi:
             Xb = np.array([])
             Q = np.array([])
 
-        for B in self.Basis:
-            _Xb,_Q = B.set_basis(time,return_q=return_q,**kwargs)
-            self.slice_basis.append(slice(self.nbasis,self.nbasis+B.nbasis))
+        results = [
+            component.set_basis(time, return_q=return_q, **kwargs)
+            for component in self.Basis
+        ]
+
+        for B, (_Xb, _Q) in zip(self.Basis, results):
+            self.slice_basis.append(
+                slice(self.nbasis, self.nbasis + B.nbasis)
+            )
             self.nbasis += B.nbasis
-            
+
             if return_q:
-                Xb = np.concatenate((Xb,_Xb))
-                Q = np.concatenate((Q,_Q))
+                Xb = np.concatenate((Xb, _Xb))
+                Q = np.concatenate((Q, _Q))
         
         if return_q:
             return Xb,Q

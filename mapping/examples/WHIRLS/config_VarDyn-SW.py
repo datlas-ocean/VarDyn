@@ -551,7 +551,13 @@ myINV = dict(
 
     super = 'INV_4DVAR', # Inherit defaults for the 4DVar minimization driver.
 
-    save_minimization = True, # Save cost-function and gradient history during minimization.
+    minimizer = 'optax-decoupled', # Keep L-BFGS vectors on GPU with a scalar Armijo line search.
+
+    jit_cost_and_grad = True, # Compile the complete SW forward/adjoint evaluation on GPU.
+
+    cost_and_grad_schedule = 'scan', # Roll checkpoint loops with lax.scan.
+
+    save_minimization = False, # Keep the Optax hot path scalar-only; Xres.nc is still saved.
 
     ftol = 5e-5, # Relative cost-function decrease threshold used for convergence.
 

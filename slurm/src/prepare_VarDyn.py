@@ -77,7 +77,10 @@ def main():
     parser.add_argument("--flag_assim_restart", action="store_true", default=False)
     parser.add_argument("--flag_init", action="store_true", default=False)
     parser.add_argument("--flag_background", action="store_true", default=False)
-    parser.add_argument("--name_exp", type=str, default=None)
+    parser.add_argument("--name_exp", type=str, default=None,
+                        help="Previous experiment used for initialization (and, for backward compatibility, background).")
+    parser.add_argument("--name_exp_background", type=str, default=None,
+                        help="Previous experiment used as the inversion background.")
 
     # Workers
     parser.add_argument("--obs_max_workers", type=int, default=1)
@@ -125,7 +128,11 @@ def main():
         flag_assim=args.flag_assim,
         flag_assim_restart=args.flag_assim_restart,
         name_exp_init=args.name_exp,
-        name_exp_background=args.name_exp,
+        # Retain the former --name_exp-only behaviour when no dedicated
+        # background experiment is supplied.
+        name_exp_background=(args.name_exp_background
+                             if args.name_exp_background is not None
+                             else args.name_exp),
         gpu_devices=gpu_devices,
         obs_max_workers=args.obs_max_workers,
         dir_save_pickle=args.dir_save_pickle,

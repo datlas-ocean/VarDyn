@@ -163,10 +163,13 @@ class Qgm:
 
 
         # Rossby radius
-        if hasattr(c, "__len__"):
-            self.c = np.nanmean(c).astype(self.dtype)
+        # ``c`` may be a Python scalar, a NumPy scalar, or a spatial field.
+        # Keep a scalar reference value for the separable Helmholtz operator.
+        c_array = np.asarray(c, dtype=self.dtype)
+        if c_array.ndim > 0:
+            self.c = np.asarray(np.nanmean(c_array), dtype=self.dtype)
         else:
-            self.c = c.astype(self.dtype)
+            self.c = c_array
 
         # Diagnostics
         _c0 = float(self.c)
@@ -183,6 +186,8 @@ class Qgm:
         self.bathymetry_PV_term = bathymetry_PV_term
 
         # Spatial scheme
+        if upwind not in (1, 2, 3):
+            raise ValueError(f"Unsupported upwind order: {upwind}; expected 1, 2, or 3")
         self.upwind = upwind
 
         # Time scheme
@@ -216,9 +221,7 @@ class Qgm:
         mask[1,1:-1] = 2
         mask[1:-1,1] = 2
         mask[-2,1:-1] = 2
-        mask[-3,1:-1] = 2
         mask[1:-1,-2] = 2
-        mask[1:-1,-3] = 2
 
         # mask=0 on land 
         if SSH is not None:
@@ -234,7 +237,7 @@ class Qgm:
                             # mask=1 for coast pixels
                             if (mask[itest,jtest]>=2) and (p1 in [-1,0,1] and p2 in [-1,0,1]):
                                 mask[itest,jtest] = 1   
-                            # mask=1 for pixels adjacent to the coast
+                            # mask=2 for pixels adjacent to the coast
                             elif (mask[itest,jtest]==3):
                                 mask[itest,jtest] = 2     
         
@@ -257,6 +260,36 @@ class Qgm:
         self.bc_trac = bc_trac
         self.sponge_coef = float(sponge_coef)
         self.ocean_h = (self.ind0 == False).astype(self.dtype)
+
+        # Passive tracers use a third-order upwind stencil.  The QG velocity
+        # mask alone is not enough around an irregular coast: a wet target
+        # cell may still read one or more land cells in that stencil.  Those
+        # land values are prescribed from the external BC field and can then
+        # inject sharp, non-physical gradients into the ocean.  Keep a
+        # two-cell no-transport collar around land so that neither the
+        # advection nor the tracer Laplacian ever crosses a land cell.
+        #
+        # ``tracer_update_mask`` is indexed like q[2:-2, 2:-2], while
+        # ``tracer_transport_mask`` is indexed like u_on_T/v_on_T
+        # (q[1:-1, 1:-1]).  The latter is zero outside the update region.
+        # This conservative treatment is preferable to extrapolating across
+        # complex coastlines: the collar can still be relaxed by the optional
+        # tracer sponge, but cannot be destabilised by the transport scheme.
+        ocean_bool = self.ocean_h.astype(bool)
+        update_mask = np.zeros((max(ny - 4, 0), max(nx - 4, 0)), dtype=bool)
+        if ny > 4 and nx > 4:
+            update_mask[:] = True
+            for di in range(-2, 3):
+                for dj in range(-2, 3):
+                    update_mask &= ocean_bool[
+                        2 + di:ny - 2 + di,
+                        2 + dj:nx - 2 + dj,
+                    ]
+        transport_mask = np.zeros((max(ny - 2, 0), max(nx - 2, 0)), dtype=bool)
+        if ny > 4 and nx > 4:
+            transport_mask[1:-1, 1:-1] = update_mask
+        self.tracer_update_mask = jnp.asarray(update_mask)
+        self.tracer_transport_mask = jnp.asarray(transport_mask)
 
         # Dynamics options
         self.advect_pv = advect_pv
@@ -281,6 +314,23 @@ class Qgm:
             self.step_jit = jit(self.step, static_argnums=2)
             self.step_tgl_jit = jit(self.step_tgl, static_argnums=3)
             self.step_adj_jit = jit(self.step_adj, static_argnums=3)
+        else:
+            # Keep the public callable attributes available in non-JIT mode.
+            # Higher-level methods consistently call these aliases.
+            self.h2uv_jit = self.h2uv
+            self.h2pv_jit = self.h2pv
+            self.pv2h_jit = self.pv2h
+            self.rhs_jit = self.rhs
+            self.adv_jit = self.adv
+            self.euler_jit = self.euler
+            self.rk2_jit = self.rk2
+            self.rk3_jit = self.rk3
+            self.bc_jit = self.bc
+            self.one_step_jit = self.one_step
+            self.one_step_for_scan_jit = self.one_step_for_scan
+            self.step_jit = self.step
+            self.step_tgl_jit = self.step_tgl
+            self.step_adj_jit = self.step_adj
 
     def _rebuild_helmoltz_dst(self):
         """Recompute helmoltz_dst from the current self.c scalar.
@@ -497,21 +547,25 @@ class Qgm:
                 vp += vap
                 vm += vam
 
-            u_mask = self.ocean_h[1:-1,1:-1]
-            up = up * u_mask
-            um = um * u_mask
-            vp = vp * u_mask
-            vm = vm * u_mask
+            # Prevent the high-order advection stencil from sampling across
+            # land.  A simple wet-cell mask here is insufficient because the
+            # stencil reaches two cells away from its update point.
+            up = up * self.tracer_transport_mask
+            um = um * self.tracer_transport_mask
+            vp = vp * self.tracer_transport_mask
+            vm = vm * self.tracer_transport_mask
 
             for i in range(c0.shape[0]):
                 rhs_c = self.adv(up, vp, um, vm, c0[i])
                 if self.Kdiffus_trac is not None:
-                    rhs_c = rhs_c.at[2:-2,2:-2].set(
-                        rhs_c[2:-2,2:-2] +
+                    diffus_c = (
                         self.Kdiffus_trac/(self.dx**2) *
                             (c0[i,2:-2,3:-1] + c0[i,2:-2,1:-3] - 2*c0[i,2:-2,2:-2]) +
                         self.Kdiffus_trac/(self.dy**2) *
                             (c0[i,3:-1,2:-2] + c0[i,1:-3,2:-2] - 2*c0[i,2:-2,2:-2])
+                    )
+                    rhs_c = rhs_c.at[2:-2,2:-2].add(
+                        self.tracer_update_mask * diffus_c
                     )
                 rhs_c = jnp.where(jnp.isnan(rhs_c), 0, rhs_c)
                 rhs_c = rhs_c.at[self.ind0].set(0)
@@ -524,21 +578,50 @@ class Qgm:
     def adv(self, up, vp, um, vm, q0):
 
         """
-            3rd-order upwind scheme
+            Upwind scheme of order ``self.upwind``.
         """
 
         ugradq = jnp.zeros_like(q0,dtype=self.dtype)
 
-        ugradq = ugradq.at[2:-2,2:-2].set(
-            - up[1:-1,1:-1] * 1 / (6 * self.dx) * \
-            (2 * q0[2:-2, 3:-1] + 3 * q0[2:-2, 2:-2] - 6 * q0[2:-2, 1:-3] + q0[2:-2, :-4]) \
-            + um[1:-1,1:-1] * 1 / (6 * self.dx) * \
-            (q0[2:-2, 4:] - 6 * q0[2:-2, 3:-1] + 3 * q0[2:-2, 2:-2] + 2 * q0[2:-2, 1:-3]) \
-            - vp[1:-1,1:-1] * 1 / (6 * self.dy) * \
-            (2 * q0[3:-1, 2:-2] + 3 * q0[2:-2, 2:-2] - 6 * q0[1:-3, 2:-2] + q0[:-4, 2:-2]) \
-            + vm[1:-1,1:-1] * 1 / (6 * self.dy) * \
-            (q0[4:, 2:-2] - 6 * q0[3:-1, 2:-2] + 3 * q0[2:-2, 2:-2] + 2 * q0[1:-3, 2:-2])
+        if self.upwind == 1:
+            tendency = (
+                - up[1:-1,1:-1] / self.dx *
+                    (q0[2:-2,2:-2] - q0[2:-2,1:-3])
+                - um[1:-1,1:-1] / self.dx *
+                    (q0[2:-2,3:-1] - q0[2:-2,2:-2])
+                - vp[1:-1,1:-1] / self.dy *
+                    (q0[2:-2,2:-2] - q0[1:-3,2:-2])
+                - vm[1:-1,1:-1] / self.dy *
+                    (q0[3:-1,2:-2] - q0[2:-2,2:-2])
             )
+        elif self.upwind == 2:
+            tendency = (
+                - up[1:-1,1:-1] / (2 * self.dx) *
+                    (3*q0[2:-2,2:-2] - 4*q0[2:-2,1:-3] + q0[2:-2,:-4])
+                + um[1:-1,1:-1] / (2 * self.dx) *
+                    (3*q0[2:-2,2:-2] - 4*q0[2:-2,3:-1] + q0[2:-2,4:])
+                - vp[1:-1,1:-1] / (2 * self.dy) *
+                    (3*q0[2:-2,2:-2] - 4*q0[1:-3,2:-2] + q0[:-4,2:-2])
+                + vm[1:-1,1:-1] / (2 * self.dy) *
+                    (3*q0[2:-2,2:-2] - 4*q0[3:-1,2:-2] + q0[4:,2:-2])
+            )
+        else:
+            tendency = (
+                - up[1:-1,1:-1] / (6 * self.dx) *
+                    (2*q0[2:-2,3:-1] + 3*q0[2:-2,2:-2]
+                     - 6*q0[2:-2,1:-3] + q0[2:-2,:-4])
+                + um[1:-1,1:-1] / (6 * self.dx) *
+                    (q0[2:-2,4:] - 6*q0[2:-2,3:-1]
+                     + 3*q0[2:-2,2:-2] + 2*q0[2:-2,1:-3])
+                - vp[1:-1,1:-1] / (6 * self.dy) *
+                    (2*q0[3:-1,2:-2] + 3*q0[2:-2,2:-2]
+                     - 6*q0[1:-3,2:-2] + q0[:-4,2:-2])
+                + vm[1:-1,1:-1] / (6 * self.dy) *
+                    (q0[4:,2:-2] - 6*q0[3:-1,2:-2]
+                     + 3*q0[2:-2,2:-2] + 2*q0[1:-3,2:-2])
+            )
+
+        ugradq = ugradq.at[2:-2,2:-2].set(tendency)
 
         return ugradq
     
@@ -895,24 +978,24 @@ if __name__ == "__main__":
 
         def h2pv_tgl(dh0, h0, hb):
 
-            _, dh1 = jvp(partial(qgm.h2pv, hbc=hb, ib=0), (h0,), (dh0,))
+            _, dh1 = jvp(partial(qgm.h2pv, hb=hb), (h0,), (dh0,))
 
             return dh1
         
         def h2pv_adj(adq0,h0,hb):
             
-            _, adf = vjp(partial(qgm.h2pv, hbc=hb, ib=0), h0)
+            _, adf = vjp(partial(qgm.h2pv, hb=hb), h0)
             
             return adf(adq0)[0]
 
         # Forward
-        PV0 = qgm.h2pv(SSH, SSHb, ib=0).astype('float64')
+        PV0 = qgm.h2pv(SSH, SSHb).astype('float64')
     
         print('Tangent test:')
         for p in range(10):
             lambd = 10 ** (-p)
 
-            PV1 = qgm.h2pv(SSH + lambd * dSSH, SSHb, ib=0).astype('float64')
+            PV1 = qgm.h2pv(SSH + lambd * dSSH, SSHb).astype('float64')
             dPV = h2pv_tgl(lambd * dSSH, SSH, SSHb).astype('float64')
 
             ps = jnp.linalg.norm((PV1 - PV0 - dPV).flatten()) / jnp.linalg.norm(dPV)
@@ -936,7 +1019,8 @@ if __name__ == "__main__":
         # Current trajectory
         PV = jnp.array(1e-2 * np.random.random((ny, nx))).astype('float64')
         SSHb = jnp.array(1e-2 * np.random.random((ny, nx))).astype('float64')
-        PVb = qgm.h2pv(SSHb, SSHb, ib=0).astype('float64')
+        PVb = qgm.h2pv(SSHb, SSHb).astype('float64')
+        helmoltz_dst = jnp.asarray(qgm.helmoltz_dst)
 
         # Perturbation
         dPV = jnp.array(1e-2 * np.random.random((ny, nx))).astype('float64')
@@ -946,24 +1030,28 @@ if __name__ == "__main__":
 
         def pv2h_tgl(dq, q, hb, qb):
 
-            _, dh = jvp(partial(qgm.pv2h, hb=hb, qb=qb, ib=0), (q,), (dq,))
+            _, dh = jvp(
+                partial(qgm.pv2h, hb=hb, qb=qb, helmoltz_dst=helmoltz_dst),
+                (q,), (dq,))
 
             return dh
         
         def pv2h_adj(adh, q, hb, qb):
             
-            _, adf = vjp(partial(qgm.pv2h, hb=hb, qb=qb, ib=0), q)
+            _, adf = vjp(
+                partial(qgm.pv2h, hb=hb, qb=qb, helmoltz_dst=helmoltz_dst), q)
             
             return adf(adh)[0]
 
         # Forward
-        SSH = qgm.pv2h(PV, SSHb, PVb, ib=0).astype('float64')
+        SSH = qgm.pv2h(PV, SSHb, PVb, helmoltz_dst).astype('float64')
         
         print('Tangent test:')
         for p in range(10):
             lambd = 10 ** (-p)
 
-            SSH1 = qgm.pv2h(PV + lambd * dPV, SSHb, PVb, ib=0).astype('float64')
+            SSH1 = qgm.pv2h(
+                PV + lambd * dPV, SSHb, PVb, helmoltz_dst).astype('float64')
             dSSH = pv2h_tgl(lambd * dPV, PV, SSHb, PVb).astype('float64')
 
             ps = jnp.linalg.norm((SSH1 - SSH - dSSH).flatten()) / jnp.linalg.norm(dSSH)
