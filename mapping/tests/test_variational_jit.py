@@ -78,7 +78,6 @@ def _config(schedule="python"):
             jit_cost_and_grad=True,
             cost_and_grad_schedule=schedule,
             cost_float64=False,
-            device_resident_state=True,
             timestep_checkpoint=SimpleNamespace(total_seconds=lambda: 1),
             prec=True,
             save_minimization=False,

@@ -53,8 +53,6 @@ EXP = dict(
 
     saveoutput_time_step = timedelta(hours=1),  # time step at which the states are saved 
 
-    plot_time_step = timedelta(days=1),  #  time step at which the states are plotted (for debugging),
-
     time_obs_min = None, 
 
     time_obs_max = None,
@@ -407,10 +405,8 @@ MOD_CSW1L = dict(
 
 )
 
-# QG-SW Models
+# One-layer baroclinic shallow-water model
 MOD_QGSW = dict(
-
-    name_class = 'qg', # Name of the model class (either qg or sw)
 
     name_var = {'U':'u', 'V':'v', 'SSH':'ssh'},
 
@@ -418,7 +414,7 @@ MOD_QGSW = dict(
 
     var_to_save = None,
 
-    name_params = None, #['H', 'hbcx', 'hbcy', 'itg'], # list of parameters to control. H denotes dimensionless equivalent-depth log-control.
+    name_params = None, # Controlled parameters. 'H' and 'g_prime' are positive dimensionless log-controls.
 
     nl = 1, # number of layers in the model (for nl>1, set H and g_prime as lists/arrays)
 
@@ -428,7 +424,7 @@ MOD_QGSW = dict(
 
     constant_f = False,
 
-    c0 = 2.7,
+    c0 = 2.7, # Reference phase speed [m s^-1]. Used to diagnose a missing H or g_prime.
 
     filec_aux = None, # if c0==None, auxilliary file to be used as phase velocity field (the spatial interpolation is handled inline)
 
@@ -438,12 +434,32 @@ MOD_QGSW = dict(
 
     cmax = None, # Maximum value of phase velocity to consider
 
-    H = None, # mean layer depth(s) in meters.  Scalar or list, e.g. H=[500., 2500.] for nl=2
+    H = None, # Reference layer depth [m]. With g_prime set, c is diagnosed; otherwise g_prime is diagnosed from c**2/H.
 
     constant_H = False, # if True and H is None (nl=1), use the spatial mean of c to derive a
                         # spatially constant H = mean(c)^2 / g_prime instead of the full 2-D field
 
-    g_prime = None, # reduced gravity(ies).  Scalar or list, e.g. g_prime=[9.81, 0.02] for nl=2
+    g_prime = None, # Reference reduced gravity [m s^-2]. With H set, c is diagnosed; with H unset, H is diagnosed from c**2/g_prime.
+
+    # Meaning of the 2-D state field named by name_var['SSH']:
+    # 'ssh' keeps the historical direct-height formulation.
+    # 'interface_displacement' (nl=1 SW only) stores reduced-gravity interface
+    # displacement eta. External SSH is diagnosed as (g_prime / physical_gravity) * eta.
+    # Parameter closure: H and g_prime are authoritative when both are set;
+    # otherwise c diagnoses the missing member through c**2 = g_prime*H.
+    # Public MOD_QGSW supports only the direct SSH and one-layer physical
+    # interface-displacement representations. Multilayer and Ekman machinery
+    # belongs to the internal SW core and is not publicly configurable here.
+    height_representation = 'ssh',
+
+    # Restart coordinate for the field mapped to name_init_var['SSH'] in
+    # interface_displacement mode. The default is the physical `ssh` written
+    # by save_output; use `interface_displacement` only when explicitly
+    # selecting the saved physical Interface Displacement field. Controlled
+    # g_prime restarts convert it back to the fixed reference state coordinate.
+    restart_height_coordinate = 'physical_ssh',
+
+    physical_gravity = 9.81, # m s^-2, used only for SSH <-> interface-displacement conversion
 
     init_from_bc = True,
 
@@ -453,17 +469,9 @@ MOD_QGSW = dict(
 
     slip_coef = 1., # Lateral wall slip coefficient (dimensionless, in [0,1]): 1 = free-slip, 0 = no-slip, in-between = partial slip. Use 1 when use_sponge_on_coast=True so the sponge is the sole near-coast damping mechanism (no double damping).
 
-    taux = 0., # wind stress in N/m^2
-
-    tauy = 0., # wind stress in N/m^2
-
     path_mdt = None, # path of MDT
 
     name_var_mdt = {'lon':'','lat':'','var':''}, # dictionary of MDT coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
-
-    name_var_mdu = {'lon':'','lat':'','var':''}, # dictionary of MDT coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
-
-    name_var_mdv = {'lon':'','lat':'','var':''}, # dictionary of MDT coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
 
     dist_sponge_bc = None,
 
@@ -507,17 +515,28 @@ MOD_QGSW = dict(
     Cd_wind = 1.3e-3, # drag coefficient used in the bulk wind-stress formula tau = rho_air * Cd * |U10| * U10
 
     Cd_wind_formula = None, # Use the Large & Pond formula for drag coefficient. Set to None to use a constant drag coefficient (Cd_wind)
-
     rho_water = 1025.0, # ocean water density (kg/m³) used to convert wind stress [Pa] to acceleration [m²/s²]: tau/(rho_water*H)*dx
 
     # Physical layer depth (m) for the wind-stress denominator:  tau / (rho_water * h_wind) * dx
-    # IMPORTANT for 1-layer QG/SW models: the model equivalent depth H = c²/g ≈ 0.4–1 m is
+    # IMPORTANT for one-layer SW models using equivalent depth: H = c²/g ≈ 0.4–1 m is
     # NOT the physical mixed-layer depth (~50–200 m).  Without setting h_wind, wind forcing
     # is 100–500× too large.  Set h_wind to the actual mixed-layer depth, e.g.:
     #   h_wind = 100.     # 100 m mixed layer
-    # Leave None to use the model's reference layer thickness (correct only for multi-layer
-    # models where H represent the true physical layer depths).
+    # Leave None with a controlled one-layer H to use the Controlled Layer Depth in
+    # the wind-stress denominator. Without a controlled H, this falls back to the
+    # model's reference layer thickness (correct only when H is a physical depth).
     h_wind = None,
+
+    # Bounds for the dimensionless logarithmic h_wind control. When h_wind is
+    # controlled, VarDyn uses h_wind_total = floor + (h_wind-floor)*exp(alpha).
+    h_wind_floor = None, # None means 0
+    h_wind_max = None, # None means no upper bound
+
+    # Use the instantaneous top-layer thickness H + eta as the wind-forcing
+    # denominator instead of h_wind/reference thickness. Keep False unless the
+    # top layer represents a physical mixed layer; True couples wind forcing to
+    # layer-thickness anomalies and can amplify thinning feedbacks.
+    wind_use_instantaneous_top_depth = False,
 
     wind_timestep = 3600, # wind update interval in seconds (default: 1 hour). Wind stress is
                           # precomputed at this cadence and held constant between updates.
@@ -527,10 +546,12 @@ MOD_QGSW = dict(
                      # split into chunks of max_nstep to limit GPU memory usage.
                      # Decrease if running out of GPU memory.
 
-    # Momentum forcing mode for external forcing (Fu, Fv, Fh).
-    # 'direct'          : use Fu, Fv as provided (default).
-    # 'mass_consistent' : derive Fu, Fv from Fh so that velocity is conserved
-    #                     when mass is added:  Fu = -u/h * Fh,  Fv = -v/h * Fh.
+    # Momentum treatment for external forcing (Fu, Fv, Fh).
+    # 'direct'                    : apply Fu, Fv and Fh independently (default).
+    # 'zero_momentum_mass_source' : additionally rescale velocity so that Fh
+    #                               adds/removes mass carrying zero horizontal
+    #                               momentum; Fu and Fv remain independent.
+    # 'mass_consistent' is accepted as a deprecated compatibility alias.
     forcing_momentum = 'direct',
 
     bc_file = None,  # Path to NetCDF file containing boundary conditions
@@ -708,8 +729,6 @@ OBS_SSH_NADIR = dict(
 
     name_var_err = None, # dictionary of error coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
     
-    nudging_params_ssh = None, # dictionary of nudging parameters on SSH {'sigma':<float>,'K':<float>,'Tau':<datetime.timedelta>}. Note that 'sigma' parameter is useless now, and will be removed soon,
-
     delta_t = None, # Sampling period of the satellite (in s), used for computing geostrophic current 
 
     velocity = None # Velocity of the satellite (in m/s), used for computing geostrophic current 
@@ -749,10 +768,6 @@ OBS_SSH_SWATH = dict(
 
     name_var_err = None, # dictionary of error coordinates and variable {'lon':<name_lon>, 'lat':<name_lat>, 'var':<name_var>}
     
-    nudging_params_ssh = None, # dictionary of nudging parameters on SSH {'sigma':<float>,'K':<float>,'Tau':<datetime.timedelta>}. Note that *sigma* parameter is useless now, and will be removed soon
-
-    nudging_params_relvort = None, # dictionary of nudging parameters on Relative Vorticity {'sigma':<float>,'K':<float>,'Tau':<datetime.timedelta>}. Note that *sigma* parameter is useless now, and will be removed soon
-    
 )
 
 #################################################################################################################################
@@ -761,6 +776,8 @@ OBS_SSH_SWATH = dict(
 NAME_OBSOP = None
 
 OBSOP_INTERP_L3 = dict(
+
+    observation_role = None, # Optional semantic model role selected by the model (e.g. surface).
 
     name_obs = None, # List of observation class names. If None, all observation will be considered. 
 
@@ -779,6 +796,8 @@ OBSOP_INTERP_L3 = dict(
 )
 
 OBSOP_INTERP_L4 = dict(
+
+    observation_role = None, # Optional semantic model role selected by the model (e.g. surface).
 
     name_obs = None, # List of observation class names. If None, all observation will be considered. 
 
@@ -809,6 +828,8 @@ BASIS_OFFSET = dict(
 
     name_mod_var = None, # String or list of model parameter names sharing this basis
 
+    use_state_background = False, # Add this parameter's State.params restart field as a constant background
+
     sigma_B = None, 
 
 )
@@ -819,6 +840,8 @@ BASIS_GAUSS2D = dict(
     super = 'BASIS_GAUSS2D',
 
     name_mod_var = '', # String or list of related model parameter names
+
+    use_state_background = False, # Add this parameter's State.params restart field as a constant background
 
     c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 
@@ -851,6 +874,8 @@ BASIS_GAUSS2D = dict(
 BASIS_GAUSS3D = dict(
 
     name_mod_var = '', # String or list of related model parameter names 
+
+    use_state_background = False, # Add this parameter's State.params restart field as a constant background
 
     c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 
@@ -895,6 +920,8 @@ BASIS_BMaux = dict(
 
     name_mod_var = None, # String or list of related model parameter names 
 
+    use_state_background = False, # Add this parameter's State.params restart field as a constant background
+
     c_grid_var = None, # C-grid variable type: None (default h-grid), 'U' (shape ny,nx+1), or 'V' (shape ny+1,nx)
 
     compute_velocities = False, # Whether to compute geostrophic velocities associated to the SSH basis vectors
@@ -926,8 +953,6 @@ BASIS_BMaux = dict(
     tdecmax = 40., # maximum time of decorrelation 
 
     facQ = 1, # factor to be multiplied to the estimated Q
-
-    facQ_aux_path = None,
 
     l_largescale = 500, # factor to be multiplied to the estimated Q
 
@@ -1000,8 +1025,6 @@ INV_4DVAR = dict(
     plot_state_during_minimization = False, # Opt in to costly device-to-host state plots from cost evaluations
 
     print_time = False, # Whether to print the time taken for each iteration, split by model, obs operator and gradient computation
-
-    JAX_mem_fraction = None,
 
     cost_float64 = True, # Accumulate cost/control terms in float64 while model kernels may stay float32
 
@@ -1153,10 +1176,6 @@ DIAG_OSE = dict(
 
     name_var_mdt = None,
     
-    delta_t_ref = None, # s
-
-    velocity_ref = None, # km/s
-
     lenght_scale = 1000, # km
 
     nb_min_obs = 10,

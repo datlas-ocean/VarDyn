@@ -18,7 +18,7 @@ def test_optax_decoupled_converges_with_shared_relative_gradient_criterion():
         initial,
         maxiter=20,
         history_size=3,
-        relative_gradient_tolerance=0.6,
+        gtol=0.6,
         convergence_patience=2,
         minimum_iterations=2,
     )
@@ -32,6 +32,29 @@ def test_optax_decoupled_converges_with_shared_relative_gradient_criterion():
         np.zeros(2),
         atol=1e-6,
     )
+
+
+def test_optax_decoupled_converges_with_relative_cost_criterion():
+    result = minimize_optax_decoupled(
+        _quadratic,
+        jnp.array([1.0, 2.0], dtype=jnp.float32),
+        maxiter=10,
+        history_size=3,
+        ftol=0.1,
+        convergence_patience=2,
+        minimum_iterations=2,
+    )
+
+    assert result.converged
+    assert result.status == "convergence criterion reached"
+    recent_pairs = zip(result.cost_history[-3:-1], result.cost_history[-2:])
+    relative_decreases = [
+        abs(previous - current)
+        / max(abs(previous), abs(current), 1.0)
+        for previous, current in recent_pairs
+    ]
+    assert len(relative_decreases) == 2
+    assert all(decrease <= 0.1 for decrease in relative_decreases)
 
 
 def test_optax_decoupled_runs_to_maxiter_without_a_criterion():

@@ -286,8 +286,6 @@ myINV = dict(
 
     freq_it_plot = 10, # Iteration interval for minimization diagnostic plots.
 
-    opt_method = 'L-BFGS-B', # SciPy optimizer used by the 4DVar driver.
-
     path_save_control_vectors = f'{myPath}/controls/{name_experiment}', # Directory for saved control vectors/restarts.
 
     timestep_checkpoint = timedelta(hours=24), # Time spacing between checkpointed analysis states.

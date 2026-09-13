@@ -118,7 +118,7 @@ def Obsop(config, State, dict_obs, Model, verbose=1, *args, **kwargs):
 class Obsop_interp:
 
     def __init__(self,config,State,dict_obs,Model):
-        
+
         self.compute_H = config.OBSOP.compute_op
 
         # Date obs list
@@ -162,9 +162,13 @@ class Obsop_interp:
         # Temporary path where to save misfit
         self.tmp_DA_path = config.EXP.tmp_DA_path
         
-        # Model variable
+        # Model variable and optional semantic observation role.  The
+        # observation operator remains model-agnostic; the model resolves the
+        # role to its own prognostic field/layer representation.
         self.name_mod_var = Model.name_var
-        
+        self.model = Model
+        self.observation_role = getattr(config.OBSOP, 'observation_role', None)
+
         # For grid interpolation:
         lon = +State.lon
         lat = +State.lat
@@ -199,7 +203,24 @@ class Obsop_interp:
         
         # Process obs
         self.dict_obs = dict_obs
-        
+
+    def _observation_model_field(self, State):
+        """Return the field selected by the model for this observation."""
+        if self.observation_role is not None and hasattr(self.model, 'observation_field'):
+            return self.model.observation_field(State, self.name_var, self.observation_role)
+        fields = State.var if hasattr(State, 'var') else State
+        return fields[self.name_mod_var[self.name_var]]
+
+    def _add_observation_adjoint(self, adState, increment):
+        """Pass an observation adjoint back through the model interface."""
+        if self.observation_role is not None and hasattr(self.model, 'add_observation_adjoint'):
+            self.model.add_observation_adjoint(
+                adState, self.name_var, self.observation_role, increment)
+        else:
+            name = self.name_mod_var[self.name_var]
+            adState.setvar(adState.var[name] + increment, name)
+
+
 
     def process_obs(self, var_bc=None):
 
@@ -208,6 +229,13 @@ class Obsop_interp:
     def is_obs(self,t):
 
         return t in self.date_obs
+
+    @staticmethod
+    def _model_to_observation_scale(Model, name_var):
+        """Return the pointwise model-height -> observed-variable scale."""
+        if name_var != 'SSH':
+            return jnp.asarray(1.)
+        return jnp.asarray(getattr(Model, 'ssh_observation_scale', 1.))
     
     def is_obs_time(self,t):
 
@@ -229,6 +257,7 @@ class Obsop_interp_l3(Obsop_interp):
 
         # Date obs
         self.name_var = config.OBSOP.name_var
+        self.model_to_observation_scale = self._model_to_observation_scale(Model, self.name_var).reshape(-1)
         self.date_obs = []
         self.t_obs = []
         self.name_obs = []
@@ -565,8 +594,11 @@ class Obsop_interp_l3(Obsop_interp):
         varobs_t = self.varobs_arr[idt][0]
         errobs_t = self.errobs_arr[idt][0]
 
-        # Project model state to obs space
-        HX = self.explicit_proj_operation(data_t, indices_t, X, varobs_t.size)
+        # Project the model coordinate after converting eta -> physical SSH
+        # when the QGSW model uses the nl=1 interface formulation.
+        HX = self.explicit_proj_operation(
+            data_t, indices_t, X * self.model_to_observation_scale, varobs_t.size
+        )
 
         # Compute misfit & errors
         misfit = HX - varobs_t
@@ -604,13 +636,13 @@ class Obsop_interp_l3(Obsop_interp):
     
     def misfit(self, t, State):
 
-        X = State.var[self.name_mod_var[self.name_var]]
+        X = self._observation_model_field(State)
 
         return self._misfit_jit(t, X.ravel() )
     
     def misfit_jax(self, t, State_var):
 
-        X = State_var[self.name_mod_var[self.name_var]].ravel() 
+        X = self._observation_model_field(State_var).ravel()
 
         return self._misfit_jit(t, X)
 
@@ -630,24 +662,23 @@ class Obsop_interp_l3(Obsop_interp):
         """Pure-pytree L3 adjoint used inside ``lax.scan``."""
         if self.varobs_arr.shape[0] == 0:
             return adState_var
-        name = self.name_mod_var[self.name_var]
-        var = State_var[name]
+        var = self._observation_model_field(State_var)
         adX = self._misfit_reduced_jit(t, misfit, var.ravel())
         result = dict(adState_var)
-        result[name] = result[name] + adX.reshape(result[name].shape)
+        if self.observation_role is not None and hasattr(self.model, 'add_observation_adjoint'):
+            self.model.add_observation_adjoint(
+                result, self.name_var, self.observation_role, adX.reshape(var.shape))
+        else:
+            name = self.name_mod_var[self.name_var]
+            result[name] = result[name] + adX.reshape(result[name].shape)
         return result
     
     def adj(self, t, adState, State, misfit):
 
-        # Read adjoint variable
-        advar = adState.var[self.name_mod_var[self.name_var]]
-        var = State.var[self.name_mod_var[self.name_var]]
-
         # Compute adjoint operation of y = Hx
-        adX = self._misfit_reduced_jit(t, misfit , var.ravel())
-
-        # Update adjoint variable
-        adState.setvar(advar + adX.reshape(advar.shape), self.name_mod_var[self.name_var])  
+        var = self._observation_model_field(State)
+        adX = self._misfit_reduced_jit(t, misfit, var.ravel())
+        self._add_observation_adjoint(adState, adX.reshape(var.shape))
     
 class Obsop_interp_l4(Obsop_interp):
 
@@ -657,6 +688,7 @@ class Obsop_interp_l4(Obsop_interp):
 
         # Date obs
         self.name_var = config.OBSOP.name_var
+        self.model_to_observation_scale = self._model_to_observation_scale(Model, self.name_var).reshape(-1)
         self.name_var_obs = {}
         self.name_obs = []
         self.t_obs = [] 
@@ -1145,9 +1177,35 @@ class Obsop_interp_l4(Obsop_interp):
         """Device-side observation mask for a rolled checkpoint scan."""
         return jnp.any(jnp.isclose(t, self.t_obs_jax))
                 
+    def _to_observation_grid(self, X):
+        """Convert a model C-grid velocity to the scalar L4 grid."""
+        ny, nx = self.DX.shape
+        if self.name_var == 'U' and X.size == ny * (nx + 1):
+            field = X.reshape((ny, nx + 1))
+            return 0.5 * (field[:, :-1] + field[:, 1:]).reshape(-1)
+        if self.name_var == 'V' and X.size == (ny + 1) * nx:
+            field = X.reshape((ny + 1, nx))
+            return 0.5 * (field[:-1, :] + field[1:, :]).reshape(-1)
+        return X.reshape(-1)
+
+    def _from_observation_grid(self, increment, shape):
+        """Adjoint of ``_to_observation_grid`` for C-grid velocities."""
+        ny, nx = self.DX.shape
+        if self.name_var == 'U' and tuple(shape) == (ny, nx + 1):
+            inc = increment.reshape((ny, nx))
+            out = jnp.zeros((ny, nx + 1), dtype=increment.dtype)
+            out = out.at[:, :-1].add(0.5 * inc)
+            return out.at[:, 1:].add(0.5 * inc)
+        if self.name_var == 'V' and tuple(shape) == (ny + 1, nx):
+            inc = increment.reshape((ny, nx))
+            out = jnp.zeros((ny + 1, nx), dtype=increment.dtype)
+            out = out.at[:-1, :].add(0.5 * inc)
+            return out.at[1:, :].add(0.5 * inc)
+        return increment.reshape(shape)
+
     def misfit(self, t, State):
 
-        X = State.var[self.name_mod_var[self.name_var]].flatten()
+        X = self._to_observation_grid(self._observation_model_field(State))
 
         if self.gradients:
             return self._misfit_grad(t, X)
@@ -1167,8 +1225,8 @@ class Obsop_interp_l4(Obsop_interp):
             raise NotImplementedError(
                 'lax.scan does not yet support gradient-form L4 observations'
             )
-        name = self.name_mod_var[self.name_var]
-        raw = self._misfit(t, State_var[name].flatten())
+        field = self._observation_model_field(State_var)
+        raw = self._misfit(t, self._to_observation_grid(field))
         return jnp.where(self.is_obs_time_jax(t), raw, jnp.zeros_like(raw))
 
     def scan_adj(self, t, adState_var, State_var, misfit):
@@ -1184,9 +1242,15 @@ class Obsop_interp_l4(Obsop_interp):
             0.,
             inverr * misfit,
         )
-        name = self.name_mod_var[self.name_var]
+        field = self._observation_model_field(State_var)
         result = dict(adState_var)
-        result[name] = result[name] + increment.reshape(result[name].shape)
+        increment = self._from_observation_grid(increment.reshape(-1), field.shape)
+        if self.observation_role is not None and hasattr(self.model, 'add_observation_adjoint'):
+            self.model.add_observation_adjoint(
+                result, self.name_var, self.observation_role, increment)
+        else:
+            name = self.name_mod_var[self.name_var]
+            result[name] = result[name] + increment
         return result
 
     def _misfit(self, t, X):
@@ -1194,8 +1258,21 @@ class Obsop_interp_l4(Obsop_interp):
         # Get data at time t
         idt = jnp.where(self.t_obs_jax==t, size=1)[0]
 
-        # Compute misfit & errors
-        misfit = X - self.varobs_arr[idt]
+        # Prognostic fields intentionally carry NaNs on land. Masking the
+        # residual *after* the subtraction leaves a NaN-valued inactive branch
+        # in the JAX reverse pass, which can contaminate gradients although J
+        # itself is finite. Make the model and conversion arrays finite before
+        # the differentiable arithmetic; invalid observations already receive
+        # an effectively zero weight below.
+        X = jnp.nan_to_num(jnp.asarray(X), nan=0., posinf=0., neginf=0.)
+        scale = jnp.nan_to_num(
+            jnp.asarray(self.model_to_observation_scale),
+            nan=0., posinf=0., neginf=0.,
+        )
+
+        # Compute misfit & errors in the observed coordinate (physical SSH
+        # for nl=1 physical reduced-gravity QGSW runs).
+        misfit = X * scale - self.varobs_arr[idt]
         inverr = 1/self.errobs_arr[idt]
         
         res = inverr * misfit
@@ -1237,8 +1314,11 @@ class Obsop_interp_l4(Obsop_interp):
         mode = 'w'
         for name in self.name_var_obs[t]:
 
-            # Get model state
+            # Get model state in the observed coordinate. This preserves the
+            # physical-SSH gradient when QGSW internally stores eta.
             X = State.getvar(self.name_mod_var[name])
+            if name == 'SSH':
+                X = X * self.model_to_observation_scale.reshape(X.shape)
 
             # Compute gradients
             HX_grady = np.zeros_like(self.DY)
@@ -1290,15 +1370,12 @@ class Obsop_interp_l4(Obsop_interp):
         # Get data at time t
         idt = jnp.where(self.t_obs_jax==t, size=1)[0]
         inverr = 1/self.errobs_arr[idt]
-        _advar = (inverr * misfit)
+        _advar = self.model_to_observation_scale * (inverr * misfit)
         _advar = jnp.where(jnp.isnan(_advar), 0., _advar)
 
-        # Read adjoint variable
-        advar = adState.var[self.name_mod_var[self.name_var]]
-        advar += _advar.reshape(advar.shape)
-    
-        # Update adjoint variable
-        adState.setvar(advar, self.name_mod_var[self.name_var])  
+        field = self._observation_model_field(adState)
+        increment = self._from_observation_grid(_advar.reshape(-1), field.shape)
+        self._add_observation_adjoint(adState, increment)
   
     def _adj_grad(self, t, adState, State, misfit):
 
@@ -1321,12 +1398,17 @@ class Obsop_interp_l4(Obsop_interp):
             # Read adjoint variable
             advar = adState.getvar(self.name_mod_var[name])
 
-            # Compute adjoint operation of y = Hx
+            # Compute adjoint operation of y = H(S eta). The pointwise
+            # scale S converts internal eta to physical SSH before gradients.
+            scale = (self.model_to_observation_scale.reshape(advar.shape)
+                     if name == 'SSH' else 1.)
             for iobs in range(inverr.shape[0]):
-                advar[2:,1:-1] += inverr[iobs,1:-1,1:-1]* inverr[iobs,1:-1,1:-1] * misfit_grady[iobs,1:-1,1:-1] / (2 * self.DY[1:-1,1:-1])
-                advar[:-2,1:-1] += -inverr[iobs,1:-1,1:-1]* inverr[iobs,1:-1,1:-1] * misfit_grady[iobs,1:-1,1:-1] / (2 * self.DY[1:-1,1:-1])
-                advar[1:-1,2:] += inverr[iobs,1:-1,1:-1]* inverr[iobs,1:-1,1:-1] * misfit_gradx[iobs,1:-1,1:-1] / (2 * self.DX[1:-1,1:-1])
-                advar[1:-1,:-2] += -inverr[iobs,1:-1,1:-1]* inverr[iobs,1:-1,1:-1] * misfit_gradx[iobs,1:-1,1:-1] / (2 * self.DX[1:-1,1:-1])
+                grad_y = inverr[iobs,1:-1,1:-1] * inverr[iobs,1:-1,1:-1] * misfit_grady[iobs,1:-1,1:-1] / (2 * self.DY[1:-1,1:-1])
+                grad_x = inverr[iobs,1:-1,1:-1] * inverr[iobs,1:-1,1:-1] * misfit_gradx[iobs,1:-1,1:-1] / (2 * self.DX[1:-1,1:-1])
+                advar[2:,1:-1] += scale[2:,1:-1] * grad_y
+                advar[:-2,1:-1] += -scale[:-2,1:-1] * grad_y
+                advar[1:-1,2:] += scale[1:-1,2:] * grad_x
+                advar[1:-1,:-2] += -scale[1:-1,:-2] * grad_x
 
             # Update adjoint variable
             adState.setvar(advar, self.name_mod_var[name])      
