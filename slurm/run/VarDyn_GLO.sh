@@ -81,6 +81,10 @@ if ! [[ "$NUM_TILES_PER_GPU" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: NUM_TILES_PER_GPU must be a positive integer (got '$NUM_TILES_PER_GPU')" >&2
     exit 1
 fi
+if ! [[ "$BARRIER_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: BARRIER_TIMEOUT must be a positive integer (got '$BARRIER_TIMEOUT')" >&2
+    exit 1
+fi
 if [ "$CLEANUP_TILE_ZARR" != "true" ] && \
    [ "$CLEANUP_TILE_ZARR" != "false" ]; then
     echo "ERROR: CLEANUP_TILE_ZARR must be true or false (got '$CLEANUP_TILE_ZARR')" >&2
@@ -101,6 +105,7 @@ MERGE_ONLY=false
 TILE_SCOPE="all"
 NAME_EXP_OVERRIDE=""
 NAME_EXP_BACKGROUND_OVERRIDE=""
+PREDECESSOR_JOB=""
 args=("$@")
 i=0
 while [ $i -lt ${#args[@]} ]; do
@@ -117,6 +122,8 @@ while [ $i -lt ${#args[@]} ]; do
         --name_exp=*)    NAME_EXP_OVERRIDE="${args[$i]#--name_exp=}" ;;
         --name_exp_background) i=$(( i + 1 )); NAME_EXP_BACKGROUND_OVERRIDE="${args[$i]}" ;;
         --name_exp_background=*) NAME_EXP_BACKGROUND_OVERRIDE="${args[$i]#--name_exp_background=}" ;;
+        --predecessor-job) i=$(( i + 1 )); PREDECESSOR_JOB="${args[$i]}" ;;
+        --predecessor-job=*) PREDECESSOR_JOB="${args[$i]#--predecessor-job=}" ;;
     esac
     i=$(( i + 1 ))
 done
@@ -179,6 +186,7 @@ submit_continuation() {
     local dependency="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"
     local next_job
     local continuation_args=(--config "${CONFIG_FILE}" --skip-prepare)
+    continuation_args+=(--predecessor-job "${dependency}")
     $MERGE_ONLY && continuation_args+=(--merge-only)
     [ "$TILE_SCOPE" != "all" ] && continuation_args+=(--tile-scope "$TILE_SCOPE")
     [ -n "${NAME_EXP_OVERRIDE}" ] && continuation_args+=(--name_exp "${NAME_EXP_OVERRIDE}")
@@ -186,6 +194,16 @@ submit_continuation() {
         --dependency="afterany:${dependency}" \
         "${CONTINUATION_SCRIPT}" "${continuation_args[@]}"); then
         echo "$(date '+%F %T') | Submitted continuation array ${next_job}"
+        if command -v scontrol >/dev/null 2>&1; then
+            local next_job_id="${next_job%%;*}"
+            local dependency_record
+            dependency_record=$(scontrol show job "$next_job_id" -o 2>/dev/null || true)
+            if [[ "$dependency_record" == *"Dependency=afterany:${dependency}"* ]]; then
+                echo "$(date '+%F %T') | Verified continuation dependency afterany:${dependency}"
+            else
+                echo "$(date '+%F %T') | WARNING: could not verify continuation dependency afterany:${dependency}" >&2
+            fi
+        fi
     else
         rmdir "$submit_lock" 2>/dev/null || true
         echo "$(date '+%F %T') | ERROR: failed to submit continuation array" >&2
@@ -311,6 +329,26 @@ echo " TILE_SCOPE=${TILE_SCOPE}"
 echo " CLEANUP_TILE_ZARR=${CLEANUP_TILE_ZARR}"
 echo " ZARR chunks=${ZARR_TIME_CHUNK}x${ZARR_SPATIAL_CHUNK}x${ZARR_SPATIAL_CHUNK}, zstd level=${ZARR_COMPRESSION_LEVEL}"
 echo "=========================================="
+if [ -n "$PREDECESSOR_JOB" ]; then
+    if ! command -v squeue >/dev/null 2>&1; then
+        echo "$(date '+%F %T') | ERROR: cannot guard continuation against predecessor ${PREDECESSOR_JOB}: squeue is unavailable" >&2
+        exit 1
+    fi
+    predecessor_waited=0
+    while true; do
+        if ! predecessor_tasks=$(squeue -h -j "$PREDECESSOR_JOB" -o '%i' 2>/dev/null); then
+            echo "$(date '+%F %T') | ERROR: failed to query predecessor array ${PREDECESSOR_JOB}" >&2
+            exit 1
+        fi
+        [ -z "$predecessor_tasks" ] && break
+        if [ "$predecessor_waited" -eq 0 ] || [ $((predecessor_waited % 300)) -eq 0 ]; then
+            echo "$(date '+%F %T') | Waiting for predecessor array ${PREDECESSOR_JOB} to finish"
+        fi
+        sleep 15
+        predecessor_waited=$((predecessor_waited + 15))
+    done
+    echo "$(date '+%F %T') | Predecessor array ${PREDECESSOR_JOB} is no longer active"
+fi
 if [ -n "$RESTART" ] && [ -f "$FINAL_MARKER" ]; then
     rm -f "$FINAL_MARKER"
     echo "$(date '+%F %T') | Removed stale completion marker for explicit restart"
@@ -396,10 +434,52 @@ fi
 
 # -------------------- TILE CLAIMING (atomic mkdir, works on Lustre/GPFS) --------------------
 try_claim_tile() {
-    # mkdir is atomic on all POSIX filesystems including Lustre/GPFS
     local tile="$1"
-    local lock_dir="${tile}/.lock_${JOB_ID}"
-    mkdir "$lock_dir" 2>/dev/null
+    local lock_dir="${tile}/.tile_running.lock"
+    local token="${JOB_ID}_${ARRAY_ID}_${BASHPID}"
+
+    # The stable lock name prevents overlapping job generations from running
+    # the same tile. mkdir is atomic on Lustre/GPFS.
+    if mkdir "$lock_dir" 2>/dev/null; then
+        printf '%s\n' "$JOB_ID" > "${lock_dir}/job_id"
+        printf '%s\n' "$token" > "${lock_dir}/token"
+        printf '%s\n' "$token"
+        return 0
+    fi
+
+    # A killed job can leave a directory behind. Reclaim it only when its
+    # owning Slurm array is no longer active; an unreadable/new lock remains
+    # conservatively busy.
+    local owner_job=""
+    [ -f "${lock_dir}/job_id" ] && owner_job=$(sed -n '1p' "${lock_dir}/job_id")
+    [ -z "$owner_job" ] && return 1
+    command -v squeue >/dev/null 2>&1 || return 1
+    local owner_tasks
+    owner_tasks=$(squeue -h -j "$owner_job" -o '%i' 2>/dev/null) || return 1
+    [ -n "$owner_tasks" ] && return 1
+
+    local stale_dir="${lock_dir}.stale-${token}"
+    mv "$lock_dir" "$stale_dir" 2>/dev/null || return 1
+    rm -f "${stale_dir}/job_id" "${stale_dir}/token"
+    rmdir "$stale_dir" 2>/dev/null || true
+    if mkdir "$lock_dir" 2>/dev/null; then
+        printf '%s\n' "$JOB_ID" > "${lock_dir}/job_id"
+        printf '%s\n' "$token" > "${lock_dir}/token"
+        printf '%s\n' "$token"
+        return 0
+    fi
+    return 1
+}
+
+release_tile_claim() {
+    local tile="$1"
+    local token="$2"
+    local lock_dir="${tile}/.tile_running.lock"
+    local owner_token=""
+    [ -f "${lock_dir}/token" ] && owner_token=$(sed -n '1p' "${lock_dir}/token")
+    [ "$owner_token" = "$token" ] || return 0
+    rm -f "${lock_dir}/job_id" "${lock_dir}/token"
+    rmdir "$lock_dir" 2>/dev/null || true
 }
 
 # Wait on completed work rather than SLURM_ARRAY_TASK_COUNT: Slurm may start
@@ -422,8 +502,8 @@ wait_for_window_tiles() {
         fi
         [ "$missing" -eq 0 ] && return 0
         if [ "$waited" -ge "$BARRIER_TIMEOUT" ]; then
-            echo "$(date '+%F %T') | Window incomplete: ${missing} tile(s) missing" >&2
-            return 2
+            echo "$(date '+%F %T') | Window still running: ${missing} tile(s) incomplete; continuing to wait" >&2
+            waited=0
         fi
         sleep 10
         waited=$((waited + 10))
@@ -454,6 +534,9 @@ wait_for_spatial_merge_parts() {
 run_single_tile() {
     local TILE="$1"
     local IW="$2"
+    local CLAIM_TOKEN="$3"
+    trap 'release_tile_claim "$TILE" "$CLAIM_TOKEN"' EXIT TERM INT
+    trap 'exit 143' TERM INT
     local TILE_BASENAME=$(basename "$TILE")
     local TILE_PARENT=$(basename "$(dirname "$TILE")")
     local LOG_SUBDIR="${LOGDIR}/${TILE_PARENT}"
@@ -481,6 +564,8 @@ run_single_tile() {
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | ERROR tile ${TILE} — last 40 lines of ${TILE_LOG}:" >&2
         tail -n 40 "$TILE_LOG" >&2
     fi
+    release_tile_claim "$TILE" "$CLAIM_TOKEN"
+    trap - EXIT TERM INT
 }
 
 # -------------------- SEQUENTIAL TIME WINDOWS, DYNAMIC TILE DISPATCH --------------------
@@ -488,7 +573,14 @@ TIME_WINDOWS=$(ls -d ${BASE_DIR}/subwindow_* 2>/dev/null | sort)
 IW=0
 
 for TIME_DIR in $TIME_WINDOWS; do
+    DURABLE_WINDOW_MARKER="${TIME_DIR}/.window_complete_${TILE_SCOPE}.ok"
     echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Time window ${IW}: $TIME_DIR"
+
+    if [ -z "$RESTART" ] && ! $FORCE_MERGE && [ -f "$DURABLE_WINDOW_MARKER" ]; then
+        echo "$(date '+%F %T') | Time window ${IW} already complete; skipping assimilation and spatial merge"
+        IW=$((IW + 1))
+        continue
+    fi
 
     # One actually-running task publishes the tile list atomically.
     TILE_LIST="${BARRIER_DIR}/tiles_iw${IW}"
@@ -562,10 +654,13 @@ PY_TILE_SCOPE
         while IFS= read -r TILE; do
             [ -z "$TILE" ] && continue
 
-            # Try to claim this tile; skip if another GPU already got it
-            try_claim_tile "$TILE" || continue
+            # Avoid paying Python/JAX startup cost for durable completed work.
+            [ -f "${TILE}/.tile_complete.ok" ] && continue
 
-            run_single_tile "$TILE" "$IW" &
+            # Try to claim this tile; skip if another GPU already got it
+            CLAIM_TOKEN=$(try_claim_tile "$TILE") || continue
+
+            run_single_tile "$TILE" "$IW" "$CLAIM_TOKEN" &
             tile_pids+=("$!")
             ((tiles_done++))
             echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Active tiles: ${#tile_pids[@]}/${NUM_TILES_PER_GPU}"
@@ -590,9 +685,6 @@ PY_TILE_SCOPE
         wait_for_window_tiles "$TILE_LIST"
         window_status=$?
         if [ "$window_status" -ne 0 ]; then
-            # A timeout can benefit from a continuation; a deterministic tile
-            # failure must be fixed instead of creating a relaunch loop.
-            [ "$window_status" -eq 2 ] && submit_continuation
             exit 1
         fi
     fi
@@ -661,6 +753,9 @@ PY_TILE_SCOPE
                 --world "$NUM_ARRAY" \
                 --finalize_spatial_parts \
                 $FORCE_MERGE_ARG $ZARR_OUTPUT_ARG $OUTPUT_FLOAT64_ARG $CLEANUP_TILE_ZARR_ARG; then
+                durable_tmp="${DURABLE_WINDOW_MARKER}.tmp-${SLURM_JOB_ID:-$$}"
+                printf 'Window completed: %s\n' "$(date -Is)" > "$durable_tmp"
+                mv -f "$durable_tmp" "$DURABLE_WINDOW_MARKER"
                 touch "$MERGE_MARKER"
                 OWNED_STAGE_LOCK=""
                 echo "$(date '+%F %T') | Spatial merge done for time window ${IW}"
@@ -691,6 +786,9 @@ PY_TILE_SCOPE
                 --rank 0 \
                 --world 1 \
                 $FORCE_MERGE_ARG $OUTPUT_FLOAT64_ARG; then
+                durable_tmp="${DURABLE_WINDOW_MARKER}.tmp-${SLURM_JOB_ID:-$$}"
+                printf 'Window completed: %s\n' "$(date -Is)" > "$durable_tmp"
+                mv -f "$durable_tmp" "$DURABLE_WINDOW_MARKER"
                 touch "$MERGE_MARKER"
                 OWNED_STAGE_LOCK=""
             else

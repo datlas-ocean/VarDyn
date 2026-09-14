@@ -70,7 +70,7 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 | `SPACE_WIN_X/Y`, `SPACE_OVERLAP_X/Y` | Spatial window size and overlap (degrees) |
 | `TIME_WIN`, `TIME_OVERLAP` | Temporal window size and overlap (days) |
 | `FLAG_INIT` / `FLAG_BACKGROUND` / `NAME_EXP` | Initialise from / use background from a previous experiment |
-| `BARRIER_TIMEOUT` | Seconds to wait for incomplete assimilation tiles |
+| `BARRIER_TIMEOUT` | Seconds between incomplete-tile waiting diagnostics |
 | `ZARR_OUTPUT` | If this shell option or `EXP.saveoutputs_zarr` is `true`, store each merged temporal window in one Zarr archive and the final experiment in one global Zarr archive |
 | `OUTPUT_FLOAT64` | If `true`, save merged floating-point data as float64; otherwise float32 (default: false) |
 | `CLEANUP_TILE_ZARR` | If `true` (default), compact validated tile trajectories to the single record needed to restart the following window |
@@ -97,9 +97,23 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 **Barrier robustness** (Lustre/GPFS):
 - `mkdir -p` for the barrier directory is retried up to 5 times with backoff
 - `touch` inside `barrier_wait` is similarly retried
-- `BARRIER_TIMEOUT` detects missing assimilation tiles
+- `BARRIER_TIMEOUT` controls periodic "still running" diagnostics while a
+  task waits for slower assimilation tiles. It does not terminate the task or
+  submit a continuation.
 - Spatial merge ranks and finalization wait until an explicit failure or the Slurm wall-time signal
 - `--force-merge` applies to the submitted run only and is not propagated to automatic continuations, so completed windows are not repeatedly recomputed
+
+Automatic continuations carry the preceding array ID in an internal
+`--predecessor-job` argument. The continuation checks `squeue` before doing any
+work, providing a runtime guard in addition to Slurm's `afterany` dependency.
+Per-tile `.tile_running.lock` leases also prevent two job generations from
+running the same tile concurrently. Locks are released when a tile process
+exits and are reclaimed only after their owning array is no longer active.
+
+After spatial merging succeeds, each time window receives a durable
+`.window_complete_<scope>.ok` marker. Normal continuation runs skip these
+windows before launching tile or merge subprocesses. Explicit `--restart` and
+`--force-merge` runs bypass the marker.
 
 ### `prepare_VarDyn.py`
 
