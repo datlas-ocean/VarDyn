@@ -108,6 +108,80 @@ class _LegacyComponent:
         pass
 
 
+class _SharedHeightComponent:
+    def __init__(self, field, scale=1.0):
+        self.dt = 10
+        self.name_var = {'SSH': field}
+        self.ssh_observation_scale = scale
+
+    def init(self, state, t0=0):
+        pass
+
+    def step(self, state, nstep=1, t=None, Xb=None):
+        pass
+
+    def step_tgl(self, dstate, state, nstep=1, t=None, Xb=None):
+        pass
+
+    def step_adj(self, adstate, state, nstep=1, t=None, Xb=None):
+        pass
+
+    def _set_land_nan(self, state):
+        pass
+
+
+def _shared_height_model():
+    model = Model_multi.__new__(Model_multi)
+    model.Models = [
+        _SharedHeightComponent('barotropic_ssh'),
+        _SharedHeightComponent('interface_displacement', scale=0.002),
+    ]
+    model.dt = 10
+    model.name_var = {'SSH': 'SSH_tot'}
+    model.name_var_tot = {'SSH': 'SSH_tot'}
+    return model
+
+
+def test_multi_model_sums_shared_ssh_in_physical_metres():
+    model = _shared_height_model()
+    state = SimpleNamespace(var={
+        'barotropic_ssh': jnp.full((2, 3), 0.1),
+        'interface_displacement': jnp.full((2, 3), 50.0),
+        'SSH_tot': jnp.zeros((2, 3)),
+    })
+
+    model.init(state)
+    np.testing.assert_allclose(state.var['SSH_tot'], 0.2)
+    model.step(state)
+    np.testing.assert_allclose(state.var['SSH_tot'], 0.2)
+
+
+def test_multi_model_shared_ssh_tangent_and_adjoint_use_same_scaling():
+    model = _shared_height_model()
+    state = SimpleNamespace(var={
+        'barotropic_ssh': jnp.zeros((2, 3)),
+        'interface_displacement': jnp.zeros((2, 3)),
+        'SSH_tot': jnp.zeros((2, 3)),
+    })
+    tangent = SimpleNamespace(var={
+        'barotropic_ssh': jnp.full((2, 3), 0.1),
+        'interface_displacement': jnp.full((2, 3), 50.0),
+        'SSH_tot': jnp.zeros((2, 3)),
+    })
+    model.step_tgl(tangent, state)
+    np.testing.assert_allclose(tangent.var['SSH_tot'], 0.2)
+
+    adjoint = SimpleNamespace(var={
+        'barotropic_ssh': jnp.zeros((2, 3)),
+        'interface_displacement': jnp.zeros((2, 3)),
+        'SSH_tot': jnp.ones((2, 3)),
+    })
+    model.step_adj(adjoint, state)
+    np.testing.assert_allclose(adjoint.var['barotropic_ssh'], 1.0)
+    np.testing.assert_allclose(adjoint.var['interface_displacement'], 0.002)
+    np.testing.assert_allclose(adjoint.var['SSH_tot'], 0.0)
+
+
 def test_multi_model_forwards_scan_boundary_conditions_under_jit():
     scan_aware = _ScanAwareComponent()
     model = Model_multi.__new__(Model_multi)

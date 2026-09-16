@@ -99,6 +99,31 @@ def _open_experiment_output(config, variables):
     return dataset[variables]
 
 
+def _is_zarr_store(path):
+    """Return whether *path* identifies a Zarr store."""
+    return isinstance(path, (str, os.PathLike)) and str(path).endswith('.zarr') \
+        and os.path.isdir(path)
+
+
+def _open_baseline_output(config, variables):
+    """Open a baseline from a Zarr store or the legacy NetCDF layout."""
+    variables = [variables] if isinstance(variables, str) else list(variables)
+    path = config.DIAG.name_bas
+    if _is_zarr_store(path):
+        dataset = xr.open_zarr(path, consolidated=False, chunks='auto')
+    else:
+        dataset = xr.open_mfdataset(path, chunks=-1)
+
+    missing = [name for name in variables if name not in dataset.variables]
+    if missing:
+        available = ', '.join(sorted(dataset.data_vars)) or '<none>'
+        dataset.close()
+        raise KeyError(
+            f'Baseline variable(s) {missing} not found. '
+            f'Available variables: {available}')
+    return dataset[variables]
+
+
 def Diag(config,State,verbose=1):
 
     """
@@ -264,10 +289,15 @@ That could be due to non regular grid or bad written netcdf file')
             self.name_bas_lon = config.DIAG.name_bas_lon
             self.name_bas_lat = config.DIAG.name_bas_lat
             self.name_bas_var = config.DIAG.name_bas_var
-            try:
-                bas = xr.open_mfdataset(config.DIAG.name_bas, chunks=-1, preprocess=lambda ds: ds[[self.name_bas_time, self.name_bas_lon, self.name_bas_lat, self.name_bas_var]])
-            except:
-                bas = xr.open_mfdataset(config.DIAG.name_bas, chunks=-1)
+            if _is_zarr_store(config.DIAG.name_bas):
+                bas = _open_baseline_output(
+                    config, [self.name_bas_time, self.name_bas_lon,
+                             self.name_bas_lat, self.name_bas_var])
+            else:
+                try:
+                    bas = xr.open_mfdataset(config.DIAG.name_bas, chunks=-1, preprocess=lambda ds: ds[[self.name_bas_time, self.name_bas_lon, self.name_bas_lat, self.name_bas_var]])
+                except:
+                    bas = xr.open_mfdataset(config.DIAG.name_bas, chunks=-1)
             if np.sign(bas[self.name_bas_lon].data.min())==-1 and State.lon_unit=='0_360':
                 bas = bas.assign_coords({self.name_bas_lon:((self.name_bas_lon, bas[self.name_bas_lon].data % 360))})
             elif np.sign(bas[self.name_bas_lon].data.min())==1 and State.lon_unit=='-180_180':
@@ -1111,25 +1141,30 @@ That could be due to non regular grid or bad written netcdf file')
             self.name_bas_lon = config.DIAG.name_bas_lon
             self.name_bas_lat = config.DIAG.name_bas_lat
             self.name_bas_var = config.DIAG.name_bas_var
-            #bas = xr.open_mfdataset(config.DIAG.name_bas)[self.name_bas_var]
-            bas_files = sorted(glob.glob(config.DIAG.name_bas))
-            bas_datasets = []
-            for file in bas_files:
-                with nc.Dataset(file) as ds:
-                    bas_data = ds.variables[self.name_bas_var][:]
-                    time_bas = ds.variables['time'][:]
-                    time_bas = nc.num2date(time_bas, ds.variables['time'].units)
-                    time_bas = np.array(time_bas, dtype='datetime64[ns]')
-                    
-                    ds_xr = xr.Dataset({
-                        self.name_bas_var: (ds.variables[self.name_bas_var].dimensions, bas_data)
-                    }, coords={'time': time_bas,
-                               self.name_bas_lon: ds.variables[self.name_bas_lon][:], 
-                               self.name_bas_lat: ds.variables[self.name_bas_lat][:]
-                               })
-                    bas_datasets.append(ds_xr)
-            bas = xr.concat(bas_datasets, dim='time')[self.name_bas_var]
-            bas = bas.copy(deep=True).load()
+            if _is_zarr_store(config.DIAG.name_bas):
+                bas_dataset = _open_baseline_output(config, [self.name_bas_var])
+                bas = bas_dataset[self.name_bas_var].load()
+                bas_dataset.close()
+            else:
+                # Legacy NetCDF baseline layout.
+                bas_files = sorted(glob.glob(config.DIAG.name_bas))
+                bas_datasets = []
+                for file in bas_files:
+                    with nc.Dataset(file) as ds:
+                        bas_data = ds.variables[self.name_bas_var][:]
+                        time_bas = ds.variables['time'][:]
+                        time_bas = nc.num2date(time_bas, ds.variables['time'].units)
+                        time_bas = np.array(time_bas, dtype='datetime64[ns]')
+
+                        ds_xr = xr.Dataset({
+                            self.name_bas_var: (ds.variables[self.name_bas_var].dimensions, bas_data)
+                        }, coords={'time': time_bas,
+                                   self.name_bas_lon: ds.variables[self.name_bas_lon][:],
+                                   self.name_bas_lat: ds.variables[self.name_bas_lat][:]
+                                   })
+                        bas_datasets.append(ds_xr)
+                bas = xr.concat(bas_datasets, dim='time')[self.name_bas_var]
+                bas = bas.copy(deep=True).load()
             
             bas = bas.transpose(self.name_bas_time, self.name_bas_lat, self.name_bas_lon)
             if np.sign(bas[self.name_bas_lon].data.min())==-1 and State.lon_unit=='0_360':

@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from src.inv import minimize_optax_decoupled
+from src.inv import minimize_optax_decoupled, minimize_optax_full_gpu
 
 
 def _quadratic(control):
@@ -68,6 +68,41 @@ def test_optax_decoupled_runs_to_maxiter_without_a_criterion():
     assert not result.converged
     assert result.status == "maximum iterations reached"
     assert result.iterations_completed == 3
+
+
+def test_optax_full_gpu_runs_complete_loop_and_stays_on_device():
+    result = minimize_optax_full_gpu(
+        _quadratic,
+        jnp.array([1.0, 2.0], dtype=jnp.float32),
+        maxiter=3,
+        history_size=3,
+    )
+
+    assert isinstance(result.control, jax.Array)
+    assert result.status == "maximum iterations reached"
+    assert result.iterations_completed == 3
+    assert result.function_evaluations == 4
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(result.control)),
+        np.zeros(2),
+        atol=1e-6,
+    )
+
+
+def test_optax_full_gpu_applies_device_side_convergence():
+    result = minimize_optax_full_gpu(
+        _quadratic,
+        jnp.array([1.0, 2.0], dtype=jnp.float32),
+        maxiter=20,
+        history_size=3,
+        gtol=0.6,
+        convergence_patience=2,
+        minimum_iterations=2,
+    )
+
+    assert result.converged
+    assert result.status == "convergence criterion reached"
+    assert result.iterations_completed == 2
 
 
 @pytest.mark.parametrize(

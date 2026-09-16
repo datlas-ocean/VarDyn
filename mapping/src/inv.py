@@ -125,6 +125,7 @@ def minimize_optax_decoupled(
     iteration_callback=None,
     initial_value=None,
     initial_gradient=None,
+    start_callback=None,
 ):
     """Run L-BFGS on device with a scalar Python Armijo line search.
 
@@ -152,6 +153,10 @@ def minimize_optax_decoupled(
     if initial_value is None or initial_gradient is None:
         initial_value, initial_gradient = evaluate(params)
         _block_until_ready((initial_value, initial_gradient))
+    # The non-jitted Python cost path may return NumPy/JAX gradients in a
+    # lower precision than the control vector.  Optax's L-BFGS history is
+    # dtype-sensitive, so normalize the gradient before initializing it.
+    initial_gradient = jnp.asarray(initial_gradient, dtype=params.dtype)
 
     direction_transform = optax.scale_by_lbfgs(memory_size=history_size)
 
@@ -213,6 +218,8 @@ def minimize_optax_decoupled(
     evaluations = 1
     converged = False
     status = "maximum iterations reached"
+    if start_callback is not None:
+        start_callback()
     minimization_start = time.perf_counter()
 
     armijo_c1 = 1e-4
@@ -246,6 +253,9 @@ def minimize_optax_decoupled(
                 jnp.asarray(step_size, dtype=params.dtype),
             )
             candidate_value, candidate_gradient = evaluate(candidate)
+            candidate_gradient = jnp.asarray(
+                candidate_gradient, dtype=params.dtype
+            )
             _block_until_ready(
                 (candidate, candidate_value, candidate_gradient)
             )
@@ -365,6 +375,362 @@ def minimize_optax_decoupled(
         step_size_history=step_size_history,
     )
 
+
+def minimize_optax_full_gpu(
+    evaluate: Callable,
+    initial_control,
+    *,
+    maxiter,
+    history_size=10,
+    gtol=None,
+    ftol=None,
+    convergence_patience=1,
+    minimum_iterations=1,
+    gradient_max_norm=None,
+    initial_value=None,
+    initial_gradient=None,
+    start_callback=None,
+):
+    """Run L-BFGS and its Armijo line search in one compiled GPU program.
+
+    No value is materialized on the host between iterations. Consequently,
+    per-iteration wall-clock timings and callbacks are intentionally absent;
+    diagnostics are copied to the host only after the complete scan finishes.
+    """
+    try:
+        import optax
+    except ImportError as exc:
+        raise ImportError(
+            "minimizer='optax-full-gpu' requires the 'optax' package"
+        ) from exc
+
+    if maxiter < 1:
+        raise ValueError("maxiter must be >= 1")
+    if history_size < 1:
+        raise ValueError("history_size must be >= 1")
+    if convergence_patience < 1:
+        raise ValueError("convergence_patience must be >= 1")
+    if minimum_iterations < 1:
+        raise ValueError("minimum_iterations must be >= 1")
+
+    params = jnp.asarray(initial_control)
+    if initial_value is None or initial_gradient is None:
+        initial_value, initial_gradient = evaluate(params)
+        _block_until_ready((initial_value, initial_gradient))
+
+    direction_transform = optax.scale_by_lbfgs(memory_size=history_size)
+    direction_state = direction_transform.init(params)
+    scalar_dtype = initial_value.dtype
+    gradient_max = jnp.asarray(
+        jnp.inf if gradient_max_norm is None else gradient_max_norm,
+        dtype=scalar_dtype,
+    )
+    gradient_tolerance = jnp.asarray(
+        -1.0 if gtol is None else gtol,
+        dtype=scalar_dtype,
+    )
+    cost_tolerance = jnp.asarray(
+        -1.0 if ftol is None else ftol,
+        dtype=scalar_dtype,
+    )
+    initial_gradient_norm = jnp.linalg.norm(initial_gradient)
+
+    armijo_c1 = jnp.asarray(1e-4, dtype=scalar_dtype)
+    contraction = jnp.asarray(0.5, dtype=scalar_dtype)
+    minimum_step = jnp.asarray(2.0**-20, dtype=scalar_dtype)
+    max_linesearch_steps = 20
+
+    def one_active_iteration(carry):
+        (
+            params,
+            value,
+            gradient,
+            direction_state,
+            evaluations,
+            convergence_count,
+            active,
+            iteration_index,
+        ) = carry
+        preconditioned, proposed_state = direction_transform.update(
+            gradient,
+            direction_state,
+            params,
+        )
+        direction = -preconditioned
+        derivative = jnp.vdot(gradient, direction).real
+        gradient_norm = jnp.linalg.norm(gradient)
+        steepest = -gradient / jnp.maximum(gradient_norm, 1.0)
+        direction = jnp.where(derivative < 0.0, direction, steepest)
+        derivative = jnp.vdot(gradient, direction).real
+
+        line_initial = (
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(1.0, dtype=scalar_dtype),
+            jnp.asarray(False),
+            params,
+            value,
+            gradient,
+            jnp.asarray(False),
+            params,
+            value,
+            gradient,
+            jnp.asarray(1.0, dtype=scalar_dtype),
+        )
+
+        def line_condition(line_state):
+            trials, step, accepted, *_ = line_state
+            return (
+                (trials < max_linesearch_steps)
+                & (~accepted)
+                & (step >= minimum_step)
+            )
+
+        def line_body(line_state):
+            (
+                trials,
+                step,
+                accepted,
+                accepted_params,
+                accepted_value,
+                accepted_gradient,
+                has_best,
+                best_params,
+                best_value,
+                best_gradient,
+                best_step,
+            ) = line_state
+            candidate = params + step * direction
+            candidate_value, candidate_gradient = evaluate(candidate)
+            stable = (
+                jnp.isfinite(candidate_value)
+                & jnp.all(jnp.isfinite(candidate_gradient))
+                & (jnp.max(jnp.abs(candidate_gradient)) <= gradient_max)
+            )
+            sufficient = stable & (
+                candidate_value
+                <= value + armijo_c1 * step * derivative
+            )
+            better = stable & ((~has_best) | (candidate_value < best_value))
+            accepted_params = jnp.where(sufficient, candidate, accepted_params)
+            accepted_value = jnp.where(
+                sufficient, candidate_value, accepted_value
+            )
+            accepted_gradient = jnp.where(
+                sufficient, candidate_gradient, accepted_gradient
+            )
+            best_params = jnp.where(better, candidate, best_params)
+            best_value = jnp.where(better, candidate_value, best_value)
+            best_gradient = jnp.where(
+                better, candidate_gradient, best_gradient
+            )
+            best_step = jnp.where(better, step, best_step)
+            return (
+                trials + 1,
+                step * contraction,
+                accepted | sufficient,
+                accepted_params,
+                accepted_value,
+                accepted_gradient,
+                has_best | better,
+                best_params,
+                best_value,
+                best_gradient,
+                best_step,
+            )
+
+        line_result = lax.while_loop(
+            line_condition,
+            line_body,
+            line_initial,
+        )
+        (
+            trials,
+            _,
+            accepted,
+            accepted_params,
+            accepted_value,
+            accepted_gradient,
+            has_best,
+            best_params,
+            best_value,
+            best_gradient,
+            best_step,
+        ) = line_result
+        use_best = (~accepted) & has_best & (best_value < value)
+        moved = accepted | use_best
+        next_params = jnp.where(use_best, best_params, accepted_params)
+        next_value = jnp.where(use_best, best_value, accepted_value)
+        next_gradient = jnp.where(
+            use_best, best_gradient, accepted_gradient
+        )
+        accepted_step = best_step
+        next_direction_state = jax.tree_util.tree_map(
+            lambda new, old: jnp.where(moved, new, old),
+            proposed_state,
+            direction_state,
+        )
+
+        next_gradient_norm = jnp.linalg.norm(next_gradient)
+        relative_gradient = next_gradient_norm / jnp.maximum(
+            initial_gradient_norm,
+            jnp.asarray(1e-30, dtype=scalar_dtype),
+        )
+        relative_cost_change = jnp.abs(value - next_value) / jnp.maximum(
+            jnp.maximum(jnp.abs(value), jnp.abs(next_value)),
+            jnp.asarray(1.0, dtype=scalar_dtype),
+        )
+        criterion = (
+            ((gradient_tolerance >= 0.0)
+             & (relative_gradient <= gradient_tolerance))
+            | ((cost_tolerance >= 0.0)
+               & (relative_cost_change <= cost_tolerance))
+        )
+        next_convergence_count = jnp.where(
+            criterion,
+            convergence_count + 1,
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        converged = (
+            (next_convergence_count >= convergence_patience)
+            & (iteration_index + 1 >= minimum_iterations)
+        )
+        next_active = moved & (~converged)
+        next_carry = (
+            next_params,
+            next_value,
+            next_gradient,
+            next_direction_state,
+            evaluations + trials,
+            next_convergence_count,
+            next_active,
+            iteration_index + 1,
+        )
+        diagnostics = (
+            next_value,
+            next_gradient_norm,
+            jnp.mean(jnp.abs(next_gradient)),
+            evaluations + trials,
+            trials,
+            accepted_step,
+            moved,
+            converged,
+        )
+        return next_carry, diagnostics
+
+    def one_iteration(carry, _):
+        def inactive_iteration(carry):
+            params, value, gradient, _, evaluations, _, _, _ = carry
+            diagnostics = (
+                value,
+                jnp.linalg.norm(gradient),
+                jnp.mean(jnp.abs(gradient)),
+                evaluations,
+                jnp.asarray(0, dtype=jnp.int32),
+                jnp.asarray(0.0, dtype=scalar_dtype),
+                jnp.asarray(False),
+                jnp.asarray(False),
+            )
+            return carry, diagnostics
+
+        return lax.cond(
+            carry[6],
+            one_active_iteration,
+            inactive_iteration,
+            carry,
+        )
+
+    def run(initial_params, value, gradient, initial_state):
+        initial_carry = (
+            initial_params,
+            value,
+            gradient,
+            initial_state,
+            jnp.asarray(1, dtype=jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(True),
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        return lax.scan(one_iteration, initial_carry, xs=None, length=maxiter)
+
+    compile_start = time.perf_counter()
+    executable = jax.jit(run).lower(
+        params,
+        initial_value,
+        initial_gradient,
+        direction_state,
+    ).compile()
+    optimizer_init_seconds = time.perf_counter() - compile_start
+
+    if start_callback is not None:
+        start_callback()
+    minimization_start = time.perf_counter()
+    final_carry, diagnostics = executable(
+        params,
+        initial_value,
+        initial_gradient,
+        direction_state,
+    )
+    _block_until_ready((final_carry, diagnostics))
+    minimization_seconds = time.perf_counter() - minimization_start
+
+    diagnostics_host = jax.device_get(diagnostics)
+    final_host = jax.device_get(
+        (final_carry[4], final_carry[6], final_carry[7])
+    )
+    values, norms, means, counts, trials, steps, moved, converged = (
+        np.asarray(item) for item in diagnostics_host
+    )
+    iterations_completed = int(np.count_nonzero(moved))
+    cost_history = [float(np.asarray(jax.device_get(initial_value)))]
+    gradient_norm_history = [
+        float(np.asarray(jax.device_get(initial_gradient_norm)))
+    ]
+    gradient_mean_history = [
+        float(np.asarray(jax.device_get(jnp.mean(jnp.abs(initial_gradient)))))
+    ]
+    cost_history.extend(values[:iterations_completed].astype(float).tolist())
+    gradient_norm_history.extend(
+        norms[:iterations_completed].astype(float).tolist()
+    )
+    gradient_mean_history.extend(
+        means[:iterations_completed].astype(float).tolist()
+    )
+    average_iteration_seconds = (
+        minimization_seconds / max(iterations_completed, 1)
+    )
+    iteration_seconds = [average_iteration_seconds] * iterations_completed
+    cumulative_seconds = [0.0] + [
+        average_iteration_seconds * index
+        for index in range(1, iterations_completed + 1)
+    ]
+    convergence_detected = bool(np.any(converged))
+    line_search_failed = (not bool(final_host[1])) and not convergence_detected
+    status = (
+        "convergence criterion reached"
+        if convergence_detected
+        else "line search failed"
+        if line_search_failed
+        else "maximum iterations reached"
+    )
+    return MinimizationResult(
+        control=final_carry[0],
+        cost_history=cost_history,
+        gradient_norm_history=gradient_norm_history,
+        gradient_mean_history=gradient_mean_history,
+        iteration_seconds=iteration_seconds,
+        cumulative_seconds=cumulative_seconds,
+        evaluation_count_history=[1]
+        + counts[:iterations_completed].astype(int).tolist(),
+        function_evaluations=int(final_host[0]),
+        iterations_completed=iterations_completed,
+        converged=convergence_detected,
+        status=status,
+        optimizer_init_seconds=optimizer_init_seconds,
+        minimization_seconds=minimization_seconds,
+        line_search_evaluations=trials[:iterations_completed].astype(int).tolist(),
+        step_size_history=steps[:iterations_completed].astype(float).tolist(),
+    )
+
 def Inv(config, State=None, Model=None, dict_obs=None, Obsop=None, Basis=None, *args, **kwargs):
 
     """
@@ -443,21 +809,21 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_device)
 
     minimizer_name = getattr(config.INV, 'minimizer', 'scipy')
-    supported_minimizers = ('scipy', 'optax-decoupled')
+    supported_minimizers = ('scipy', 'optax-decoupled', 'optax-full-gpu')
     if minimizer_name not in supported_minimizers:
         raise ValueError(
             f"Unknown 4DVar minimizer {minimizer_name!r}; expected one of "
             f"{supported_minimizers}"
         )
-    if minimizer_name == 'optax-decoupled':
+    if minimizer_name in ('optax-decoupled', 'optax-full-gpu'):
         if not getattr(config.INV, 'jit_cost_and_grad', False):
             raise ValueError(
-                "minimizer='optax-decoupled' requires "
+                f"minimizer={minimizer_name!r} requires "
                 "jit_cost_and_grad=True"
             )
         if getattr(config.INV, 'cost_and_grad_schedule', None) != 'scan':
             raise ValueError(
-                "minimizer='optax-decoupled' requires "
+                f"minimizer={minimizer_name!r} requires "
                 "cost_and_grad_schedule='scan'"
             )
         
@@ -605,7 +971,36 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         and maxiter == 0
     )
 
-    if minimizer_name == 'optax-decoupled' and not skip_minimization:
+    if minimizer_name == 'optax-full-gpu' and not skip_minimization:
+        print('\n*** Minimization (Optax L-BFGS, full GPU) ***\n')
+        patience = getattr(config.INV, 'convergence_nit', None)
+        if patience is None:
+            patience = 1
+        minimization_result = minimize_optax_full_gpu(
+            var.cost_and_grad,
+            jnp.asarray(Xopt, dtype=var.cost_dtype),
+            maxiter=maxiter,
+            history_size=10,
+            gtol=getattr(config.INV, 'gtol', None),
+            ftol=getattr(config.INV, 'ftol', None),
+            convergence_patience=patience,
+            minimum_iterations=getattr(
+                config.INV,
+                'minimum_iterations',
+                1,
+            ),
+            gradient_max_norm=getattr(
+                config.INV,
+                'gradient_max_norm',
+                None,
+            ),
+        )
+        Xres = minimization_result.control
+        print(f"\nMinimization status: {minimization_result.status}")
+        print(f"\nFinal cost function value: {minimization_result.cost_history[-1]}")
+        print(f"\nNumber of iterations: {minimization_result.iterations_completed}")
+
+    elif minimizer_name == 'optax-decoupled' and not skip_minimization:
         print('\n*** Minimization (Optax L-BFGS, decoupled line search) ***\n')
 
         iterations_path = os.path.join(

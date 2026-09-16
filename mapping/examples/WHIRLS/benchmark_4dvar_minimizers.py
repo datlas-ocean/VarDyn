@@ -11,11 +11,18 @@ so the 4DVar executable is not inlined in a second, optimizer-sized executable.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
+import resource
+import sys
 import time
 from datetime import timedelta
 from pathlib import Path
+
+MAPPING_ROOT = Path(__file__).resolve().parents[2]
+if str(MAPPING_ROOT) not in sys.path:
+    sys.path.insert(0, str(MAPPING_ROOT))
 
 from benchmark_4dvar_iteration import (
     block_until_ready,
@@ -30,7 +37,7 @@ def parse_args():
     parser.add_argument("--label", required=True)
     parser.add_argument(
         "--optimizer",
-        choices=("scipy", "optax-decoupled"),
+        choices=("scipy", "optax-decoupled", "optax-full-gpu"),
         required=True,
     )
     parser.add_argument("--iterations", type=int, default=10)
@@ -69,7 +76,33 @@ def parse_args():
         choices=("python", "scan"),
         required=True,
     )
+    parser.add_argument(
+        "--output-npz",
+        type=Path,
+        help="Write the final prognostic trajectory after minimization.",
+    )
+    parser.add_argument("--barrier-dir", type=Path)
+    parser.add_argument("--participant-id")
+    parser.add_argument(
+        "--run-directory",
+        type=Path,
+        help="Isolate generated observation/operator caches for this worker.",
+    )
     return parser.parse_args()
+
+
+def cpu_memory_snapshot():
+    """Return current RSS and the process peak RSS in MiB."""
+    import psutil
+
+    rss = psutil.Process().memory_info().rss
+    peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return {
+        "rss_bytes": int(rss),
+        "rss_mib": rss / (1024**2),
+        "peak_rss_bytes": int(peak_kib * 1024),
+        "peak_rss_mib": peak_kib / 1024,
+    }
 
 
 def relative_gradient_converged(gradient_norm_history, args):
@@ -103,6 +136,53 @@ def prepare_problem(args):
 
     setup_start = time.perf_counter()
     config = exp.Exp(str(config_path))
+    if args.run_directory is not None:
+        run_directory = args.run_directory.resolve()
+        run_directory.mkdir(parents=True, exist_ok=True)
+        private_directories = {
+            name: run_directory / name
+            for name in ("obs", "scratch", "outputs", "controls", "operators")
+        }
+        for directory in private_directories.values():
+            directory.mkdir(parents=True, exist_ok=True)
+        config.EXP.path_obs = str(private_directories["obs"])
+        config.EXP.tmp_DA_path = str(private_directories["scratch"])
+        config.EXP.path_save = str(private_directories["outputs"])
+        config.INV.path_save_control_vectors = str(private_directories["controls"])
+        for operator_config in config.OBSOP.values():
+            if hasattr(operator_config, "path_save"):
+                operator_config.path_save = str(private_directories["operators"])
+    input_substitutions = []
+    sst_boundary = config.MOD.bc_files.get("SST")
+    if sst_boundary is not None and not glob.glob(sst_boundary["file"]):
+        remss_pattern = "/data1/flo/SST/L4/REMSS/mw/20250[56]*.nc"
+        if glob.glob(remss_pattern):
+            input_substitutions.append({
+                "field": "MOD.bc_files.SST.file",
+                "missing": sst_boundary["file"],
+                "replacement": remss_pattern,
+                "reason": "configured ODYSSEA L4 directory is empty",
+            })
+            sst_boundary["file"] = remss_pattern
+            sst_boundary["name_var"] = "analysed_sst"
+            sst_boundary["name_lon"] = "lon"
+            sst_boundary["name_lat"] = "lat"
+            sst_boundary["name_time"] = "time"
+    sst_observation = config.OBS.get("SST_MW")
+    if sst_observation is not None and not glob.glob(sst_observation.path):
+        remss_pattern = "/data1/flo/SST/L4/REMSS/mw/20250[56]*.nc"
+        if glob.glob(remss_pattern):
+            input_substitutions.append({
+                "field": "OBS.SST_MW.path",
+                "missing": sst_observation.path,
+                "replacement": remss_pattern,
+                "reason": "configured ODYSSEA L4 directory is empty",
+            })
+            sst_observation.path = remss_pattern
+            sst_observation.name_var = {"SST": "analysed_sst"}
+            sst_observation.name_lon = "lon"
+            sst_observation.name_lat = "lat"
+            sst_observation.name_time = "time"
     config.INV.device_resident_state = args.device_resident_state == "on"
     config.INV.jit_cost_and_grad = args.jit_cost_and_grad == "on"
     config.INV.cost_and_grad_schedule = args.cost_and_grad_schedule
@@ -113,7 +193,9 @@ def prepare_problem(args):
         requested_end = config.EXP.init_date + timedelta(days=args.window_days)
         config.EXP.final_date = min(config.EXP.final_date, requested_end)
 
-    config.EXP.compute_obs = False
+    # Rebuild in every isolated process so stale caches created from missing
+    # input paths cannot silently change the benchmark problem.
+    config.EXP.compute_obs = True
     config.EXP.flag_plot = 0
     config.EXP.saveoutputs = False
     config.INV.compute_test = False
@@ -199,6 +281,11 @@ def prepare_problem(args):
         "setup_seconds": time.perf_counter() - setup_start,
         "grid_shape": list(np.shape(model_state.mask)),
         "control_size": int(background.size),
+        "model_state": model_state,
+        "model": model,
+        "basis": reduced_basis,
+        "background_covariance": background_covariance,
+        "input_substitutions": input_substitutions,
     }
 
 
@@ -230,7 +317,15 @@ def warmup(problem, optimizer_name, jax, np):
     )
 
 
-def run_scipy(problem, initial_cost, initial_gradient, args, jax, np):
+def run_scipy(
+    problem,
+    initial_cost,
+    initial_gradient,
+    args,
+    jax,
+    np,
+    start_callback=None,
+):
     import scipy.optimize as scipy_optimize
 
     variational = problem["variational"]
@@ -245,7 +340,7 @@ def run_scipy(problem, initial_cost, initial_gradient, args, jax, np):
     iteration_seconds = []
     cumulative_seconds = [0.0]
     evaluation_count_history = [evaluations]
-    last_iteration_time = time.perf_counter()
+    last_iteration_time = None
     stopped_by_criterion = False
 
     def objective(control):
@@ -263,6 +358,9 @@ def run_scipy(problem, initial_cost, initial_gradient, args, jax, np):
         accepted_cost = cached_cost
         return cached_cost, cached_gradient
 
+    if start_callback is not None:
+        start_callback()
+    last_iteration_time = time.perf_counter()
     minimization_start = time.perf_counter()
 
     def callback(control):
@@ -314,6 +412,7 @@ def run_scipy(problem, initial_cost, initial_gradient, args, jax, np):
             else str(result.message)
         ),
         "final_control_norm": float(np.linalg.norm(result.x)),
+        "_final_control": result.x,
     }
 
 
@@ -326,6 +425,7 @@ def run_optax_decoupled(
     args,
     jax,
     np,
+    start_callback=None,
 ):
     from src.inv import minimize_optax_decoupled
 
@@ -334,13 +434,12 @@ def run_optax_decoupled(
         problem["control_device"],
         maxiter=args.iterations,
         history_size=args.history_size,
-        relative_gradient_tolerance=(
-            args.relative_gradient_tolerance or None
-        ),
+        gtol=args.relative_gradient_tolerance or None,
         convergence_patience=args.convergence_patience,
         minimum_iterations=args.minimum_iterations,
         initial_value=initial_value,
         initial_gradient=initial_grad,
+        start_callback=start_callback,
     )
     return {
         "cost_history": result.cost_history,
@@ -360,6 +459,145 @@ def run_optax_decoupled(
         "final_control_norm": float(
             np.linalg.norm(np.asarray(jax.device_get(result.control)))
         ),
+        "_final_control": result.control,
+    }
+
+
+def run_optax_full_gpu(
+    problem,
+    initial_value,
+    initial_grad,
+    args,
+    jax,
+    np,
+    start_callback=None,
+):
+    from src.inv import minimize_optax_full_gpu
+
+    result = minimize_optax_full_gpu(
+        problem["variational"].cost_and_grad,
+        problem["control_device"],
+        maxiter=args.iterations,
+        history_size=args.history_size,
+        gtol=args.relative_gradient_tolerance or None,
+        convergence_patience=args.convergence_patience,
+        minimum_iterations=args.minimum_iterations,
+        initial_value=initial_value,
+        initial_gradient=initial_grad,
+        start_callback=start_callback,
+    )
+    return {
+        "cost_history": result.cost_history,
+        "gradient_norm_history": result.gradient_norm_history,
+        "iteration_seconds": result.iteration_seconds,
+        "cumulative_seconds": result.cumulative_seconds,
+        "evaluation_count_history": result.evaluation_count_history,
+        "line_search_evaluations": result.line_search_evaluations,
+        "step_size_history": result.step_size_history,
+        "line_search": "compiled_armijo_backtracking",
+        "optimizer_init_seconds": result.optimizer_init_seconds,
+        "minimization_seconds": result.minimization_seconds,
+        "iterations_completed": result.iterations_completed,
+        "function_evaluations": result.function_evaluations,
+        "converged": result.converged,
+        "status": result.status,
+        "final_control_norm": float(
+            np.linalg.norm(np.asarray(jax.device_get(result.control)))
+        ),
+        "_final_control": result.control,
+    }
+
+
+def save_analysis_trajectory(problem, control, output_path, jax, np):
+    """Propagate the analysis and save comparable prognostic outputs."""
+    import jax.numpy as jnp
+
+    config = problem["config"]
+    variational = problem["variational"]
+    model = problem["model"]
+    basis = problem["basis"]
+    covariance = problem["background_covariance"]
+    with variational.cost_precision():
+        analysis = variational.Xb + covariance.sqr(
+            jnp.asarray(control, dtype=variational.cost_dtype)
+        )
+    analysis = jnp.asarray(analysis, dtype=variational.model_control_dtype)
+
+    state = problem["model_state"].copy()
+    model.init(state)
+    names = tuple(model.var_to_save)
+    trajectory = {name: [state.var[name]] for name in names}
+    dates = [config.EXP.init_date.timestamp()]
+    date = config.EXP.init_date
+    checkpoint_seconds = int(config.INV.timestep_checkpoint.total_seconds())
+    save_seconds = int(config.EXP.saveoutput_time_step.total_seconds())
+    nstep = min(
+        int(checkpoint_seconds // model.dt),
+        int(save_seconds // model.dt),
+    )
+    while date < config.EXP.final_date:
+        seconds = int((date - config.EXP.init_date).total_seconds())
+        if seconds % checkpoint_seconds == 0:
+            basis.operg(seconds / 86400, analysis, State=state.params)
+        model.step(t=seconds, State=state, nstep=nstep)
+        date += timedelta(seconds=nstep * model.dt)
+        elapsed = int((date - config.EXP.init_date).total_seconds())
+        if elapsed % save_seconds == 0 and date <= config.EXP.final_date:
+            for name in names:
+                trajectory[name].append(state.var[name])
+            dates.append(date.timestamp())
+
+    stacked = {
+        name: np.asarray(jax.device_get(jnp.stack(values)))
+        for name, values in trajectory.items()
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        time_unix=np.asarray(dates, dtype=np.float64),
+        **stacked,
+    )
+    return {
+        "path": str(output_path.resolve()),
+        "variables": list(names),
+        "time_count": len(dates),
+    }
+
+
+def concurrent_start_barrier(args):
+    """Wait until the parent releases all minimizers at the same instant."""
+    if args.barrier_dir is None:
+        return None
+    if not args.participant_id:
+        raise ValueError("--participant-id is required with --barrier-dir")
+    barrier_dir = args.barrier_dir.resolve()
+    barrier_dir.mkdir(parents=True, exist_ok=True)
+    ready = barrier_dir / f"ready-{args.participant_id}"
+    ready.write_text(str(time.time()))
+    go = barrier_dir / "go"
+    while not go.exists():
+        time.sleep(0.05)
+    return {
+        "ready_wall_time": float(ready.read_text()),
+        "go_wall_time": float(go.read_text()),
+        "start_wall_time": time.time(),
+    }
+
+
+def concurrent_finish_barrier(args):
+    """Keep postprocessing off the GPU until every minimizer has stopped."""
+    if args.barrier_dir is None:
+        return None
+    barrier_dir = args.barrier_dir.resolve()
+    done = barrier_dir / f"done-{args.participant_id}"
+    done_time = time.time()
+    done.write_text(str(done_time))
+    release = barrier_dir / "release-outputs"
+    while not release.exists():
+        time.sleep(0.05)
+    return {
+        "done_wall_time": done_time,
+        "outputs_release_wall_time": float(release.read_text()),
     }
 
 def main():
@@ -382,8 +620,10 @@ def main():
     import numpy as np
 
     device = jax.devices()[0]
+    cpu_memory_initial = cpu_memory_snapshot()
     memory_initial = device_memory_snapshot(device)
     problem = prepare_problem(args)
+    cpu_memory_after_setup = cpu_memory_snapshot()
     memory_after_setup = device_memory_snapshot(device)
 
     (
@@ -394,6 +634,12 @@ def main():
         initial_gradient,
     ) = warmup(problem, args.optimizer, jax, np)
     memory_after_warmup = device_memory_snapshot(device)
+    cpu_memory_after_warmup = cpu_memory_snapshot()
+    barrier_timing = None
+
+    def start_callback():
+        nonlocal barrier_timing
+        barrier_timing = concurrent_start_barrier(args)
 
     if args.optimizer == "scipy":
         optimizer_result = run_scipy(
@@ -403,8 +649,9 @@ def main():
             args,
             jax,
             np,
+            start_callback,
         )
-    else:
+    elif args.optimizer == "optax-decoupled":
         optimizer_result = run_optax_decoupled(
             problem,
             initial_cost,
@@ -413,9 +660,32 @@ def main():
             args,
             jax,
             np,
+            start_callback,
+        )
+    else:
+        optimizer_result = run_optax_full_gpu(
+            problem,
+            initial_value,
+            initial_gradient,
+            args,
+            jax,
+            np,
+            start_callback,
         )
 
     memory_after_minimization = device_memory_snapshot(device)
+    cpu_memory_after_minimization = cpu_memory_snapshot()
+    finish_timing = concurrent_finish_barrier(args)
+    final_control = optimizer_result.pop("_final_control")
+    output_trajectory = None
+    if args.output_npz is not None:
+        output_trajectory = save_analysis_trajectory(
+            problem,
+            final_control,
+            args.output_npz,
+            jax,
+            np,
+        )
     config = problem["config"]
     result = {
         "label": args.label,
@@ -430,6 +700,7 @@ def main():
         ).total_seconds() / 86400,
         "grid_shape": problem["grid_shape"],
         "control_size": problem["control_size"],
+        "input_substitutions": problem["input_substitutions"],
         "checkpoint_count": int(problem["checkpoints"].size),
         "device_resident_state": bool(config.INV.device_resident_state),
         "jit_cost_and_grad": bool(config.INV.jit_cost_and_grad),
@@ -447,6 +718,13 @@ def main():
         "memory_after_setup": memory_after_setup,
         "memory_after_warmup": memory_after_warmup,
         "memory_after_minimization": memory_after_minimization,
+        "cpu_memory_initial": cpu_memory_initial,
+        "cpu_memory_after_setup": cpu_memory_after_setup,
+        "cpu_memory_after_warmup": cpu_memory_after_warmup,
+        "cpu_memory_after_minimization": cpu_memory_after_minimization,
+        "output_trajectory": output_trajectory,
+        "barrier_timing": barrier_timing,
+        "finish_timing": finish_timing,
         **optimizer_result,
     }
     result["final_relative_gradient_norm"] = (
@@ -457,6 +735,10 @@ def main():
         result["cost_compile_and_first_evaluation_seconds"]
         + result["optimizer_init_seconds"]
         + result["minimization_seconds"]
+    )
+    result["mean_iteration_seconds"] = (
+        result["minimization_seconds"]
+        / max(result["iterations_completed"], 1)
     )
     print("VARDYN_MINIMIZER_BENCHMARK_JSON=" + json.dumps(result, sort_keys=True))
 
