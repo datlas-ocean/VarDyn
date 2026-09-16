@@ -2,7 +2,10 @@ import os
 
 import pytest
 
-from src.background_paths import background_control_path
+pytest.importorskip('astropy')
+pytest.importorskip('cartopy')
+
+from src.run_assimilation import background_control_path
 
 
 def test_background_control_path_uses_sibling_experiment(tmp_path):
