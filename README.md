@@ -149,15 +149,12 @@ The Optax adapter keeps the control, gradient, direction, and L-BFGS history on
 the JAX device. With `save_minimization=False`, Python receives only scalar
 line-search diagnostics. Enabling per-iteration saves transfers and writes the
 complete Control Vector after every accepted iteration; the final `Xres.nc` is
-saved in either mode. See
-[the GPU minimization benchmark](docs/benchmarks/gpu-4dvar-minimization.md) for
-performance results and configuration constraints.
+saved in either mode.
 
 ## Testing and checks
 
-Unit checks for the compiled variational path and minimizer live under
-`mapping/tests`. Run them with an environment containing `pytest`, or at least
-run syntax checks on touched modules, for example:
+Tests and benchmarks are maintained on development branches. On `main`, run
+syntax checks on touched modules, for example:
 
 ```bash
 python -m py_compile mapping/src/mod.py mapping/src/inv.py
