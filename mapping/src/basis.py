@@ -100,6 +100,8 @@ class _StateBackgroundMixin:
 def _ensure_adstate_names(obj, adState, zero):
     for name in _as_name_list(obj.name_mod_var):
         if adState[name] is None:
+            if callable(zero):
+                zero = zero()
             adState[name] = zero.copy() if hasattr(zero, 'copy') else +zero
 
 
@@ -116,6 +118,28 @@ def _sum_adstate_names(obj, adState):
 def _clear_adstate_names(obj, adState):
     for name in _as_name_list(obj.name_mod_var):
         adState[name] *= 0.
+
+
+def _cached_zero_like(obj, value):
+    """Reuse an immutable device zero for eager adjoint state clearing."""
+    if isinstance(value, jax.core.Tracer):
+        # A traced array must never be retained on a long-lived basis object.
+        return jnp.zeros_like(value)
+    if not isinstance(value, jax.Array):
+        # NumPy arrays are mutable: sharing a cached zero would be unsafe.
+        return np.zeros_like(value)
+    cache = getattr(obj, '_adstate_zero_cache', None)
+    if cache is None:
+        cache = obj._adstate_zero_cache = {}
+    key = (value.shape, value.dtype, value.device)
+    if key not in cache:
+        cache[key] = jnp.zeros_like(value)
+    return cache[key]
+
+
+def _clear_adstate_names_cached(obj, adState):
+    for name in _as_name_list(obj.name_mod_var):
+        adState[name] = _cached_zero_like(obj, adState[name])
 
 
 def _bounded_wavelet_frequencies(lmin, lmax, npsp, facpsp):
@@ -167,6 +191,49 @@ def _wavelet_center_has_support(obj, lon, lat, radius):
     if obj.depth is not None:
         indphys = indphys[obj.depth[indphys] > obj.depth1]
     return indphys.size > 0
+
+
+def _jax_csr_from_scipy(matrix):
+    """Transfer only the nonzero entries of a SciPy matrix to JAX."""
+    matrix = matrix.tocsr()
+    dtype = np.float64 if USE_FLOAT64 else np.float32
+    return sparse.CSR((jnp.asarray(matrix.data, dtype=dtype),
+                       jnp.asarray(matrix.indices, dtype=jnp.int32),
+                       jnp.asarray(matrix.indptr, dtype=jnp.int32)),
+                      shape=matrix.shape)
+
+
+def _gaussian_space_matrix(obj):
+    """Build spatial Gaussians without a dense (centres, grid) array."""
+    values, rows, cols = [], [], []
+    for i, (lat0, lon0) in enumerate(zip(obj.ENSLAT, obj.ENSLON)):
+        dx = (np.mod(obj.lon1d - lon0 + 180., 360.) - 180.) / obj.km2deg
+        dx *= np.cos(lat0 * np.pi / 180.)
+        dy = (obj.lat1d - lat0) / obj.km2deg
+        supported = (np.abs(dx) <= obj.sigma_D) & (np.abs(dy) <= obj.sigma_D)
+        if obj.mask1d is not None:
+            supported &= ~obj.mask1d
+        indices = np.flatnonzero(supported)
+        if indices.size:
+            rows.append(indices)
+            cols.append(np.full(indices.size, i, dtype=np.int32))
+            values.append(mywindow(dx[indices] / obj.sigma_D)
+                          * mywindow(dy[indices] / obj.sigma_D))
+    if values:
+        row = np.concatenate(rows)
+        col = np.concatenate(cols)
+        data = np.concatenate(values)
+    else:
+        row = col = np.empty(0, dtype=np.int32)
+        data = np.empty(0)
+    return scipy.sparse.coo_matrix(
+        (data, (row, col)), shape=(obj.nphys, obj.ENSLAT.size)).tocsr()
+
+
+def _window_jax(x, flux=False):
+    if flux:
+        return -jnp.pi * jnp.sin(0.5 * jnp.pi * x) * jnp.cos(0.5 * jnp.pi * x)
+    return jnp.cos(0.5 * jnp.pi * x) ** 2
 
 
 def Basis(config, State, verbose=True, multi_mode=False, *args, **kwargs):
@@ -623,7 +690,8 @@ class _Basis_gauss3d:
             Project to reduced space
         """
 
-        _ensure_adstate_names(self, adState, np.zeros(self.shape_phys))
+        _ensure_adstate_names(self, adState,
+                              lambda: np.zeros(self.shape_phys))
         
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
             adState[self.name_mod_u] = np.zeros_like(self.f_on_u)
@@ -662,11 +730,8 @@ class Basis_gauss3d(_StateBackgroundMixin, _Basis_gauss3d):
         self.capture_state_background(kwargs.get('State'))
         res = super().set_basis(time,return_q=return_q,**kwargs)
 
-        self.time = time
-        self.vect_time = jnp.eye(time.size)
-
-        self.zero_basis = jnp.zeros((self.nbasis,))
-        self.zero_phys = jnp.zeros((self.nphys,))
+        self.time = jnp.asarray(time)
+        self.enst_device = jnp.asarray(self.ENST)
 
         return res
     
@@ -681,47 +746,15 @@ class Basis_gauss3d(_StateBackgroundMixin, _Basis_gauss3d):
             self.Gauss_xy_T, gauss_xy = cache[cache_key]
             return gauss_xy
 
-        Gauss_2d = np.zeros((self.ENSLAT.size,self.lon1d.size))
-        for i,(lat0,lon0) in enumerate(zip(self.ENSLAT,self.ENSLON)):
-            indphys = np.where(
-                    (np.abs((np.mod(self.lon1d - lon0+180,360)-180) / self.km2deg * np.cos(lat0 * np.pi / 180.)) <= self.sigma_D) &
-                    (np.abs((self.lat1d - lat0) / self.km2deg) <= self.sigma_D)
-                    )[0]
-            xx = (np.mod(self.lon1d[indphys] - lon0+180,360)-180) / self.km2deg * np.cos(lat0 * np.pi / 180.) 
-            yy = (self.lat1d[indphys] - lat0) / self.km2deg
-            if self.mask1d is not None:
-                indmask = self.mask1d[indphys]
-                indphys = indphys[~indmask]
-                xx = xx[~indmask]
-                yy = yy[~indmask]
-            Gauss_2d[i,indphys] = mywindow(xx / self.sigma_D) * mywindow(yy / self.sigma_D)
-        Gauss_2d = jnp.array(Gauss_2d)
-        self.Gauss_xy_T = sparse.CSR.fromdense(Gauss_2d)
-        gauss_xy = sparse.CSR.fromdense(Gauss_2d.T)
+        matrix = _gaussian_space_matrix(self)
+        self.Gauss_xy_T = _jax_csr_from_scipy(matrix.T)
+        gauss_xy = _jax_csr_from_scipy(matrix)
         if cache is not None:
             cache[cache_key] = (self.Gauss_xy_T, gauss_xy)
         return gauss_xy
 
     def _compute_component_time(self, time):
-
-        Gt_np = np.zeros((time.size,self.nbasis))
-        ind_tmp = 0
-        for it in range(len(self.ENST)):
-            for _ in range(self.ENSLAT.size):
-                for i,t in enumerate(time) :
-                    dt = t - self.ENST[it]
-                    if abs(dt) < self.sigma_T:
-                        fact = self.window(dt / self.sigma_T) 
-                        if self.normalize_fact:
-                            fact /= self.norm_fact
-                        if self.time_spinup is not None and t<self.time_spinup:
-                            fact *= (1-self.window(t / self.time_spinup))
-                        if fact!=0:   
-                            Gt_np[i,ind_tmp:ind_tmp+1] = fact
-                ind_tmp += 1
-        Gt = sparse.csr_fromdense(jnp.array(Gt_np).T)
-
-        return Gt, None
+        return None, None
     
     def _ssh2uv(self, ssh):
 
@@ -741,10 +774,15 @@ class Basis_gauss3d(_StateBackgroundMixin, _Basis_gauss3d):
         return _u, _v
     
     def get_Gt_value(self, t):
-
-        idt = jnp.where(self.time == t, size=1)[0]  # Find index
-
-        return self.Gauss_t @ self.vect_time[idt[0]] # Get corresponding value
+        dt = t - self.enst_device
+        weights = jnp.where(jnp.abs(dt) < self.sigma_T,
+                            _window_jax(dt / self.sigma_T, self.flux), 0.)
+        if self.normalize_fact:
+            weights = weights / self.norm_fact
+        if self.time_spinup is not None:
+            ramp = 1. - _window_jax(t / self.time_spinup, self.flux)
+            weights = weights * jnp.where(t < self.time_spinup, ramp, 1.)
+        return jnp.repeat(weights, self.Nx)
     
     def _operg(self, t, X):
 
@@ -753,7 +791,7 @@ class Basis_gauss3d(_StateBackgroundMixin, _Basis_gauss3d):
         """
 
         # Initialize phi
-        phi = self.zero_phys.ravel()
+        phi = jnp.zeros((self.nphys,), dtype=X.dtype)
 
         # Get Gt value
         Gt = self.get_Gt_value(t)
@@ -811,7 +849,8 @@ class Basis_gauss3d(_StateBackgroundMixin, _Basis_gauss3d):
             Project to reduced space
         """
 
-        _ensure_adstate_names(self, adState, jnp.zeros(self.shape_phys))
+        _ensure_adstate_names(self, adState,
+                              lambda: jnp.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
             adState[self.name_mod_u] = jnp.zeros_like(self.f_on_u)
             adState[self.name_mod_v] = jnp.zeros_like(self.f_on_v)
@@ -822,10 +861,10 @@ class Basis_gauss3d(_StateBackgroundMixin, _Basis_gauss3d):
         adX = self._operg_reduced_jit(t, adparams)
         
         if not self.multi_mode:
-            _clear_adstate_names(self, adState)
+            _clear_adstate_names_cached(self, adState)
             if self.compute_velocities:
-                adState[self.name_mod_u] *= 0.
-                adState[self.name_mod_v] *= 0.
+                adState[self.name_mod_u] = _cached_zero_like(self, adState[self.name_mod_u])
+                adState[self.name_mod_v] = _cached_zero_like(self, adState[self.name_mod_v])
         
         return adX
 
@@ -1112,7 +1151,8 @@ class _Basis_gauss2d:
     def operg_transpose(self, t, adState):
         """Project adjoint physical-space field to control space."""
 
-        _ensure_adstate_names(self, adState, np.zeros(self.shape_phys))
+        _ensure_adstate_names(self, adState,
+                              lambda: np.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
             adState[self.name_mod_u] = np.zeros_like(self.f_on_u)
             adState[self.name_mod_v] = np.zeros_like(self.f_on_v)
@@ -1154,23 +1194,9 @@ class Basis_gauss2d(_StateBackgroundMixin, _Basis_gauss2d):
     def _compute_component_space(self):
         """Gaussian functions in space (JAX sparse CSR)."""
 
-        Gauss_2d = np.zeros((self.ENSLAT.size, self.lon1d.size))
-        for i, (lat0, lon0) in enumerate(zip(self.ENSLAT, self.ENSLON)):
-            indphys = np.where(
-                (np.abs((np.mod(self.lon1d - lon0 + 180, 360) - 180) / self.km2deg * np.cos(lat0 * np.pi / 180.)) <= self.sigma_D) &
-                (np.abs((self.lat1d - lat0) / self.km2deg) <= self.sigma_D)
-            )[0]
-            xx = (np.mod(self.lon1d[indphys] - lon0 + 180, 360) - 180) / self.km2deg * np.cos(lat0 * np.pi / 180.)
-            yy = (self.lat1d[indphys] - lat0) / self.km2deg
-            if self.mask1d is not None:
-                indmask = self.mask1d[indphys]
-                indphys = indphys[~indmask]
-                xx = xx[~indmask]
-                yy = yy[~indmask]
-            Gauss_2d[i, indphys] = mywindow(xx / self.sigma_D) * mywindow(yy / self.sigma_D)
-        Gauss_2d = jnp.array(Gauss_2d)
-        self.Gauss_xy_T = sparse.CSR.fromdense(Gauss_2d)
-        return sparse.CSR.fromdense(Gauss_2d.T)
+        matrix = _gaussian_space_matrix(self)
+        self.Gauss_xy_T = _jax_csr_from_scipy(matrix.T)
+        return _jax_csr_from_scipy(matrix)
 
     def _ssh2uv(self, ssh):
         _ssh = jnp.pad(ssh, pad_width=((1, 0), (1, 0)), mode='edge')
@@ -1223,7 +1249,8 @@ class Basis_gauss2d(_StateBackgroundMixin, _Basis_gauss2d):
     def operg_transpose(self, t, adState):
         """Project adjoint physical-space field to control space."""
 
-        _ensure_adstate_names(self, adState, jnp.zeros(self.shape_phys))
+        _ensure_adstate_names(self, adState,
+                              lambda: jnp.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
             adState[self.name_mod_u] = jnp.zeros_like(self.f_on_u)
             adState[self.name_mod_v] = jnp.zeros_like(self.f_on_v)
@@ -1235,10 +1262,10 @@ class Basis_gauss2d(_StateBackgroundMixin, _Basis_gauss2d):
         adX = self._operg_reduced_jit(t, adparams)
 
         if not self.multi_mode:
-            _clear_adstate_names(self, adState)
+            _clear_adstate_names_cached(self, adState)
             if self.compute_velocities:
-                adState[self.name_mod_u] *= 0.
-                adState[self.name_mod_v] *= 0.
+                adState[self.name_mod_u] = _cached_zero_like(self, adState[self.name_mod_u])
+                adState[self.name_mod_v] = _cached_zero_like(self, adState[self.name_mod_v])
 
         return adX
 
@@ -1797,9 +1824,7 @@ class Basis_bm(_StateBackgroundMixin, _Basis_bm):
         res = super().set_basis(time,return_q=return_q,**kwargs)
 
         self.time = jnp.asarray(time)
-        self.vect_time = jnp.eye(time.size)
-        self.zero_basis = jnp.zeros((self.nbasis,))
-        self.zero_phys = jnp.zeros((self.nphys,))
+        self.enst_device = [jnp.asarray(centres) for centres in self.enst]
 
         return res
 
@@ -1878,32 +1903,16 @@ class Basis_bm(_StateBackgroundMixin, _Basis_bm):
         return Gx, Nx
 
     def _compute_component_time(self, time):
-
-        Gt = {} # Time operator that gathers the time factors for each frequency
-
-        for iff in range(self.nf):
-            nbasis_f = self.iff_wavebounds[iff+1] - self.iff_wavebounds[iff]
-            Gt_np = np.zeros((time.size,nbasis_f))
-            ind_tmp = 0
-            for it in range(len(self.enst[iff])):
-                for _ in range(self.NP[iff]):
-                    for i,t in enumerate(time) :
-                        dt = t - self.enst[iff][it]
-                        if not (abs(dt)>self.tdec[iff] or np.isnan(self.enst[iff][it])):
-                            fact = self.window(dt / self.tdec[iff])
-                            if self.norm_time:
-                                fact /= self.norm_fact[iff]
-                            Gt_np[i,ind_tmp:ind_tmp+2*self.ntheta] = fact
-                    ind_tmp += 2*self.ntheta
-            Gt[iff] = sparse.csr_fromdense(jnp.array(Gt_np).T)
-
-        return Gt, None
+        return None, None
 
     def get_Gt_value(self, t, iff):
-
-        idt = jnp.where(self.time == t, size=1)[0]  # Find index
-
-        return self.Gt[iff] @ self.vect_time[idt[0]] # Get corresponding value
+        dt = t - self.enst_device[iff]
+        weights = jnp.where(
+            (jnp.abs(dt) <= self.tdec[iff]) & jnp.isfinite(dt),
+            _window_jax(dt / self.tdec[iff], self.flux), 0.)
+        if self.norm_time:
+            weights = weights / self.norm_fact[iff]
+        return jnp.repeat(weights, self.Nx[iff])
 
     def _operg(self, t, X):
         """
@@ -1911,7 +1920,7 @@ class Basis_bm(_StateBackgroundMixin, _Basis_bm):
         """
 
         # Initialize phi
-        phi = self.zero_phys
+        phi = jnp.zeros((self.nphys,), dtype=X.dtype)
 
         for iff in range(self.nf):
 
@@ -1932,7 +1941,7 @@ class Basis_bm(_StateBackgroundMixin, _Basis_bm):
 
     def _operg_reduced(self, t, phi_2d):
         """Project a 2D physical adjoint field back to reduced space."""
-        adX = self.zero_basis
+        adX = jnp.zeros((self.nbasis,), dtype=phi_2d.dtype)
         phi_1d = phi_2d.ravel()
         for iff in range(self.nf):
             Gt = self.get_Gt_value(t, iff)
@@ -1978,7 +1987,8 @@ class Basis_bm(_StateBackgroundMixin, _Basis_bm):
             Project to reduced space
         """
 
-        _ensure_adstate_names(self, adState, jnp.zeros(self.shape_phys))
+        _ensure_adstate_names(self, adState,
+                              lambda: jnp.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
             adState[self.name_mod_u] = jnp.zeros_like(self.f_on_u)
             adState[self.name_mod_v] = jnp.zeros_like(self.f_on_v)
@@ -1989,10 +1999,10 @@ class Basis_bm(_StateBackgroundMixin, _Basis_bm):
         adX = self._operg_reduced_jit(t, adssh)
 
         if not self.multi_mode:
-            _clear_adstate_names(self, adState)
+            _clear_adstate_names_cached(self, adState)
             if self.compute_velocities:
-                adState[self.name_mod_u] *= 0.
-                adState[self.name_mod_v] *= 0.
+                adState[self.name_mod_u] = _cached_zero_like(self, adState[self.name_mod_u])
+                adState[self.name_mod_v] = _cached_zero_like(self, adState[self.name_mod_v])
 
         return adX
 
@@ -2679,7 +2689,8 @@ class _Basis_bmaux:
             Project to reduced space
         """
 
-        _ensure_adstate_names(self, adState, np.zeros(self.shape_phys))
+        _ensure_adstate_names(self, adState,
+                              lambda: np.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
             adState[self.name_mod_u] = np.zeros_like(self.f_on_u)
             adState[self.name_mod_v] = np.zeros_like(self.f_on_v)
@@ -2723,11 +2734,8 @@ class Basis_bmaux(_StateBackgroundMixin, _Basis_bmaux):
     def set_basis(self,time,return_q=False,**kwargs):
         self.capture_state_background(kwargs.get('State'))
         res = super().set_basis(time,return_q=return_q,**kwargs)
-        self.time = time
-        self.vect_time = jnp.eye(time.size)
-
-        self.zero_basis = jnp.zeros((self.nbasis,))
-        self.zero_phys = jnp.zeros((self.nphys,))
+        self.time = jnp.asarray(time)
+        self.enst_device = [jnp.asarray(centres) for centres in self.enst]
 
         return res
 
@@ -2823,25 +2831,7 @@ class Basis_bmaux(_StateBackgroundMixin, _Basis_bmaux):
         return Gx, Nx
 
     def _compute_component_time(self, time):
-
-        Gt = {} # Time operator that gathers the time factors for each frequency
-        
-        for iff in range(self.nf):
-            nbasis_f = self.iff_wavebounds[iff+1] - self.iff_wavebounds[iff]
-            Gt_np = np.zeros((time.size,nbasis_f))
-            ind_tmp = 0
-            for it in range(self.enst[iff].shape[1]):
-                for P in range(self.NP[iff]):
-                    for i,t in enumerate(time) :
-                        dt = t - self.enst[iff][P,it]
-                        if not (abs(dt)>self.tdec[iff][P] or np.isnan(self.enst[iff][P,it])):
-                            fact = self.window(dt / self.tdec[iff][P])
-                            fact /= self.norm_fact[iff][P]
-                            Gt_np[i,ind_tmp:ind_tmp+2*self.ntheta] = fact
-                    ind_tmp += 2*self.ntheta
-            Gt[iff] = sparse.csr_fromdense(jnp.array(Gt_np).T)
-
-        return Gt, None
+        return None, None
 
     def _ssh2uv(self, ssh):
 
@@ -2861,10 +2851,14 @@ class Basis_bmaux(_StateBackgroundMixin, _Basis_bmaux):
         return _u, _v
 
     def get_Gt_value(self, t, iff):
-
-        idt = jnp.where(self.time == t, size=1)[0]  # Find index
-
-        return self.Gt[iff] @ self.vect_time[idt[0]] # Get corresponding value
+        centres = self.enst_device[iff].T
+        dt = t - centres
+        decay = jnp.asarray(self.tdec[iff])[None, :]
+        norm = jnp.asarray(self.norm_fact[iff])[None, :]
+        weights = jnp.where(
+            (jnp.abs(dt) <= decay) & jnp.isfinite(dt),
+            _window_jax(dt / decay, self.flux) / norm, 0.)
+        return jnp.repeat(weights.reshape(-1), 2 * self.ntheta)
     
     def _operg(self, t, X):
         """
@@ -2872,7 +2866,7 @@ class Basis_bmaux(_StateBackgroundMixin, _Basis_bmaux):
         """
 
         # Initialize phi
-        phi = self.zero_phys.ravel()
+        phi = jnp.zeros((self.nphys,), dtype=X.dtype)
 
         for iff in range(self.nf):
 
@@ -2897,7 +2891,7 @@ class Basis_bmaux(_StateBackgroundMixin, _Basis_bmaux):
     def _operg_reduced(self, t, phi_2d):
         """Project a 2D physical adjoint field back to reduced space."""
 
-        adX = self.zero_basis
+        adX = jnp.zeros((self.nbasis,), dtype=phi_2d.dtype)
         phi_1d = phi_2d.ravel()
 
         for iff in range(self.nf):
@@ -2944,7 +2938,8 @@ class Basis_bmaux(_StateBackgroundMixin, _Basis_bmaux):
             Project to reduced space
         """
 
-        _ensure_adstate_names(self, adState, jnp.zeros(self.shape_phys))
+        _ensure_adstate_names(self, adState,
+                              lambda: jnp.zeros(self.shape_phys))
         if self.compute_velocities and (adState[self.name_mod_u] is None or adState[self.name_mod_v] is None):
             adState[self.name_mod_u] = jnp.zeros_like(self.f_on_u)
             adState[self.name_mod_v] = jnp.zeros_like(self.f_on_v)
@@ -2955,10 +2950,10 @@ class Basis_bmaux(_StateBackgroundMixin, _Basis_bmaux):
         adX = self._operg_reduced_jit(t, adssh)
 
         if not self.multi_mode:
-            _clear_adstate_names(self, adState)
+            _clear_adstate_names_cached(self, adState)
             if self.compute_velocities:
-                adState[self.name_mod_u] *= 0.
-                adState[self.name_mod_v] *= 0.
+                adState[self.name_mod_u] = _cached_zero_like(self, adState[self.name_mod_u])
+                adState[self.name_mod_v] = _cached_zero_like(self, adState[self.name_mod_v])
     
         return adX
 
@@ -3053,8 +3048,7 @@ class Basis_hbc:
         LAT_MAX = self.lat_max
         if (LON_MAX<LON_MIN): LON_MAX = LON_MAX+360.
 
-        self.time = time 
-        self.vect_time = jnp.eye(time.size)
+        self.time = jnp.asarray(time)
 
         self.Gxy = {} # Dictionary containing gaussian basis elements for each parameters. 
         self.GxyT = {} # Transpose operators for explicit adjoint projection.
@@ -3224,10 +3218,10 @@ class Basis_hbc:
             bc_N_gauss[i,iobs] = mywindow(xx / self.D_bc) 
 
         # Saving gaussian reduced basis elements 
-        self.Gxy["hbcS"] = sparse.CSR.fromdense(jnp.array(bc_S_gauss.T)) # For South boundary 
-        self.Gxy["hbcN"] = sparse.CSR.fromdense(jnp.array(bc_N_gauss.T)) # For North boundary
-        self.GxyT["hbcS"] = sparse.CSR.fromdense(jnp.array(bc_S_gauss))
-        self.GxyT["hbcN"] = sparse.CSR.fromdense(jnp.array(bc_N_gauss))
+        self.Gxy["hbcS"] = _jax_csr_from_scipy(scipy.sparse.csr_matrix(bc_S_gauss.T))
+        self.Gxy["hbcN"] = _jax_csr_from_scipy(scipy.sparse.csr_matrix(bc_N_gauss.T))
+        self.GxyT["hbcS"] = _jax_csr_from_scipy(scipy.sparse.csr_matrix(bc_S_gauss))
+        self.GxyT["hbcN"] = _jax_csr_from_scipy(scipy.sparse.csr_matrix(bc_N_gauss))
 
         ####################################
         ###   - BASIS ELEMENT SHAPES -   ###
@@ -3339,10 +3333,10 @@ class Basis_hbc:
             bc_W_gauss[i,iobs] = mywindow(yy / self.D_bc) 
 
         # Gaussian reduced basis elements
-        self.Gxy["hbcE"] = sparse.CSR.fromdense(jnp.array(bc_E_gauss.T)) # For East boundary 
-        self.Gxy["hbcW"] = sparse.CSR.fromdense(jnp.array(bc_W_gauss.T)) # For West boundary 
-        self.GxyT["hbcE"] = sparse.CSR.fromdense(jnp.array(bc_E_gauss))
-        self.GxyT["hbcW"] = sparse.CSR.fromdense(jnp.array(bc_W_gauss))
+        self.Gxy["hbcE"] = _jax_csr_from_scipy(scipy.sparse.csr_matrix(bc_E_gauss.T))
+        self.Gxy["hbcW"] = _jax_csr_from_scipy(scipy.sparse.csr_matrix(bc_W_gauss.T))
+        self.GxyT["hbcE"] = _jax_csr_from_scipy(scipy.sparse.csr_matrix(bc_E_gauss))
+        self.GxyT["hbcW"] = _jax_csr_from_scipy(scipy.sparse.csr_matrix(bc_W_gauss))
 
         ####################################
         ###   - BASIS ELEMENT SHAPES -   ###
@@ -3397,23 +3391,13 @@ class Basis_hbc:
 
         self.ENST_bc = ENST_bc
 
-        Gt = np.zeros((time.size,self.ENST_bc.size))
-
-        for i,t in enumerate(time) :
-            for it in range(len(self.ENST_bc)):
-                dt = t - self.ENST_bc[it]
-                if abs(dt) < self.T_bc:
-                    fact = self.window(dt / self.T_bc) 
-                    if fact!=0:   
-                        Gt[i,it] = fact
-        
-        self.Gt = sparse.csr_fromdense(jnp.array(Gt).T)
+        self.enst_bc_device = jnp.asarray(self.ENST_bc)
 
     def get_bc_t_gauss_value(self,t):
 
-        idt = jnp.where(self.time == t, size=1)[0]  # Find index
-
-        return self.Gt @ self.vect_time[idt[0]] # Get corresponding value
+        dt = t - self.enst_bc_device
+        return jnp.where(jnp.abs(dt) < self.T_bc,
+                         _window_jax(dt / self.T_bc), 0.)
 
     def _operg(self,t,X):
 
@@ -3559,7 +3543,7 @@ class Basis_hbc:
         adX = self._operg_reduced_jit(t, adparams)
         
         for _param in self.name_params : 
-            adState[_param] *= 0.
+            adState[_param] = _cached_zero_like(self, adState[_param])
         
         return adX
 
@@ -3617,7 +3601,8 @@ class _Basis_offset:
         """
             Project to reduced space
         """
-        _ensure_adstate_names(self, adState, np.zeros(self.shape_phys))
+        _ensure_adstate_names(self, adState,
+                              lambda: np.zeros(self.shape_phys))
         adparams = _sum_adstate_names(self, adState)
 
         adX = [np.sum(adparams)]
@@ -3655,14 +3640,15 @@ class Basis_offset(_StateBackgroundMixin, _Basis_offset):
         """
             Project to reduced space
         """
-        _ensure_adstate_names(self, adState, jnp.zeros(self.shape_phys))
+        _ensure_adstate_names(self, adState,
+                              lambda: jnp.zeros(self.shape_phys))
         adparams = _sum_adstate_names(self, adState)
 
         adX = jnp.expand_dims(jnp.sum(adparams), axis=0)
         
         if not self.multi_mode:
-            _clear_adstate_names(self, adState)
-        
+            _clear_adstate_names_cached(self, adState)
+
         return adX
     
 ###############################################################################
@@ -3801,7 +3787,7 @@ class Basis_multi:
         adX = jnp.concatenate(adX_parts)
         
         for name_mod_var in self.name_mod_var:
-            adState[name_mod_var] *= 0.
+            adState[name_mod_var] = _cached_zero_like(self, adState[name_mod_var])
 
         return adX
 
