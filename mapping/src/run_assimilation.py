@@ -276,7 +276,8 @@ def prepare_process(config, config_eq, State,
                 _ny_band = ny_proc
                 if _lat0 < config.GRID.lat_min:
                     _lat0 = config.GRID.lat_min
-                    _ny_band = max(1, int(ny_proc * (_lat1 - _lat0) / space_window_size_proc_y))
+                    if ny_proc is not None:
+                        _ny_band = max(1, int(ny_proc * (_lat1 - _lat0) / space_window_size_proc_y))
                 # Skip if band is entirely within the equatorial band
                 if _lat0 >= eq_south:
                     break
@@ -292,7 +293,8 @@ def prepare_process(config, config_eq, State,
                 _ny_band = ny_proc
                 if _lat1 > config.GRID.lat_max:
                     _lat1 = config.GRID.lat_max
-                    _ny_band = max(1, int(ny_proc * (_lat1 - _lat0) / space_window_size_proc_y))
+                    if ny_proc is not None:
+                        _ny_band = max(1, int(ny_proc * (_lat1 - _lat0) / space_window_size_proc_y))
                 # Skip if band is entirely within the equatorial band
                 if _lat1 <= eq_north:
                     break
@@ -311,7 +313,8 @@ def prepare_process(config, config_eq, State,
                 _ny_band = ny_proc
                 if _lat1 > config.GRID.lat_max:
                     _lat1 = config.GRID.lat_max
-                    _ny_band = max(1, int(ny_proc * (_lat1 - _lat0) / space_window_size_proc_y))
+                    if ny_proc is not None:
+                        _ny_band = max(1, int(ny_proc * (_lat1 - _lat0) / space_window_size_proc_y))
                 lat_bands.append((_lat0, _lat1, _ny_band, nx_proc, space_window_size_proc_x, False))
                 if _lat1 >= config.GRID.lat_max:
                     break

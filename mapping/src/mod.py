@@ -4288,11 +4288,7 @@ class Model_qgsw(M):
         if 'H' in self.name_params:
             if (config.GRID.super == 'GRID_FROM_FILE'):
                 dsin = grid.open_grid_restart(config)
-                if self._H_from_init_file_used:
-                    # Saved H is already the total equivalent depth from the
-                    # previous run. Start new increments from zero around it.
-                    State.params['H'] = np.zeros((State.ny,State.nx))
-                elif 'H_control' in dsin:
+                if 'H_control' in dsin:
                     State.params['H'] = dsin['H_control'].values.squeeze()
                     State.params['H'][np.isnan(State.params['H'])] = 0.
                 else:
@@ -5126,7 +5122,11 @@ class Model_qgsw(M):
     def init(self, State, t0=0):
 
         if type(self.init_from_bc)==dict:
-            if 'SSH' in self.init_from_bc:
+            # SSH, U, and V are initialized as one dynamically consistent
+            # boundary state.  Test the flag value (not just the presence of
+            # the ``SSH`` key), so a selective mapping such as
+            # {'SSH': False, 'SST': True} only initializes SST.
+            if self.init_from_bc.get('SSH', False):
                 u0 = self.bc['U'][t0]
                 v0 = self.bc['V'][t0]
                 ssh0 = self.bc['SSH'][t0]
@@ -8563,6 +8563,28 @@ class Model_bmit(_ITOpenBoundaryExtensionMixin, M):
 
 class Model_multi:
 
+    @staticmethod
+    def _component_to_shared_variable(model, name, value):
+        """Convert a component field to the common multi-model coordinate.
+
+        Shared SSH fields are expressed in physical metres.  Most component
+        models already use that coordinate, while a one-layer QGSW model in
+        ``interface_displacement`` mode stores eta and exposes the pointwise
+        eta-to-SSH factor as ``ssh_observation_scale``.
+        """
+        if name == 'SSH':
+            return value * jnp.asarray(
+                getattr(model, 'ssh_observation_scale', 1.),
+                dtype=jnp.asarray(value).dtype,
+            )
+        return value
+
+    @classmethod
+    def _shared_to_component_adjoint(cls, model, name, value):
+        """Apply the transpose of the component-to-shared conversion."""
+        # The SSH conversion is a real diagonal scaling, hence self-adjoint.
+        return cls._component_to_shared_variable(model, name, value)
+
     def __init__(self,config,State):
 
         # Initialize models
@@ -8617,6 +8639,10 @@ class Model_multi:
                         self.var_to_save = np.append(self.var_to_save,new_name)
         self.var_to_save = list(self.var_to_save)
 
+        # A multi-model SSH total is always maintained in physical metres,
+        # even when one of its components stores interface displacement.
+        self.ssh_observation_scale = 1.
+
         for M in self.Models:
             for name in M.name_var:
                 if name not in self.name_var_tot:
@@ -8645,7 +8671,8 @@ class Model_multi:
             M.init(State, t0=t0)
             for name in self.name_var:
                 if name in M.name_var:
-                    var_tot_tmp[name] += State.var[M.name_var[name]]
+                    var_tot_tmp[name] += self._component_to_shared_variable(
+                        M, name, State.var[M.name_var[name]])
 
         # Update state
         for name in self.name_var:
@@ -8675,7 +8702,11 @@ class Model_multi:
         # Totals are maintained by Model_multi.step() on the original state
         # and were historically written by this final save call.
         for name in self.var_to_save:
-            collected[name] = State.var[name]
+            # Component save methods may have converted their native state to
+            # an external coordinate (notably QGSW eta -> physical SSH).  Do
+            # not overwrite that converted field with the raw model state.
+            if name not in collected:
+                collected[name] = State.var[name]
 
         if previous_collector is not None:
             previous_collector.update(collected)
@@ -8733,7 +8764,8 @@ class Model_multi:
             # Add to total variables
             for name in self.name_var:
                 if name in M.name_var and (name in self.name_var_tot):
-                    var_tot_tmp[name] += +State.var[M.name_var[name]]
+                    var_tot_tmp[name] += self._component_to_shared_variable(
+                        M, name, State.var[M.name_var[name]])
                     
         # Update state
         for name in self.name_var_tot:
@@ -8764,7 +8796,8 @@ class Model_multi:
             # Add to total variables
             for name in self.name_var:
                 if name in M.name_var and name in var_tot_tmp:
-                    var_tot_tmp[name] += dState.var[M.name_var[name]]
+                    var_tot_tmp[name] += self._component_to_shared_variable(
+                        M, name, dState.var[M.name_var[name]])
         
         # Update state
         for name in self.name_var_tot:
@@ -8784,7 +8817,8 @@ class Model_multi:
             # Add to local variable
             for name in self.name_var:
                 if name in M.name_var and name in self.name_var_tot:
-                    adState.var[M.name_var[name]] += var_tot_tmp[name]  
+                    adState.var[M.name_var[name]] += self._shared_to_component_adjoint(
+                        M, name, var_tot_tmp[name])
             # Adjoint propagation
             if component_boundary is None:
                 M.step_adj(adState,State,nstep=_nstep,t=t)

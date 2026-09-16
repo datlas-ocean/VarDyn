@@ -859,6 +859,8 @@ BASIS_GAUSS2D = dict(
 
     facQ = 1., # Factor multiplied to the estimated Q
 
+    time_spinup = None, # Smooth ramp-up duration (days); None applies the basis immediately
+
     flag_variable_Q = False, # If True, read spatially varying std from *path_sad*
 
     path_sad = None, # Path to a netcdf file with a spatially varying std field (used when flag_variable_Q=True)
@@ -918,6 +920,69 @@ BASIS_GAUSS3D = dict(
     var_background = None # name of the variable of the basis vector
 
 ) 
+
+# Balanced-motion wavelet basis with analytical scale-dependent priors.
+BASIS_BM = dict(
+
+    name_mod_var = None, # String or list of related model parameter names
+
+    use_state_background = False, # Add controlled State.params restart fields as a constant background
+
+    c_grid_var = None, # C-grid variable type: None (h-grid), 'U' (ny,nx+1), or 'V' (ny+1,nx)
+
+    compute_velocities = False, # Compute geostrophic velocities associated with an SSH basis
+
+    name_mod_u = 'u', # Zonal-velocity model variable when compute_velocities=True
+
+    name_mod_v = 'v', # Meridional-velocity model variable when compute_velocities=True
+
+    flux = False, # Make components appear/disappear in time; use False for dynamical mapping
+
+    facns = 1., # Spatial wavelet-grid density factor
+
+    facnlt = 2., # Temporal wavelet-grid density factor
+
+    npsp = 3.5, # Wavelet spatial-envelope width in wavelengths
+
+    facpsp = 1.5, # Wavelength sampling factor
+
+    lmin = 80., # Minimum wavelength (km)
+
+    lmax = 970., # Maximum wavelength (km)
+
+    lmeso = 300., # Largest mesoscale wavelength (km)
+
+    tmeso = 20., # Decorrelation time at lmeso (days)
+
+    sloptdec = -1.28, # Scale exponent for the decorrelation time
+
+    factdec = 0.5, # Multiplicative decorrelation-time factor
+
+    tdecmin = 2.5, # Minimum decorrelation time (days)
+
+    tdecmax = 40., # Maximum decorrelation time (days)
+
+    facQ = 1., # Multiplicative factor for prior standard deviations
+
+    Qmax = 1e-3, # Large-scale prior standard deviation
+
+    slopQ = -5., # Scale exponent for mesoscale prior standard deviations
+
+    norm_time = True, # Normalize temporal wavelets (recommended for dynamical forcings)
+
+    file_depth = None, # Optional bathymetry file used to attenuate shallow-water wavelets
+
+    name_var_depth = {'lon':'', 'lat':'', 'var':''}, # Bathymetry coordinate and variable names
+
+    depth1 = 0., # Depth below which wavelets vanish (m)
+
+    depth2 = 30., # Depth above which wavelets are unattenuated (m)
+
+    path_background = None, # Optional NetCDF file containing background control coefficients
+
+    var_background = None # Background coefficient variable name
+
+)
 
 # Balanced Motions with auxilliary data 
 BASIS_BMaux = dict(
@@ -1020,7 +1085,7 @@ NAME_INV = None
 # 4-Dimensional Variational 
 INV_4DVAR = dict(
 
-    minimizer = 'scipy', # 'scipy': historical host L-BFGS-B; 'optax-decoupled': device L-BFGS with a scalar Python line search
+    minimizer = 'scipy', # 'scipy': host L-BFGS-B; 'optax-decoupled': device vectors/Python line search; 'optax-full-gpu': compiled device optimizer
 
     compute_test = False, # TLM, ADJ & GRAD tests
 
