@@ -175,6 +175,8 @@ class _Basis_gauss3d:
         self.sigma_T = config.BASIS.sigma_T
         self.sigma_Q = config.BASIS.sigma_Q
         self.facQ = config.BASIS.facQ
+        self.file_facQaux = getattr(config.BASIS, 'file_facQaux', None)
+        self.name_var_facQaux = getattr(config.BASIS, 'name_var_facQaux', None)
         self.normalize_fact = config.BASIS.normalize_fact
         self.name_mod_var = config.BASIS.name_mod_var
         self.time_spinup = config.BASIS.time_spinup
@@ -364,6 +366,35 @@ class _Basis_gauss3d:
 
 
         
+        if self.file_facQaux is not None:
+            names = self.name_var_facQaux
+            with xr.open_dataset(self.file_facQaux, decode_times=False) as auxQ:
+                daFacQ = auxQ[names['var']]
+                lon_name = names['lon']
+                lon_values = daFacQ[lon_name].values
+                if lon_values.min() < 0 and self.lon_unit == '0_360':
+                    daFacQ = daFacQ.assign_coords({lon_name: lon_values % 360})
+                elif (lon_values.min() >= 0 or lon_values.max() > 180) and self.lon_unit == '-180_180':
+                    daFacQ = daFacQ.assign_coords({lon_name: (lon_values + 180) % 360 - 180})
+                daFacQ = daFacQ.sortby(lon_name)
+
+                spatial_facQ = []
+                for lon, lat in zip(ENSLON, ENSLAT):
+                    dlon = .5 * self.sigma_D * self.km2deg / np.cos(lat * np.pi / 180.)
+                    dlat = .5 * self.sigma_D * self.km2deg
+                    elon, elat = np.meshgrid(
+                        np.linspace(lon - dlon, lon + dlon, 10),
+                        np.linspace(lat - dlat, lat + dlat, 10))
+                    if self.lon_unit == '0_360':
+                        elon = elon % 360
+                    elif self.lon_unit == '-180_180':
+                        elon = (elon + 180) % 360 - 180
+                    values = daFacQ.interp({lon_name: elon.ravel(),
+                                            names['lat']: elat.ravel()}).values
+                    factor = np.nanmean(values) if not np.all(np.isnan(values)) else 1.0
+                    spatial_facQ.append(np.sqrt(np.clip(factor, 0.0, 1.0)))
+            Q *= np.tile(spatial_facQ, len(ENST))
+
         Xb = np.zeros_like(Q)
         # Background
         if self.path_background is not None and os.path.exists(self.path_background):

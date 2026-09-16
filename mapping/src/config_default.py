@@ -899,6 +899,10 @@ BASIS_GAUSS3D = dict(
 
     facQ = 1., # Factor multiplied to the estimated Q
 
+    file_facQaux = None, # Optional NetCDF field reducing Q by a spatial factor
+
+    name_var_facQaux = {'lon':'', 'lat':'', 'var':''},
+
     normalize_fact = True,
 
     time_spinup = None, # days
