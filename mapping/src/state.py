@@ -13,9 +13,85 @@ import pandas as pd
 from copy import deepcopy
 import matplotlib.pyplot as plt
 import glob
+import shutil
+import fcntl
 import pyinterp 
 
 from . import tools as grid
+from .config import USE_FLOAT64
+
+
+_ZARR_TIME_UNITS = 'nanoseconds since 1970-01-01'
+
+
+def _set_zarr_time_encoding(dataset):
+    """Use one lossless encoding for sub-daily timestamps across appends."""
+    if 'time' in dataset.coords:
+        dataset.time.encoding.update({
+            'units': _ZARR_TIME_UNITS,
+            'calendar': 'proleptic_gregorian',
+            'dtype': 'int64',
+        })
+
+
+def _zarr_encoding(
+        dataset, zarr_time_chunk=4, zarr_spatial_chunk=256,
+        zarr_compression_level=3):
+    """Return one explicit, space-efficient encoding for new Zarr v2 stores."""
+    zarr_time_chunk = int(zarr_time_chunk)
+    zarr_spatial_chunk = int(zarr_spatial_chunk)
+    zarr_compression_level = int(zarr_compression_level)
+    if zarr_time_chunk < 1 or zarr_spatial_chunk < 1:
+        raise ValueError('Zarr chunk sizes must be positive integers')
+    if not 0 <= zarr_compression_level <= 9:
+        raise ValueError('Zarr compression level must be between 0 and 9')
+    try:
+        from numcodecs import Blosc
+    except ImportError as exc:
+        raise RuntimeError(
+            'Zarr output compression requires the numcodecs package') from exc
+
+    compressor = Blosc(
+        cname='zstd',
+        clevel=zarr_compression_level,
+        shuffle=Blosc.BITSHUFFLE,
+    )
+    encoding = {}
+    for name, variable in dataset.variables.items():
+        if variable.ndim == 0:
+            continue
+        chunks = []
+        for dim, size in zip(variable.dims, variable.shape):
+            if dim == 'time':
+                # A new archive initially contains one record. Keeping the
+                # configured chunk larger than that lets later appends share
+                # chunks and exploit temporal coherence.
+                chunks.append(zarr_time_chunk)
+            else:
+                chunks.append(max(
+                    1, min(int(size), zarr_spatial_chunk)))
+        item = {'chunks': tuple(chunks)}
+        if variable.dtype.kind not in {'O', 'U'}:
+            item['compressor'] = compressor
+        encoding[name] = item
+    return encoding
+
+
+def _write_new_zarr(
+        dataset, filename, zarr_time_chunk=4, zarr_spatial_chunk=256,
+        zarr_compression_level=3):
+    """Create a compressed Zarr v2 store with deterministic chunk sizes."""
+    dataset.to_zarr(
+        filename,
+        mode='w',
+        encoding=_zarr_encoding(
+            dataset,
+            zarr_time_chunk=zarr_time_chunk,
+            zarr_spatial_chunk=zarr_spatial_chunk,
+            zarr_compression_level=zarr_compression_level),
+        zarr_format=2,
+        safe_chunks=False,
+    )
 
 
 def _is_jax_array(value):
@@ -42,6 +118,14 @@ class State:
             config.INV is not None
             and getattr(config.INV, 'jit_cost_and_grad', False)
         )
+        # Model_multi temporarily shares this mapping with component-state
+        # copies.  Component save methods can then contribute physical and
+        # diagnosed fields without each opening the output archive.
+        self._output_var_collector = None
+        # Optional shared batching context used by the final 4DVar trajectory.
+        # State.copy() deliberately keeps the same object because Model_multi
+        # persists output through short-lived State copies.
+        self._zarr_output_batch = None
         
         # Parameters
         self.name_time = config.EXP.name_time
@@ -221,8 +305,7 @@ class State:
                 config (module): configuration module
         """
         
-        dsin = xr.open_dataset(config.path_init_grid)
-
+        dsin = grid.open_grid_restart(self.config, config)
         lon = dsin[config.name_init_lon].values
         lat = dsin[config.name_init_lat].values
 
@@ -363,14 +446,29 @@ class State:
         
         self.mask += (np.isnan(self.lon) + np.isnan(self.lat)).astype(bool)
             
-    def save_output(self,date,name_var=None,grid_type=None):
-        
-        filename = os.path.join(self.path_save,f'{self.name_exp_save}'\
-            f'_y{date.year}'\
-            f'm{str(date.month).zfill(2)}'\
-            f'd{str(date.day).zfill(2)}'\
-            f'h{str(date.hour).zfill(2)}'\
-            f'm{str(date.minute).zfill(2)}.nc')
+    def save_output(self,date,name_var=None,grid_type=None,dtype=None):
+        output_var_collector = getattr(
+            self, '_output_var_collector', None)
+        if output_var_collector is not None:
+            selected_names = self.var.keys() if name_var is None else name_var
+            for name in selected_names:
+                # Keep device arrays lazy here.  The single assembled write
+                # below performs the host transfer exactly once per field.
+                output_var_collector[name] = self.var[name]
+            return
+
+        save_zarr = bool(getattr(self.config.EXP, 'saveoutputs_zarr', False))
+        if save_zarr:
+            filename = os.path.join(self.path_save, f'{self.name_exp_save}.zarr')
+            if dtype is None:
+                dtype = np.float64 if USE_FLOAT64 else np.float32
+        else:
+            filename = os.path.join(self.path_save,f'{self.name_exp_save}'\
+                f'_y{date.year}'\
+                f'm{str(date.month).zfill(2)}'\
+                f'd{str(date.day).zfill(2)}'\
+                f'h{str(date.hour).zfill(2)}'\
+                f'm{str(date.minute).zfill(2)}.nc')
         
         coords = {}
         coords[self.name_time] = ((self.name_time), [pd.to_datetime(date)],)
@@ -402,6 +500,8 @@ class State:
         for name in name_var:
 
             var_to_save = +np.array(self.var[name])
+            if dtype is not None and np.issubdtype(var_to_save.dtype, np.floating):
+                var_to_save = var_to_save.astype(dtype, copy=False)
 
             # Apply Mask
             try:
@@ -437,6 +537,37 @@ class State:
             else:
                 coords[lon_name] = (('y' + suffix, 'x' + suffix), _lon)
                 coords[lat_name] = (('y' + suffix, 'x' + suffix), _lat)
+
+        if save_zarr:
+            for key, value in coords.items():
+                if key != self.name_time and isinstance(value, tuple):
+                    coord_values = value[-1]
+                    if np.issubdtype(np.asarray(coord_values).dtype, np.floating):
+                        coords[key] = (*value[:-1], np.asarray(coord_values).astype(dtype))
+            ds = xr.Dataset(var, coords=coords)
+            if self._zarr_output_batch is not None:
+                batch = self._zarr_output_batch
+                if batch['filename'] not in (None, filename):
+                    raise RuntimeError(
+                        'A Zarr output batch cannot span multiple archives')
+                batch['filename'] = filename
+                batch['records'].append(ds)
+                if len(batch['records']) >= batch['size']:
+                    self.flush_output_batch()
+                return
+            self._save_zarr_record(
+                ds,
+                filename,
+                date,
+                window_start=self.config.EXP.init_date,
+                window_end=self.config.EXP.final_date,
+                zarr_time_chunk=self.config.EXP.get('zarr_time_chunk', 4),
+                zarr_spatial_chunk=self.config.EXP.get(
+                    'zarr_spatial_chunk', 256),
+                zarr_compression_level=(
+                    self.config.EXP.get('zarr_compression_level', 3)),
+            )
+            return
 
         def _write_fresh():
             ds = xr.Dataset(var, coords=coords)
@@ -481,7 +612,435 @@ class State:
         
         return 
 
+    def enable_output_batching(self, batch_size=None):
+        """Buffer final-trajectory Zarr records before writing them.
+
+        The buffer is host-resident: ``save_output`` has already converted
+        device arrays to NumPy before records are added.  This bounds device
+        memory while avoiding one metadata transaction and one partial-chunk
+        append per timestamp.
+        """
+        if not bool(getattr(self.config.EXP, 'saveoutputs_zarr', False)):
+            return
+        if self._zarr_output_batch is not None:
+            raise RuntimeError('Zarr output batching is already enabled')
+        if batch_size is None:
+            batch_size = self.config.EXP.get('zarr_write_batch_size', None)
+        if batch_size is None:
+            batch_size = self.config.EXP.get('zarr_time_chunk', 4)
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError('Zarr output batch size must be positive')
+        self._zarr_output_batch = {
+            'size': batch_size,
+            'filename': None,
+            'records': [],
+        }
+
+    def flush_output_batch(self):
+        """Persist all pending Zarr records in one transaction."""
+        batch = self._zarr_output_batch
+        if batch is None or not batch['records']:
+            return
+        records = batch['records']
+        combined = xr.concat(
+            records,
+            dim='time',
+            data_vars='all',
+            coords='minimal',
+            compat='override',
+            join='outer',
+        ).sortby('time')
+        try:
+            self._save_zarr_records(
+                combined,
+                batch['filename'],
+                window_start=self.config.EXP.init_date,
+                window_end=self.config.EXP.final_date,
+                zarr_time_chunk=self.config.EXP.get('zarr_time_chunk', 4),
+                zarr_spatial_chunk=self.config.EXP.get(
+                    'zarr_spatial_chunk', 256),
+                zarr_compression_level=self.config.EXP.get(
+                    'zarr_compression_level', 3),
+            )
+        except Exception:
+            # Keep the original records available for an explicit retry.
+            combined.close()
+            raise
+        else:
+            for record in records:
+                record.close()
+            records.clear()
+
+    @staticmethod
+    def _save_zarr_record(
+            record, filename, date, window_start=None, window_end=None,
+            zarr_time_chunk=4, zarr_spatial_chunk=256,
+            zarr_compression_level=3):
+        # Serialize the complete read/modify/write transaction. Slurm array
+        # ranks shard dates but intentionally share one experiment archive.
+        lock_filename = f'{filename}.lock'
+        with open(lock_filename, 'w') as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                State._save_zarr_record_unlocked(
+                    record, filename, date,
+                    window_start=window_start, window_end=window_end,
+                    zarr_time_chunk=zarr_time_chunk,
+                    zarr_spatial_chunk=zarr_spatial_chunk,
+                    zarr_compression_level=zarr_compression_level)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _save_zarr_records(
+            records, filename, window_start=None, window_end=None,
+            zarr_time_chunk=4, zarr_spatial_chunk=256,
+            zarr_compression_level=3):
+        """Write an ordered batch, optimizing append and restart updates."""
+        lock_filename = f'{filename}.lock'
+        with open(lock_filename, 'w') as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                State._save_zarr_records_unlocked(
+                    records, filename,
+                    window_start=window_start, window_end=window_end,
+                    zarr_time_chunk=zarr_time_chunk,
+                    zarr_spatial_chunk=zarr_spatial_chunk,
+                    zarr_compression_level=zarr_compression_level)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _save_zarr_records_unlocked(
+            records, filename, window_start=None, window_end=None,
+            zarr_time_chunk=4, zarr_spatial_chunk=256,
+            zarr_compression_level=3):
+        """Write several records with one metadata inspection.
+
+        Normal 4DVar execution either appends a complete batch or overwrites a
+        contiguous batch during a restart.  Irregular/legacy archives retain
+        the conservative atomic-rewrite fallback.
+        """
+        if 'time' not in records.dims or records.sizes['time'] < 1:
+            records.close()
+            raise ValueError('A Zarr output batch must contain time records')
+
+        record_times = pd.DatetimeIndex(pd.to_datetime(records.time.values))
+        if record_times.has_duplicates:
+            records.close()
+            raise ValueError('A Zarr output batch contains duplicate timestamps')
+        if not record_times.is_monotonic_increasing:
+            records = records.sortby('time')
+            record_times = pd.DatetimeIndex(pd.to_datetime(records.time.values))
+
+        start = pd.Timestamp(window_start) if window_start is not None else None
+        end = pd.Timestamp(window_end) if window_end is not None else None
+        if ((start is not None and record_times[0] < start)
+                or (end is not None and record_times[-1] > end)):
+            records.close()
+            raise ValueError(
+                f'Refusing to save Zarr batch outside window [{start}, {end}]')
+
+        _set_zarr_time_encoding(records)
+        if not os.path.exists(filename):
+            _write_new_zarr(
+                records, filename,
+                zarr_time_chunk=zarr_time_chunk,
+                zarr_spatial_chunk=zarr_spatial_chunk,
+                zarr_compression_level=zarr_compression_level)
+            records.close()
+            return
+
+        existing = None
+        fast_region_size = 0
+        fast_region_start = None
+        append_start = None
+        record_names = set(records.data_vars)
+        with xr.open_zarr(filename, consolidated=False) as existing_open:
+            existing_times = pd.DatetimeIndex(
+                pd.to_datetime(existing_open.time.values))
+            existing_names = set(existing_open.data_vars)
+            existing_time_units = existing_open.time.encoding.get('units')
+            existing_time_dtype = existing_open.time.encoding.get('dtype')
+            keep = np.ones(existing_open.sizes.get('time', 0), dtype=bool)
+            if start is not None:
+                keep &= existing_times >= start
+            if end is not None:
+                keep &= existing_times <= end
+            regular_archive = (
+                np.all(keep)
+                and not existing_times.has_duplicates
+                and record_names == existing_names
+                and existing_time_units == _ZARR_TIME_UNITS
+                and np.dtype(existing_time_dtype) == np.dtype('int64')
+            )
+
+            if regular_archive:
+                positions = existing_times.get_indexer(record_times)
+                present = positions >= 0
+                present_count = int(np.count_nonzero(present))
+                # A resumed sequential trajectory can only contain an existing
+                # prefix followed by timestamps newer than the archive.
+                prefix = np.array_equal(
+                    present,
+                    np.arange(len(record_times)) < present_count)
+                contiguous = (
+                    present_count == 0
+                    or np.array_equal(
+                        positions[:present_count],
+                        np.arange(
+                            positions[0], positions[0] + present_count)))
+                newer_suffix = (
+                    present_count == len(record_times)
+                    or len(existing_times) == 0
+                    or record_times[present_count] > existing_times[-1])
+                if prefix and contiguous and newer_suffix:
+                    if present_count:
+                        fast_region_start = int(positions[0])
+                        fast_region_size = present_count
+                    if present_count < len(record_times):
+                        append_start = present_count
+                else:
+                    existing = existing_open.load()
+            else:
+                existing = existing_open.load()
+
+        # Static spatial coordinates were written when the archive was
+        # created. Avoid overwriting their chunks during every append.
+        def time_only(dataset):
+            return dataset.drop_vars(
+                [name for name in dataset.coords if name != 'time'],
+                errors='ignore')
+
+        if existing is None:
+            if fast_region_size:
+                region_records = time_only(
+                    records.isel(time=slice(0, fast_region_size)))
+                _set_zarr_time_encoding(region_records)
+                region_records.to_zarr(
+                    filename, mode='r+',
+                    region={'time': slice(
+                        fast_region_start,
+                        fast_region_start + fast_region_size)})
+                region_records.close()
+            if append_start is not None:
+                append_records = time_only(
+                    records.isel(time=slice(append_start, None)))
+                _set_zarr_time_encoding(append_records)
+                append_records.to_zarr(
+                    filename, mode='a', append_dim='time')
+                append_records.close()
+            records.close()
+            return
+
+        combined = xr.concat(
+            [existing, records],
+            dim='time',
+            join='outer',
+            fill_value=np.nan,
+            data_vars='all',
+            coords='minimal',
+            compat='override',
+        )
+        combined_times = pd.DatetimeIndex(pd.to_datetime(combined.time.values))
+        combined = combined.isel(
+            time=np.flatnonzero(~combined_times.duplicated(keep='last'))
+        ).sortby('time')
+        temporary = f'{filename}.tmp-{os.getpid()}'
+        _set_zarr_time_encoding(combined)
+        if os.path.exists(temporary):
+            shutil.rmtree(temporary)
+        _write_new_zarr(
+            combined, temporary,
+            zarr_time_chunk=zarr_time_chunk,
+            zarr_spatial_chunk=zarr_spatial_chunk,
+            zarr_compression_level=zarr_compression_level)
+        combined.close()
+        existing.close()
+        records.close()
+        shutil.rmtree(filename)
+        os.replace(temporary, filename)
+
+    @staticmethod
+    def _save_zarr_record_unlocked(record, filename, date,
+                                   window_start=None, window_end=None,
+                                   zarr_time_chunk=4,
+                                   zarr_spatial_chunk=256,
+                                   zarr_compression_level=3):
+        # Write partial model records into one consistent Zarr archive.
+        record_time = pd.Timestamp(date)
+        start = pd.Timestamp(window_start) if window_start is not None else None
+        end = pd.Timestamp(window_end) if window_end is not None else None
+        if ((start is not None and record_time < start)
+                or (end is not None and record_time > end)):
+            record.close()
+            raise ValueError(
+                f'Refusing to save {record_time} outside Zarr window '
+                f'[{start}, {end}]')
+        _set_zarr_time_encoding(record)
+        if not os.path.exists(filename):
+            _write_new_zarr(
+                record, filename,
+                zarr_time_chunk=zarr_time_chunk,
+                zarr_spatial_chunk=zarr_spatial_chunk,
+                zarr_compression_level=zarr_compression_level)
+            record.close()
+            return
+
+        record_names = set(record.data_vars)
+        output_dtype = np.float64 if USE_FLOAT64 else np.float32
+        fast_region_index = None
+        append_missing = None
+
+        # Always read the live array metadata while an archive is being
+        # extended. With Zarr v2, consolidated metadata may still describe
+        # the archive shape from before the latest append.
+        with xr.open_zarr(filename, consolidated=False) as existing_open:
+            times = pd.to_datetime(existing_open.time.values)
+            existing_names = set(existing_open.data_vars)
+            existing_time_units = existing_open.time.encoding.get('units')
+            existing_time_dtype = existing_open.time.encoding.get('dtype')
+            keep = np.ones(existing_open.sizes.get('time', 0), dtype=bool)
+            if start is not None:
+                keep &= times >= start
+            if end is not None:
+                keep &= times <= end
+            duplicate_times = pd.Index(times).duplicated(keep='last')
+            needs_rewrite = (
+                not np.all(keep)
+                or np.any(duplicate_times)
+                or not record_names <= existing_names
+                or existing_time_units != _ZARR_TIME_UNITS
+                or np.dtype(existing_time_dtype) != np.dtype('int64')
+            )
+
+            if needs_rewrite:
+                # Schema changes and repair operations are rare and require a
+                # complete, atomic archive rewrite.
+                existing = existing_open.load()
+            else:
+                matching_indexes = np.flatnonzero(times == record_time)
+                if matching_indexes.size:
+                    fast_region_index = int(matching_indexes[0])
+                else:
+                    append_missing = {}
+                    for name in existing_names - record_names:
+                        template = existing_open[name].isel(
+                            time=slice(0, 1)).load()
+                        fill = (
+                            xr.zeros_like(template, dtype=output_dtype)
+                            * np.nan)
+                        append_missing[name] = fill.assign_coords(
+                            time=record.time)
+
+        if fast_region_index is not None:
+            region_record = record[list(record.data_vars)]
+            region_record = region_record.drop_vars(
+                [name for name in region_record.coords if name != 'time'],
+                errors='ignore',
+            )
+            _set_zarr_time_encoding(region_record)
+            region_record.to_zarr(
+                filename,
+                mode='r+',
+                region={
+                    'time': slice(
+                        fast_region_index, fast_region_index + 1)},
+            )
+            region_record.close()
+            record.close()
+            return
+
+        if append_missing is not None:
+            full_record = xr.merge(
+                [record, xr.Dataset(append_missing)],
+                compat='override',
+                join='outer',
+            )
+            _set_zarr_time_encoding(full_record)
+            full_record.to_zarr(filename, mode='a', append_dim='time')
+            full_record.close()
+            record.close()
+            return
+
+        # A tile/archive belongs to exactly one temporal window. Prune stale
+        # records and repair all duplicate timestamps in the same rewrite.
+        valid = keep & ~duplicate_times
+        pruned = not np.all(valid)
+        if np.any(duplicate_times):
+            duplicate_count = int(np.count_nonzero(duplicate_times))
+            print(
+                f'Warning: repairing {duplicate_count} duplicate time records '
+                f'in {filename}')
+        if pruned:
+            existing = existing.isel(time=np.flatnonzero(valid))
+        times = pd.to_datetime(existing.time.values)
+        matching_record_indexes = np.flatnonzero(times == record_time)
+
+        if record_time in times:
+            # Keep the most recently written matching record as the template,
+            # then remove every duplicate positionally. ``drop_sel`` cannot be
+            # used here because pandas rejects selection on a non-unique index.
+            time_index = int(matching_record_indexes[-1])
+            current = existing.isel(time=slice(time_index, time_index + 1)).copy()
+            for name in record.data_vars:
+                current[name] = record[name]
+            existing_without = existing.isel(
+                time=np.flatnonzero(times != record_time))
+            combined = xr.concat(
+                [existing_without, current],
+                dim='time',
+                join='outer',
+                fill_value=np.nan,
+                data_vars='all',
+                coords='minimal',
+                compat='override',
+            ).sortby('time')
+        else:
+            combined = xr.concat(
+                [existing, record],
+                dim='time',
+                join='outer',
+                fill_value=np.nan,
+                data_vars='all',
+                coords='minimal',
+                compat='override',
+            ).sortby('time')
+
+        temporary = f'{filename}.tmp-{os.getpid()}'
+        _set_zarr_time_encoding(combined)
+        if os.path.exists(temporary):
+            shutil.rmtree(temporary)
+        _write_new_zarr(
+            combined, temporary,
+            zarr_time_chunk=zarr_time_chunk,
+            zarr_spatial_chunk=zarr_spatial_chunk,
+            zarr_compression_level=zarr_compression_level)
+        combined.close()
+        existing.close()
+        record.close()
+        if os.path.exists(filename):
+            shutil.rmtree(filename)
+        os.replace(temporary, filename)
+
     def load_output(self, date, name_var=None):
+        zarr_filename = os.path.join(self.path_save, f'{self.name_exp_save}.zarr')
+        if bool(getattr(self.config.EXP, 'saveoutputs_zarr', False)) and os.path.exists(zarr_filename):
+            with xr.open_zarr(zarr_filename, consolidated=False) as ds:
+                selected = ds.sel(time=pd.Timestamp(date))
+                if 'time' in selected.dims:
+                    duplicate_count = selected.sizes['time']
+                    if duplicate_count > 1:
+                        print(
+                            f'Warning: {zarr_filename} contains {duplicate_count} '
+                            f'records for {pd.Timestamp(date)}; using the latest one')
+                    selected = selected.isel(time=-1)
+                ds1 = selected.load().squeeze(drop=True)
+            if name_var is None:
+                return ds1
+            return np.array([ds1[name].values for name in name_var])
+
         
 
         filename = os.path.join(
@@ -552,6 +1111,9 @@ class State:
         other.lat_v = self.lat_v
         other.geo_grid = self.geo_grid
         other.preserve_device_arrays = self.preserve_device_arrays
+        other._output_var_collector = getattr(
+            self, '_output_var_collector', None)
+        other._zarr_output_batch = self._zarr_output_batch
 
         def _copy_array(v):
             # JAX arrays are immutable: each step() replaces the reference rather than

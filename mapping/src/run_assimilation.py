@@ -10,10 +10,15 @@ import os
 # raise "NetCDF: Not a valid ID" otherwise.
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 import sys
+import json
+import queue
+import time
 import glob
 import copy as _copy
+import shutil
 import pickle
 import numpy as np
+import pandas as pd
 import multiprocessing as mp
 from scipy.interpolate import LinearNDInterpolator, RegularGridInterpolator
 from scipy.ndimage import distance_transform_edt
@@ -24,6 +29,7 @@ from datetime import timedelta
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import traceback
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -35,6 +41,20 @@ import xarray as xr
 
 from . import exp, tools as grid, state, mod, inv, diag, obs as _obs
 from .tools import gaspari_cohn
+
+
+def background_control_path(control_root, experiment_name, name_subwindow):
+    """Find a source experiment's tile control beside the current experiment."""
+    if control_root is None:
+        raise ValueError(
+            'Background mode requires INV.path_save_control_vectors to point '
+            'to the current experiment control directory.')
+    if not experiment_name:
+        raise ValueError(
+            'Background mode requires name_exp_background (or name_exp).')
+    control_parent = os.path.dirname(os.path.normpath(os.fspath(control_root)))
+    return os.path.join(control_parent, experiment_name, name_subwindow,
+                        'Xres.nc')
 
 
 def prepare_process(config, config_eq, State, 
@@ -52,7 +72,10 @@ def prepare_process(config, config_eq, State,
                     gpu_devices=['0'],
                     obs_max_workers=None,
                     read_obs=False,
-                    dir_save_pickle=None):
+                    dir_save_pickle=None,
+                    zarr_time_chunk=4,
+                    zarr_spatial_chunk=256,
+                    zarr_compression_level=3):
     """
     Prepare subprocesses for assimilation in subwindows in time and space.
     The subprocesses can then be run in parallel using multiprocessing. 
@@ -128,7 +151,9 @@ def prepare_process(config, config_eq, State,
     flag_init : bool, optional
         If True, initialize the control vector from a previous experiment given by name_exp_init (default: False).
     flag_background : bool, optional
-        If True, use a background field from another experiment given by name_exp_background (default: False).
+        If True, set each tile's INV.path_background to the Xres.nc control
+        file of name_exp_background under the same controls parent directory
+        as INV.path_save_control_vectors (default: False).
     flag_assim : bool, optional
         If True, create and launch assimilation subprocesses (default: True).
     flag_assim_restart : bool, optional
@@ -179,6 +204,11 @@ def prepare_process(config, config_eq, State,
     interpolators : list of callable
         Precomputed interpolation operators mapping each subwindow grid to the target grid.
     """
+
+    for current_config in (config, config_eq):
+        current_config.EXP.zarr_time_chunk = zarr_time_chunk
+        current_config.EXP.zarr_spatial_chunk = zarr_spatial_chunk
+        current_config.EXP.zarr_compression_level = zarr_compression_level
 
     # Split full experimental time window in sub windows
     list_processes = []
@@ -534,14 +564,19 @@ def prepare_process(config, config_eq, State,
                 name_prev_subwindow = (
                     f'subwindow_{str(list_date_middle[-2])[:10]}/{tpl["geom_name"]}')
                 path_output = config.EXP.path_save + f'/{name_prev_subwindow}/'
-                filename = os.path.join(
-                    path_output,
-                    f'{State.name_exp_save}'
-                    f'_y{date0.year}'
-                    f'm{str(date0.month).zfill(2)}'
-                    f'd{str(date0.day).zfill(2)}'
-                    f'h{str(date0.hour).zfill(2)}'
-                    f'm{str(date0.minute).zfill(2)}.nc')
+                if getattr(_config.EXP, 'saveoutputs_zarr', False):
+                    filename = os.path.join(
+                        path_output,
+                        f'{State.name_exp_save}.zarr')
+                else:
+                    filename = os.path.join(
+                        path_output,
+                        f'{State.name_exp_save}'
+                        f'_y{date0.year}'
+                        f'm{str(date0.month).zfill(2)}'
+                        f'd{str(date0.day).zfill(2)}'
+                        f'h{str(date0.hour).zfill(2)}'
+                        f'm{str(date0.minute).zfill(2)}.nc')
                 _base_config = tpl['parent_config']
                 _config.GRID = exp.Config({
                     'super': 'GRID_FROM_FILE',
@@ -554,18 +589,26 @@ def prepare_process(config, config_eq, State,
                     for NAME_MOD in _config.MOD:
                         _config.MOD[NAME_MOD] = _base_config.MOD[NAME_MOD].copy()
                         _config.MOD[NAME_MOD].init_from_bc = False
+                        if getattr(_config.MOD[NAME_MOD], 'height_representation', 'ssh') == 'interface_displacement':
+                            _restart_names = dict(getattr(_config.MOD[NAME_MOD], 'name_init_var', {}) or {})
+                            _restart_names['SSH'] = _config.MOD[NAME_MOD].name_var['SSH']
+                            _config.MOD[NAME_MOD].name_init_var = _restart_names
                 else:
                     _config.MOD.init_from_bc = False
+                    if getattr(_config.MOD, 'height_representation', 'ssh') == 'interface_displacement':
+                        _restart_names = dict(getattr(_config.MOD, 'name_init_var', {}) or {})
+                        _restart_names['SSH'] = _config.MOD.name_var['SSH']
+                        _config.MOD.name_init_var = _restart_names
 
             if flag_init and name_exp_init is not None:
                 path_control_init = _config.INV.path_save_control_vectors.replace(
                     config.EXP.name_experiment, name_exp_init)
                 _config.INV.path_init_4Dvar = os.path.join(path_control_init, 'Xres.nc')
 
-            if flag_background and name_exp_background is not None:
-                path_background = _config.INV.path_background.replace(
-                    config.EXP.name_experiment, name_exp_background)
-                _config.INV.path_background = os.path.join(path_background, 'Xres.nc')
+            if flag_background:
+                _config.INV.path_background = background_control_path(
+                    tpl['orig_path_save_control_vectors'],
+                    name_exp_background, name_subwindow)
 
             # makedirs (sequential, fast)
             if not os.path.exists(_config.EXP.tmp_DA_path):
@@ -681,7 +724,7 @@ def compute_weights_map(State, list_State, path_save_pickle=None,
                         taper_factor=1.0):
 
     """Compute weights maps and precomputed interpolation operators for merging outputs from subprocesses.
-    
+
     Weights use smootherstep tapering based on per-row (longitude) and per-column
     (latitude) distance from tile edges. This correctly handles GRID_CAR tiles whose 
     shape is trapezoidal in lon/lat space. No tapering is applied on sides that lie
@@ -823,7 +866,8 @@ def compute_weights_map(State, list_State, path_save_pickle=None,
             # One tile on the target grid is already the merged grid: keep this
             # as a strict copy path and avoid interpolation edge/precision artefacts.
             _interp_func = None
-            _weights_space_interp = np.ones((State.ny, State.nx))
+            _weights_space_interp = np.ones(
+                (State.ny, State.nx), dtype=np.float32)
         else:
             # Build interpolation operator (precomputed, reused for all dates)
             _interp_func, _weights_space_interp = _build_interpolator(
@@ -831,15 +875,26 @@ def compute_weights_map(State, list_State, path_save_pickle=None,
                 _State.lon_unit, State.lon_unit, State.ny, State.nx,
                 _State.geo_grid)
 
-        ind = ~np.isnan(_weights_space_interp)
-        weights_space_sum[ind] += _weights_space_interp[ind]
+        output_indices = getattr(_interp_func, 'output_indices', None)
+        if output_indices is None:
+            ind = ~np.isnan(_weights_space_interp)
+            weights_space_sum[ind] += _weights_space_interp[ind]
+        else:
+            _weights_space_interp = np.asarray(_weights_space_interp)
+            ind = ~np.isnan(_weights_space_interp)
+            weights_space_sum.ravel()[output_indices[ind]] += (
+                _weights_space_interp[ind])
 
         if list_tile_paths is not None:
             # Save per-tile and free memory immediately
             tile_path = list_tile_paths[itile]
             with open(f'{tile_path}/weights.pkl', 'wb') as f:
-                pickle.dump({'weights_space': _weights_space_interp,
-                             'interpolator': _interp_func}, f)
+                pickle.dump({
+                    'projection_format': 2,
+                    'weights_space': _weights_space_interp,
+                    'output_indices': output_indices,
+                    'interpolator': _interp_func,
+                }, f, protocol=pickle.HIGHEST_PROTOCOL)
             del _interp_func, _weights_space_interp
         else:
             interpolators.append(_interp_func)
@@ -850,13 +905,18 @@ def compute_weights_map(State, list_State, path_save_pickle=None,
             os.makedirs(path_save_pickle)
         with open(f'{path_save_pickle}/weights.pkl', 'wb') as f:
             pickle.dump({'weights_space_sum': weights_space_sum,
-                         'list_tile_paths': list_tile_paths}, f)
+                         'list_tile_paths': list_tile_paths,
+                         'projection_format': 2}, f)
 
     return weights_space, weights_space_sum, interpolators
 
 
 class _RegularInterpolator:
-    """Picklable regular grid interpolator."""
+    """Legacy picklable regular-grid interpolator.
+
+    Kept so preparation pickles created by older VarDyn revisions remain
+    readable.  New pickles use :class:`_CompactLinearInterpolator` below.
+    """
     def __init__(self, lat_1d, lon_1d, pts, ny_out, nx_out):
         self.lat_1d = lat_1d
         self.lon_1d = lon_1d
@@ -884,7 +944,7 @@ class _IrregularInterpolator:
 
 
 class _SplitInterpolator:
-    """Picklable interpolator for longitude-wrapping grids."""
+    """Legacy picklable interpolator for longitude-wrapping grids."""
     def __init__(self, ind_0, ind_1, tri_0, tri_1, pts_out, ny_out, nx_out):
         self.ind_0 = ind_0
         self.ind_1 = ind_1
@@ -902,6 +962,102 @@ class _SplitInterpolator:
         return np.where(np.isnan(r0), r1, r0)
 
 
+class _CompactLinearInterpolator:
+    """Apply precomputed linear coefficients only on a tile's support.
+
+    ``source_indices`` and ``coefficients`` have shape ``(n_output, n_vertex)``.
+    The returned one-dimensional array corresponds to ``output_indices`` in
+    the flattened target grid.  Storing this compact projection instead of all
+    global query points is the key memory and runtime property of the spatial
+    merge.
+    """
+
+    def __init__(self, output_indices, source_indices, coefficients):
+        self.output_indices = np.asarray(output_indices, dtype=np.int32)
+        self.source_indices = np.asarray(source_indices, dtype=np.int32)
+        # Geometry coefficients remain float64 so --output_float64 preserves
+        # the accuracy of SciPy's original interpolation path.
+        self.coefficients = np.asarray(coefficients, dtype=np.float64)
+
+    def __call__(self, var_2d):
+        values = np.asarray(var_2d).reshape(-1)
+        gathered = values[self.source_indices]
+        return np.einsum(
+            'ij,ij->i', gathered, self.coefficients, optimize=True)
+
+
+def _compact_delaunay_projection(triangulation, target_points,
+                                 source_indices=None):
+    """Precompute simplex vertices and barycentric coefficients."""
+    simplex = triangulation.find_simplex(target_points)
+    valid = simplex >= 0
+    output_indices = np.flatnonzero(valid)
+    simplex = simplex[valid]
+    selected_points = target_points[valid]
+
+    transforms = triangulation.transform[simplex, :2]
+    offsets = selected_points - triangulation.transform[simplex, 2]
+    first = np.einsum('ijk,ik->ij', transforms, offsets, optimize=True)
+    coefficients = np.column_stack(
+        [first, 1.0 - first.sum(axis=1)])
+    vertices = triangulation.simplices[simplex]
+    if source_indices is not None:
+        vertices = np.asarray(source_indices)[vertices]
+    return output_indices, vertices, coefficients
+
+
+def _compact_regular_projection(lat_1d, lon_1d, target_points):
+    """Precompute bilinear source indices and coefficients."""
+    lat_1d = np.asarray(lat_1d)
+    lon_1d = np.asarray(lon_1d)
+    ny, nx = len(lat_1d), len(lon_1d)
+    if ny < 2 or nx < 2:
+        raise ValueError('Regular interpolation requires at least a 2x2 grid')
+
+    # searchsorted requires ascending coordinates.  Map the resulting logical
+    # indexes back to the original flattened input grid when an axis descends.
+    lat_order = np.arange(ny)
+    lon_order = np.arange(nx)
+    if lat_1d[0] > lat_1d[-1]:
+        lat_1d = lat_1d[::-1]
+        lat_order = lat_order[::-1]
+    if lon_1d[0] > lon_1d[-1]:
+        lon_1d = lon_1d[::-1]
+        lon_order = lon_order[::-1]
+
+    target_lat = target_points[:, 0]
+    target_lon = target_points[:, 1]
+    valid = (
+        (target_lat >= lat_1d[0]) & (target_lat <= lat_1d[-1])
+        & (target_lon >= lon_1d[0]) & (target_lon <= lon_1d[-1]))
+    output_indices = np.flatnonzero(valid)
+    target_lat = target_lat[valid]
+    target_lon = target_lon[valid]
+
+    iy = np.searchsorted(lat_1d, target_lat, side='right') - 1
+    ix = np.searchsorted(lon_1d, target_lon, side='right') - 1
+    iy = np.clip(iy, 0, ny - 2)
+    ix = np.clip(ix, 0, nx - 2)
+    fy = (target_lat - lat_1d[iy]) / (lat_1d[iy + 1] - lat_1d[iy])
+    fx = (target_lon - lon_1d[ix]) / (lon_1d[ix + 1] - lon_1d[ix])
+
+    y0, y1 = lat_order[iy], lat_order[iy + 1]
+    x0, x1 = lon_order[ix], lon_order[ix + 1]
+    source = np.column_stack((
+        y0 * nx + x0,
+        y0 * nx + x1,
+        y1 * nx + x0,
+        y1 * nx + x1,
+    ))
+    coefficients = np.column_stack((
+        (1.0 - fy) * (1.0 - fx),
+        (1.0 - fy) * fx,
+        fy * (1.0 - fx),
+        fy * fx,
+    ))
+    return output_indices, source, coefficients
+
+
 def _build_interpolator(lon_in, lat_in, values, lon_out, lat_out, 
                         lon_unit_in, lon_unit_out, ny_out, nx_out, geo_grid):
     """Build a reusable interpolation operator from a subwindow grid to the target grid.
@@ -915,22 +1071,30 @@ def _build_interpolator(lon_in, lat_in, values, lon_out, lat_out,
                        and (lon_in.max() > 180 or lon_in.min() < -180))
 
     if not needs_lon_split:
+        target_points = np.column_stack(
+            [lat_out.ravel(), lon_out.ravel()])
         if geo_grid:
-            # Regular grid: use fast RegularGridInterpolator
             lon_1d = lon_in[0, :]
             lat_1d = lat_in[:, 0]
-            pts = np.column_stack([lat_out.ravel(), lon_out.ravel()])
-            interp_func = _RegularInterpolator(lat_1d, lon_1d, pts, ny_out, nx_out)
-            values_interp = interp_func(values)
+            output_indices, source_indices, coefficients = (
+                _compact_regular_projection(
+                    lat_1d, lon_1d, target_points))
         else:
-            # Irregular grid: precompute Delaunay triangulation once
             points = np.column_stack([lon_in.ravel(), lat_in.ravel()])
-            pts_out = np.column_stack([lon_out.ravel(), lat_out.ravel()])
             lndi = LinearNDInterpolator(points, values.ravel())
-            values_interp = lndi(pts_out).reshape(ny_out, nx_out)
-            interp_func = _IrregularInterpolator(lndi.tri, pts_out, ny_out, nx_out)
+            # Delaunay coordinates are (lon, lat), unlike the regular-grid
+            # helper above.
+            delaunay_targets = np.column_stack(
+                [lon_out.ravel(), lat_out.ravel()])
+            output_indices, source_indices, coefficients = (
+                _compact_delaunay_projection(
+                    lndi.tri, delaunay_targets))
+        interp_func = _CompactLinearInterpolator(
+            output_indices, source_indices, coefficients)
+        values_interp = interp_func(values)
     else:
-        # Longitude wrapping: split into two halves
+        # Longitude wrapping: retain the historical preference for the first
+        # half where both projections cover a target point.
         pts_out = np.column_stack([lon_out.ravel(), lat_out.ravel()])
         
         ind_0 = lon_in <= 180
@@ -944,12 +1108,21 @@ def _build_interpolator(lon_in, lat_in, values, lon_out, lat_out,
         lndi_0 = LinearNDInterpolator(points_0, values[ind_0].ravel())
         lndi_1 = LinearNDInterpolator(points_1, values[ind_1].ravel())
 
-        v0 = lndi_0(pts_out).reshape(ny_out, nx_out)
-        v1 = lndi_1(pts_out).reshape(ny_out, nx_out)
-        values_interp = np.where(np.isnan(v0), v1, v0)
-        values_interp = np.where(np.isnan(values_interp), np.nan, values_interp)
-
-        interp_func = _SplitInterpolator(ind_0, ind_1, lndi_0.tri, lndi_1.tri, pts_out, ny_out, nx_out)
+        src0 = np.flatnonzero(ind_0.ravel())
+        src1 = np.flatnonzero(ind_1.ravel())
+        out0, vertices0, coeff0 = _compact_delaunay_projection(
+            lndi_0.tri, pts_out, src0)
+        out1, vertices1, coeff1 = _compact_delaunay_projection(
+            lndi_1.tri, pts_out, src1)
+        keep1 = ~np.isin(out1, out0, assume_unique=True)
+        output_indices = np.concatenate((out0, out1[keep1]))
+        source_indices = np.concatenate((vertices0, vertices1[keep1]))
+        coefficients = np.concatenate((coeff0, coeff1[keep1]))
+        order = np.argsort(output_indices)
+        interp_func = _CompactLinearInterpolator(
+            output_indices[order], source_indices[order],
+            coefficients[order])
+        values_interp = interp_func(values)
 
     return interp_func, values_interp
 
@@ -1045,12 +1218,54 @@ def plot_subdomains(lonlat_grid):
 _TILE_WEIGHTS_CACHE = {}
 
 
+def _upgrade_legacy_tile_projection(data):
+    """Convert a legacy global-query projection to compact coefficients."""
+    if data.get('output_indices') is not None:
+        return data
+    interpolator = data.get('interpolator')
+    if interpolator is None:
+        return data
+
+    if isinstance(interpolator, _RegularInterpolator):
+        output, source, coefficients = _compact_regular_projection(
+            interpolator.lat_1d, interpolator.lon_1d, interpolator.pts)
+    elif isinstance(interpolator, _IrregularInterpolator):
+        output, source, coefficients = _compact_delaunay_projection(
+            interpolator.tri, interpolator.pts_out)
+    elif isinstance(interpolator, _SplitInterpolator):
+        src0 = np.flatnonzero(interpolator.ind_0.ravel())
+        src1 = np.flatnonzero(interpolator.ind_1.ravel())
+        out0, source0, coeff0 = _compact_delaunay_projection(
+            interpolator.tri_0, interpolator.pts_out, src0)
+        out1, source1, coeff1 = _compact_delaunay_projection(
+            interpolator.tri_1, interpolator.pts_out, src1)
+        keep1 = ~np.isin(out1, out0, assume_unique=True)
+        output = np.concatenate((out0, out1[keep1]))
+        source = np.concatenate((source0, source1[keep1]))
+        coefficients = np.concatenate((coeff0, coeff1[keep1]))
+        order = np.argsort(output)
+        output, source, coefficients = (
+            output[order], source[order], coefficients[order])
+    else:
+        return data
+
+    weights = np.asarray(data['weights_space']).reshape(-1)[output]
+    return {
+        'projection_format': 2,
+        'weights_space': np.asarray(weights),
+        'output_indices': np.asarray(output, dtype=np.int32),
+        'interpolator': _CompactLinearInterpolator(
+            output, source, coefficients),
+    }
+
+
 def _load_tile_weights(tile_path):
     cached = _TILE_WEIGHTS_CACHE.get(tile_path)
     if cached is not None:
         return cached
     with open(f'{tile_path}/weights.pkl', 'rb') as f:
         data = pickle.load(f)
+    data = _upgrade_legacy_tile_projection(data)
     _TILE_WEIGHTS_CACHE[tile_path] = data
     return data
 
@@ -1071,7 +1286,140 @@ def _fill_nans_nearest(arr):
     return arr[tuple(idx)]
 
 
-def merge_output_date(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=None, plot=False, save=True):
+def _discover_merge_variables(date, list_State, requested):
+    """Return only the explicitly requested output variables.
+
+    Diagnosed tile fields can have staggered or temporal dimensions that are
+    not part of the configured spatial product. Auto-discovering them made a
+    merge depend on whichever tile was inspected first.
+    """
+    return list(dict.fromkeys(requested))
+
+
+def _prepare_runtime_tiles(list_tile_paths, weights_space, interpolators,
+                           inv_wsum, weight_dtype=np.float64):
+    """Load tile projections once and normalize their blend weights once."""
+    runtime = []
+    if list_tile_paths is not None:
+        sources = (_load_tile_weights(path) for path in list_tile_paths)
+    else:
+        sources = (
+            {'weights_space': weight, 'interpolator': interpolator}
+            for weight, interpolator in zip(weights_space, interpolators))
+
+    for tile_data in sources:
+        interpolator = tile_data['interpolator']
+        output_indices = tile_data.get(
+            'output_indices', getattr(interpolator, 'output_indices', None))
+        weights = np.asarray(tile_data['weights_space'])
+        if output_indices is None:
+            blend_weight = np.asarray(
+                weights * inv_wsum, dtype=weight_dtype)
+        else:
+            output_indices = np.asarray(output_indices, dtype=np.int32)
+            blend_weight = np.asarray(
+                weights * inv_wsum.ravel()[output_indices],
+                dtype=weight_dtype)
+        runtime.append((output_indices, blend_weight, interpolator))
+    return runtime
+
+
+def _add_compact(array, output_indices, values):
+    """Add compact values into a target array without a global temporary."""
+    if output_indices is None:
+        array += values
+    else:
+        array.ravel()[output_indices] += values
+
+
+def _merge_date_arrays(date, State, list_State, name_var_save,
+                       runtime_tiles, no_coverage, accumulation_dtype):
+    """Merge one date in-process and return global arrays for persistence."""
+    ny, nx = State.ny, State.nx
+    result = {
+        name: np.zeros((ny, nx), dtype=accumulation_dtype)
+        for name in name_var_save}
+    # Missing coverage is exceptional.  Allocate its global arrays lazily so
+    # the normal path uses half the former accumulator memory.
+    missing = {name: None for name in name_var_save}
+
+    def mark_missing(name, output_indices, blend_weight, valid=None):
+        if missing[name] is None:
+            missing[name] = np.zeros(
+                (ny, nx), dtype=accumulation_dtype)
+        values = blend_weight if valid is None else blend_weight[valid]
+        indexes = output_indices
+        if valid is not None and output_indices is not None:
+            indexes = output_indices[valid]
+        if output_indices is None and valid is not None:
+            missing[name].ravel()[valid] += values
+        else:
+            _add_compact(missing[name], indexes, values)
+
+    for (_State, (output_indices, blend_weight, interpolator)) in zip(
+            list_State, runtime_tiles):
+        try:
+            dataset = _State.load_output(date)
+        except Exception as exc:
+            print(
+                f'[merge worker] tile failed for {date}: {exc}',
+                flush=True)
+            for name in name_var_save:
+                mark_missing(name, output_indices, blend_weight)
+            continue
+
+        try:
+            for name in name_var_save:
+                if name not in dataset.data_vars:
+                    mark_missing(name, output_indices, blend_weight)
+                    continue
+                try:
+                    values = dataset[name].values
+                    if values.shape == (_State.ny, _State.nx + 1):
+                        values = 0.5 * (values[:, :-1] + values[:, 1:])
+                    elif values.shape == (_State.ny + 1, _State.nx):
+                        values = 0.5 * (values[:-1, :] + values[1:, :])
+                    if np.isnan(values).any():
+                        values = _fill_nans_nearest(values)
+                    projected = (
+                        interpolator(values)
+                        if interpolator is not None else values)
+                    projected = np.asarray(projected).reshape(-1)
+                    flat_weight = np.asarray(blend_weight).reshape(-1)
+                    finite = np.isfinite(projected)
+                    contribution = np.asarray(
+                        flat_weight[finite] * projected[finite],
+                        dtype=accumulation_dtype)
+                    if output_indices is None:
+                        target = result[name].ravel()
+                        target[np.flatnonzero(finite)] += contribution
+                    else:
+                        _add_compact(
+                            result[name], output_indices[finite], contribution)
+                    if not np.all(finite):
+                        mark_missing(
+                            name, output_indices, blend_weight, ~finite)
+                except Exception as exc:
+                    print(
+                        f'[merge worker] variable {name} failed for '
+                        f'{date}: {exc}', flush=True)
+                    mark_missing(name, output_indices, blend_weight)
+        finally:
+            dataset.close()
+
+    for name, array in result.items():
+        array[no_coverage] = np.nan
+        if missing[name] is not None:
+            available = 1.0 - missing[name]
+            usable = (~no_coverage) & (available > 1e-6)
+            array[usable] /= available[usable]
+            array[~usable] = np.nan
+        if State.mask is not None and np.any(State.mask):
+            array[State.mask] = np.nan
+    return result
+
+
+def merge_output_date(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=None, plot=False, save=True, output_dtype=None):
 
     """Merge outputs from subprocesses for a given date.
     
@@ -1084,91 +1432,33 @@ def merge_output_date(date, State, list_State, name_var_save, kernel, weights_sp
     every date.
     """
 
-    # Shallow copy of State: avoids re-running State.__init__ (which calls
-    # os.makedirs on Lustre) and deep-copying grid/mask arrays. We give it a
-    # fresh `var` dict so setvar() does not mutate the caller's State.
+    name_var_save = _discover_merge_variables(date, list_State, name_var_save)
+    no_coverage = (weights_space_sum <= 0) | ~np.isfinite(weights_space_sum)
+    accumulation_dtype = (
+        np.dtype(output_dtype) if output_dtype is not None else np.float64)
+    inv_wsum = np.zeros_like(weights_space_sum, dtype=accumulation_dtype)
+    inv_wsum[~no_coverage] = 1.0 / weights_space_sum[~no_coverage]
+    runtime_tiles = _prepare_runtime_tiles(
+        list_tile_paths, weights_space, interpolators, inv_wsum,
+        weight_dtype=accumulation_dtype)
+    dict_var = _merge_date_arrays(
+        date, State, list_State, name_var_save, runtime_tiles,
+        no_coverage, accumulation_dtype)
+
     State0 = _copy.copy(State)
     State0.var = dict(State.var)
-    ny, nx = State0.ny, State0.nx
-
-    # Cells not covered by any tile (weights_space_sum == 0) must be flagged as
-    # NaN, otherwise 0/0 would produce NaN/garbage that propagates into the
-    # surrounding ocean via interpolation. Use a safe inverse for the division.
-    no_coverage = (weights_space_sum <= 0) | ~np.isfinite(weights_space_sum)
-    inv_wsum = np.zeros_like(weights_space_sum)
-    inv_wsum[~no_coverage] = 1.0 / weights_space_sum[~no_coverage]
-
-    dict_var = {name: np.zeros((ny, nx)) for name in name_var_save}
-        
-    for i, _State in enumerate(list_State):
-
-        # Load weights/interpolator: per-tile from disk (cached) or from in-memory lists
-        if list_tile_paths is not None:
-            tile_data = _load_tile_weights(list_tile_paths[i])
-            _weights_space = tile_data['weights_space']
-            _interp_func = tile_data['interpolator']
-        else:
-            _weights_space = weights_space[i]
-            _interp_func = interpolators[i]
-
-        try:
-            # Load output
-            _ds = _State.load_output(date)
-            lon = _ds.lon.values
-            lat = _ds.lat.values
-            if len(lon.shape) == 1:
-                lon, lat = np.meshgrid(lon, lat)
-
-            for name in name_var_save:
-
-                _var = _ds[name].values
-                
-                # Handle C-grid staggering: average U/V-grid variables to H-grid
-                if _var.shape == (_State.ny, _State.nx + 1):
-                    # U-grid → H-grid: average adjacent columns
-                    _var = 0.5 * (_var[:, :-1] + _var[:, 1:])
-                elif _var.shape == (_State.ny + 1, _State.nx):
-                    # V-grid → H-grid: average adjacent rows
-                    _var = 0.5 * (_var[:-1, :] + _var[1:, :])
-                
-                # Fill NaN gaps near coasts before interpolation (fast EDT-based nearest-neighbour fill)
-                if np.any(np.isnan(_var)):
-                    _var = _fill_nans_nearest(_var)
-                
-                # Interpolate using precomputed operator
-                if _interp_func is not None:
-                    _var_interp = _interp_func(_var)
-                else:
-                    # Single subwindow, no interpolation needed (grids match)
-                    _var_interp = _var
-
-                # Merge (safe division: 0 where no coverage)
-                ind = ~np.isnan(_var_interp)
-                dict_var[name][ind] += (_weights_space * _var_interp * inv_wsum)[ind]
-            
-            _ds.close()
-            del _ds
-        except Exception as e:
-            print(f'[merge_output_date] Warning: failed to merge subwindow for date {date}: {e}')
-            continue
-
-    for name in name_var_save:
-        # Cells not covered by any tile -> NaN (avoid propagating 0)
-        dict_var[name][no_coverage] = np.nan
-        # Mask
-        if State0.mask is not None and np.any(State0.mask):
-            dict_var[name][State0.mask] = np.nan
-            if plot:
-                plt.figure()
-                plt.pcolormesh(State0.lon, State0.lat, dict_var[name])
-                cbar = plt.colorbar()
-                cbar.ax.set_ylabel(name)
-                plt.title(date)
-                plt.show()
-        State0.setvar(dict_var[name], name)
+    for name, values in dict_var.items():
+        State0.setvar(values, name)
+        if plot:
+            plt.figure()
+            plt.pcolormesh(State0.lon, State0.lat, values)
+            cbar = plt.colorbar()
+            cbar.ax.set_ylabel(name)
+            plt.title(date)
+            plt.show()
     
     if save:
-        State0.save_output(date, name_var=name_var_save)
+        State0.save_output(date, name_var=name_var_save, dtype=output_dtype)
     
 def generate_dates(start_date, end_date, delta):
     """Generate a list of dates between start_date and end_date with a given timedelta."""
@@ -1179,33 +1469,182 @@ def generate_dates(start_date, end_date, delta):
         current_date += delta
     return dates
 
-def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=None, num_workers=4):
+
+def cleanup_tile_zarr_window(
+        config, checkpoint_date, states, zarr_time_chunk=4,
+        zarr_spatial_chunk=256, zarr_compression_level=3):
+    """Compact one temporal window's tile archives to a restart checkpoint."""
+    if not getattr(config.EXP, 'saveoutputs_zarr', False):
+        raise ValueError('Tile Zarr cleanup requires EXP.saveoutputs_zarr=True')
+
+    compacted = 0
+    already_compact = 0
+    missing = 0
+    checkpoint_time = pd.Timestamp(checkpoint_date)
+
+    for tile_state in states:
+        archive = os.path.join(
+            tile_state.path_save, f'{config.EXP.name_exp_save}.zarr')
+        if not os.path.exists(archive):
+            # All-land or skipped tiles legitimately have no trajectory.
+            missing += 1
+            continue
+
+        temporary = f'{archive}.checkpoint-{os.getpid()}'
+        backup = f'{archive}.trajectory-{os.getpid()}'
+        lock_filename = f'{temporary}.lock'
+        for stale in (temporary, backup):
+            if os.path.exists(stale):
+                shutil.rmtree(stale)
+
+        with xr.open_zarr(archive, consolidated=False) as dataset:
+            times = pd.DatetimeIndex(pd.to_datetime(dataset.time.values))
+            indexes = np.flatnonzero(times == checkpoint_time)
+            if indexes.size == 0:
+                raise RuntimeError(
+                    f'Tile restart checkpoint {checkpoint_time} is '
+                    f'missing from {archive}')
+            if dataset.sizes.get('time', 0) == 1:
+                already_compact += 1
+                continue
+            record = dataset.isel(
+                time=slice(int(indexes[-1]), int(indexes[-1]) + 1)
+            ).load()
+
+        try:
+            state.State._save_zarr_record(
+                record, temporary, checkpoint_time,
+                window_start=checkpoint_time,
+                window_end=checkpoint_time,
+                zarr_time_chunk=zarr_time_chunk,
+                zarr_spatial_chunk=zarr_spatial_chunk,
+                zarr_compression_level=zarr_compression_level)
+            with xr.open_zarr(temporary, consolidated=False) as checkpoint:
+                checkpoint_times = pd.DatetimeIndex(
+                    pd.to_datetime(checkpoint.time.values))
+                if (checkpoint.sizes.get('time', 0) != 1
+                        or checkpoint_times[0] != checkpoint_time):
+                    raise RuntimeError(
+                        f'Invalid compacted tile checkpoint: {temporary}')
+
+            os.replace(archive, backup)
+            try:
+                os.replace(temporary, archive)
+            except Exception:
+                if not os.path.exists(archive):
+                    os.replace(backup, archive)
+                raise
+            else:
+                shutil.rmtree(backup)
+                compacted += 1
+        finally:
+            if os.path.exists(temporary):
+                shutil.rmtree(temporary)
+            if os.path.exists(lock_filename):
+                os.remove(lock_filename)
+            if os.path.exists(backup) and os.path.exists(archive):
+                shutil.rmtree(backup)
+
+    print(
+        f'Tile Zarr cleanup at {checkpoint_time}: '
+        f'{compacted} compacted, {already_compact} already compact, '
+        f'{missing} absent/all-land',
+        flush=True)
+
+
+def cleanup_tile_zarr_trajectories(
+        config, list_date_start, list_date_middle, list_date_end,
+        list_State, zarr_time_chunk=4, zarr_spatial_chunk=256,
+        zarr_compression_level=3):
+    """Compact all temporal windows; retained for batch/backward use."""
+    if not (len(list_date_start) == len(list_date_middle)
+            == len(list_date_end) == len(list_State)):
+        raise ValueError('Time-window and State lists must have the same length')
+    for iw, states in enumerate(list_State):
+        checkpoint_date = (
+            list_date_start[iw + 1]
+            if iw + 1 < len(list_date_start)
+            else list_date_end[iw])
+        cleanup_tile_zarr_window(
+            config, checkpoint_date, states,
+            zarr_time_chunk=zarr_time_chunk,
+            zarr_spatial_chunk=zarr_spatial_chunk,
+            zarr_compression_level=zarr_compression_level)
+
+
+def _merge_dates_worker(worker_index, dates, State, list_State,
+                        name_var_save, tile_paths, weights_space,
+                        interpolators, weights_space_sum,
+                        output_dtype, result_q,
+                        direct_copy_single_tile=False):
+    """Own complete dates, including reduction and persistence."""
+    try:
+        no_coverage = (
+            (weights_space_sum <= 0) | ~np.isfinite(weights_space_sum))
+        accumulation_dtype = (
+            np.dtype(output_dtype) if output_dtype is not None else np.float64)
+        inv_wsum = np.zeros_like(
+            weights_space_sum, dtype=accumulation_dtype)
+        inv_wsum[~no_coverage] = 1.0 / weights_space_sum[~no_coverage]
+        runtime_tiles = _prepare_runtime_tiles(
+            tile_paths, weights_space, interpolators, inv_wsum,
+            weight_dtype=accumulation_dtype)
+        if direct_copy_single_tile:
+            runtime_tiles = [(
+                None,
+                np.ones((State.ny, State.nx), dtype=accumulation_dtype),
+                None,
+            )]
+        output_state = _copy.copy(State)
+        for date in dates:
+            merged = _merge_date_arrays(
+                date, State, list_State, name_var_save, runtime_tiles,
+                no_coverage, accumulation_dtype)
+            output_state.var = dict(State.var)
+            for name, values in merged.items():
+                output_state.setvar(values, name)
+            output_state.save_output(
+                date, name_var=name_var_save, dtype=output_dtype)
+            print(f'[parallel_merge] {date} done', flush=True)
+            result_q.put({
+                'kind': 'progress', 'worker': worker_index,
+                'date': str(date), 'error': None})
+        result_q.put({
+            'kind': 'result', 'worker': worker_index,
+            'count': len(dates), 'error': None})
+    except BaseException as exc:
+        result_q.put({
+            'kind': 'result', 'worker': worker_index,
+            'count': 0,
+            'error': f'{type(exc).__name__}: {exc}',
+        })
+
+
+def parallel_merge(dates, State, list_State, name_var_save, kernel,
+                   weights_space, weights_space_sum, interpolators,
+                   list_tile_paths=None, num_workers=4, output_dtype=None,
+                   worker_stall_timeout=900):
     """Merge outputs from subprocesses in parallel for a list of dates.
 
-    When ``list_tile_paths`` is provided, uses a tile-partitioned worker pool:
-    each worker is assigned a fixed subset of tiles, loads its weights/interpolator
-    pickles ONCE at startup, and contributes partial sums for every date. The main
-    process reduces and saves. This bounds worker memory to (n_tiles / num_workers)
-    tiles instead of having every worker cache every tile (which OOM-kills workers
-    silently and makes the pool hang).
+    With on-disk compact tile projections, workers own contiguous date shards.
+    Reduction and persistence stay in the worker, so global arrays never cross
+    multiprocessing queues.
     """
+
+    if not dates:
+        return
+    name_var_save = _discover_merge_variables(
+        dates[0], list_State, name_var_save)
 
     if num_workers <= 1:
         for date in dates:
-            merge_output_date(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=list_tile_paths)
+            merge_output_date(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=list_tile_paths, output_dtype=output_dtype)
         return
 
-    # Fall back to old per-date pool when tiles are kept in memory (no pickle path).
-    if list_tile_paths is None:
-        with mp.Pool(processes=num_workers) as pool:
-            pool.starmap(
-                merge_output_date,
-                [(date, State, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, None) for date in dates]
-            )
-        return
-
-    # Tile-partitioned design (avoids per-worker cache blow-up).
-    n_tiles = len(list_tile_paths)
+    # Workers own contiguous date shards.  In particular, do not use a forked
+    # multiprocessing.Pool after JAX has run: forking a multithreaded JAX/XLA
+    # process can deadlock before the first merged record is written.
+    n_tiles = len(list_tile_paths) if list_tile_paths is not None else len(list_State)
     direct_copy_single_tile = (
         n_tiles == 1
         and len(list_State) == 1
@@ -1215,152 +1654,127 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel, weights_spac
         and np.allclose(list_State[0].lat, State.lat, equal_nan=True)
     )
     if direct_copy_single_tile:
-        weights_space_sum = np.ones((State.ny, State.nx))
-    nw = min(num_workers, n_tiles)
-
-    # Round-robin partition so workers get roughly equal load.
-    parts_paths = [[] for _ in range(nw)]
-    parts_states = [[] for _ in range(nw)]
-    for i, (p, s) in enumerate(zip(list_tile_paths, list_State)):
-        parts_paths[i % nw].append(p)
-        parts_states[i % nw].append(s)
+        weights_space_sum = np.ones(
+            (State.ny, State.nx), dtype=np.float32)
+    nw = min(num_workers, len(dates))
+    date_parts = [
+        list(part)
+        for part in np.array_split(np.asarray(dates, dtype=object), nw)
+        if len(part)
+    ]
 
     ctx = mp.get_context('spawn')
-    task_qs = [ctx.Queue() for _ in range(nw)]
-    result_qs = [ctx.Queue() for _ in range(nw)]
+    result_q = ctx.Queue()
     procs = []
-    for k in range(nw):
+    for worker_index, worker_dates in enumerate(date_parts):
         p = ctx.Process(
-            target=_merge_worker_loop,
-            args=(parts_paths[k], parts_states[k], name_var_save,
-                  State.ny, State.nx, weights_space_sum,
-                  task_qs[k], result_qs[k], direct_copy_single_tile),
+            target=_merge_dates_worker,
+            args=(worker_index, worker_dates, State, list_State,
+                  name_var_save, list_tile_paths, weights_space,
+                  interpolators, weights_space_sum,
+                  output_dtype, result_q, direct_copy_single_tile),
             daemon=False,
         )
         p.start()
         procs.append(p)
 
-    # Cells uncovered by any tile -> NaN in the merged output
-    no_coverage = (weights_space_sum <= 0) | ~np.isfinite(weights_space_sum)
-
     try:
-        for date in dates:
-            for q in task_qs:
-                q.put(date)
-            dict_var = {n: np.zeros((State.ny, State.nx)) for n in name_var_save}
-            # Accumulate the fractional weight from failed tiles (0‥1 per cell),
-            # tracked per variable so one missing diagnostic does not poison all fields.
-            total_missing_weight = {n: np.zeros((State.ny, State.nx)) for n in name_var_save}
-            for k, q in enumerate(result_qs):
-                result = q.get()
-                if result is None:
-                    raise RuntimeError(f'merge worker {k} died on date {date}')
-                for n in name_var_save:
-                    dict_var[n] += result['contrib'][n]
-                    total_missing_weight[n] += result['missing_weight'][n]
-
+        results = []
+        last_progress = time.monotonic()
+        while len(results) < len(procs):
             try:
-                State0 = _copy.copy(State)
-                State0.var = dict(State.var)
-                for n in name_var_save:
-                    dict_var[n][no_coverage] = np.nan
-                    dict_var[n][total_missing_weight[n] >= 1.0 - 1e-12] = np.nan
-                    if State0.mask is not None and np.any(State0.mask):
-                        dict_var[n][State0.mask] = np.nan
-                    State0.setvar(dict_var[n], n)
-                State0.save_output(date, name_var=name_var_save)
-                print(f'[parallel_merge] {date} done', flush=True)
-            except Exception as e:
-                print(f'[parallel_merge] WARNING: failed to save output for {date}: {e}', flush=True)
+                item = result_q.get(timeout=5)
+            except queue.Empty:
+                failed = [p for p in procs
+                          if not p.is_alive() and p.exitcode not in (0, None)]
+                if failed:
+                    raise RuntimeError(
+                        'merge worker exited without reporting a result: '
+                        + ', '.join(
+                            f'pid={p.pid}, exitcode={p.exitcode}' for p in failed))
+                if time.monotonic() - last_progress > worker_stall_timeout:
+                    raise TimeoutError(
+                        f'no merge-worker progress for {worker_stall_timeout} s')
+                continue
+            last_progress = time.monotonic()
+            if item.get('kind') == 'result':
+                results.append(item)
+        failures = [item for item in results if item['error'] is not None]
+        if failures:
+            first = failures[0]
+            raise RuntimeError(
+                f"merge worker {first['worker']} failed: {first['error']}")
     finally:
-        for q in task_qs:
-            try:
-                q.put(None)
-            except Exception:
-                pass
         for p in procs:
             p.join(timeout=30)
             if p.is_alive():
                 p.terminate()
+                p.join(timeout=30)
 
 
-def _merge_worker_loop(tile_paths, states, name_var_save, ny, nx,
-                       weights_space_sum, task_q, result_q,
-                       direct_copy_single_tile=False):
-    """Worker: load assigned tiles once, then process dates sent via task_q."""
+def _add_diagnosed_output_names(config, name_var_save):
+    """Keep QG1L diagnosed fields when merging tiled output files."""
+    configured_models = config.MOD.values() if isinstance(config.MOD, dict) \
+        and 'super' not in config.MOD else [config.MOD]
+    names = list(name_var_save)
+    for model_config in configured_models:
+        if (getattr(model_config, 'super', None) == 'MOD_QG1L'
+                and getattr(model_config, 'save_diagnosed_variables', False)):
+            for name in ('ug', 'vg'):
+                if name not in names:
+                    names.append(name)
+    return names
+
+
+def _run_assimilation_worker(worker, gpu_id):
+    """Run one tile and exit without a potentially blocking Python teardown."""
+    exitcode = 0
     try:
-        tiles = [_load_tile_weights(p) for p in tile_paths]
-    except Exception as e:
-        print(f'[merge worker] failed to load tiles: {e}', flush=True)
+        worker(gpu_device=gpu_id)
+    except BaseException:
+        traceback.print_exc()
+        exitcode = 1
+    finally:
         try:
-            result_q.put(None)
-        except Exception:
-            pass
-        return
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            # JAX/XLA teardown has occasionally blocked after the final Zarr
+            # record.  All useful state is persisted before the worker returns.
+            os._exit(exitcode)
 
-    # Safe inverse of weights_space_sum: 0 where there is no coverage,
-    # so the partial reductions don't produce NaN/inf. The main process
-    # marks no_coverage cells as NaN after summing.
-    no_coverage = (weights_space_sum <= 0) | ~np.isfinite(weights_space_sum)
-    inv_wsum = np.zeros_like(weights_space_sum)
-    inv_wsum[~no_coverage] = 1.0 / weights_space_sum[~no_coverage]
 
-    while True:
-        try:
-            date = task_q.get()
-        except Exception:
-            return
-        if date is None:
-            return
+def _zarr_time_size(archive):
+    """Read a Zarr v2 time length without opening every chunk in the store."""
+    metadata = os.path.join(archive, 'time', '.zarray')
+    if not os.path.isfile(metadata):
+        return None
+    with open(metadata, encoding='utf-8') as stream:
+        shape = json.load(stream).get('shape', [])
+    return int(shape[0]) if shape else None
 
-        contrib = {n: np.zeros((ny, nx)) for n in name_var_save}
-        # Weight fraction lost to failed tiles for this date, per variable.
-        missing_weight = {n: np.zeros((ny, nx)) for n in name_var_save}
-        for tile_data, _State in zip(tiles, states):
-            if direct_copy_single_tile:
-                _weights_space = np.ones((ny, nx))
-                _interp_func = None
-            else:
-                _weights_space = tile_data['weights_space']
-                _interp_func = tile_data['interpolator']
-            try:
-                _ds = _State.load_output(date)
-            except Exception as e:
-                print(f'[merge worker] tile failed for {date}: {e}', flush=True)
-                # Accumulate the fractional weight this tile would have contributed
-                # so the main process can mark those cells NaN instead of 0.
-                for n in name_var_save:
-                    missing_weight[n] += _weights_space * inv_wsum
-                continue
 
-            try:
-                for name in name_var_save:
-                    try:
-                        _var = _ds[name].values
-                        if _var.shape == (_State.ny, _State.nx + 1):
-                            _var = 0.5 * (_var[:, :-1] + _var[:, 1:])
-                        elif _var.shape == (_State.ny + 1, _State.nx):
-                            _var = 0.5 * (_var[:-1, :] + _var[1:, :])
-                        if np.any(np.isnan(_var)):
-                            _var = _fill_nans_nearest(_var)
-                        if _interp_func is not None:
-                            _var_interp = _interp_func(_var)
-                        else:
-                            _var_interp = _var
-                        ind = ~np.isnan(_var_interp)
-                        contrib[name][ind] += (_weights_space * _var_interp * inv_wsum)[ind]
-                    except Exception as e:
-                        print(f'[merge worker] variable {name} failed for {date}: {e}', flush=True)
-                        missing_weight[name] += _weights_space * inv_wsum
-                        continue
-            finally:
-                _ds.close()
-                del _ds
+def _tile_trajectories_complete(list_State, expected_count):
+    """Whether every non-land tile still contains a complete trajectory."""
+    incomplete = []
+    for tile_state in list_State:
+        if (tile_state.mask is not None
+                and np.asarray(tile_state.mask).all()):
+            continue
+        save_zarr = bool(getattr(
+            tile_state.config.EXP, 'saveoutputs_zarr', False))
+        if save_zarr:
+            source = os.path.join(
+                tile_state.path_save, f'{tile_state.name_exp_save}.zarr')
+            count = _zarr_time_size(source)
+        else:
+            source = os.path.join(
+                tile_state.path_save, f'{tile_state.name_exp_save}_*.nc')
+            count = len(glob.glob(source))
+        if count != expected_count:
+            incomplete.append((source, count))
+    return not incomplete, incomplete
 
-        try:
-            result_q.put({'contrib': contrib, 'missing_weight': missing_weight})
-        except Exception:
-            return
 
 def run_assimilation_time_window(config, date_start, date_middle, date_end, list_State, processes, 
                                  weights_space=None, weights_space_sum=None, interpolators=None,
@@ -1368,7 +1782,12 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
                                  flag_assim=True, flag_merge_outputs=True, flag_diag=True, flag_overwrite_outputs=True,
                                  nprocs=4, nprocs_output=None,
                                  path_pickle=None,
-                                 gpu_devices=None):
+                                 gpu_devices=None,
+                                 zarr_time_chunk=4,
+                                 zarr_spatial_chunk=256,
+                                 zarr_compression_level=3,
+                                 cleanup_tile_zarr=False,
+                                 tile_checkpoint_date=None):
     
     """
     Run assimilation in a given time window using subprocesses.
@@ -1379,6 +1798,7 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
     they are loaded from '{path_pickle}/weights.pkl'.
     """
 
+    name_var_save = _add_diagnosed_output_names(config, name_var_save)
     list_tile_paths = None
 
     # Load weights and interpolators from pickle if not provided
@@ -1393,10 +1813,8 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
     # Run subprocesses
     ############################
     if flag_assim:
-        print('Run subprocesses')
+        print(f'Run subprocesses ({len(processes)} pending tiles)', flush=True)
         try:
-            old_stdout = sys.stdout # backup current stdout
-            sys.stdout = open(os.devnull, "w") # prevent printoing outputs
             _gpu_devices = gpu_devices if gpu_devices is not None else ['0']
             gpu_load = {g: 0 for g in _gpu_devices}
             active_processes = set()  # set of (process, gpu_id)
@@ -1404,7 +1822,9 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
             for worker in processes[:nprocs]:  # Start initial nprocs processes
                 gpu_id = str(min(gpu_load, key=gpu_load.get))
                 os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
-                p = mp.get_context("spawn").Process(target=worker, kwargs={'gpu_device': gpu_id})
+                p = mp.get_context("spawn").Process(
+                    target=_run_assimilation_worker,
+                    args=(worker, gpu_id))
                 p.start()
                 active_processes.add((p, gpu_id))
                 gpu_load[gpu_id] += 1
@@ -1416,11 +1836,19 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
                             p.join()
                             active_processes.discard((p, g))
                             gpu_load[g] -= 1
+                            if p.exitcode != 0:
+                                raise RuntimeError(
+                                    f'assimilation worker pid={p.pid} failed '
+                                    f'with exit code {p.exitcode}')
                             break
+                    else:
+                        time.sleep(1)
 
                 gpu_id = str(min(gpu_load, key=gpu_load.get))
                 os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
-                p = mp.get_context("spawn").Process(target=worker, kwargs={'gpu_device': gpu_id})
+                p = mp.get_context("spawn").Process(
+                    target=_run_assimilation_worker,
+                    args=(worker, gpu_id))
                 p.start()
                 active_processes.add((p, gpu_id))
                 gpu_load[gpu_id] += 1
@@ -1428,10 +1856,14 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
             # Wait for remaining processes to finish
             for p, g in list(active_processes):
                 p.join()
-            sys.stdout = old_stdout
-        except:
-            sys.stdout = old_stdout
-            print('Unable to run subprocesses')
+                if p.exitcode != 0:
+                    raise RuntimeError(
+                        f'assimilation worker pid={p.pid} failed '
+                        f'with exit code {p.exitcode}')
+        except Exception:
+            print('Unable to run subprocesses', flush=True)
+            traceback.print_exc()
+            raise
 
     
     ############################
@@ -1441,6 +1873,9 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
     config0.EXP = config0.EXP.copy()
     config0.EXP.init_date = date_start
     config0.EXP.final_date = date_end
+    config0.EXP.zarr_time_chunk = zarr_time_chunk
+    config0.EXP.zarr_spatial_chunk = zarr_spatial_chunk
+    config0.EXP.zarr_compression_level = zarr_compression_level
     config0.EXP.tmp_DA_path += f'/subwindow_{str(date_middle)[:10]}'
     config0.EXP.path_save += f'/subwindow_{str(date_middle)[:10]}'
     if flag_diag and config.DIAG is not None:
@@ -1461,21 +1896,64 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
     ############################
     # Merge outputs
     ############################
-    if flag_merge_outputs and ((flag_overwrite_outputs) or (len(glob.glob(f'{config0.EXP.path_save}/*.nc'))==0) or (flag_assim and len(processes)>0)): 
+    merge_succeeded = False
+    list_dates = generate_dates(
+        date_start, date_end, config.EXP.saveoutput_time_step)
+    merged_zarr = os.path.join(
+        config0.EXP.path_save, f'{config0.EXP.name_exp_save}.zarr')
+    merged_exists = (
+        os.path.isdir(merged_zarr)
+        if getattr(config0.EXP, 'saveoutputs_zarr', False)
+        else bool(glob.glob(f'{config0.EXP.path_save}/*.nc')))
+    sources_complete, incomplete_sources = _tile_trajectories_complete(
+        list_State, len(list_dates))
+    skip_protected_merge = (
+        flag_merge_outputs and merged_exists and not processes
+        and not sources_complete)
+    if skip_protected_merge:
+        print(
+            'Skip merge: the existing temporal-window product is preserved '
+            'because its tile trajectories have already been compacted. ',
+            f'Incomplete sources: {len(incomplete_sources)}',
+            flush=True)
+
+    should_merge = (
+        flag_merge_outputs and not skip_protected_merge
+        and (flag_overwrite_outputs or not merged_exists
+             or (flag_assim and len(processes) > 0)))
+    if should_merge:
+        if not sources_complete:
+            details = ', '.join(
+                f'{path} (time={count})'
+                for path, count in incomplete_sources[:3])
+            raise RuntimeError(
+                'Cannot rebuild the merged temporal-window output: tile '
+                f'trajectories are incomplete. Examples: {details}')
         try:
-            print('Merge outputs')
+            print('Merge outputs', flush=True)
             kernel = Gaussian2DKernel(x_stddev=1, y_stddev=1)  # Kernel to convolve output maps to replace NaN pixels close to the coast for interpolation
-            list_dates = generate_dates(date_start, date_end, config.EXP.saveoutput_time_step)
             num_workers = nprocs_output if nprocs_output is not None else nprocs
             parallel_merge(list_dates, State0, list_State, name_var_save, kernel, weights_space, weights_space_sum, interpolators, list_tile_paths=list_tile_paths, num_workers=num_workers)
+            merge_succeeded = True
 
-        except:
-            print('Unable to merge outputs')
+        except Exception as exc:
+            print(f'Unable to merge outputs: {exc}')
+
+    if cleanup_tile_zarr and merge_succeeded:
+        if tile_checkpoint_date is None:
+            raise ValueError(
+                'tile_checkpoint_date is required when '
+                'cleanup_tile_zarr=True')
+        cleanup_tile_zarr_window(
+            config, tile_checkpoint_date, list_State,
+            zarr_time_chunk=zarr_time_chunk,
+            zarr_spatial_chunk=zarr_spatial_chunk,
+            zarr_compression_level=zarr_compression_level)
     
     ############################
     # Diagnostics
     ############################
-    if flag_diag:
+    if flag_diag and (merge_succeeded or not flag_merge_outputs):
         try:
             print('Run Diagnostics')
             Diag = diag.Diag(config0,State0)
@@ -1484,12 +1962,21 @@ def run_assimilation_time_window(config, date_start, date_middle, date_end, list
             Diag.psd_based_scores(plot=True)
             Diag.movie(framerate=12)
             Diag.Leaderboard()
-        except:
-            print('Unable to compute diags')
+        except Exception as exc:
+            # Keep the multi-window driver running, but expose the concrete
+            # diagnostic failure instead of hiding it behind a bare message.
+            print(f'Unable to compute diags: {type(exc).__name__}: {exc}')
+            import traceback
+            traceback.print_exc()
         
         del State0, config0
 
-def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_date_end, time_overlap):
+    return merge_succeeded
+
+def merge_time_windows_outputs(
+        config, list_date_start, list_date_middle, list_date_end, time_overlap,
+        zarr_output=False, output_dtype=np.float32, zarr_time_chunk=4,
+        zarr_spatial_chunk=256, zarr_compression_level=3):
     
     """
     Merge outputs from different time windows.
@@ -1514,23 +2001,35 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
 
     n_windows = len(list_date_start)
 
+    def _filename(prefix, date):
+        return (f"{prefix}_y{date.year}m{date.month:02d}d{date.day:02d}"
+                f"h{date.hour:02d}m{date.minute:02d}.nc")
+
     def _build_path(subwindow_middle, date):
-        return (f'{config.EXP.path_save}/subwindow_{str(subwindow_middle)[:10]}/'
-                f'{config.EXP.name_experiment}'
-                f'_y{date.year}'
-                f'm{str(date.month).zfill(2)}'
-                f'd{str(date.day).zfill(2)}'
-                f'h{str(date.hour).zfill(2)}'
-                f'm{str(date.minute).zfill(2)}.nc')
-    
+        root = f"{config.EXP.path_save}/subwindow_{str(subwindow_middle)[:10]}"
+        if zarr_output:
+            return f"{root}/{config.EXP.name_exp_save}.zarr"
+        return f"{root}/{_filename(config.EXP.name_exp_save, date)}"
+
     def _build_output_path(date):
-        return (f'{config.EXP.path_save}/'
-                f'{config.EXP.name_experiment}'
-                f'_y{date.year}'
-                f'm{str(date.month).zfill(2)}'
-                f'd{str(date.day).zfill(2)}'
-                f'h{str(date.hour).zfill(2)}'
-                f'm{str(date.minute).zfill(2)}.nc')
+        if zarr_output:
+            return f"{config.EXP.path_save}/{config.EXP.name_exp_save}.zarr"
+        return f"{config.EXP.path_save}/{_filename(config.EXP.name_exp_save, date)}"
+
+    def _load_date(path, date):
+        if zarr_output:
+            context = xr.open_zarr(path, consolidated=False)
+        else:
+            context = xr.open_dataset(path)
+        with context as dataset:
+            selected = dataset
+            if zarr_output:
+                selected = dataset.sel(time=pd.Timestamp(date))
+                if 'time' in selected.dims:
+                    # Defensive fallback for a legacy archive containing the
+                    # same timestamp more than once.
+                    selected = selected.isel(time=-1)
+            return selected.load()
 
     # Collect all unique dates across all windows
     all_dates = set()
@@ -1541,6 +2040,148 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
             date += config.EXP.saveoutput_time_step
     all_dates = sorted(all_dates)
 
+    if zarr_output:
+        # Open every Analysis Window once.  Keep the merge block-based rather
+        # than selecting one timestamp at a time: a long experiment otherwise
+        # builds a Dask graph with one independent Zarr read per timestamp.
+        # Besides its scheduler overhead, that prevents neighbouring output
+        # times from sharing their source time chunks (normally four records).
+        # Each block below has one active-window combination, so non-overlap
+        # regions are copied as contiguous slices and overlap regions are
+        # blended vectorially.
+        window_datasets = []
+        combined = None
+        temporary_path = None
+        backup_path = None
+        try:
+            for middle in list_date_middle:
+                window_datasets.append(xr.open_zarr(
+                    _build_path(middle, all_dates[0]),
+                    consolidated=False))
+
+            blocks = []
+            block_dates = []
+            block_active = None
+            for date in all_dates:
+                active = tuple(
+                    i for i in range(n_windows)
+                    if list_date_start[i] <= date <= list_date_end[i])
+                if not active:
+                    continue
+                if block_active is not None and active != block_active:
+                    blocks.append((block_active, block_dates))
+                    block_dates = []
+                block_active = active
+                block_dates.append(pd.Timestamp(date))
+            if block_active is not None:
+                blocks.append((block_active, block_dates))
+
+            if not blocks:
+                return
+
+            records = []
+            for active, dates in blocks:
+                # ``slice`` preserves the source time-chunk layout.  Every
+                # block spans consecutive output timestamps by construction.
+                time_slice = slice(dates[0], dates[-1])
+                ds1 = window_datasets[active[0]].sel(time=time_slice)
+                dsout = ds1.copy()
+
+                if len(active) >= 2:
+                    i, j = active[0], active[1]
+                    ds2 = window_datasets[j].sel(time=time_slice)
+                    overlap_start = list_date_start[j]
+                    overlap_end = list_date_end[i]
+                    duration = (
+                        overlap_end - overlap_start).total_seconds()
+                    if duration > 0:
+                        alpha = np.asarray([
+                            (date - overlap_start).total_seconds() / duration
+                            for date in dates
+                        ])
+                        alpha = np.clip(alpha, 0.0, 1.0)
+                        weight2 = xr.DataArray(
+                            0.5 * (1.0 - np.cos(np.pi * alpha)),
+                            dims=('time',), coords={'time': dates})
+                        weight1 = 1.0 - weight2
+                    else:
+                        weight1, weight2 = 0.5, 0.5
+                    # Preserve the union: equatorial and non-equatorial
+                    # windows can expose different diagnostic variables.
+                    for name in ds2.data_vars:
+                        if name not in dsout.data_vars:
+                            dsout[name] = ds2[name]
+                    for name in dsout.data_vars:
+                        if name in ds1.data_vars and name in ds2.data_vars:
+                            dsout[name] = (
+                                weight1 * ds1[name] + weight2 * ds2[name])
+                records.append(dsout)
+
+            print(
+                f'Building final Zarr archive from {len(records)} contiguous '
+                f'time blocks ({len(all_dates)} timestamps)',
+                flush=True)
+            combined = xr.concat(
+                records,
+                dim='time',
+                data_vars='all',
+                coords='minimal',
+                compat='override',
+                join='outer',
+            ).sortby('time')
+            for name in combined.data_vars:
+                if np.issubdtype(combined[name].dtype, np.floating):
+                    combined[name] = combined[name].astype(output_dtype)
+
+            output_path = _build_output_path(all_dates[0])
+            temporary_path = f'{output_path}.tmp-{os.getpid()}'
+            backup_path = f'{output_path}.backup-{os.getpid()}'
+            if os.path.exists(temporary_path):
+                shutil.rmtree(temporary_path)
+            if os.path.exists(backup_path):
+                shutil.rmtree(backup_path)
+            state._set_zarr_time_encoding(combined)
+            state._write_new_zarr(
+                combined, temporary_path,
+                zarr_time_chunk=zarr_time_chunk,
+                zarr_spatial_chunk=zarr_spatial_chunk,
+                zarr_compression_level=zarr_compression_level)
+
+            with xr.open_zarr(
+                    temporary_path, consolidated=False) as candidate:
+                candidate_times = pd.DatetimeIndex(
+                    pd.to_datetime(candidate.time.values))
+                expected_times = pd.DatetimeIndex(pd.to_datetime(all_dates))
+                if (candidate_times.has_duplicates
+                        or not candidate_times.equals(expected_times)):
+                    raise RuntimeError(
+                        'Batched time-window archive has invalid timestamps')
+                _ = candidate.sizes
+
+            had_output = os.path.exists(output_path)
+            if had_output:
+                os.replace(output_path, backup_path)
+            try:
+                os.replace(temporary_path, output_path)
+            except Exception:
+                if had_output and not os.path.exists(output_path):
+                    os.replace(backup_path, output_path)
+                raise
+            else:
+                if os.path.exists(backup_path):
+                    shutil.rmtree(backup_path)
+            return
+        finally:
+            if combined is not None:
+                combined.close()
+            for dataset in window_datasets:
+                dataset.close()
+            if temporary_path and os.path.exists(temporary_path):
+                shutil.rmtree(temporary_path)
+            if (backup_path and os.path.exists(backup_path)
+                    and os.path.exists(_build_output_path(all_dates[0]))):
+                shutil.rmtree(backup_path)
+
     for date in all_dates:
         try:
             # Find which windows contain this date
@@ -1550,7 +2191,7 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
             if len(active) == 1:
                 # No overlap: use the single window directly
                 i = active[0]
-                dsout = xr.open_dataset(_build_path(list_date_middle[i], date)).load()
+                dsout = _load_date(_build_path(list_date_middle[i], date), date)
 
             elif len(active) >= 2:
                 # Overlap region: blend the two closest consecutive windows
@@ -1559,8 +2200,10 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
                 overlap_end = list_date_end[i]
                 overlap_duration = (overlap_end - overlap_start).total_seconds()
 
-                ds1 = xr.open_dataset(_build_path(list_date_middle[i], date)).load()
-                ds2 = xr.open_dataset(_build_path(list_date_middle[j], date)).load()
+                ds1 = _load_date(
+                    _build_path(list_date_middle[i], date), date)
+                ds2 = _load_date(
+                    _build_path(list_date_middle[j], date), date)
 
                 if overlap_duration > 0:
                     # alpha goes from 0 (at overlap_start) to 1 (at overlap_end)
@@ -1573,31 +2216,53 @@ def merge_time_windows_outputs(config, list_date_start, list_date_middle, list_d
                     W1, W2 = 0.5, 0.5
 
                 dsout = ds1.copy()
-                for var in ds1.data_vars:
-                    if var in ds2.data_vars:
+                # Preserve the union: equatorial and non-equatorial windows
+                # can expose different diagnostic variables.
+                for var in ds2.data_vars:
+                    if var not in dsout.data_vars:
+                        dsout[var] = ds2[var]
+                for var in dsout.data_vars:
+                    if var in ds1.data_vars and var in ds2.data_vars:
                         dsout[var] = W1 * ds1[var] + W2 * ds2[var]
-                    else:
-                        dsout[var] = ds1[var]
                 ds1.close()
                 ds2.close()
             else:
                 continue
 
             output_path = _build_output_path(date)
-            # Write beside the destination and publish atomically. A direct
-            # to_netcdf(output_path) can leave a truncated HDF5 file when a
-            # merge job is interrupted or a reader opens it mid-write.
-            temporary_path = f'{output_path}.tmp-{os.getpid()}'
-            try:
-                dsout.to_netcdf(temporary_path, mode='w')
-                dsout.close()
-                os.replace(temporary_path, output_path)
-            except Exception:
+            for name in dsout.data_vars:
+                if np.issubdtype(dsout[name].dtype, np.floating):
+                    dsout[name] = dsout[name].astype(output_dtype)
+
+            if zarr_output:
+                if 'time' in dsout.coords and 'time' not in dsout.dims:
+                    dsout = dsout.drop_vars('time')
+                if 'time' not in dsout.dims:
+                    dsout = dsout.expand_dims(time=[pd.Timestamp(date)])
+                else:
+                    dsout = dsout.assign_coords(time=[pd.Timestamp(date)])
+                state.State._save_zarr_record(
+                    dsout, output_path, date,
+                    window_start=min(list_date_start),
+                    window_end=max(list_date_end),
+                    zarr_time_chunk=zarr_time_chunk,
+                    zarr_spatial_chunk=zarr_spatial_chunk,
+                    zarr_compression_level=zarr_compression_level)
+            else:
+                # Write beside the destination and publish atomically. A
+                # direct write can leave a truncated HDF5 file when a merge
+                # job is interrupted or a reader opens it mid-write.
+                temporary_path = f'{output_path}.tmp-{os.getpid()}'
                 try:
+                    dsout.to_netcdf(temporary_path, mode='w')
                     dsout.close()
-                finally:
-                    if os.path.exists(temporary_path):
-                        os.remove(temporary_path)
-                raise
+                    os.replace(temporary_path, output_path)
+                except Exception:
+                    try:
+                        dsout.close()
+                    finally:
+                        if os.path.exists(temporary_path):
+                            os.remove(temporary_path)
+                    raise
         except Exception as e:
             print(f'[merge_time_windows_outputs] WARNING: failed for {date}: {e}', flush=True)

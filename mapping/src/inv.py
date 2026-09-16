@@ -556,6 +556,9 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     # Initial Control vector 
     if config.INV.path_init_4Dvar is None:
         Xopt = np.zeros((Xb.size,))
+    elif not os.path.exists(config.INV.path_init_4Dvar):
+        print(f"File {config.INV.path_init_4Dvar} does not exist. We take the default initialization.")
+        Xopt = np.zeros((Xb.size,))
     else:
         # Read previous minimum 
         print('Read previous minimum:',config.INV.path_init_4Dvar)
@@ -637,9 +640,40 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         patience = getattr(config.INV, 'convergence_nit', None)
         if patience is None:
             patience = 1
+        # Evaluate the initial control explicitly before entering the
+        # optimizer, so NaNs are visible before line-search iterations.
+        Xopt_jax = jnp.asarray(Xopt, dtype=var.cost_dtype)
+        J_initial, G_initial = var.cost_and_grad(Xopt_jax)
+        J_initial, G_initial = jax.device_get((J_initial, G_initial))
+        G_initial_np = np.asarray(G_initial)
+        finite_gradient = np.isfinite(G_initial_np)
+        gradient_norm = float(np.linalg.norm(G_initial_np[finite_gradient])) if np.any(finite_gradient) else np.nan
+        print(
+            'Initial 4DVar evaluation: '
+            f'J={float(np.asarray(J_initial)):.6E}, '
+            f'||G||={gradient_norm:.6E}, '
+            f'finite_grad={int(finite_gradient.sum())}/{G_initial_np.size}, '
+            f'nan_grad={int(np.isnan(G_initial_np).sum())}, '
+            f'inf_grad={int(np.isinf(G_initial_np).sum())}'
+        )
+        # The six parameter bases in the multilayer configuration are stored
+        # consecutively. Report each block separately to identify whether the
+        # invalid derivative comes from a depth or drag control.
+        block_names = getattr(config.MOD, 'name_params', None)
+        if block_names and G_initial_np.size % len(block_names) == 0:
+            block_size = G_initial_np.size // len(block_names)
+            for ib, name in enumerate(block_names):
+                block = G_initial_np[ib*block_size:(ib+1)*block_size]
+                print(
+                    f'  gradient block {name}: '
+                    f'nan={int(np.isnan(block).sum())}, '
+                    f'inf={int(np.isinf(block).sum())}, '
+                    f'norm={float(np.linalg.norm(block[np.isfinite(block)])):.6E}'
+                )
+
         minimization_result = minimize_optax_decoupled(
             var.cost_and_grad,
-            jnp.asarray(Xopt, dtype=var.cost_dtype),
+            Xopt_jax,
             maxiter=maxiter,
             history_size=10,
             gtol=getattr(
@@ -659,6 +693,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
                 'gradient_max_norm',
                 None,
             ),
+            initial_value=jnp.asarray(J_initial),
+            initial_gradient=jnp.asarray(G_initial),
             iteration_callback=optax_callback,
         )
         Xres = minimization_result.control
@@ -885,10 +921,17 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     ds.to_netcdf(os.path.join(path_save_control_vectors, 'Xres.nc'))
     ds.close()
 
-    # Init
+    # Init.  Apply the converged control at t=0 before writing the first
+    # trajectory file.  Without this, the initial output contains the restart
+    # window's old parameter fields while the first propagated step already
+    # uses Xa_model, which looks like a discontinuity between outputs.
+    if Basis is not None:
+        Basis.operg(0., Xa_model, State=State.params)
     State0 = State.copy()
+    State0.enable_output_batching()
     Model.init(State0)
     date = config.EXP.init_date
+    print(f'[4DVAR SAVE] date={date.isoformat()} t=0 dt={Model.dt} save_step={config.EXP.saveoutput_time_step}', flush=True)
     Model.save_output(State0, date, name_var=Model.var_to_save, t=0) 
     
     nstep = min(nstep_check, int(config.EXP.saveoutput_time_step.total_seconds()//Model.dt))
@@ -910,11 +953,19 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         if (((date - config.EXP.init_date).total_seconds()
             /config.EXP.saveoutput_time_step.total_seconds())%1 == 0)\
             & (date>=config.EXP.init_date) & (date<=config.EXP.final_date) :
+            print(f'[4DVAR SAVE] date={date.isoformat()} t={t} nstep={nstep} dt={Model.dt}', flush=True)
             Model.save_output(State0, date, name_var=Model.var_to_save, t=t) 
+
+    # Flush the last, possibly incomplete, time chunk before publishing the
+    # tile completion marker in the Slurm worker.
+    State0.flush_output_batch()
         
     del State, State0, Xa, dict_obs, B, R, Model, Basis, var, Xopt, Xres, checkpoints, time_checkpoints, t_checkpoints
-    gc.collect()
-    print()
+    # This routine normally runs in a short-lived spawned process.  Forcing a
+    # full cyclic collection here can stall indefinitely while JAX/XLA still
+    # owns device-backed objects, even though the complete trajectory is
+    # already on disk.  Let normal process teardown reclaim those objects.
+    print(flush=True)
 
 
 # =============================================================================
@@ -958,6 +1009,9 @@ class Variational:
 
         self.jit_cost_and_grad = bool(
             getattr(config.INV, 'jit_cost_and_grad', False)
+        )
+        self.debug_adjoint_nan = bool(
+            getattr(config.INV, 'debug_adjoint_nan', False)
         )
         self.cost_and_grad_schedule = getattr(
             config.INV,
@@ -1048,12 +1102,14 @@ class Variational:
                     'jit_cost_and_grad is incompatible with state plotting '
                     'inside the compiled evaluation'
                 )
-            implementation = (
-                self._cost_and_grad_scan_impl
-                if self.cost_and_grad_schedule == 'scan'
-                else self._cost_and_grad_impl
-            )
-            self._compiled_cost_and_grad = jax.jit(implementation)
+            if self.cost_and_grad_schedule == 'scan':
+                # Boundary/wind arrays can be several GB at hourly cadence.
+                # Make them dynamic JIT inputs, rather than closure constants.
+                self._compiled_cost_and_grad = jax.jit(
+                    lambda control, boundary: self._cost_and_grad_scan_impl(
+                        control, scan_boundary_conditions=boundary))
+            else:
+                self._compiled_cost_and_grad = jax.jit(self._cost_and_grad_impl)
             print(
                 '[cost] complete cost-and-gradient schedule: JIT enabled '
                 f'({self.cost_and_grad_schedule})'
@@ -1290,7 +1346,10 @@ class Variational:
         """Evaluate through either the compiled or legacy adapter."""
         if self._compiled_cost_and_grad is not None:
             X0 = jnp.asarray(X0, dtype=self.cost_dtype)
-            J, G = self._compiled_cost_and_grad(X0)
+            if self.cost_and_grad_schedule == 'scan':
+                J, G = self._compiled_cost_and_grad(X0, self._scan_boundary_conditions)
+            else:
+                J, G = self._compiled_cost_and_grad(X0)
         else:
             J, G = self._cost_and_grad_impl(X0)
 
@@ -1304,7 +1363,7 @@ class Variational:
         state.params = dict(params)
         return state
 
-    def _cost_and_grad_scan_impl(self, X0):
+    def _cost_and_grad_scan_impl(self, X0, scan_boundary_conditions=None):
         """Cost and explicit adjoint with rolled checkpoint loops.
 
         The historical implementation below deliberately remains available as
@@ -1379,10 +1438,12 @@ class Variational:
             )
             return (dict(state.var), dict(state.params), Jo), trajectory
 
+        if scan_boundary_conditions is None:
+            scan_boundary_conditions = self._scan_boundary_conditions
         scan_inputs = (
             self._scan_times,
             self._scan_basis_active,
-            self._scan_boundary_conditions,
+            scan_boundary_conditions,
         )
         (final_var, final_params, Jo), trajectory = lax.scan(
             forward_body,
@@ -1456,6 +1517,27 @@ class Variational:
                     nstep=self._scan_nstep,
                 )
 
+            # Optional runtime tracing for the explicit scan adjoint. It is
+            # deliberately performed before the basis transpose so a NaN can
+            # be attributed to a physical model parameter rather than to its
+            # reduced Gaussian representation.
+            if self.debug_adjoint_nan:
+                h_names = ('H_ek0', 'H_ek1', 'H_bc1')
+                h_nonfinite = [
+                    jnp.any(~jnp.isfinite(jnp.asarray(adjoint.params[name])))
+                    if name in adjoint.params else jnp.asarray(False)
+                    for name in h_names
+                ]
+                has_h_nonfinite = jnp.any(jnp.stack(h_nonfinite))
+                def _report_nonfinite(_):
+                    jax.debug.print(
+                        '[4DVar adjoint] non-finite H adjoint before basis transpose at t={t:.1f} s '
+                        '(H_ek0={h0}, H_ek1={h1}, H_bc1={h2})',
+                        t=t, h0=h_nonfinite[0], h1=h_nonfinite[1], h2=h_nonfinite[2],
+                    )
+                    return 0
+                lax.cond(has_h_nonfinite, _report_nonfinite, lambda _: 0, operand=0)
+
             ad_params, ad_control = lax.cond(
                 basis_active,
                 lambda operands: transpose_basis(t, operands),
@@ -1473,7 +1555,7 @@ class Variational:
         reverse_inputs = (
             self._scan_times,
             self._scan_basis_active,
-            self._scan_boundary_conditions,
+            scan_boundary_conditions,
             trajectory_var,
             trajectory_params,
             trajectory_misfit,

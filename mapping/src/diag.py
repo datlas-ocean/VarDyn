@@ -28,6 +28,77 @@ from . import tools as switchvar
 import cmocean
 
 
+def _create_mp4_from_frames(sourcefolder, framerate, moviename='movie.mp4'):
+    """Encode diagnostic PNG frames as an H.264 movie.
+
+    ``yuv420p`` requires even frame dimensions.  Matplotlib can produce odd
+    dimensions depending on the figure layout, so pad at most one pixel on
+    the right and bottom before encoding.
+    """
+    frame_pattern = 'frame_*.png'
+    frames = sorted(glob.glob(os.path.join(sourcefolder, frame_pattern)))
+    if not frames:
+        raise FileNotFoundError(
+            f'No diagnostic frames found in {sourcefolder!r}')
+
+    movie_path = os.path.join(sourcefolder, moviename)
+    command = [
+        'ffmpeg', '-f', 'image2', '-r', str(framerate),
+        '-pattern_type', 'glob',
+        '-i', os.path.join(sourcefolder, frame_pattern),
+        '-y',
+        '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2',
+        '-c:v', 'libx264', '-preset', 'veryslow', '-crf', '15',
+        '-pix_fmt', 'yuv420p', '-r', str(framerate),
+        movie_path,
+    ]
+    print(' '.join(command))
+
+    try:
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            'FFmpeg executable not found; diagnostic frames were kept.') \
+            from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'FFmpeg failed while creating {moviename}; diagnostic frames '
+            f'were kept:\n{result.stderr}')
+
+    return movie_path, frames
+
+
+def _open_experiment_output(config, variables):
+    """Open model outputs from the configured Zarr or legacy NetCDF layout."""
+    variables = [variables] if isinstance(variables, str) else list(variables)
+    root = config.EXP.path_save
+    stem = config.EXP.name_exp_save
+
+    if bool(getattr(config.EXP, 'saveoutputs_zarr', False)):
+        path = os.path.join(root, f'{stem}.zarr')
+        if not os.path.isdir(path):
+            raise FileNotFoundError(
+                f'Experiment Zarr archive not found: {path}')
+        dataset = xr.open_zarr(path, consolidated=False, chunks='auto')
+    else:
+        files = sorted(glob.glob(os.path.join(root, f'{stem}*.nc')))
+        if not files:
+            raise FileNotFoundError(
+                f'No experiment NetCDF outputs found in {root} for {stem}')
+        dataset = xr.open_mfdataset(files, chunks=-1)
+
+    missing = [name for name in variables if name not in dataset.data_vars]
+    if missing:
+        available = ', '.join(sorted(dataset.data_vars)) or '<none>'
+        dataset.close()
+        raise KeyError(
+            f'Experiment output variable(s) {missing} not found. '
+            f'Available variables: {available}')
+    return dataset[variables]
+
+
 def Diag(config,State,verbose=1):
 
     """
@@ -162,14 +233,18 @@ That could be due to non regular grid or bad written netcdf file')
         else:
             self.name_exp_lat = config.EXP.name_lat + suffix
         self.name_exp_var = config.DIAG.name_exp_var
-        exp = xr.open_mfdataset(f'{config.EXP.path_save}/{config.EXP.name_exp_save}*nc', chunks=-1, preprocess=lambda ds: ds[[self.name_exp_var]])
+        exp = _open_experiment_output(config, [self.name_exp_var])
         exp = exp.assign_coords({self.name_exp_lon:exp[self.name_exp_lon]})
+        if exp.sizes.get(self.name_exp_time, 0) < 2:
+            exp.close()
+            raise ValueError(
+                'At least two experiment output timestamps are required '
+                'for diagnostics')
         dt = (exp[self.name_exp_time][1]-exp[self.name_exp_time][0]).values
         self.exp = exp.sel(
             {self.name_exp_time:slice(np.datetime64(self.time_min)-dt,np.datetime64(self.time_max)+dt)},
-             )
+             ).load()
         exp.close()
-        self.exp = self.exp.load()
 
         # Check if longitude coordinates are consistent between reference and experimental data
         lon_exp = self.exp[self.name_exp_lon].values
@@ -775,14 +850,10 @@ That could be due to non regular grid or bad written netcdf file')
         # Run in parallel using all available cores (or specify n_jobs=4, n_jobs=8, etc.)
         results = Parallel(n_jobs=-1, verbose=10)(delayed(_save_single_frame)(ds.load(), tt) for tt in range(ds[self.name_ref_time].size))
 
-        # Create movie
-        if self.path_images2mp4  is not None and os.path.exists(self.path_images2mp4):
-            command = f'{self.path_images2mp4} -i {self.dir_output}/frame -f {framerate} -D {self.dir_output}'
-            print(command)
-            os.system(command)
-
-        # Delete frames
-        os.system(f'rm {os.path.join(self.dir_output, "frame_*.png")}')
+        # Create movie.  Delete source frames only after successful encoding.
+        _, frames = _create_mp4_from_frames(self.dir_output, framerate)
+        for frame in frames:
+            os.remove(frame)
         
         # Display movie
         if Display:
@@ -1005,26 +1076,13 @@ class Diag_ose():
         self.name_exp_lon = config.EXP.name_lon
         self.name_exp_lat = config.EXP.name_lat
         self.name_exp_var = config.DIAG.name_exp_var
-        exp_files = sorted(glob.glob(f'{config.EXP.path_save}/{config.EXP.name_exp_save}*nc'))
-        try:
-            exp = xr.open_mfdataset(exp_files, chunks=-1)[self.name_exp_var]
-        except:
-            exp_datasets = []
-            for file in exp_files:
-                with nc.Dataset(file) as ds:
-                    exp_data = ds.variables[self.name_exp_var][:]
-                    time_exp = ds.variables['time'][:]
-                    time_exp = nc.num2date(time_exp, ds.variables['time'].units)
-                    time_exp = np.array(time_exp, dtype='datetime64[ns]')
-                    
-                    ds_xr = xr.Dataset({
-                        self.name_exp_var: (ds.variables[self.name_exp_var].dimensions, exp_data)
-                    }, coords={'time': time_exp,
-                            self.name_exp_lon: ds.variables[self.name_exp_lon][:], 
-                            self.name_exp_lat: ds.variables[self.name_exp_lat][:]})
-                    exp_datasets.append(ds_xr)
-            exp = xr.concat(exp_datasets, dim='time')[self.name_exp_var]
-            exp = exp.copy(deep=True).load()
+        exp_dataset = _open_experiment_output(config, [self.name_exp_var])
+        exp = exp_dataset[self.name_exp_var]
+        if exp.sizes.get(self.name_exp_time, 0) < 2:
+            exp_dataset.close()
+            raise ValueError(
+                'At least two experiment output timestamps are required '
+                'for diagnostics')
         dt = (exp[self.name_exp_time][1]-exp[self.name_exp_time][0]).values
         self.exp = exp.sel(
             {self.name_exp_time:slice(np.datetime64(self.time_min)-dt,np.datetime64(self.time_max)+dt)},
@@ -1042,7 +1100,8 @@ That could be due to non regular grid or bad written netcdf file')
                                       (self.exp.lat>=self.lat_min) & 
                                       (self.exp.lat<=self.lat_max)).compute(),
                                       drop=True)
-        exp.close()
+        self.exp = self.exp.load()
+        exp_dataset.close()
         del exp
 
         # Baseline data
@@ -1966,28 +2025,14 @@ That could be due to non regular grid or bad written netcdf file')
         results = Parallel(n_jobs=-1, verbose=10)(delayed(_save_single_frame)(tt) for tt in range(self.exp[self.name_exp_time].size))
 
         # Create movie
-        sourcefolder = self.dir_output
-        moviename = 'movie.mp4'
-        frame_pattern = 'frame_*.png'
-        ffmpeg_options="-c:v libx264 -preset veryslow -crf 15 -pix_fmt yuv420p"
-
-        command = 'ffmpeg -f image2 -r %i -pattern_type glob -i %s -y %s -r %i %s' % (
-                framerate,
-                os.path.join(sourcefolder, frame_pattern),
-                ffmpeg_options,
-                framerate,
-                os.path.join(self.dir_output, moviename),
-            )
-        print(command)
-
-        _ = subprocess.run(command.split(' '),stdout=subprocess.PIPE)
+        _create_mp4_from_frames(self.dir_output, framerate)
 
         ## Delete frames
         #os.system(f'rm {os.path.join(sourcefolder, frame_pattern)}')
 
         # Display movie
         if Display:
-            Video(os.path.join(self.dir_output, moviename),embed=True)
+            Video(os.path.join(self.dir_output, 'movie.mp4'),embed=True)
         return 
     
     def Leaderboard(self):

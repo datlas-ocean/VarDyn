@@ -19,11 +19,19 @@ sys.path.append(_MASSH_PATH)
 from src import inv
 
 TILE_SUCCESS_MARKER = "outputs_saved.ok"
+ORCHESTRATION_SUCCESS_MARKER = ".tile_complete.ok"
 
 
 def marker_path(config) -> Path:
     """File written when a tile completed through output saving."""
     return Path(config.EXP.path_save) / TILE_SUCCESS_MARKER
+
+def write_orchestration_marker(path: Path, message: str):
+    """Atomically publish completion to the Slurm coordinator."""
+    temporary = path.with_name(f'{path.name}.tmp-{os.getpid()}')
+    temporary.write_text(message, encoding='utf-8')
+    temporary.replace(path)
+
 
 
 def run_tile(tile_dir: Path, restart:bool):
@@ -61,10 +69,15 @@ def run_tile(tile_dir: Path, restart:bool):
     with open(state_path, "rb") as f:
         State = pickle.load(f)
 
+    orchestration_marker = tile_dir / ORCHESTRATION_SUCCESS_MARKER
+    if restart and orchestration_marker.exists():
+        orchestration_marker.unlink()
+
     # Skip tiles with no ocean points: nothing to assimilate and the SW model
     # core will hard-fail on an all-zero mask.
     if getattr(State, 'mask', None) is not None and State.mask.all():
         print(f"[SKIP] Tile is all land (no ocean points), skipping: {tile_dir}")
+        write_orchestration_marker(orchestration_marker, "all-land tile\n")
         return
 
     print(f"Running inversion, output path: {config.EXP.path_save}")
@@ -89,9 +102,14 @@ def run_tile(tile_dir: Path, restart:bool):
             encoding="utf-8",
         )
         tmp_marker.replace(success_marker)
+        write_orchestration_marker(
+            orchestration_marker, f"completed: {datetime.now().isoformat()}\n")
 
         print(f"[{datetime.now()}] Finished tile: {tile_dir}")
     else:
+        write_orchestration_marker(
+            orchestration_marker,
+            f"already completed: {datetime.now().isoformat()}\n")
         print(f"[{datetime.now()}] Non-processed tile: {tile_dir}")
         print(f"Because you did not ask for restart and {success_marker} exists.")
 
