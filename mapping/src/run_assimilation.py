@@ -41,6 +41,7 @@ import xarray as xr
 
 from . import exp, tools as grid, state, mod, inv, diag, obs as _obs
 from .tools import gaspari_cohn
+from .background_paths import background_control_path
 
 
 def prepare_process(config, config_eq, State, 
@@ -137,7 +138,9 @@ def prepare_process(config, config_eq, State,
     flag_init : bool, optional
         If True, initialize the control vector from a previous experiment given by name_exp_init (default: False).
     flag_background : bool, optional
-        If True, use a background field from another experiment given by name_exp_background (default: False).
+        If True, set each tile's INV.path_background to the Xres.nc control
+        file of name_exp_background under the same controls parent directory
+        as INV.path_save_control_vectors (default: False).
     flag_assim : bool, optional
         If True, create and launch assimilation subprocesses (default: True).
     flag_assim_restart : bool, optional
@@ -589,10 +592,10 @@ def prepare_process(config, config_eq, State,
                     config.EXP.name_experiment, name_exp_init)
                 _config.INV.path_init_4Dvar = os.path.join(path_control_init, 'Xres.nc')
 
-            if flag_background and name_exp_background is not None:
-                path_background = _config.INV.path_background.replace(
-                    config.EXP.name_experiment, name_exp_background)
-                _config.INV.path_background = os.path.join(path_background, 'Xres.nc')
+            if flag_background:
+                _config.INV.path_background = background_control_path(
+                    tpl['orig_path_save_control_vectors'],
+                    name_exp_background, name_subwindow)
 
             # makedirs (sequential, fast)
             if not os.path.exists(_config.EXP.tmp_DA_path):

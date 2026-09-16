@@ -70,6 +70,7 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 | `SPACE_WIN_X/Y`, `SPACE_OVERLAP_X/Y` | Spatial window size and overlap (degrees) |
 | `TIME_WIN`, `TIME_OVERLAP` | Temporal window size and overlap (days) |
 | `FLAG_INIT` / `FLAG_BACKGROUND` / `NAME_EXP` | Initialise from / use background from a previous experiment |
+| `NAME_EXP_BACKGROUND` | Source experiment for the inversion background; alternatively pass `--name_exp_background` |
 | `BARRIER_TIMEOUT` | Seconds between incomplete-tile waiting diagnostics |
 | `ZARR_OUTPUT` | If this shell option or `EXP.saveoutputs_zarr` is `true`, store each merged temporal window in one Zarr archive and the final experiment in one global Zarr archive |
 | `OUTPUT_FLOAT64` | If `true`, save merged floating-point data as float64; otherwise float32 (default: false) |
@@ -93,6 +94,17 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 1. `--name_exp` CLI flag
 2. `name_experiment = '...'` variable in `PATH_CONFIG`
 3. Config filename with `config_` prefix stripped
+
+**Background controls:** Set `FLAG_BACKGROUND=true` and `NAME_EXP_BACKGROUND`
+in the shell config, or pass `--name_exp_background SOURCE` when submitting.
+Preparation sets each tile's `INV.path_background` automatically from its
+`INV.path_save_control_vectors` root. For a current control root
+`/path/controls/CURRENT`, it reads
+`/path/controls/SOURCE/subwindow_<date>/<tile>/Xres.nc`.
+The main and equatorial Python configs need a `path_save_control_vectors`
+root; they do not need `path_background`. `NAME_EXP` remains the legacy
+fallback source name when background mode is enabled without
+`NAME_EXP_BACKGROUND`.
 
 **Barrier robustness** (Lustre/GPFS):
 - `mkdir -p` for the barrier directory is retried up to 5 times with backoff
