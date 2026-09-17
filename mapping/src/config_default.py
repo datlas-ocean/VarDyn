@@ -901,9 +901,12 @@ BASIS_GAUSS3D = dict(
 
     facQ = 1., # Factor multiplied to the estimated Q
 
-    file_facQaux = None, # Optional NetCDF field reducing Q by a spatial factor
+    file_facQaux = None, # Optional variance factor; Q (STD) is multiplied by sqrt(factor)
 
-    name_var_facQaux = {'lon':'', 'lat':'', 'var':''},
+    # Optional wavenumber coordinate in cycles/km: interpolate at 1/(2*sigma_D),
+    # the cosine-window wavelength 2*sigma_D. Clamp to endpoints outside range.
+    # Leave wavenumber=None for spatial-only maps.
+    name_var_facQaux = {'lon':'', 'lat':'', 'var':'', 'wavenumber':None},
 
     normalize_fact = True,
 
