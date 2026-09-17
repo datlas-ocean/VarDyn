@@ -23,6 +23,45 @@ import jax
 jax.config.update("jax_enable_x64", USE_FLOAT64)
 
 
+def _gauss3d_facq_at_scale(field, names, sigma_D):
+    """Select the cosine-window wavelength 2*sigma_D from a variance map.
+
+    The spatial window is cos²(pi*x/(2*sigma_D)) on [-sigma_D, sigma_D].
+    Its cosine term has wavelength 2*sigma_D; use this as the representative
+    Fourier scale (the localized window is not monochromatic). Auxiliary
+    wavenumbers must be in cycles/km, including k=0 for infinite wavelength.
+    Spatial-only maps retain their existing behavior. Outside the spectral
+    range, use the nearest endpoint rather than silently dropping correction.
+    """
+    spatial_dims = {names['lon'], names['lat']}
+    spectral_dims = set(field.dims) - spatial_dims
+    if not spectral_dims:
+        return field
+    wavenumber = names.get('wavenumber')
+    if not wavenumber or spectral_dims != {wavenumber}:
+        raise ValueError(
+            'BASIS_GAUSS3D spectral file_facQaux requires '
+            "name_var_facQaux['wavenumber'] and only lon/lat/wavenumber dimensions.")
+    if not np.isfinite(sigma_D) or sigma_D <= 0:
+        raise ValueError('BASIS_GAUSS3D sigma_D must be positive and finite.')
+    field = field.sortby(wavenumber)
+    frequencies = np.asarray(field[wavenumber].values, dtype=float)
+    if (frequencies.ndim != 1 or frequencies.size == 0
+            or not np.all(np.isfinite(frequencies))
+            or np.any(frequencies < 0) or np.any(np.diff(frequencies) <= 0)):
+        raise ValueError('facQaux wavenumbers must be finite, nonnegative, '
+                         'unique values in cycles/km.')
+    target = 1. / (2. * sigma_D)
+    selected = np.clip(target, frequencies[0], frequencies[-1])
+    if selected != target:
+        logging.warning('BASIS_GAUSS3D facQaux: k=%g cycles/km is outside '
+                        '[%g, %g]; using endpoint k=%g.',
+                        target, frequencies[0], frequencies[-1], selected)
+    if frequencies.size == 1:
+        return field.isel({wavenumber: 0}, drop=True)
+    return field.interp({wavenumber: selected})
+
+
 def _as_name_list(name_mod_var):
     if isinstance(name_mod_var, (list, tuple, np.ndarray)):
         return list(name_mod_var)
@@ -489,6 +528,7 @@ class _Basis_gauss3d:
             names = self.name_var_facQaux
             with xr.open_dataset(self.file_facQaux, decode_times=False) as auxQ:
                 daFacQ = auxQ[names['var']]
+                daFacQ = _gauss3d_facq_at_scale(daFacQ, names, self.sigma_D)
                 lon_name = names['lon']
                 lon_values = daFacQ[lon_name].values
                 if lon_values.min() < 0 and self.lon_unit == '0_360':
