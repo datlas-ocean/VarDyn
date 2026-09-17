@@ -1380,26 +1380,37 @@ class Model_qg1l(M):
         if self.anomaly_from_bc:
             self._set_land_nan(State)
             return
-        elif type(self.init_from_bc)==dict:
-            for name in self.init_from_bc:
-                if self.init_from_bc[name] and t0 in self.bc[name]:
-                    State.setvar(self.bc[name][t0], self.name_var[name])
+        if isinstance(self.init_from_bc, dict):
+            names = [name for name, enabled in self.init_from_bc.items()
+                     if enabled and name in self.name_var]
         elif self.init_from_bc:
-            # Boundary-condition times are generally stored on the model time
-            # axis (seconds since the experiment start), and may not contain
-            # the exact value passed to ``init``.  Use the same nearest-time
-            # selection as the prognostic BC application instead of silently
-            # leaving the state at its zero initial value.
-            try:
-                u0, v0, ssh0 = self._apply_bc(t0, t0 + self.dt)
-                State.setvar(u0, self.name_var['U'])
-                State.setvar(v0, self.name_var['V'])
-                State.setvar(ssh0, self.name_var['SSH'])
-                print('MOD_QGSW initialization: boundary conditions applied.')
-            except (KeyError, TypeError, ValueError):
-                # Keep the historical zero-initialisation fallback when no
-                # usable BC field is available.
-                print('MOD_QGSW initialization: no usable boundary condition; using zeros.')
+            names = list(self.name_var)
+        else:
+            names = []
+
+        applied = []
+        for name in names:
+            fields = self.bc.get(name, {})
+            if not fields:
+                continue
+            # QG boundary fields are stored per variable, not as the (U, V,
+            # SSH) tuple returned by QGSW. Initialize every field at t0,
+            # including tracers, using its own nearest available time.
+            key = t0
+            if key not in fields:
+                times = np.asarray(list(fields))
+                key = times[np.argmin(np.abs(times - t0))]
+            State.setvar(fields[key], self.name_var[name])
+            applied.append(name)
+
+        if names:
+            if applied:
+                print('MOD_QG1L initialization: boundary conditions applied to '
+                      + ', '.join(applied) + '.')
+            missing = [name for name in names if name not in applied]
+            if missing:
+                print('MOD_QG1L initialization: no boundary condition loaded for '
+                      + ', '.join(missing) + '; keeping existing initial values.')
         self._set_land_nan(State)
     
     def save_output(self,State,present_date,name_var=None,t=None):
