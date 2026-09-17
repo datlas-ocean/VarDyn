@@ -452,6 +452,12 @@ MOD_QGSW = dict(
     # belongs to the internal SW core and is not publicly configurable here.
     height_representation = 'ssh',
 
+    # Thickness regularization is evaluated in equivalent SSH units in both
+    # representations (minimum 0.01 m, softplus sharpness 5 / m). In interface
+    # mode the core converts thickness by g_prime/physical_gravity before
+    # limiting and converts back afterwards. This does not rescale h_wind
+    # or its physical-metre safety floor.
+
     # Restart coordinate for the field mapped to name_init_var['SSH'] in
     # interface_displacement mode. The default is the physical `ssh` written
     # by save_output; use `interface_displacement` only when explicitly

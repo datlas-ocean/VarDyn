@@ -1584,8 +1584,6 @@ class Variational:
             f'{scan_times.size} uniform intervals, nstep={self._scan_nstep}, '
             'unroll=1'
         )
-
-        
     def cost(self,X0):
                 
         # Initial state

@@ -240,9 +240,23 @@ class SW:
                 stacklevel=2,
             )
 
-        # Minimum layer thickness to prevent negative h_tot
+        # Limiter parameters are expressed in SSH units when the public
+        # wrapper supplies a conversion, otherwise in native height units.
+        # h_min also retains its historical physical-metre role as the wind
+        # denominator floor; never scale that wind safety floor with g/g'.
         self.h_min = param['h_min'] if 'h_min' in param.keys() else 0.01
         self.h_min_sharpness = param['h_min_sharpness'] if 'h_min_sharpness' in param.keys() else 5.
+        self.thickness_to_ssh = jnp.asarray(param.get('thickness_to_ssh', 1.), dtype=self.dtype)
+        if self.thickness_to_ssh.ndim >= 2:
+            scale = jnp.broadcast_to(self.thickness_to_ssh, (self.nl, self.nx, self.ny))
+            self.thickness_to_ssh = scale
+            scale_u = jnp.pad(scale, ((0, 0), (1, 1), (0, 0)), mode='edge')
+            scale_v = jnp.pad(scale, ((0, 0), (0, 0), (1, 1)), mode='edge')
+            self.thickness_to_ssh_u = .5 * (scale_u[:, 1:, :] + scale_u[:, :-1, :])
+            self.thickness_to_ssh_v = .5 * (scale_v[:, :, 1:] + scale_v[:, :, :-1])
+        else:
+            self.thickness_to_ssh_u = self.thickness_to_ssh
+            self.thickness_to_ssh_v = self.thickness_to_ssh
 
         # Equivalent depth bounds
         self.H_min = param['H_min'] if 'H_min' in param.keys() else None
@@ -629,6 +643,17 @@ class SW:
             return self.tracer_diff_coef * lap_c_phys * self.area * self.masks.h
         return jnp.zeros_like(c_area)
 
+    def _limit_thickness(self, thickness, grid='h'):
+        """Limit unscaled thickness in SSH units, then return native units.
+
+        For eta = S*SSH, this is S*clamp(eta/S), equivalent to scaling
+        the minimum by S and dividing sharpness by S. Face conversions
+        use the adjacent cell mean, matching the staggered grid convention.
+        """
+        scale = (self.thickness_to_ssh_u if grid == 'u' else
+                 self.thickness_to_ssh_v if grid == 'v' else self.thickness_to_ssh)
+        return smooth_clamp(thickness * scale, self.h_min, self.h_min_sharpness) / scale
+
     def advection_h(self, U, V, h, h_ref=None):
         """
         Advection RHS for thickness perturbation h
@@ -654,15 +679,14 @@ class SW:
             h_tot = _h_ref * jnp.ones_like(h)
         else:
             h_tot = _h_ref + h
-        # Physical thickness — small magnitudes safe for WENO in float32.
-        # Clamp in PHYSICAL units so that h_min_sharpness has a grid-independent
-        # meaning: transition width = 1/h_min_sharpness in metres (default 10
-        # → 0.1 m).  Previously the clamp acted on the area-scaled h_tot, so
-        # for area ~1e8 the kink was effectively a hard step, producing a
-        # delta-like adjoint singularity at h_phys ≈ h_min.
+        # Remove cell-area scaling before limiting/reconstruction. The limiter
+        # uses a grid-independent width of 1/h_min_sharpness (default 0.2 m
+        # in SSH coordinates), including when native height is an interface
+        # displacement. Limiting area-integrated thickness would instead
+        # create an effectively hard step and poorly conditioned derivatives.
         h_tot_phys = h_tot / self.area
         if not self.flag_linear:
-            h_tot_phys = smooth_clamp(h_tot_phys, self.h_min, self.h_min_sharpness)
+            h_tot_phys = self._limit_thickness(h_tot_phys)
         # Face-averaged cell area on u- and v-faces.
         # Guard: self.area is 0-d (scalar) when dx/dy are uniform scalars (QG);
         # slicing a 0-d array raises IndexError.  For uniform grids face area == cell area.
@@ -882,21 +906,33 @@ class SW:
 
     def add_h_diffusion(self, h):
         """
-        Laplacian diffusion κ∇²(h_phys) for layer thickness.
-        Returns diffusion tendency in scaled form (h = h_phys * area).
+        Conservative diffusion of physical layer thickness, with zero flux
+        across land faces and the outer domain boundary.
+        Returns the area-integrated tendency (h = h_phys * area).
         Critical for adjoint stability: counteracts anti-diffusivity of
         the adjoint WENO scheme.
         """
         if self.diff_coef is not None and self.diff_coef > 0:
-            # Operate on the physical variable h_phys = h / area so that
-            # the Laplacian is correct on non-uniform grids.  The previous
-            # version applied ∇² to the scaled variable h = h_phys*area,
-            # which introduces spurious terms proportional to ∇(area).
-            h_phys = h / self.area
-            h_phys_pad = jnp.pad(h_phys, ((0,0), (0,0), (1,1), (1,1)), mode='edge')
-            lap_h_phys = (h_phys_pad[..., 2:, 1:-1] - 2*h_phys_pad[..., 1:-1, 1:-1] + h_phys_pad[..., :-2, 1:-1]) / self.dx**2 \
-                       + (h_phys_pad[..., 1:-1, 2:] - 2*h_phys_pad[..., 1:-1, 1:-1] + h_phys_pad[..., 1:-1, :-2]) / self.dy**2
-            return self.diff_coef * lap_h_phys * self.area * self.masks.h
+            # Mask the face flux, not just the resulting cell tendency:
+            # zero-filled land must not act as a reservoir of zero SSH.
+            h_phys = jnp.where(self.masks.h > 0.5, h / self.area, 0.0)
+            if self.dx.ndim >= 2:
+                x_metric = self.dy_ugrid[1:-1, :] / self.dx_ugrid[1:-1, :]
+                y_metric = self.dx_vgrid[:, 1:-1] / self.dy_vgrid[:, 1:-1]
+            else:
+                x_metric = self.dy / self.dx
+                y_metric = self.dx / self.dy
+            # Face length / centre distance gives integrated gradient fluxes.
+            # Shared face fluxes cancel exactly between adjacent cells, also
+            # when cell areas vary. Pad with zero exterior fluxes explicitly.
+            flux_x = jnp.where(self.masks.u[..., 1:-1, :],
+                               jnp.diff(h_phys, axis=-2) * x_metric, 0.0)
+            flux_y = jnp.where(self.masks.v[..., 1:-1],
+                               jnp.diff(h_phys, axis=-1) * y_metric, 0.0)
+            flux_x = jnp.pad(flux_x, ((0, 0), (0, 0), (1, 1), (0, 0)))
+            flux_y = jnp.pad(flux_y, ((0, 0), (0, 0), (0, 0), (1, 1)))
+            return self.diff_coef * (jnp.diff(flux_x, axis=-2)
+                                     + jnp.diff(flux_y, axis=-1))
         return jnp.zeros_like(h)
 
     def add_wind_forcing(self, du, dv, taux=None, tauy=None, h_wind=None, wind_strength=None):
@@ -1053,8 +1089,8 @@ class SW:
         h_vgrid = 0.5 * (h_[...,1:-1,1:] + h_[...,1:-1,:-1])
         # Clamp in PHYSICAL units (metres): see advection_h note. h_tot_*grid stays
         # area-scaled for downstream consumers, so we divide by area, clamp, multiply back.
-        h_tot_ugrid = smooth_clamp((_h_ref_ugrid + h_ugrid) / self.area_ugrid, self.h_min, self.h_min_sharpness) * self.area_ugrid
-        h_tot_vgrid = smooth_clamp((_h_ref_vgrid + h_vgrid) / self.area_vgrid, self.h_min, self.h_min_sharpness) * self.area_vgrid
+        h_tot_ugrid = self._limit_thickness((_h_ref_ugrid + h_ugrid) / self.area_ugrid, 'u') * self.area_ugrid
+        h_tot_vgrid = self._limit_thickness((_h_ref_vgrid + h_vgrid) / self.area_vgrid, 'v') * self.area_vgrid
 
         return omega, eta, p, U, V, U_m, V_m, k_energy, h_tot_ugrid, h_tot_vgrid
 
@@ -1260,12 +1296,8 @@ class SW:
                 h_vgrid = 0.5 * (h_[..., 1:-1, 1:] + h_[..., 1:-1, :-1])
                 # Clamp in PHYSICAL units; result stays area-scaled for the
                 # mass-consistent forcing ratio u/h_tot * Fh.
-                h_tot_u = smooth_clamp((ref_vals[1] + h_ugrid) / self.area_ugrid,
-                                       self.h_min,
-                                       self.h_min_sharpness) * self.area_ugrid
-                h_tot_v = smooth_clamp((ref_vals[2] + h_vgrid) / self.area_vgrid,
-                                       self.h_min,
-                                       self.h_min_sharpness) * self.area_vgrid
+                h_tot_u = self._limit_thickness((ref_vals[1] + h_ugrid) / self.area_ugrid, 'u') * self.area_ugrid
+                h_tot_v = self._limit_thickness((ref_vals[2] + h_vgrid) / self.area_vgrid, 'v') * self.area_vgrid
                 Fh_ = replicate_pad(_Fh, self.masks.h)
                 Fh_u = 0.5 * (Fh_[..., 1:, 1:-1] + Fh_[..., :-1, 1:-1])
                 Fh_v = 0.5 * (Fh_[..., 1:-1, 1:] + Fh_[..., 1:-1, :-1])
@@ -1504,10 +1536,8 @@ class SW:
                 h_ugrid = 0.5 * (h_[..., 1:, 1:-1] + h_[..., :-1, 1:-1])
                 h_vgrid = 0.5 * (h_[..., 1:-1, 1:] + h_[..., 1:-1, :-1])
                 # Clamp in PHYSICAL units; result stays area-scaled.
-                h_tot_u = smooth_clamp((ref_vals[1] + h_ugrid) / self.area_ugrid,
-                                       self.h_min, self.h_min_sharpness) * self.area_ugrid
-                h_tot_v = smooth_clamp((ref_vals[2] + h_vgrid) / self.area_vgrid,
-                                       self.h_min, self.h_min_sharpness) * self.area_vgrid
+                h_tot_u = self._limit_thickness((ref_vals[1] + h_ugrid) / self.area_ugrid, 'u') * self.area_ugrid
+                h_tot_v = self._limit_thickness((ref_vals[2] + h_vgrid) / self.area_vgrid, 'v') * self.area_vgrid
                 Fh_ = replicate_pad(_Fh, self.masks.h)
                 Fh_u = 0.5 * (Fh_[..., 1:, 1:-1] + Fh_[..., :-1, 1:-1])
                 Fh_v = 0.5 * (Fh_[..., 1:-1, 1:] + Fh_[..., 1:-1, :-1])

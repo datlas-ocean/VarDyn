@@ -3452,9 +3452,13 @@ class Model_qgsw(M):
         
         # CFL
         if config.MOD.cfl is not None:
-            grid_spacing = min(np.nanmin(State.DX), np.nanmin(State.DY)) 
+            # Apply the constraint locally.  The extrema of the grid spacing
+            # and wave speed need not occur at the same cell, so
+            # min(grid_spacing) / max(c) is overly restrictive in general.
+            dt_x = np.nanmin(np.asarray(State.DX) / self.c)
+            dt_y = np.nanmin(np.asarray(State.DY) / self.c)
             c_max = float(np.nanmax(self.c))
-            dt = config.MOD.cfl * grid_spacing / c_max
+            dt = config.MOD.cfl * min(dt_x, dt_y)
             divisors = [i for i in range(1, 3600 + 1) if 3600 % i == 0]  # Find all divisors of one hour in seconds
             lower_divisors = [d for d in divisors if d <= dt]
             self.dt = max(lower_divisors)  # Get closest
@@ -3562,6 +3566,10 @@ class Model_qgsw(M):
         self.sponge_width = config.MOD.dist_sponge_bc  # km
         self.sponge_coef = config.MOD.sponge_coef
 
+        # Wind is tapered only at the outer domain edges, not at coastlines.
+        self.wind_taper_u = np.ones((State.ny, State.nx+1))
+        self.wind_taper_v = np.ones((State.ny+1, State.nx))
+
         if self.sponge_width is not None and self.sponge_width>0:
             lon_h = State.lon
             lat_h = State.lat
@@ -3616,6 +3624,9 @@ class Model_qgsw(M):
             wc_v, wNS_v, wWE_v = grid.compute_sponge_components(lon_v, lat_v, mask_v, config.MOD.dist_sponge_bc)
             sponge_v = 1.0 - (1.0 - wc_v) * (1.0 - wNS_v) * (1.0 - alpha * wWE_v)
 
+            self.wind_taper_u = (1.0 - alpha * wNS_u) * (1.0 - wWE_u)
+            self.wind_taper_v = (1.0 - wNS_v) * (1.0 - alpha * wWE_v)
+
             _, (ax1,ax2,ax3) = plt.subplots(1, 3, figsize=(15, 5))
             im1 = ax1.pcolormesh(sponge_h)
             plt.colorbar(im1, ax=ax1)
@@ -3649,6 +3660,9 @@ class Model_qgsw(M):
             "H": H,
             "g_prime": g_prime,
             "f": np.pad(self.f.T, ((0, 1), (0, 1)), mode='edge'),
+            # Apply the same thickness regularization in SSH units in either
+            # public height representation. Wind depth remains in metres.
+            "thickness_to_ssh": g_prime / self.g if self._physical_interface_height else 1.,
             "taux": 0.,
             "tauy": 0.,
             "bottom_drag_coef": config.MOD.bottom_drag_coef,
@@ -4209,14 +4223,15 @@ class Model_qgsw(M):
     def _get_wind_stress(self, t):
         """
         Return (taux, tauy) as jnp arrays for time t (seconds from init).
+        Taper at outer domain edges only; coastal sponge does not reduce wind.
         Returns (None, None) when no wind file was loaded.
         """
         if self.taux_wind is None:
             return None, None
         it = int(np.floor(t / self.wind_dt)) if self.wind_dt > 0 else 0
         it = int(np.clip(it, 0, len(self.taux_wind) - 1))
-        taux = (1 - self.sponge_u) * jnp.asarray(self.taux_wind[it], dtype=self.dtype)  # (ny, nx+1)
-        tauy = (1 - self.sponge_v) * jnp.asarray(self.tauy_wind[it], dtype=self.dtype)  # (ny+1, nx)
+        taux = self.wind_taper_u * jnp.asarray(self.taux_wind[it], dtype=self.dtype)  # (ny, nx+1)
+        tauy = self.wind_taper_v * jnp.asarray(self.tauy_wind[it], dtype=self.dtype)  # (ny+1, nx)
         return taux, tauy
 
     def _ssh_to_model_height(self, ssh):
