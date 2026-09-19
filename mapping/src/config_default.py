@@ -84,6 +84,12 @@ GRID_FROM_FILE = dict(
 
     path_init_grid = '', 
 
+    # True: restore available controlled parameters from the file's
+    # *_control fields; parameters absent from the file start at their neutral
+    # values. False: use the file only for the grid/initial state and start
+    # every controlled parameter from its neutral value.
+    load_control_parameters_from_file = True,
+
     name_init_lon = 'lon',
 
     name_init_lat = 'lat',
@@ -1094,7 +1100,19 @@ NAME_INV = None
 # 4-Dimensional Variational 
 INV_4DVAR = dict(
 
-    minimizer = 'scipy', # 'scipy': host L-BFGS-B; 'optax-decoupled': device vectors/Python line search; 'optax-full-gpu': compiled device optimizer
+    forcing_window_days = None, # If set, share controlled model parameters across the experiment and give each aligned time window independent forcing-basis coefficients. State and adjoint remain continuous.
+
+    forcing_window_taper_days = 0., # Smoothly ramp local forcing to zero at both window edges; 0 disables the ramp.
+
+    forcing_window_overlap_days = 0., # Blend neighboring forcing bases over this many days before each window boundary; incompatible with taper.
+
+    minimizer = 'scipy', # 'scipy', 'optax-decoupled', 'optax-full-gpu', or 'block-coordinate'
+
+    block_outer_cycles = 20, # Block-coordinate sweeps over all forcing windows and shared parameters
+
+    block_inner_maxiter = 10, # L-BFGS iterations for each forcing-window block per sweep
+
+    block_parameter_maxiter = 10, # L-BFGS iterations for shared H/h_wind after each forcing sweep
 
     compute_test = False, # TLM, ADJ & GRAD tests
 
@@ -1132,7 +1150,7 @@ INV_4DVAR = dict(
 
     path_save_control_vectors = None, # Path where to save the control vector at each 4Dvar iteration 
 
-    timestep_checkpoint = timedelta(hours=12), # timestep separating two consecutive analysis 
+    timestep_checkpoint = timedelta(hours=12), # timestep separating two consecutive analysis states
 
     sigma_R = None, # Observational standard deviation
 

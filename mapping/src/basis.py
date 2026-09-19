@@ -218,6 +218,34 @@ def _bounded_wavelet_frequencies(lmin, lmax, npsp, facpsp):
     return ff
 
 
+def _legacy_wavelet_frequencies(lmin, lmax, npsp, facpsp):
+    """Reproduce the pre-sparse-refactor BM/BMaux wavelength grid."""
+    values = np.asarray([lmin, lmax, npsp, facpsp], dtype=float)
+    if (not np.all(np.isfinite(values)) or lmin <= 0 or lmax <= 0
+            or lmin > lmax or npsp <= 0 or facpsp <= 0):
+        raise ValueError('Invalid legacy wavelet scale parameters.')
+    log_step = np.log1p(facpsp / npsp)
+    logff = np.arange(
+        np.log(1. / lmin),
+        np.log(1. / lmax) - log_step,
+        -log_step,
+    )[::-1]
+    ff = np.exp(logff)
+    if ff.size < 2:
+        raise ValueError(
+            'At least two wavelength bands are required to define wavelet '
+            'directions; increase lmax/lmin or reduce facpsp/npsp.')
+    return ff
+
+
+def _bmaux_uses_legacy_background_layout(config):
+    """Whether BMaux must match controls written before the sparse refactor."""
+    inv_background = getattr(
+        getattr(config, 'INV', None), 'path_background', None)
+    basis_background = getattr(config.BASIS, 'path_background', None)
+    return inv_background is not None or basis_background is not None
+
+
 def _wavelet_center_has_support(obj, lon, lat, radius):
     """Whether a wavelet centre reaches an active physical grid point."""
     indphys = np.where(
@@ -288,6 +316,10 @@ def Basis(config, State, verbose=True, multi_mode=False, *args, **kwargs):
         return 
     
     elif config.BASIS.super is None:
+        window_days = getattr(getattr(config, 'INV', None),
+                              'forcing_window_days', None)
+        if window_days is not None:
+            return Basis_windowed_forcing(config, State, verbose=verbose)
         return Basis_multi(config, State, verbose=verbose)
 
     else:
@@ -2075,6 +2107,8 @@ class _Basis_bmaux:
         self.path_background = config.BASIS.path_background
         self.var_background = config.BASIS.var_background
         self.norm_time = config.BASIS.norm_time
+        self.legacy_background_layout = (
+            _bmaux_uses_legacy_background_layout(config))
 
         # C-grid variable type (None, 'U', or 'V')
         self.c_grid_var = getattr(config.BASIS, 'c_grid_var', None)
@@ -2245,9 +2279,16 @@ class _Basis_bmaux:
             if (LON_MAX<LON_MIN): LON_MAX = LON_MAX+360.
 
             # Ensemble of pseudo-frequencies for the wavelets (spatial)
-            ff = _bounded_wavelet_frequencies(
+            frequency_builder = (
+                _legacy_wavelet_frequencies
+                if self.legacy_background_layout
+                else _bounded_wavelet_frequencies)
+            ff = frequency_builder(
                 self.lmin, self.lmax, self.npsp, self.facpsp)
             dff = ff[1:] - ff[:-1]
+
+        if self.legacy_background_layout:
+            print('BMaux background compatibility: using legacy control layout')
 
         # Ensemble of directions for the wavelets (2D plane)
         theta = np.linspace(0, np.pi, int(np.pi * ff[0] / dff[0] * self.facpsp))[:-1]
@@ -2319,12 +2360,28 @@ class _Basis_bmaux:
                 _ENSLON = np.arange(lon0, lon1, dlon)
                 _ENSLAT = np.repeat(ENSLAT1[I],len(_ENSLON))
 
-                _ENSLON1 = []
-                _ENSLAT1 = []
-                for lon, lat in zip(_ENSLON, _ENSLAT):
-                    if _wavelet_center_has_support(self, lon, lat, DX[iff]):
-                        _ENSLON1.append(lon)
-                        _ENSLAT1.append(lat)
+                if self.legacy_background_layout and self.mask1d is None:
+                    _ENSLON1 = _ENSLON
+                    _ENSLAT1 = _ENSLAT
+                else:
+                    _ENSLON1 = []
+                    _ENSLAT1 = []
+                    radius = 1. / ff[iff] if self.legacy_background_layout else DX[iff]
+                    for lon, lat in zip(_ENSLON, _ENSLAT):
+                        if self.legacy_background_layout:
+                            indphys = np.where(
+                                (np.abs((self.lon1d - lon) / self.km2deg
+                                        * np.cos(lat * np.pi / 180.)) <= radius)
+                                & (np.abs((self.lat1d - lat) / self.km2deg)
+                                   <= radius)
+                            )[0]
+                            keep = not np.all(self.mask1d[indphys])
+                        else:
+                            keep = _wavelet_center_has_support(
+                                self, lon, lat, radius)
+                        if keep:
+                            _ENSLON1.append(lon)
+                            _ENSLAT1.append(lat)
 
                 ENSLAT[iff] = np.concatenate(([ENSLAT[iff],_ENSLAT1]))
                 ENSLON[iff] = np.concatenate(([ENSLON[iff],_ENSLON1]))
@@ -3695,16 +3752,297 @@ class Basis_offset(_StateBackgroundMixin, _Basis_offset):
 #                              Multi-Basis                                    #
 ###############################################################################      
 
+class Basis_windowed_forcing:
+    """One set of static parameter controls and independent forcing per window.
+
+    The model state is never reset here. The usual Variational forward and
+    adjoint scans carry it across every window boundary.
+    """
+
+    def __init__(self, config, State, verbose=True):
+        self.window_days = float(config.INV.forcing_window_days)
+        if not np.isfinite(self.window_days) or self.window_days <= 0:
+            raise ValueError('INV.forcing_window_days must be positive and finite.')
+        self.taper_days = float(getattr(config.INV,
+                                        'forcing_window_taper_days', 0.) or 0.)
+        if not np.isfinite(self.taper_days) or self.taper_days < 0:
+            raise ValueError(
+                'INV.forcing_window_taper_days must be nonnegative and finite.')
+        self.overlap_days = float(getattr(config.INV,
+                                          'forcing_window_overlap_days', 0.) or 0.)
+        if not np.isfinite(self.overlap_days) or self.overlap_days < 0:
+            raise ValueError(
+                'INV.forcing_window_overlap_days must be nonnegative and finite.')
+        if self.overlap_days and self.taper_days:
+            raise ValueError(
+                'Use either forcing_window_overlap_days or '
+                'forcing_window_taper_days, not both.')
+        controlled = _controlled_model_parameter_names(config)
+        global_names, forcing_names = [], []
+        for key in config.BASIS:
+            block = config.BASIS[key]
+            targets = set(_as_name_list(block.name_mod_var))
+            if not targets or None in targets:
+                raise ValueError(f'Windowed forcing basis {key!r} needs name_mod_var.')
+            if targets <= controlled:
+                if block.super not in ('BASIS_GAUSS2D', 'BASIS_OFFSET'):
+                    raise ValueError(
+                        f'Shared parameter basis {key!r} must be static '
+                        '(BASIS_GAUSS2D or BASIS_OFFSET).')
+                global_names.append(key)
+            elif targets.isdisjoint(controlled):
+                forcing_names.append(key)
+            else:
+                raise ValueError(
+                    f'Windowed forcing basis {key!r} mixes model parameters '
+                    'and time-local forcing targets.')
+        if not global_names or not forcing_names:
+            raise ValueError('Windowed forcing requires both parameter and forcing bases.')
+        self.control_basis_order = tuple(global_names + forcing_names)
+
+        def subset(names):
+            local_config = config.copy()
+            local_config.BASIS = type(config.BASIS)(
+                {name: config.BASIS[name] for name in names})
+            return local_config
+
+        self.global_basis = Basis_multi(subset(global_names), State, verbose=verbose)
+        self.forcing_config = subset(forcing_names)
+        self.State = State
+        self.verbose = verbose
+        self.local_bases = []
+        self.local_slices = []
+        self.shared_space_cache = {}
+
+    def set_basis(self, time, return_q=False, State=None, **kwargs):
+        time = np.asarray(time, dtype=float)
+        if time.ndim != 1 or time.size < 2 or np.any(np.diff(time) <= 0):
+            raise ValueError('Windowed forcing requires increasing basis times.')
+        cadence = float(time[1] - time[0])
+        if not np.allclose(np.diff(time), cadence):
+            raise ValueError('Windowed forcing requires uniform basis times.')
+        steps = int(round(self.window_days / cadence))
+        if steps < 1 or not np.isclose(steps * cadence, self.window_days):
+            raise ValueError(
+                'INV.forcing_window_days must be an integer multiple of '
+                'INV.timestep_checkpoint.')
+        overlap_steps = int(round(self.overlap_days / cadence))
+        if (not np.isclose(overlap_steps * cadence, self.overlap_days)
+                or overlap_steps >= steps):
+            raise ValueError(
+                'INV.forcing_window_overlap_days must be an integer multiple '
+                'of INV.timestep_checkpoint and shorter than a window.')
+        indices = list(range(0, time.size - 1, steps))
+        if (len(indices) > 1
+                and time.size - 1 - indices[-1] < 0.5 * steps):
+            indices.pop()  # Avoid a very short final window.
+        indices.append(time.size - 1)
+        self.bounds = np.asarray(time[indices])
+        self.bounds_jax = jnp.asarray(self.bounds[1:-1])
+        support_indices = [indices[0]] + [index - overlap_steps
+                                           for index in indices[1:-1]]
+        self.support_starts = np.asarray(time[support_indices])
+        self.local_bases = []
+        self.local_slices = []
+        Xg, Qg = self.global_basis.set_basis(
+            time, return_q=True, State=State, **kwargs)
+        x_parts, q_parts = [Xg], [Qg]
+        offset = self.global_basis.nbasis
+        for start_index, end_index in zip(support_indices, indices[1:]):
+            local = Basis_multi(
+                self.forcing_config, self.State, verbose=self.verbose,
+                shared_space_cache=self.shared_space_cache)
+            local_time = time[start_index:end_index + 1] - time[start_index]
+            X, Q = local.set_basis(
+                local_time, return_q=True, State=State, **kwargs)
+            self.local_bases.append(local)
+            self.local_slices.append(slice(offset, offset + local.nbasis))
+            offset += local.nbasis
+            x_parts.append(X)
+            q_parts.append(Q)
+        self.nbasis = offset
+        self.name_mod_var = list(dict.fromkeys(
+            self.global_basis.name_mod_var +
+            self.local_bases[0].name_mod_var))
+        if self.verbose:
+            print(f'Windowed forcing: {len(self.local_bases)} windows, '
+                  f'{self.global_basis.nbasis} shared parameter controls, '
+                  f'{self.nbasis - self.global_basis.nbasis} forcing controls, '
+                  f'{self.overlap_days:g}-day overlap')
+        if return_q:
+            return np.concatenate(x_parts), np.concatenate(q_parts)
+
+    def _window_index(self, t):
+        return jnp.sum(jnp.asarray(t) >= self.bounds_jax).astype(jnp.int32)
+
+    def _taper(self, local_t, duration):
+        if self.taper_days == 0:
+            return 1.
+        width = min(self.taper_days, 0.5 * duration)
+        edge = jnp.minimum(local_t, duration - local_t)
+        phase = jnp.clip(edge / width, 0., 1.)
+        return jnp.sin(0.5 * jnp.pi * phase) ** 2
+
+    def _next_weight(self, t, next_start):
+        phase = jnp.clip((t - next_start) / self.overlap_days, 0., 1.)
+        return jnp.sin(0.5 * jnp.pi * phase) ** 2
+
+    def _project_blended(self, index, t, X, state):
+        current = dict(state)
+        self.local_bases[index].operg(
+            t - self.support_starts[index], X[self.local_slices[index]],
+            State=current)
+        if index == len(self.local_bases) - 1:
+            return current
+
+        def blend(fields):
+            following = dict(state)
+            self.local_bases[index + 1].operg(
+                t - self.support_starts[index + 1],
+                X[self.local_slices[index + 1]], State=following)
+            next_weight = self._next_weight(t, self.support_starts[index + 1])
+            result = dict(fields)
+            for name in self.local_bases[index].name_mod_var:
+                result[name] = ((1. - next_weight) * fields[name]
+                                + next_weight * following[name])
+            return result
+
+        return jax.lax.cond(
+            jnp.asarray(t) >= self.support_starts[index + 1],
+            blend, lambda fields: fields, current)
+
+    def _transpose_blended(self, index, t, state):
+        current_state = dict(state)
+        current = self.local_bases[index].operg_transpose(
+            t - self.support_starts[index], current_state)
+        gradient = jnp.zeros((self.nbasis,), dtype=current.dtype)
+        gradient = gradient.at[self.local_slices[index]].set(current)
+        if index == len(self.local_bases) - 1:
+            return gradient, current_state
+
+        def blend(_):
+            following_state = dict(state)
+            following = self.local_bases[index + 1].operg_transpose(
+                t - self.support_starts[index + 1], following_state)
+            next_weight = self._next_weight(t, self.support_starts[index + 1])
+            result = gradient.at[self.local_slices[index]].set(
+                (1. - next_weight) * current)
+            return result.at[self.local_slices[index + 1]].set(
+                next_weight * following)
+
+        gradient = jax.lax.cond(
+            jnp.asarray(t) >= self.support_starts[index + 1],
+            blend, lambda _: gradient, operand=None)
+        return gradient, current_state
+
+    def operg(self, t, X, State=None):
+        if State is None:
+            raise ValueError('Windowed forcing projection requires State.')
+        self.global_basis.operg(t, X[:self.global_basis.nbasis], State=State)
+        if self.overlap_days:
+            branches = tuple(
+                lambda state, index=index: self._project_blended(
+                    index, t, X, state)
+                for index in range(len(self.local_bases)))
+            State.update(jax.lax.switch(self._window_index(t), branches, State))
+            return
+        branches = tuple(
+            (lambda state, basis=basis, slc=slc, start=start, end=end:
+             self._project_local(
+                 basis, t - start, X[slc] * self._taper(t - start, end - start),
+                 state))
+            for basis, slc, start, end in zip(
+                self.local_bases, self.local_slices,
+                self.bounds[:-1], self.bounds[1:]))
+        State.update(jax.lax.switch(self._window_index(t), branches, State))
+
+    def operg_for_output(self, t, X, State=None):
+        """Project at a concrete time without tracing every forcing window."""
+        if State is None:
+            raise ValueError('Windowed forcing projection requires State.')
+        t = float(t)
+        index = int(np.searchsorted(self.bounds[1:-1], t, side='right'))
+        self.global_basis.operg(t, X[:self.global_basis.nbasis], State=State)
+
+        current = dict(State)
+        local_t = t - self.support_starts[index]
+        if self.overlap_days:
+            self.local_bases[index].operg(
+                local_t, X[self.local_slices[index]], State=current)
+            if (index + 1 < len(self.local_bases)
+                    and t >= self.support_starts[index + 1]):
+                following = dict(State)
+                self.local_bases[index + 1].operg(
+                    t - self.support_starts[index + 1],
+                    X[self.local_slices[index + 1]], State=following)
+                phase = np.clip(
+                    (t - self.support_starts[index + 1]) / self.overlap_days,
+                    0., 1.)
+                weight = np.sin(0.5 * np.pi * phase) ** 2
+                for name in self.local_bases[index].name_mod_var:
+                    current[name] = ((1. - weight) * current[name]
+                                     + weight * following[name])
+        else:
+            local_x = X[self.local_slices[index]]
+            if self.taper_days:
+                duration = self.bounds[index + 1] - self.bounds[index]
+                width = min(self.taper_days, 0.5 * duration)
+                edge = min(local_t, duration - local_t)
+                phase = np.clip(edge / width, 0., 1.)
+                local_x = local_x * np.sin(0.5 * np.pi * phase) ** 2
+            self.local_bases[index].operg(local_t, local_x, State=current)
+        State.update(current)
+
+    @staticmethod
+    def _project_local(basis, t, X, state):
+        basis.operg(t, X, State=state)
+        return state
+
+    def operg_transpose(self, t, adState):
+        global_gradient = self.global_basis.operg_transpose(t, adState)
+        if self.overlap_days:
+            branches = tuple(
+                lambda state, index=index: self._transpose_blended(
+                    index, t, state)
+                for index in range(len(self.local_bases)))
+            local_gradient, updated_state = jax.lax.switch(
+                self._window_index(t), branches, adState)
+            adState.update(updated_state)
+            gradient = jnp.zeros((self.nbasis,), dtype=global_gradient.dtype)
+            gradient = gradient.at[:self.global_basis.nbasis].set(global_gradient)
+            return gradient + local_gradient
+        branches = tuple(
+            (lambda state, basis=basis, slc=slc, start=start, end=end:
+             self._transpose_local(
+                 basis, t - start, slc,
+                 self._taper(t - start, end - start), state))
+            for basis, slc, start, end in zip(
+                self.local_bases, self.local_slices,
+                self.bounds[:-1], self.bounds[1:]))
+        local_gradient, updated_state = jax.lax.switch(
+            self._window_index(t), branches, adState)
+        adState.update(updated_state)
+        gradient = jnp.zeros((self.nbasis,), dtype=global_gradient.dtype)
+        gradient = gradient.at[:self.global_basis.nbasis].set(global_gradient)
+        return gradient + local_gradient
+
+    def _transpose_local(self, basis, t, slc, taper, state):
+        local = taper * basis.operg_transpose(t, state)
+        full = jnp.zeros((self.nbasis,), dtype=local.dtype)
+        return full.at[slc].set(local), state
+
+
 class Basis_multi:
 
-    def __init__(self,config,State,verbose=True):
+    def __init__(self,config,State,verbose=True,shared_space_cache=None):
 
         self.Basis = []
         _config = config.copy()
         # Identical basis blocks often target different model variables.  Their
         # immutable spatial operators depend only on the shared State/grid and
         # spatial parameters, so compute them once per Basis_multi instance.
-        shared_space_cache = {}
+        if shared_space_cache is None:
+            shared_space_cache = {}
 
         self.name_mod_var = []
         for _BASIS in config.BASIS:

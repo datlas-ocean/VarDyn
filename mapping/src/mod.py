@@ -3809,40 +3809,45 @@ class Model_qgsw(M):
 
         # Control parameters
         self.name_params = self._configured_name_params
+        load_controls_from_file = getattr(
+            config.GRID, 'load_control_parameters_from_file', True)
+        if config.GRID.super == 'GRID_FROM_FILE' and not isinstance(load_controls_from_file, (bool, np.bool_)):
+            raise ValueError(
+                'GRID_FROM_FILE.load_control_parameters_from_file must be a boolean.')
         if 'H' in self.name_params:
-            if (config.GRID.super == 'GRID_FROM_FILE'):
+            if (config.GRID.super == 'GRID_FROM_FILE'
+                    and load_controls_from_file):
                 dsin = grid.open_grid_restart(config)
                 if 'H_control' in dsin:
                     State.params['H'] = dsin['H_control'].values.squeeze()
                     State.params['H'][np.isnan(State.params['H'])] = 0.
                 else:
-                    dsin.close()
-                    raise ValueError(
-                        'Controlled H restarts require H_control, the dimensionless equivalent-depth control.'
-                    )
+                    State.params['H'] = np.zeros((State.ny, State.nx))
                 dsin.close()
                 del dsin
             else:
                 State.params['H'] = np.zeros((State.ny,State.nx))
 
         if 'g_prime' in self.name_params:
-            if config.GRID.super == 'GRID_FROM_FILE':
+            if (config.GRID.super == 'GRID_FROM_FILE'
+                    and load_controls_from_file):
                 dsin = xr.open_dataset(config.GRID.path_init_grid)
                 try:
-                    if 'g_prime_control' not in dsin:
-                        raise ValueError(
-                            'Controlled g_prime restarts require g_prime_control, '
-                            'the dimensionless reduced-gravity log-control.')
-                    value = np.asarray(dsin['g_prime_control'].values.squeeze(), dtype=float)
-                    State.params['g_prime'] = np.nan_to_num(
-                        value, nan=0., posinf=0., neginf=0.)
+                    if 'g_prime_control' in dsin:
+                        value = np.asarray(
+                            dsin['g_prime_control'].values.squeeze(), dtype=float)
+                        State.params['g_prime'] = np.nan_to_num(
+                            value, nan=0., posinf=0., neginf=0.)
+                    else:
+                        State.params['g_prime'] = np.zeros((State.ny, State.nx))
                 finally:
                     dsin.close()
             else:
                 State.params['g_prime'] = np.zeros((State.ny, State.nx))
 
         if 'h_wind' in self.name_params:
-            if (config.GRID.super == 'GRID_FROM_FILE'):
+            if (config.GRID.super == 'GRID_FROM_FILE'
+                    and load_controls_from_file):
                 dsin = grid.open_grid_restart(config)
                 if 'h_wind_control' in dsin:
                     State.params['h_wind'] = dsin['h_wind_control'].values.squeeze()
@@ -3863,7 +3868,8 @@ class Model_qgsw(M):
                 State.params['h_wind'] = np.zeros((State.ny,State.nx))
 
         if 'wind_strength' in self.name_params:
-            if (config.GRID.super == 'GRID_FROM_FILE'):
+            if (config.GRID.super == 'GRID_FROM_FILE'
+                    and load_controls_from_file):
                 dsin = grid.open_grid_restart(config)
                 if 'wind_strength' in dsin:
                     State.params['wind_strength'] = dsin['wind_strength'].values.squeeze()
