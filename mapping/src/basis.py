@@ -218,6 +218,34 @@ def _bounded_wavelet_frequencies(lmin, lmax, npsp, facpsp):
     return ff
 
 
+def _legacy_wavelet_frequencies(lmin, lmax, npsp, facpsp):
+    """Reproduce the pre-sparse-refactor BM/BMaux wavelength grid."""
+    values = np.asarray([lmin, lmax, npsp, facpsp], dtype=float)
+    if (not np.all(np.isfinite(values)) or lmin <= 0 or lmax <= 0
+            or lmin > lmax or npsp <= 0 or facpsp <= 0):
+        raise ValueError('Invalid legacy wavelet scale parameters.')
+    log_step = np.log1p(facpsp / npsp)
+    logff = np.arange(
+        np.log(1. / lmin),
+        np.log(1. / lmax) - log_step,
+        -log_step,
+    )[::-1]
+    ff = np.exp(logff)
+    if ff.size < 2:
+        raise ValueError(
+            'At least two wavelength bands are required to define wavelet '
+            'directions; increase lmax/lmin or reduce facpsp/npsp.')
+    return ff
+
+
+def _bmaux_uses_legacy_background_layout(config):
+    """Whether BMaux must match controls written before the sparse refactor."""
+    inv_background = getattr(
+        getattr(config, 'INV', None), 'path_background', None)
+    basis_background = getattr(config.BASIS, 'path_background', None)
+    return inv_background is not None or basis_background is not None
+
+
 def _wavelet_center_has_support(obj, lon, lat, radius):
     """Whether a wavelet centre reaches an active physical grid point."""
     indphys = np.where(
@@ -2075,6 +2103,8 @@ class _Basis_bmaux:
         self.path_background = config.BASIS.path_background
         self.var_background = config.BASIS.var_background
         self.norm_time = config.BASIS.norm_time
+        self.legacy_background_layout = (
+            _bmaux_uses_legacy_background_layout(config))
 
         # C-grid variable type (None, 'U', or 'V')
         self.c_grid_var = getattr(config.BASIS, 'c_grid_var', None)
@@ -2245,9 +2275,16 @@ class _Basis_bmaux:
             if (LON_MAX<LON_MIN): LON_MAX = LON_MAX+360.
 
             # Ensemble of pseudo-frequencies for the wavelets (spatial)
-            ff = _bounded_wavelet_frequencies(
+            frequency_builder = (
+                _legacy_wavelet_frequencies
+                if self.legacy_background_layout
+                else _bounded_wavelet_frequencies)
+            ff = frequency_builder(
                 self.lmin, self.lmax, self.npsp, self.facpsp)
             dff = ff[1:] - ff[:-1]
+
+        if self.legacy_background_layout:
+            print('BMaux background compatibility: using legacy control layout')
 
         # Ensemble of directions for the wavelets (2D plane)
         theta = np.linspace(0, np.pi, int(np.pi * ff[0] / dff[0] * self.facpsp))[:-1]
@@ -2319,12 +2356,30 @@ class _Basis_bmaux:
                 _ENSLON = np.arange(lon0, lon1, dlon)
                 _ENSLAT = np.repeat(ENSLAT1[I],len(_ENSLON))
 
-                _ENSLON1 = []
-                _ENSLAT1 = []
-                for lon, lat in zip(_ENSLON, _ENSLAT):
-                    if _wavelet_center_has_support(self, lon, lat, DX[iff]):
-                        _ENSLON1.append(lon)
-                        _ENSLAT1.append(lat)
+                if self.legacy_background_layout and self.mask1d is None:
+                    _ENSLON1 = _ENSLON
+                    _ENSLAT1 = _ENSLAT
+                else:
+                    _ENSLON1 = []
+                    _ENSLAT1 = []
+                    radius = (
+                        1. / ff[iff]
+                        if self.legacy_background_layout else DX[iff])
+                    for lon, lat in zip(_ENSLON, _ENSLAT):
+                        if self.legacy_background_layout:
+                            indphys = np.where(
+                                (np.abs((self.lon1d - lon) / self.km2deg
+                                        * np.cos(lat * np.pi / 180.)) <= radius)
+                                & (np.abs((self.lat1d - lat) / self.km2deg)
+                                   <= radius)
+                            )[0]
+                            keep = not np.all(self.mask1d[indphys])
+                        else:
+                            keep = _wavelet_center_has_support(
+                                self, lon, lat, radius)
+                        if keep:
+                            _ENSLON1.append(lon)
+                            _ENSLAT1.append(lat)
 
                 ENSLAT[iff] = np.concatenate(([ENSLAT[iff],_ENSLAT1]))
                 ENSLON[iff] = np.concatenate(([ENSLON[iff],_ENSLON1]))
