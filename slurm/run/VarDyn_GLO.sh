@@ -433,6 +433,15 @@ else
 fi
 
 # -------------------- TILE CLAIMING (atomic mkdir, works on Lustre/GPFS) --------------------
+slurm_task_is_active() {
+    local task_id="$1"
+    local active_task
+    while IFS= read -r active_task; do
+        [ "$active_task" = "$task_id" ] && return 0
+    done <<< "$ACTIVE_SLURM_TASKS"
+    return 1
+}
+
 try_claim_tile() {
     local tile="$1"
     local lock_dir="${tile}/.tile_running.lock"
@@ -460,7 +469,6 @@ try_claim_tile() {
     [ -f "${lock_dir}/job_id" ] && owner_job=$(sed -n '1p' "${lock_dir}/job_id")
     [ -f "${lock_dir}/token" ] && owner_token=$(sed -n '1p' "${lock_dir}/token")
     [ -z "$owner_job" ] && return 1
-    command -v squeue >/dev/null 2>&1 || return 1
 
     # Older locks stored only the array's base ID. Their token still identifies
     # the exact task, so do not keep a tile locked merely because a different
@@ -470,9 +478,7 @@ try_claim_tile() {
           "$owner_token" =~ ^${owner_job}_([0-9]+)_ ]]; then
         owner_query="${owner_job}_${BASH_REMATCH[1]}"
     fi
-    local owner_tasks
-    owner_tasks=$(squeue -h -j "$owner_query" -o '%i' 2>/dev/null) || return 1
-    [ -n "$owner_tasks" ] && return 1
+    slurm_task_is_active "$owner_query" && return 1
 
     local stale_dir="${lock_dir}.stale-${token}"
     mv "$lock_dir" "$stale_dir" 2>/dev/null || return 1
@@ -580,6 +586,13 @@ process_available_tiles() {
     local tile_pid
     local tile_pids=()
     TILES_PROCESSED_IN_PASS=0
+
+    # Query Slurm once per pass. `-r` expands array expressions such as
+    # 12532022_[1-5], allowing exact owner-task checks for every tile lock.
+    if ! ACTIVE_SLURM_TASKS=$(squeue -r -h -u "$USER" -o '%i' 2>/dev/null); then
+        echo "$(date '+%F %T') | ERROR: failed to query active Slurm tasks before scanning tiles" >&2
+        return 1
+    fi
 
     while IFS= read -r tile; do
         [ -z "$tile" ] && continue
@@ -690,7 +703,9 @@ PY_TILE_SCOPE
         tiles_done=0
         window_waited=0
         while true; do
-            process_available_tiles "$TILE_LIST" "$IW"
+            if ! process_available_tiles "$TILE_LIST" "$IW"; then
+                exit 1
+            fi
             tiles_done=$((tiles_done + TILES_PROCESSED_IN_PASS))
 
             window_tile_state "$TILE_LIST"
