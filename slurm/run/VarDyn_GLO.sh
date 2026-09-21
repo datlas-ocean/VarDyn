@@ -437,25 +437,41 @@ try_claim_tile() {
     local tile="$1"
     local lock_dir="${tile}/.tile_running.lock"
     local token="${JOB_ID}_${ARRAY_ID}_${BASHPID}"
+    local claimant_job="${SLURM_JOB_ID:-$JOB_ID}"
+    if [ -n "${SLURM_ARRAY_JOB_ID:-}" ] && \
+       [ -n "${SLURM_ARRAY_TASK_ID:-}" ]; then
+        claimant_job="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
+    fi
 
     # The stable lock name prevents overlapping job generations from running
     # the same tile. mkdir is atomic on Lustre/GPFS.
     if mkdir "$lock_dir" 2>/dev/null; then
-        printf '%s\n' "$JOB_ID" > "${lock_dir}/job_id"
+        printf '%s\n' "$claimant_job" > "${lock_dir}/job_id"
         printf '%s\n' "$token" > "${lock_dir}/token"
         printf '%s\n' "$token"
         return 0
     fi
 
     # A killed job can leave a directory behind. Reclaim it only when its
-    # owning Slurm array is no longer active; an unreadable/new lock remains
-    # conservatively busy.
+    # owning Slurm array task is no longer active; an unreadable/new lock
+    # remains conservatively busy.
     local owner_job=""
+    local owner_token=""
     [ -f "${lock_dir}/job_id" ] && owner_job=$(sed -n '1p' "${lock_dir}/job_id")
+    [ -f "${lock_dir}/token" ] && owner_token=$(sed -n '1p' "${lock_dir}/token")
     [ -z "$owner_job" ] && return 1
     command -v squeue >/dev/null 2>&1 || return 1
+
+    # Older locks stored only the array's base ID. Their token still identifies
+    # the exact task, so do not keep a tile locked merely because a different
+    # element of that array is pending or running.
+    local owner_query="$owner_job"
+    if [[ "$owner_job" != *_* && \
+          "$owner_token" =~ ^${owner_job}_([0-9]+)_ ]]; then
+        owner_query="${owner_job}_${BASH_REMATCH[1]}"
+    fi
     local owner_tasks
-    owner_tasks=$(squeue -h -j "$owner_job" -o '%i' 2>/dev/null) || return 1
+    owner_tasks=$(squeue -h -j "$owner_query" -o '%i' 2>/dev/null) || return 1
     [ -n "$owner_tasks" ] && return 1
 
     local stale_dir="${lock_dir}.stale-${token}"
@@ -463,7 +479,7 @@ try_claim_tile() {
     rm -f "${stale_dir}/job_id" "${stale_dir}/token"
     rmdir "$stale_dir" 2>/dev/null || true
     if mkdir "$lock_dir" 2>/dev/null; then
-        printf '%s\n' "$JOB_ID" > "${lock_dir}/job_id"
+        printf '%s\n' "$claimant_job" > "${lock_dir}/job_id"
         printf '%s\n' "$token" > "${lock_dir}/token"
         printf '%s\n' "$token"
         return 0
@@ -482,32 +498,20 @@ release_tile_claim() {
     rmdir "$lock_dir" 2>/dev/null || true
 }
 
-# Wait on completed work rather than SLURM_ARRAY_TASK_COUNT: Slurm may start
+# Inspect completed work rather than SLURM_ARRAY_TASK_COUNT: Slurm may start
 # fewer array elements than requested, while every running element scans the
 # same dynamically claimed queue.
-wait_for_window_tiles() {
+window_tile_state() {
     local tile_list="$1"
-    local waited=0
-    while true; do
-        local missing=0
-        local failed=0
-        while IFS= read -r tile; do
-            [ -z "$tile" ] && continue
-            [ -f "${tile}/.tile_complete.ok" ] || missing=$((missing + 1))
-            [ -f "${tile}/.tile_failed" ] && failed=$((failed + 1))
-        done < "$tile_list"
-        if [ "$failed" -gt 0 ]; then
-            echo "$(date '+%F %T') | Window failed: ${failed} tile(s) reported an error" >&2
-            return 1
-        fi
-        [ "$missing" -eq 0 ] && return 0
-        if [ "$waited" -ge "$BARRIER_TIMEOUT" ]; then
-            echo "$(date '+%F %T') | Window still running: ${missing} tile(s) incomplete; continuing to wait" >&2
-            waited=0
-        fi
-        sleep 10
-        waited=$((waited + 10))
-    done
+    WINDOW_TILES_MISSING=0
+    WINDOW_TILES_FAILED=0
+    while IFS= read -r tile; do
+        [ -z "$tile" ] && continue
+        [ -f "${tile}/.tile_complete.ok" ] \
+            || WINDOW_TILES_MISSING=$((WINDOW_TILES_MISSING + 1))
+        [ -f "${tile}/.tile_failed" ] \
+            && WINDOW_TILES_FAILED=$((WINDOW_TILES_FAILED + 1))
+    done < "$tile_list"
 }
 
 
@@ -566,6 +570,38 @@ run_single_tile() {
     fi
     release_tile_claim "$TILE" "$CLAIM_TOKEN"
     trap - EXIT TERM INT
+}
+
+process_available_tiles() {
+    local tile_list="$1"
+    local iw="$2"
+    local tile
+    local claim_token
+    local tile_pid
+    local tile_pids=()
+    TILES_PROCESSED_IN_PASS=0
+
+    while IFS= read -r tile; do
+        [ -z "$tile" ] && continue
+
+        # Another rank or an earlier job generation may finish between scans.
+        [ -f "${tile}/.tile_complete.ok" ] && continue
+
+        claim_token=$(try_claim_tile "$tile") || continue
+        run_single_tile "$tile" "$iw" "$claim_token" &
+        tile_pids+=("$!")
+        TILES_PROCESSED_IN_PASS=$((TILES_PROCESSED_IN_PASS + 1))
+        echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Active tiles: ${#tile_pids[@]}/${NUM_TILES_PER_GPU}"
+
+        if (( ${#tile_pids[@]} >= NUM_TILES_PER_GPU )); then
+            wait "${tile_pids[0]}"
+            tile_pids=("${tile_pids[@]:1}")
+        fi
+    done < "$tile_list"
+
+    for tile_pid in "${tile_pids[@]}"; do
+        wait "$tile_pid"
+    done
 }
 
 # -------------------- SEQUENTIAL TIME WINDOWS, DYNAMIC TILE DISPATCH --------------------
@@ -647,46 +683,33 @@ PY_TILE_SCOPE
         exit 1
     fi
 
-    # Each task dynamically claims tiles (first to mkdir wins)
+    # Each task repeatedly scans the dynamic queue. A tile can initially be
+    # locked by another job generation and become claimable later, and array
+    # tasks that Slurm starts late can join the same loop at any time.
     if ! $MERGE_ONLY; then
         tiles_done=0
-        tile_pids=()
-        while IFS= read -r TILE; do
-            [ -z "$TILE" ] && continue
+        window_waited=0
+        while true; do
+            process_available_tiles "$TILE_LIST" "$IW"
+            tiles_done=$((tiles_done + TILES_PROCESSED_IN_PASS))
 
-            # Avoid paying Python/JAX startup cost for durable completed work.
-            [ -f "${TILE}/.tile_complete.ok" ] && continue
-
-            # Try to claim this tile; skip if another GPU already got it
-            CLAIM_TOKEN=$(try_claim_tile "$TILE") || continue
-
-            run_single_tile "$TILE" "$IW" "$CLAIM_TOKEN" &
-            tile_pids+=("$!")
-            ((tiles_done++))
-            echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Active tiles: ${#tile_pids[@]}/${NUM_TILES_PER_GPU}"
-
-            # Wait for a PID that belongs to this tile queue.  An unscoped
-            # `wait -n` can be satisfied by another child of the launcher and
-            # decrement the counter while every tile is still running.
-            if (( ${#tile_pids[@]} >= NUM_TILES_PER_GPU )); then
-                wait "${tile_pids[0]}"
-                tile_pids=("${tile_pids[@]:1}")
+            window_tile_state "$TILE_LIST"
+            if [ "$WINDOW_TILES_FAILED" -gt 0 ]; then
+                echo "$(date '+%F %T') | Window failed: ${WINDOW_TILES_FAILED} tile(s) reported an error" >&2
+                exit 1
             fi
-        done < "$TILE_LIST"
-        for tile_pid in "${tile_pids[@]}"; do
-            wait "$tile_pid"
+            [ "$WINDOW_TILES_MISSING" -eq 0 ] && break
+
+            if [ "$window_waited" -ge "$BARRIER_TIMEOUT" ]; then
+                echo "$(date '+%F %T') | Window still running: ${WINDOW_TILES_MISSING} tile(s) incomplete; rescanning dynamic queue" >&2
+                window_waited=0
+            fi
+            sleep 10
+            window_waited=$((window_waited + 10))
         done
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Processed ${tiles_done} tiles in time window ${IW}"
     else
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Skipping assimilation (--merge-only)"
-    fi
-
-    if ! $MERGE_ONLY; then
-        wait_for_window_tiles "$TILE_LIST"
-        window_status=$?
-        if [ "$window_status" -ne 0 ]; then
-            exit 1
-        fi
     fi
 
 
