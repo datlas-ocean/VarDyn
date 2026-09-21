@@ -754,7 +754,8 @@ class SW:
         return 0.5 * velocity * (h_left + h_right) - 0.5 * speed * (h_right - h_left)
 
     def advection_momentum(self, u, v, omega, U_m, V_m, k_energy, p, h_tot_ugrid, h_tot_vgrid,
-                           dx_p_ref=None, dy_p_ref=None, taux=None, tauy=None, h_wind=None, wind_strength=None):
+                           dx_p_ref=None, dy_p_ref=None, taux=None, tauy=None,
+                           h_wind=None, wind_strength=None, visc_coef=None):
         """
         Advection RHS for momentum (u, v)
         """
@@ -781,7 +782,7 @@ class SW:
         # wind forcing and bottom drag
         dt_u, dt_v = self.add_wind_forcing(dt_u, dt_v, taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength)
         dt_u, dt_v = self.add_bottom_drag(dt_u, dt_v, u, v)
-        dt_u, dt_v = self.add_diffusion(dt_u, dt_v, u, v)
+        dt_u, dt_v = self.add_diffusion(dt_u, dt_v, u, v, visc_coef)
 
         return jnp.pad(dt_u, ((0,0), (0,0), (1, 1), (0, 0)))*self.masks.u, \
                jnp.pad(dt_v, ((0,0), (0,0), (0, 0), (1, 1)))*self.masks.v
@@ -858,13 +859,14 @@ class SW:
 
         return omega_Vm, omega_Um
 
-    def add_diffusion(self, du, dv, u, v):
+    def add_diffusion(self, du, dv, u, v, visc_coef=None):
         """
         Add Laplacian diffusion ν∇²(u_phys) to velocity derivatives.
         Uses Neumann (zero-flux) BCs via edge-padding.
         Applies to all layers.
         """
-        if self.visc_coef is not None and self.visc_coef > 0:
+        if visc_coef is not None or (self.visc_coef is not None and self.visc_coef > 0):
+            coef = self.visc_coef if visc_coef is None else visc_coef
             # Pad u in y, v in x for Neumann-like boundary treatment
             u_pad = jnp.pad(u, ((0,0), (0,0), (0,0), (1,1)), mode='edge')
             v_pad = jnp.pad(v, ((0,0), (0,0), (1,1), (0,0)), mode='edge')
@@ -899,12 +901,21 @@ class SW:
                   + (v_phys[..., 1:-1, 2:] - 2*v_phys[..., 1:-1, 1:-1] + v_phys[..., 1:-1, :-2]) / dy_v_int**2
 
             # Convert back to scaled variables
-            du = du + self.visc_coef * lap_u * dx_u_int
-            dv = dv + self.visc_coef * lap_v * dy_v_int
+            if jnp.ndim(coef) >= 2:
+                coef = jnp.asarray(coef, dtype=self.dtype)
+                coef_pad = jnp.pad(coef, ((1, 1), (1, 1)), mode='edge')
+                coef_u = .5 * (coef_pad[1:, 1:-1] + coef_pad[:-1, 1:-1])
+                coef_v = .5 * (coef_pad[1:-1, 1:] + coef_pad[1:-1, :-1])
+                coef_u = coef_u[1:-1]
+                coef_v = coef_v[:, 1:-1]
+            else:
+                coef_u = coef_v = coef
+            du = du + coef_u * lap_u * dx_u_int
+            dv = dv + coef_v * lap_v * dy_v_int
 
         return du, dv
 
-    def add_h_diffusion(self, h):
+    def add_h_diffusion(self, h, diff_coef=None):
         """
         Conservative diffusion of physical layer thickness, with zero flux
         across land faces and the outer domain boundary.
@@ -912,7 +923,8 @@ class SW:
         Critical for adjoint stability: counteracts anti-diffusivity of
         the adjoint WENO scheme.
         """
-        if self.diff_coef is not None and self.diff_coef > 0:
+        if diff_coef is not None or (self.diff_coef is not None and self.diff_coef > 0):
+            coef = self.diff_coef if diff_coef is None else diff_coef
             # Mask the face flux, not just the resulting cell tendency:
             # zero-filled land must not act as a reservoir of zero SSH.
             h_phys = jnp.where(self.masks.h > 0.5, h / self.area, 0.0)
@@ -925,14 +937,21 @@ class SW:
             # Face length / centre distance gives integrated gradient fluxes.
             # Shared face fluxes cancel exactly between adjacent cells, also
             # when cell areas vary. Pad with zero exterior fluxes explicitly.
-            flux_x = jnp.where(self.masks.u[..., 1:-1, :],
-                               jnp.diff(h_phys, axis=-2) * x_metric, 0.0)
-            flux_y = jnp.where(self.masks.v[..., 1:-1],
-                               jnp.diff(h_phys, axis=-1) * y_metric, 0.0)
+            if jnp.ndim(coef) >= 2:
+                coef = jnp.asarray(coef, dtype=self.dtype)
+                coef_x = .5 * (coef[1:, :] + coef[:-1, :])
+                coef_y = .5 * (coef[:, 1:] + coef[:, :-1])
+            else:
+                coef_x = coef_y = coef
+            flux_x = jnp.where(
+                self.masks.u[..., 1:-1, :],
+                coef_x * jnp.diff(h_phys, axis=-2) * x_metric, 0.0)
+            flux_y = jnp.where(
+                self.masks.v[..., 1:-1],
+                coef_y * jnp.diff(h_phys, axis=-1) * y_metric, 0.0)
             flux_x = jnp.pad(flux_x, ((0, 0), (0, 0), (1, 1), (0, 0)))
             flux_y = jnp.pad(flux_y, ((0, 0), (0, 0), (0, 0), (1, 1)))
-            return self.diff_coef * (jnp.diff(flux_x, axis=-2)
-                                     + jnp.diff(flux_y, axis=-1))
+            return jnp.diff(flux_x, axis=-2) + jnp.diff(flux_y, axis=-1)
         return jnp.zeros_like(h)
 
     def add_wind_forcing(self, du, dv, taux=None, tauy=None, h_wind=None, wind_strength=None):
@@ -1126,7 +1145,9 @@ class SW:
                dt_v + filt_v, \
                dt_h
 
-    def compute_time_derivatives(self, u, v, h, ref_vals=None, taux=None, tauy=None, h_wind=None, wind_strength=None, **kwargs):
+    def compute_time_derivatives(self, u, v, h, ref_vals=None, taux=None, tauy=None,
+                                 h_wind=None, wind_strength=None,
+                                 diff_coef=None, visc_coef=None, **kwargs):
         """
         Computes the state variables derivatives dt_u, dt_v, dt_h.
         ref_vals: optional tuple (h_ref, h_ref_ugrid, h_ref_vgrid, dx_p_ref, dy_p_ref)
@@ -1143,10 +1164,11 @@ class SW:
 
         omega, eta, p, U, V, U_m, V_m, k_energy, h_tot_ugrid, h_tot_vgrid = \
             self.compute_diagnostic_variables(u, v, h, h_ref_ugrid, h_ref_vgrid)
-        dt_h = self.advection_h(U, V, h, h_ref) + self.add_h_diffusion(h)
+        dt_h = self.advection_h(U, V, h, h_ref) + self.add_h_diffusion(h, diff_coef)
         dt_u, dt_v = self.advection_momentum(
             u, v, omega, U_m, V_m, k_energy, p, h_tot_ugrid, h_tot_vgrid,
-            dx_p_ref, dy_p_ref, taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength)
+            dx_p_ref, dy_p_ref, taux=taux, tauy=tauy, h_wind=h_wind,
+            wind_strength=wind_strength, visc_coef=visc_coef)
         if self.barotropic_filter:
             dt_u, dt_v, dt_h = self.filter_barotropic_waves(dt_u, dt_v, dt_h, u, v, h_tot_ugrid, h_tot_vgrid)
 
@@ -1169,6 +1191,8 @@ class SW:
         tauy=None,
         h_wind=None,
         wind_strength=None,
+        diff_coef=None,
+        visc_coef=None,
     ):
         """
         Performs nstep time-integration with RK3-SSP scheme.
@@ -1242,6 +1266,7 @@ class SW:
                 dtu, dtv, dth = self.compute_time_derivatives(
                     u_, v_, h_, ref_vals, taux=_taux, tauy=_tauy,
                     h_wind=_h_wind, wind_strength=wind_strength,
+                    diff_coef=diff_coef, visc_coef=visc_coef,
                     h_b=_h_b if h_b is not None else None)
                 dtu = dtu + _gamma_u * (_u_b - u_)
                 dtv = dtv + _gamma_v * (_v_b - v_)
@@ -1390,6 +1415,8 @@ class SW:
         tauy=None,
         h_wind=None,
         wind_strength=None,
+        diff_coef=None,
+        visc_coef=None,
     ):
         """
         Performs nstep time-integration for (u, v, h) *and* passive tracer c.
@@ -1452,12 +1479,13 @@ class SW:
             """
             omega, eta, p, U, V, U_m, V_m, k_energy, h_tot_ugrid, h_tot_vgrid = \
                 self.compute_diagnostic_variables(u, v, h, ref_vals[1], ref_vals[2])
-            dt_h = self.advection_h(U, V, h, ref_vals[0]) + self.add_h_diffusion(h)
+            dt_h = self.advection_h(U, V, h, ref_vals[0]) + self.add_h_diffusion(h, diff_coef)
             dt_u, dt_v = self.advection_momentum(
                 u, v, omega, U_m, V_m, k_energy, p,
                 h_tot_ugrid, h_tot_vgrid,
                 ref_vals[3], ref_vals[4],
-                taux=_taux, tauy=_tauy, h_wind=_h_wind, wind_strength=wind_strength)
+                taux=_taux, tauy=_tauy, h_wind=_h_wind,
+                wind_strength=wind_strength, visc_coef=visc_coef)
             if self.barotropic_filter:
                 dt_u, dt_v, dt_h = self.filter_barotropic_waves(
                     dt_u, dt_v, dt_h, u, v, h_tot_ugrid, h_tot_vgrid)

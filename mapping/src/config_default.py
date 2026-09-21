@@ -420,7 +420,7 @@ MOD_QGSW = dict(
 
     var_to_save = None,
 
-    name_params = None, # Controlled parameters. 'H' and 'g_prime' are positive dimensionless log-controls.
+    name_params = None, # Controlled parameters. 'H', 'g_prime', 'h_wind', 'diff_coef', and 'visc_coef' use dimensionless log-controls.
 
     nl = 1, # number of layers in the model (for nl>1, set H and g_prime as lists/arrays)
 
