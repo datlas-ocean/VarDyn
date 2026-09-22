@@ -68,6 +68,25 @@ def _validate_windowed_control_file(dataset, basis, expected_size, label):
             f'Windowed forcing {label} has a different control layout; '
             'use a file created with the same window boundaries and bases.')
 
+
+def _analysis_to_minimizer_control(analysis, background, covariance,
+                                   preconditioned):
+    """Convert a saved ``Xres`` analysis to optimizer coordinates."""
+    background = np.asarray(jax.device_get(background))
+    analysis = np.asarray(analysis).ravel()
+    if analysis.size > background.size:
+        raise ValueError(
+            f'Saved analysis has {analysis.size} controls, but the current '
+            f'basis has only {background.size}.')
+
+    complete_analysis = np.zeros(background.shape, dtype=np.float64)
+    complete_analysis[:analysis.size] = analysis
+    increment = complete_analysis - background
+    if preconditioned:
+        increment = covariance.invsqr(increment)
+    return np.asarray(increment, dtype=np.float64)
+
+
 def _block_until_ready(obj):
     """Wait for pending JAX work before reporting wall-clock timings."""
     return jax.tree_util.tree_map(
@@ -1118,7 +1137,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     var = Variational(
         config=config, M=Model, H=Obsop, State=State, B=B, R=R, Basis=Basis, Xb=Xb, checkpoints=checkpoints, freq_it_plot=config.INV.freq_it_plot, print_time=config.INV.print_time)
     
-    # Initial Control vector 
+    # Initial Control vector
+    initial_control_loaded = False
     if config.INV.path_init_4Dvar is None:
         Xopt = np.zeros((Xb.size,))
     elif not os.path.exists(config.INV.path_init_4Dvar):
@@ -1129,11 +1149,9 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         print('Read previous minimum:',config.INV.path_init_4Dvar)
         with xr.open_dataset(config.INV.path_init_4Dvar) as ds:
             _validate_windowed_control_file(ds, Basis, Xb.size, 'restart')
-            Xopt = np.zeros(var.Xb.shape, dtype=np.float64)
-            Xopt[:ds.res.size] = ds.res.values
-        if config.INV.prec:
-            with var.cost_precision():
-                Xopt = B.invsqr(Xopt - var.Xb)
+            Xopt = _analysis_to_minimizer_control(
+                ds.res.values, var.Xb, B, config.INV.prec)
+        initial_control_loaded = True
     
     # Path where to save the control vector at each 4Dvar iteration 
     # (carefull, depending on the number of control variables, these files may use large disk space)
@@ -1159,6 +1177,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
                     ds, Basis, Xb.size, 'block checkpoint')
                 completed_cycles = int(ds.attrs['completed_cycles'])
                 Xopt = ds.res.values.copy()
+                initial_control_loaded = True
             maxiter = max(maxiter - completed_cycles, 0)
     elif config.INV.restart_4Dvar:
         tmp_files = sorted(glob.glob(os.path.join(path_save_control_vectors,'X_it*.nc')))
@@ -1173,8 +1192,24 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
                 Xopt = ds.res.values
                 maxiter = max(config.INV.maxiter - len(tmp_files), 0)
                 ds.close()
+                initial_control_loaded = True
             except:
                 Xopt = +Xopt
+        else:
+            # Iteration checkpoints are optional (save_minimization=False),
+            # whereas Xres.nc is always written after a successful analysis.
+            # Xres stores the full analysis, so convert it back to optimizer
+            # coordinates before either resuming or replaying with maxiter=0.
+            analysis_restart = os.path.join(
+                path_save_control_vectors, 'Xres.nc')
+            if os.path.exists(analysis_restart):
+                print('Restart at:', analysis_restart)
+                with xr.open_dataset(analysis_restart) as ds:
+                    _validate_windowed_control_file(
+                        ds, Basis, Xb.size, 'restart')
+                    Xopt = _analysis_to_minimizer_control(
+                        ds.res.values, var.Xb, B, config.INV.prec)
+                initial_control_loaded = True
 
     # The historical SciPy adapter owns a host vector. The Optax adapter
     # converts this initial/restart value once, then keeps every vector on GPU.
@@ -1183,6 +1218,11 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         (config.INV.restart_4Dvar or config.INV.path_init_4Dvar is not None)
         and maxiter == 0
     )
+    if skip_minimization and not initial_control_loaded:
+        raise FileNotFoundError(
+            'Cannot replay a 4DVar trajectory with maxiter=0: no restart '
+            'control was loaded. Expected path_init_4Dvar or a control file '
+            f'in {path_save_control_vectors!r}.')
 
     if minimizer_name == 'block-coordinate' and not skip_minimization:
         print('\n*** Minimization (windowed block coordinates) ***\n')
