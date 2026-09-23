@@ -447,6 +447,22 @@ MOD_QGSW = dict(
 
     g_prime = None, # Reference reduced gravity [m s^-2]. With H set, c is diagnosed; with H unset, H is diagnosed from c**2/g_prime.
 
+    # Optional static physical-parameter maps.  A file may be one model-output
+    # snapshot (including a singleton time dimension) or a glob; for a glob,
+    # the lexicographically last file is used.  Mapped values override the
+    # scalar H, h_wind, diff_coef, and visc_coef references below.
+    file_params_aux = None,
+
+    name_var_params_aux = {
+        'lon': 'lon', 'lat': 'lat', 'time': 'time',
+        'H': 'H', 'h_wind': 'h_wind',
+        'diff_coef': 'diff_coef', 'visc_coef': 'visc_coef',
+    },
+
+    params_aux_time_index = -1, # Time record used when the selected file has more than one record.
+
+    params_aux_file_index = -1, # File used when file_params_aux is a glob.
+
     # Meaning of the 2-D state field named by name_var['SSH']:
     # 'ssh' keeps the historical direct-height formulation.
     # 'interface_displacement' (nl=1 SW only) stores reduced-gravity interface
@@ -1107,6 +1123,8 @@ INV_4DVAR = dict(
     forcing_window_overlap_days = 0., # Blend neighboring forcing bases over this many days before each window boundary; incompatible with taper.
 
     minimizer = 'scipy', # 'scipy', 'optax-decoupled', 'optax-full-gpu', or 'block-coordinate'
+
+    lbfgs_history_size = 10, # Number of L-BFGS correction pairs retained on device; reduce for very large controls.
 
     block_outer_cycles = 20, # Block-coordinate sweeps over all forcing windows and shared parameters
 

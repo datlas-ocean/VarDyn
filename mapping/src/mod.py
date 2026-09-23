@@ -12,9 +12,11 @@ import sys
 import xarray as xr
 import numpy as np
 import os
+import glob
 from math import pi
 from datetime import timedelta
 import matplotlib.pylab as plt 
+from matplotlib.colors import LogNorm
 import pyinterp
 import pyinterp.fill
 import jax
@@ -3081,18 +3083,16 @@ class Model_qgsw(M):
         self._controls_g_prime = 'g_prime' in self._configured_name_params
         self._controls_diff_coef = 'diff_coef' in self._configured_name_params
         self._controls_visc_coef = 'visc_coef' in self._configured_name_params
-        for coef_name in ('diff_coef', 'visc_coef'):
-            if coef_name in self._configured_name_params:
-                reference = np.asarray(getattr(config.MOD, coef_name), dtype=float)
-                if reference.ndim != 0 or not np.isfinite(reference) or reference <= 0.:
-                    raise ValueError(
-                        f"Controlling '{coef_name}' requires MOD.{coef_name} "
-                        'to be a finite positive scalar reference.')
-                setattr(self, f'{coef_name}_ref', float(reference))
+        self._params_aux_path = getattr(config.MOD, 'file_params_aux', None)
+        self._params_aux_names = getattr(config.MOD, 'name_var_params_aux', None) or {}
+        self._has_params_aux = self._params_aux_path is not None
         self.wind_use_instantaneous_top_depth = getattr(
             config.MOD, 'wind_use_instantaneous_top_depth', False)
         self._controls_h_wind = 'h_wind' in self._configured_name_params
-        self._prescribes_h_wind = getattr(config.MOD, 'h_wind', None) is not None
+        self._prescribes_h_wind = (
+            getattr(config.MOD, 'h_wind', None) is not None
+            or (self._has_params_aux and self._params_aux_names.get('h_wind'))
+        )
         # In the one-layer physical representation, a controlled H is also the
         # default wind-forcing depth unless an independent h_wind is selected.
         # Keep this decision as configuration state: testing ``h_wind is None``
@@ -3107,7 +3107,8 @@ class Model_qgsw(M):
 
         model = model_sw
         if self._physical_interface_height:
-            if config.MOD.H is None and config.MOD.g_prime is None:
+            has_aux_H = self._has_params_aux and self._params_aux_names.get('H')
+            if config.MOD.H is None and config.MOD.g_prime is None and not has_aux_H:
                 raise ValueError(
                     'interface_displacement requires MOD.H or MOD.g_prime; '
                     'the missing field is diagnosed from the reference phase speed.'
@@ -3140,6 +3141,8 @@ class Model_qgsw(M):
         self.Yh = State.Y
         self.Xu, self.Yu = grid.dxdy2xy(self.dx_on_u, self.dy_on_u)
         self.Xv, self.Yv = grid.dxdy2xy(self.dx_on_v, self.dy_on_v)
+
+        self.parameter_maps = self._load_parameter_maps(config, State)
 
         # Open MDT map if provided
         if config.MOD.path_mdt is not None and os.path.exists(config.MOD.path_mdt):
@@ -3263,9 +3266,10 @@ class Model_qgsw(M):
             print(f'MOD_QGSW observation height mode: SLA (MDT prescribed: {config.MOD.path_mdt})')
 
         # Open Rossby Radius if provided
+        H_reference_value = self.parameter_maps.get('H', config.MOD.H)
         phase_speed_required = not (
             config.MOD.nl == 1
-            and config.MOD.H is not None
+            and H_reference_value is not None
             and config.MOD.g_prime is not None
         )
         if (phase_speed_required and config.MOD.filec_aux is not None
@@ -3355,7 +3359,7 @@ class Model_qgsw(M):
                 raise ValueError(f'MOD.{label} must contain finite positive values.')
             return array
 
-        H_configured = config.MOD.H is not None
+        H_configured = H_reference_value is not None
         g_prime_configured = config.MOD.g_prime is not None
         if self.c is not None:
             if self.c.shape != (State.ny, State.nx):
@@ -3369,7 +3373,7 @@ class Model_qgsw(M):
             c_sw = None
 
         if H_configured:
-            H = _reference_field(config.MOD.H, 'H')
+            H = _reference_field(H_reference_value, 'H')
         else:
             H = None
         if g_prime_configured:
@@ -3425,12 +3429,11 @@ class Model_qgsw(M):
         self.H_floor = self._zero_H_floor_on_mask(self.H_floor, State)
         self._validate_H_floor(self.H0, self.H_floor)
 
-        # Keep controlled wind depth in SW layout so its transformation is
-        # differentiated within the same JAX forward kernel as H.
-        if self._controls_h_wind:
-            h_wind_ref = getattr(config.MOD, 'h_wind', None)
-            if h_wind_ref is None:
-                raise ValueError("Controlling 'h_wind' requires MOD.h_wind to define a positive reference depth.")
+        # Keep wind depth in SW layout.  A controlled field is represented as
+        # a logarithmic perturbation around this scalar or mapped reference.
+        h_wind_ref = self.parameter_maps.get(
+            'h_wind', getattr(config.MOD, 'h_wind', None))
+        if h_wind_ref is not None:
             h_wind_ref = np.asarray(h_wind_ref, dtype=float)
             if h_wind_ref.ndim == 0:
                 h_wind_ref = np.full((State.ny, State.nx), float(h_wind_ref))
@@ -3459,6 +3462,30 @@ class Model_qgsw(M):
                 self.h_wind_max_bound_sw = None
             self.h_wind_ref_sw = jnp.asarray(h_wind_ref.T, dtype=self.dtype)
             self.h_wind_floor_sw = jnp.asarray(h_wind_floor.T, dtype=self.dtype)
+        elif self._controls_h_wind:
+            raise ValueError(
+                "Controlling 'h_wind' requires MOD.h_wind or an auxiliary "
+                "'h_wind' map to define a positive reference depth.")
+
+        for coef_name in ('diff_coef', 'visc_coef'):
+            reference = np.asarray(
+                self.parameter_maps.get(coef_name, getattr(config.MOD, coef_name)),
+                dtype=float)
+            if reference.ndim == 0:
+                reference_sw = reference
+            elif reference.shape == (State.ny, State.nx):
+                reference_sw = reference.T
+            else:
+                raise ValueError(
+                    f'MOD.{coef_name} must be scalar or have State shape '
+                    f'(ny, nx)=({State.ny}, {State.nx}); got {reference.shape}.')
+            if not np.all(np.isfinite(reference_sw)) or np.any(reference_sw < 0.):
+                raise ValueError(
+                    f'MOD.{coef_name} must contain finite non-negative values.')
+            if coef_name in self._configured_name_params and np.any(reference_sw <= 0.):
+                raise ValueError(
+                    f"Controlling '{coef_name}' requires a strictly positive reference.")
+            setattr(self, f'{coef_name}_ref', reference_sw)
         
         # CFL
         if config.MOD.cfl is not None:
@@ -3677,14 +3704,15 @@ class Model_qgsw(M):
             "tauy": 0.,
             "bottom_drag_coef": config.MOD.bottom_drag_coef,
             "rho_water": getattr(config.MOD, 'rho_water', 1025.0),
-            "h_wind": getattr(config.MOD, 'h_wind', None),
+            "h_wind": (self.h_wind_ref_sw
+                       if self._prescribes_h_wind else None),
             "wind_depth_from_H": self._wind_depth_from_H,
             "dtype": self.dtype,
             "mask": (1-State.mask.astype(int).T),
             "compile": True,
             "slip_coef": config.MOD.slip_coef,
-            "visc_coef": config.MOD.visc_coef,
-            "diff_coef": config.MOD.diff_coef,
+            "visc_coef": self.visc_coef_ref,
+            "diff_coef": self.diff_coef_ref,
             "dt": self.dt,
             "barotropic_filter": False,
             'barotropic_filter_spectral': False,
@@ -3927,6 +3955,131 @@ class Model_qgsw(M):
             #self.adjoint_test_jstep(nstep=10)
             adjoint_test(self,State,nstep=10)#, ampl=1e-3)
     
+    def _load_parameter_maps(self, config, State):
+        """Read static QGSW parameter references on the model h-grid."""
+        path_pattern = getattr(config.MOD, 'file_params_aux', None)
+        if path_pattern is None:
+            return {}
+
+        paths = sorted(glob.glob(path_pattern))
+        if not paths and os.path.exists(path_pattern):
+            paths = [path_pattern]
+        if not paths:
+            raise FileNotFoundError(
+                f'MOD_QGSW parameter-map file not found: {path_pattern}')
+        file_index = int(getattr(config.MOD, 'params_aux_file_index', -1))
+        try:
+            path = paths[file_index]
+        except IndexError as exc:
+            raise IndexError(
+                f'MOD.params_aux_file_index={file_index} is outside the '
+                f'{len(paths)} files matching {path_pattern}.') from exc
+
+        names = getattr(config.MOD, 'name_var_params_aux', None) or {}
+        for coordinate in ('lon', 'lat'):
+            if not names.get(coordinate):
+                raise ValueError(
+                    f"MOD.name_var_params_aux requires a '{coordinate}' entry.")
+
+        ds = xr.open_dataset(path)
+        try:
+            time_name = names.get('time')
+            if time_name and time_name in ds:
+                time_dim = ds[time_name].dims[0] if ds[time_name].dims else None
+                if time_dim is not None and time_dim in ds.dims:
+                    time_index = int(getattr(
+                        config.MOD, 'params_aux_time_index', -1))
+                    ds = ds.isel({time_dim: time_index}, drop=True)
+
+            lon_name = names['lon']
+            lat_name = names['lat']
+            if lon_name not in ds or lat_name not in ds:
+                raise KeyError(
+                    f'Parameter map {path} must contain coordinates '
+                    f'{lon_name!r} and {lat_name!r}.')
+
+            lon = ds[lon_name]
+            if np.sign(float(lon.min())) == -1 and State.lon_unit == '0_360':
+                ds = ds.assign_coords({lon_name: lon % 360})
+            elif (float(lon.min()) >= 0 or float(lon.max()) > 180) and State.lon_unit == '-180_180':
+                ds = ds.assign_coords({lon_name: (lon + 180) % 360 - 180})
+            if ds[lon_name].ndim == 1:
+                ds = ds.sortby(lon_name)
+
+            maps = {}
+            for parameter in ('H', 'h_wind', 'diff_coef', 'visc_coef'):
+                variable = names.get(parameter)
+                if not variable:
+                    continue
+                if variable not in ds:
+                    raise KeyError(
+                        f'Parameter map {path} has no variable {variable!r} '
+                        f'configured for {parameter}.')
+                field = grid.interp2d(
+                    ds,
+                    {'lon': lon_name, 'lat': lat_name, 'var': variable},
+                    State.lon,
+                    State.lat,
+                )
+                field = _fill_nan_nearest(field)
+                if field.shape != (State.ny, State.nx):
+                    raise ValueError(
+                        f'Interpolated {parameter} map has shape {field.shape}; '
+                        f'expected ({State.ny}, {State.nx}).')
+                if not np.all(np.isfinite(field)):
+                    raise ValueError(
+                        f'Interpolated {parameter} map contains non-finite values.')
+                maps[parameter] = field
+                print(
+                    f'{parameter} read from {path}:{variable} '
+                    f'(min={field.min():.6g}, max={field.max():.6g})')
+
+            if config.EXP.flag_plot >= 1 and maps:
+                units = {
+                    'H': 'm',
+                    'h_wind': 'm',
+                    'diff_coef': r'm$^2$ s$^{-1}$',
+                    'visc_coef': r'm$^2$ s$^{-1}$',
+                }
+                fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
+                for axis, parameter in zip(axes.ravel(),
+                                           ('H', 'h_wind', 'diff_coef', 'visc_coef')):
+                    if parameter not in maps:
+                        axis.set_visible(False)
+                        continue
+                    plotted = np.where(
+                        State.mask | (maps[parameter] <= 0.),
+                        np.nan,
+                        maps[parameter],
+                    )
+                    finite = plotted[np.isfinite(plotted)]
+                    if finite.size == 0:
+                        raise ValueError(
+                            f'{parameter} has no positive ocean value to plot '
+                            'on a logarithmic colour scale.')
+                    vmin = finite.min()
+                    vmax = finite.max()
+                    if vmax <= vmin:
+                        vmax = np.nextafter(vmin, np.inf)
+                    image = axis.pcolormesh(
+                        State.lon,
+                        State.lat,
+                        plotted,
+                        shading='auto',
+                        norm=LogNorm(vmin=vmin, vmax=vmax),
+                    )
+                    colorbar = fig.colorbar(image, ax=axis)
+                    colorbar.set_label(units[parameter])
+                    axis.set_title(parameter)
+                    axis.set_xlabel('Longitude')
+                    axis.set_ylabel('Latitude')
+                fig.suptitle(
+                    f'MOD_QGSW parameter maps — {os.path.basename(path)}')
+                plt.show()
+            return maps
+        finally:
+            ds.close()
+
     def _H_from_init_file(self, config, State):
         if config.GRID.super != 'GRID_FROM_FILE':
             return None
@@ -4105,7 +4258,9 @@ class Model_qgsw(M):
 
     def _coefficient_control_to_total_sw(self, name, control):
         """Map a dimensionless log-control to a positive coefficient field."""
-        reference = getattr(self, f'{name}_ref')
+        reference = jnp.asarray(getattr(self, f'{name}_ref'), dtype=self.dtype)
+        if control is None:
+            return reference
         total = reference * jnp.exp(jnp.asarray(control, dtype=self.dtype))
         return jnp.maximum(total, jnp.finfo(self.dtype).tiny)
 
@@ -4342,6 +4497,19 @@ class Model_qgsw(M):
 
         _name_var = [self.name_var['U'], self.name_var['V'], self.name_var['SSH']] if name_var is None else list(name_var)
 
+        # Persist the external forcing controls alongside the prognostic
+        # variables.  Keep their native C-grid shapes so the saved fields are
+        # exactly those consumed by jstep_core (before its unit conversion).
+        forcing_names = {
+            'Fu': self.name_var['U'],
+            'Fv': self.name_var['V'],
+            'Fh': self.name_var['SSH'],
+        }
+        for output_name, parameter_name in forcing_names.items():
+            State0.var[output_name] = +State.params[parameter_name]
+            if output_name not in _name_var:
+                _name_var.append(output_name)
+
         if self._physical_interface_height:
             ssh_name = self.name_var['SSH']
             interface_displacement = +State0.var[ssh_name]
@@ -4364,12 +4532,16 @@ class Model_qgsw(M):
             State0.var['H'] = self._H_control_to_total_state(State.params['H'])
             State0.var['H_control'] = +State.params['H']
             _name_var += ['H', 'H_control']
+        elif 'H' in self.parameter_maps:
+            State0.var['H'] = self._H_control_to_total_state(None)
+            _name_var += ['H']
         if 'g_prime' in self.name_params:
             State0.var['g_prime'] = self._g_prime_control_to_total_state(
                 State.params['g_prime'])
             State0.var['g_prime_control'] = +State.params['g_prime']
             _name_var += ['g_prime', 'g_prime_control']
-        if 'H' in self.name_params or 'g_prime' in self.name_params:
+        if ('H' in self.name_params or 'g_prime' in self.name_params
+                or 'H' in self.parameter_maps):
             State0.var['c'] = self._controlled_phase_speed_state(State)
             _name_var += ['c']
 
@@ -4383,6 +4555,9 @@ class Model_qgsw(M):
             State0.var['h_wind'] = self._h_wind_control_to_total_state(State.params['h_wind'])
             State0.var['h_wind_control'] = +State.params['h_wind']
             _name_var += ['h_wind', 'h_wind_control']
+        elif 'h_wind' in self.parameter_maps:
+            State0.var['h_wind'] = np.array(self.h_wind_ref_sw.T)
+            _name_var += ['h_wind']
 
         for coef_name in ('diff_coef', 'visc_coef'):
             if coef_name in self.name_params:
@@ -4391,6 +4566,10 @@ class Model_qgsw(M):
                 control_name = f'{coef_name}_control'
                 State0.var[control_name] = +State.params[coef_name]
                 _name_var += [coef_name, control_name]
+            elif coef_name in self.parameter_maps:
+                State0.var[coef_name] = np.array(
+                    jnp.asarray(getattr(self, f'{coef_name}_ref')).T)
+                _name_var += [coef_name]
         
         if 'wind_strength' in self.name_params:
             State0.var['wind_strength'] = State.params['wind_strength']
@@ -4738,10 +4917,10 @@ class Model_qgsw(M):
         H_model = self._H_control_to_model_increment(H)
         h_wind_model = self._wind_depth_to_model(
             H, h_wind)
-        diff_coef_model = (self._coefficient_control_to_total_sw('diff_coef', diff_coef)
-                           if diff_coef is not None else None)
-        visc_coef_model = (self._coefficient_control_to_total_sw('visc_coef', visc_coef)
-                           if visc_coef is not None else None)
+        diff_coef_model = self._coefficient_control_to_total_sw(
+            'diff_coef', diff_coef)
+        visc_coef_model = self._coefficient_control_to_total_sw(
+            'visc_coef', visc_coef)
 
         # The public one-layer state keeps the reference interface coordinate
         # used by observations and restarts. When g' is controlled, convert it
@@ -4835,10 +5014,10 @@ class Model_qgsw(M):
         H_model = self._H_control_to_model_increment(H)
         h_wind_model = self._wind_depth_to_model(
             H, h_wind)
-        diff_coef_model = (self._coefficient_control_to_total_sw('diff_coef', diff_coef)
-                           if diff_coef is not None else None)
-        visc_coef_model = (self._coefficient_control_to_total_sw('visc_coef', visc_coef)
-                           if visc_coef is not None else None)
+        diff_coef_model = self._coefficient_control_to_total_sw(
+            'diff_coef', diff_coef)
+        visc_coef_model = self._coefficient_control_to_total_sw(
+            'visc_coef', visc_coef)
 
         if self._physical_interface_height and g_prime_control is not None:
             height_scale = (jnp.asarray(self.g_prime, dtype=self.dtype)

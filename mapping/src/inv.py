@@ -433,6 +433,7 @@ def minimize_windowed_blocks(
     outer_cycles,
     inner_maxiter=10,
     parameter_maxiter=1,
+    history_size=10,
     ftol=None,
     convergence_patience=1,
     minimum_cycles=1,
@@ -446,6 +447,8 @@ def minimize_windowed_blocks(
         raise ValueError('Block iteration counts must all be positive.')
     if convergence_patience < 1 or minimum_cycles < 1:
         raise ValueError('Block convergence counts must be positive.')
+    if history_size < 1:
+        raise ValueError('history_size must be positive.')
     x = jnp.asarray(initial_control)
     forcing_slices = tuple(forcing_slices)
     slices = (parameter_slice,) + forcing_slices
@@ -496,7 +499,7 @@ def minimize_windowed_blocks(
                 evaluate_block,
                 x[slc],
                 maxiter=inner_maxiter,
-                history_size=10,
+                history_size=history_size,
                 gradient_max_norm=gradient_max_norm,
                 initial_value=block_value,
                 initial_gradient=block_gradient[slc],
@@ -529,7 +532,7 @@ def minimize_windowed_blocks(
             evaluate_parameters,
             x[parameter_slice],
             maxiter=parameter_maxiter,
-            history_size=10,
+            history_size=history_size,
             gradient_max_norm=gradient_max_norm,
             initial_value=value,
             initial_gradient=gradient[parameter_slice],
@@ -1292,6 +1295,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             outer_cycles=maxiter,
             inner_maxiter=int(config.INV.block_inner_maxiter),
             parameter_maxiter=int(config.INV.block_parameter_maxiter),
+            history_size=int(getattr(
+                config.INV, 'lbfgs_history_size', None) or 10),
             ftol=getattr(config.INV, 'ftol', None),
             convergence_patience=int(patience),
             minimum_cycles=int(getattr(config.INV, 'minimum_iterations', 1)),
@@ -1326,7 +1331,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             var.cost_and_grad,
             jnp.asarray(Xopt, dtype=var.cost_dtype),
             maxiter=maxiter,
-            history_size=10,
+            history_size=int(getattr(
+                config.INV, 'lbfgs_history_size', None) or 10),
             gtol=getattr(config.INV, 'gtol', None),
             ftol=getattr(config.INV, 'ftol', None),
             convergence_patience=patience,
@@ -1416,7 +1422,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             var.cost_and_grad,
             Xopt_jax,
             maxiter=maxiter,
-            history_size=10,
+            history_size=int(getattr(
+                config.INV, 'lbfgs_history_size', None) or 10),
             gtol=getattr(
                 config.INV,
                 'gtol',
