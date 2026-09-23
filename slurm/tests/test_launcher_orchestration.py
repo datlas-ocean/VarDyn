@@ -9,9 +9,9 @@ LAUNCHER = REPOSITORY / "slurm" / "run" / "VarDyn_GLO.sh"
 
 def _tile_lock_functions() -> str:
     launcher = LAUNCHER.read_text(encoding="utf-8")
-    start = launcher.index("try_claim_tile() {")
+    start = launcher.index("slurm_task_is_active() {")
     end = launcher.index(
-        "# Wait on completed work rather than SLURM_ARRAY_TASK_COUNT", start
+        "# Inspect completed work rather than SLURM_ARRAY_TASK_COUNT", start
     )
     return launcher[start:end]
 
@@ -23,7 +23,7 @@ def _run_lock_scenario(tmp_path: Path, scenario: str) -> subprocess.CompletedPro
     fake_squeue.write_text(
         "#!/bin/bash\n"
         "case \" $* \" in\n"
-        "  *\" -j 101 \"*) printf '101_0\\n' ;;\n"
+        "  *\" -j 101_0 \"*) printf '101_0\\n' ;;\n"
         "esac\n",
         encoding="utf-8",
     )
@@ -89,20 +89,28 @@ test ! -d "$tile/.tile_running.lock"
     assert result.returncode == 0, result.stderr
 
 
-def test_launcher_waits_instead_of_submitting_on_barrier_diagnostic():
-    launcher = LAUNCHER.read_text(encoding="utf-8")
-    wait_function = launcher[
-        launcher.index("wait_for_window_tiles() {") : launcher.index(
-            "wait_for_spatial_merge_parts()", launcher.index("wait_for_window_tiles() {")
-        )
-    ]
-    assert "continuing to wait" in wait_function
-    assert "submit_continuation" not in wait_function
-    assert 'return 2' not in wait_function
+def test_tile_lock_never_steals_from_current_array(tmp_path):
+    tile = tmp_path / "tile"
+    tile.mkdir()
+    result = _run_lock_scenario(
+        tmp_path,
+        f"""
+tile={tile!s}
+JOB_ID=101
+ARRAY_ID=0
+first_token=$(try_claim_tile "$tile") || exit 1
+ARRAY_ID=1
+if try_claim_tile "$tile" >/dev/null; then exit 2; fi
+test "$(cat "$tile/.tile_running.lock/token")" = "$first_token" || exit 3
+release_tile_claim "$tile" "$first_token"
+test ! -d "$tile/.tile_running.lock"
+""",
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_launcher_has_resume_and_predecessor_guards():
     launcher = LAUNCHER.read_text(encoding="utf-8")
     assert '--predecessor-job "${dependency}"' in launcher
-    assert '[ -f "${TILE}/.tile_complete.ok" ] && continue' in launcher
+    assert '[ -f "${tile}/.tile_complete.ok" ] && continue' in launcher
     assert '.window_complete_${TILE_SCOPE}.ok' in launcher

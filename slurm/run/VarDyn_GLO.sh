@@ -267,6 +267,7 @@ conda activate MASSHv2
 # Configure GPU allocation before any Python process imports JAX/XLA.
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export TF_GPU_ALLOCATOR=cuda_malloc_async
+export HDF5_USE_FILE_LOCKING=FALSE
 
 # Derive source and library paths from MASH_DIR (set in USER SETTINGS above).
 # readlink -f "$0" is intentionally avoided: SLURM copies the script to
@@ -435,10 +436,15 @@ fi
 # -------------------- TILE CLAIMING (atomic mkdir, works on Lustre/GPFS) --------------------
 slurm_task_is_active() {
     local task_id="$1"
+    local active_tasks
     local active_task
+    if ! active_tasks=$(squeue -r -h -j "$task_id" -o '%i' 2>/dev/null); then
+        # A scheduler query failure must never authorize stealing a live lock.
+        return 0
+    fi
     while IFS= read -r active_task; do
         [ "$active_task" = "$task_id" ] && return 0
-    done <<< "$ACTIVE_SLURM_TASKS"
+    done <<< "$active_tasks"
     return 1
 }
 
@@ -478,6 +484,14 @@ try_claim_tile() {
           "$owner_token" =~ ^${owner_job}_([0-9]+)_ ]]; then
         owner_query="${owner_job}_${BASH_REMATCH[1]}"
     fi
+    # Never steal from another element of this array generation. A stale lock
+    # from this generation is recovered by the dependent continuation job.
+    local current_array_job="${SLURM_ARRAY_JOB_ID:-$JOB_ID}"
+    if [[ "$owner_query" == "${current_array_job}_"* ]]; then
+        return 1
+    fi
+
+    # Query the exact owner immediately before reclaiming an older lock.
     slurm_task_is_active "$owner_query" && return 1
 
     local stale_dir="${lock_dir}.stale-${token}"
@@ -586,13 +600,6 @@ process_available_tiles() {
     local tile_pid
     local tile_pids=()
     TILES_PROCESSED_IN_PASS=0
-
-    # Query Slurm once per pass. `-r` expands array expressions such as
-    # 12532022_[1-5], allowing exact owner-task checks for every tile lock.
-    if ! ACTIVE_SLURM_TASKS=$(squeue -r -h -u "$USER" -o '%i' 2>/dev/null); then
-        echo "$(date '+%F %T') | ERROR: failed to query active Slurm tasks before scanning tiles" >&2
-        return 1
-    fi
 
     while IFS= read -r tile; do
         [ -z "$tile" ] && continue

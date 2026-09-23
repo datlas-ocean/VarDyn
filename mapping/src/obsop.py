@@ -16,6 +16,7 @@ import xarray as xr
 import numpy as np 
 from src import tools as grid
 import pickle
+import tempfile
 import matplotlib.pylab as plt
 from scipy.interpolate import CloughTocher2DInterpolator, griddata
 from scipy.sparse import csc_matrix, csr_matrix
@@ -27,6 +28,33 @@ from jax import jit
 import jax
 
 jax.config.update("jax_enable_x64", USE_FLOAT64)
+def _load_pickle_cache(filename):
+    """Load a cache, treating truncated/corrupt pickles as cache misses."""
+    try:
+        with open(filename, 'rb') as stream:
+            return pickle.load(stream)
+    except (EOFError, pickle.UnpicklingError):
+        return None
+
+
+def _atomic_pickle_dump(payload, filename):
+    """Publish a complete pickle atomically for concurrent readers."""
+    filename = os.fspath(filename)
+    directory = os.path.dirname(filename) or '.'
+    basename = os.path.basename(filename)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f'.{basename}.tmp-', dir=directory)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, filename)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 
 
 def _linear_barycentric_weights(source_coords, target_coords):
@@ -372,14 +400,15 @@ class Obsop_interp_l3(Obsop_interp):
     def process_obs(self, var_bc=None):
 
         stacked_cache = _stacked_obs_cache_path(self, 'l3')
+        cached = None
         if (
             var_bc is None
             and not self.compute_op
             and stacked_cache is not None
             and os.path.exists(stacked_cache)
         ):
-            with open(stacked_cache, 'rb') as stream:
-                cached = pickle.load(stream)
+            cached = _load_pickle_cache(stacked_cache)
+        if cached is not None:
             self.n_data = jnp.asarray(cached['n_data'])
             self.n_obs = jnp.asarray(cached['n_obs'])
             self.data_arr = jnp.asarray(cached['data_arr'])
@@ -416,8 +445,7 @@ class Obsop_interp_l3(Obsop_interp):
                 and self.write_op
                 and os.path.exists(file_L3)
             ):
-                with open(file_L3, "rb") as f:
-                    cached_payload = pickle.load(f)
+                cached_payload = _load_pickle_cache(file_L3)
                 if isinstance(cached_payload, dict):
                     data = cached_payload['data']
                     indices = cached_payload['indices']
@@ -519,8 +547,7 @@ class Obsop_interp_l3(Obsop_interp):
             # Versioned cache includes observation vectors as well as H,
             # so repeated inversions no longer reopen every altimetry NetCDF.
             if self.write_op:
-                with open(file_L3, "wb") as f:
-                    pickle.dump({
+                _atomic_pickle_dump({
                         'version': 2,
                         'data': data,
                         'indices': indices,
@@ -528,7 +555,7 @@ class Obsop_interp_l3(Obsop_interp):
                         'err_obs': err_obs,
                         'lon_obs': lon_obs,
                         'lat_obs': lat_obs,
-                    }, f)
+                    }, file_L3)
         
         self.n_data = np.array([self.data[t].size for t in self.t_obs])
         self.n_obs = np.array([self.varobs[t].size for t in self.t_obs])
@@ -547,8 +574,7 @@ class Obsop_interp_l3(Obsop_interp):
                 self.errobs_arr[i,:self.n_obs[i]] = self.errobs[t] 
             
             if stacked_cache is not None and var_bc is None:
-                with open(stacked_cache, 'wb') as stream:
-                    pickle.dump({
+                _atomic_pickle_dump({
                         'version': 1,
                         'n_data': self.n_data,
                         'n_obs': self.n_obs,
@@ -556,7 +582,7 @@ class Obsop_interp_l3(Obsop_interp):
                         'indices_arr': self.indices_arr,
                         'varobs_arr': self.varobs_arr,
                         'errobs_arr': self.errobs_arr,
-                    }, stream)
+                    }, stacked_cache)
 
             self.n_data = jnp.array(self.n_data)
             self.n_obs = jnp.array(self.n_obs)
@@ -753,14 +779,15 @@ class Obsop_interp_l4(Obsop_interp):
     def process_obs(self, var_bc=None):
         
         stacked_cache = _stacked_obs_cache_path(self, 'l4')
+        cached = None
         if (
             var_bc is None
             and not self.compute_op
             and stacked_cache is not None
             and os.path.exists(stacked_cache)
         ):
-            with open(stacked_cache, 'rb') as stream:
-                cached = pickle.load(stream)
+            cached = _load_pickle_cache(stacked_cache)
+        if cached is not None:
             self.date_obs = cached['date_obs']
             self.t_obs = np.asarray(cached['t_obs'])
             self.t_obs_jax = jnp.asarray(self.t_obs)
@@ -821,8 +848,11 @@ class Obsop_interp_l4(Obsop_interp):
                 and os.path.exists(file_L4)
             )
             if cached_L4:
-                with open(file_L4, "rb") as f:
-                    var_obs_interp, err_obs_interp = pickle.load(f)
+                cached_payload = _load_pickle_cache(file_L4)
+                if cached_payload is None:
+                    cached_L4 = False
+            if cached_L4:
+                var_obs_interp, err_obs_interp = cached_payload
                 var_obs_interp = np.asarray(var_obs_interp).copy()
                 err_obs_interp = np.asarray(err_obs_interp).copy()
                 if var_bc is not None and self.name_var in var_bc:
@@ -1103,8 +1133,8 @@ class Obsop_interp_l4(Obsop_interp):
                 
                 # Save operator if asked
                 if self.write_op:
-                    with open(file_L4, "wb") as f:
-                        pickle.dump((var_obs_interp,err_obs_interp), f)
+                    _atomic_pickle_dump(
+                        (var_obs_interp, err_obs_interp), file_L4)
 
             mask = ((var_obs_interp < np.nanmin(var_obs)) |
                     (var_obs_interp > np.nanmax(var_obs)) |
@@ -1156,8 +1186,7 @@ class Obsop_interp_l4(Obsop_interp):
                 cached['varobs_gradx'] = self.varobs_gradx
             else:
                 cached['varobs'] = self.varobs
-            with open(stacked_cache, 'wb') as stream:
-                pickle.dump(cached, stream)
+            _atomic_pickle_dump(cached, stacked_cache)
 
         self.varobs_arr = jnp.array(
             self.varobs_grady if self.gradients else self.varobs
