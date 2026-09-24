@@ -5,7 +5,7 @@
 
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=3
+#SBATCH --cpus-per-task=4
 #SBATCH --gpus=v100_32g:1
 
 #SBATCH --array=0-5          # Keep in sync with NUM_GPUS below: 0-$((NUM_GPUS-1))
@@ -19,8 +19,8 @@
 
 # -------------------- SLURM --------------------
 NUM_GPUS=6                   # Number of GPU array tasks — also update #SBATCH --array above
-NUM_MERGE_WORKERS=3
-NUM_TILES_PER_GPU=3
+NUM_MERGE_WORKERS=4
+NUM_TILES_PER_GPU=4
 ARRAY_ID=${SLURM_ARRAY_TASK_ID:-0}
 NUM_ARRAY=${SLURM_ARRAY_TASK_COUNT:-$NUM_GPUS}
 # Use SLURM_ARRAY_JOB_ID (common to all array tasks), fall back to SLURM_JOB_ID
@@ -437,26 +437,22 @@ fi
 slurm_task_is_active() {
     local task_id="$1"
     local active_tasks
-    local active_task
     if ! active_tasks=$(squeue -r -h -j "$task_id" -o '%i' 2>/dev/null); then
         # A scheduler query failure must never authorize stealing a live lock.
         return 0
     fi
-    while IFS= read -r active_task; do
-        [ "$active_task" = "$task_id" ] && return 0
-    done <<< "$active_tasks"
-    return 1
+    # Slurm may print the canonical array identity when queried with a raw
+    # per-element ID. Any result for this exact -j query means it is active.
+    [ -n "$active_tasks" ]
 }
 
 try_claim_tile() {
     local tile="$1"
     local lock_dir="${tile}/.tile_running.lock"
     local token="${JOB_ID}_${ARRAY_ID}_${BASHPID}"
-    local claimant_job="${SLURM_JOB_ID:-$JOB_ID}"
-    if [ -n "${SLURM_ARRAY_JOB_ID:-}" ] && \
-       [ -n "${SLURM_ARRAY_TASK_ID:-}" ]; then
-        claimant_job="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
-    fi
+    # Use the normalized array identity instead of Slurm's raw per-element
+    # IDs, whose representation differs between squeue and sacct.
+    local claimant_job="${JOB_ID}_${ARRAY_ID}"
 
     # The stable lock name prevents overlapping job generations from running
     # the same tile. mkdir is atomic on Lustre/GPFS.
@@ -518,9 +514,13 @@ release_tile_claim() {
     rmdir "$lock_dir" 2>/dev/null || true
 }
 
-# Inspect completed work rather than SLURM_ARRAY_TASK_COUNT: Slurm may start
-# fewer array elements than requested, while every running element scans the
-# same dynamically claimed queue.
+tile_is_owned_by_task() {
+    local tile_index="$1"
+    (( tile_index % NUM_ARRAY == ARRAY_ID ))
+}
+
+# Inspect completed work across every deterministic shard rather than
+# inferring completion from the number of running array elements.
 window_tile_state() {
     local tile_list="$1"
     WINDOW_TILES_MISSING=0
@@ -598,13 +598,23 @@ process_available_tiles() {
     local tile
     local claim_token
     local tile_pid
+    local tile_index=0
     local tile_pids=()
     TILES_PROCESSED_IN_PASS=0
 
     while IFS= read -r tile; do
         [ -z "$tile" ] && continue
 
-        # Another rank or an earlier job generation may finish between scans.
+        # Stable round-robin ownership prevents two array tasks from ever
+        # launching the same tile, independently of distributed lock
+        # visibility and Slurm job-ID normalization.
+        if ! tile_is_owned_by_task "$tile_index"; then
+            tile_index=$((tile_index + 1))
+            continue
+        fi
+        tile_index=$((tile_index + 1))
+
+        # A previous pass or job generation may already have completed it.
         [ -f "${tile}/.tile_complete.ok" ] && continue
 
         claim_token=$(try_claim_tile "$tile") || continue
@@ -624,7 +634,7 @@ process_available_tiles() {
     done
 }
 
-# -------------------- SEQUENTIAL TIME WINDOWS, DYNAMIC TILE DISPATCH --------------------
+# --------------- SEQUENTIAL TIME WINDOWS, DETERMINISTIC TILE DISPATCH ---------------
 TIME_WINDOWS=$(ls -d ${BASE_DIR}/subwindow_* 2>/dev/null | sort)
 IW=0
 
@@ -703,9 +713,8 @@ PY_TILE_SCOPE
         exit 1
     fi
 
-    # Each task repeatedly scans the dynamic queue. A tile can initially be
-    # locked by another job generation and become claimable later, and array
-    # tasks that Slurm starts late can join the same loop at any time.
+    # Each task repeatedly scans only its deterministic shard. Locks remain
+    # solely as protection against overlapping job generations.
     if ! $MERGE_ONLY; then
         tiles_done=0
         window_waited=0

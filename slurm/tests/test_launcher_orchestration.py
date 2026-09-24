@@ -10,9 +10,7 @@ LAUNCHER = REPOSITORY / "slurm" / "run" / "VarDyn_GLO.sh"
 def _tile_lock_functions() -> str:
     launcher = LAUNCHER.read_text(encoding="utf-8")
     start = launcher.index("slurm_task_is_active() {")
-    end = launcher.index(
-        "# Inspect completed work rather than SLURM_ARRAY_TASK_COUNT", start
-    )
+    end = launcher.index("window_tile_state() {", start)
     return launcher[start:end]
 
 
@@ -109,8 +107,28 @@ test ! -d "$tile/.tile_running.lock"
     assert result.returncode == 0, result.stderr
 
 
+def test_deterministic_tile_shards_are_disjoint_and_complete(tmp_path):
+    result = _run_lock_scenario(
+        tmp_path,
+        """
+NUM_ARRAY=6
+for tile_index in $(seq 0 135); do
+    owners=0
+    for ARRAY_ID in $(seq 0 $((NUM_ARRAY - 1))); do
+        if tile_is_owned_by_task "$tile_index"; then
+            owners=$((owners + 1))
+        fi
+    done
+    test "$owners" -eq 1 || exit 1
+done
+""",
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_launcher_has_resume_and_predecessor_guards():
     launcher = LAUNCHER.read_text(encoding="utf-8")
     assert '--predecessor-job "${dependency}"' in launcher
     assert '[ -f "${tile}/.tile_complete.ok" ] && continue' in launcher
+    assert 'tile_is_owned_by_task "$tile_index"' in launcher
     assert '.window_complete_${TILE_SCOPE}.ok' in launcher
