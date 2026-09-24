@@ -437,13 +437,27 @@ fi
 slurm_task_is_active() {
     local task_id="$1"
     local active_tasks
-    if ! active_tasks=$(squeue -r -h -j "$task_id" -o '%i' 2>/dev/null); then
-        # A scheduler query failure must never authorize stealing a live lock.
+    if active_tasks=$(squeue -r -h -j "$task_id" -o '%i'); then
+        # A targeted query can return a canonical array ID for a raw job ID.
+        [ -n "$active_tasks" ]
+        return
+    fi
+    # Finished jobs can make a targeted query fail with "Invalid job id".
+    # Only a successful full listing can establish that an array task is gone.
+    if ! active_tasks=$(squeue -r -h -o '%i'); then
+        echo "WARNING: cannot determine Slurm owner ${task_id}; retaining tile lock" >&2
         return 0
     fi
-    # Slurm may print the canonical array identity when queried with a raw
-    # per-element ID. Any result for this exact -j query means it is active.
-    [ -n "$active_tasks" ]
+    local active_task
+    while read -r active_task; do
+        [ "$active_task" = "$task_id" ] && return 0
+    done <<< "$active_tasks"
+    if [[ ! "$task_id" =~ ^[0-9]+_[0-9]+$ ]]; then
+        # A legacy raw ID may appear under a different canonical array ID.
+        echo "WARNING: unresolved legacy Slurm owner ${task_id}; retaining tile lock" >&2
+        return 0
+    fi
+    return 1
 }
 
 try_claim_tile() {
@@ -517,6 +531,22 @@ release_tile_claim() {
 tile_is_owned_by_task() {
     local tile_index="$1"
     (( tile_index % NUM_ARRAY == ARRAY_ID ))
+}
+
+report_incomplete_tiles() {
+    local tile_list="$1"
+    local tile owner token
+    while IFS= read -r tile; do
+        [ -z "$tile" ] && continue
+        [ -f "${tile}/.tile_complete.ok" ] && continue
+        if [ -d "${tile}/.tile_running.lock" ]; then
+            owner=$(sed -n '1p' "${tile}/.tile_running.lock/job_id" 2>/dev/null) || owner="unreadable"
+            token=$(sed -n '1p' "${tile}/.tile_running.lock/token" 2>/dev/null) || token="unreadable"
+            printf 'Incomplete tile: %s | lock owner=%s | token=%s\n' "$tile" "$owner" "$token" >&2
+        else
+            printf 'Incomplete tile: %s | no lock directory\n' "$tile" >&2
+        fi
+    done < "$tile_list"
 }
 
 # Inspect completed work across every deterministic shard rather than
@@ -732,7 +762,8 @@ PY_TILE_SCOPE
             [ "$WINDOW_TILES_MISSING" -eq 0 ] && break
 
             if [ "$window_waited" -ge "$BARRIER_TIMEOUT" ]; then
-                echo "$(date '+%F %T') | Window still running: ${WINDOW_TILES_MISSING} tile(s) incomplete; rescanning dynamic queue" >&2
+                echo "$(date '+%F %T') | Window still running: ${WINDOW_TILES_MISSING} tile(s) incomplete; rescanning deterministic shards" >&2
+                report_incomplete_tiles "$TILE_LIST"
                 window_waited=0
             fi
             sleep 10

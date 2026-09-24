@@ -132,3 +132,65 @@ def test_launcher_has_resume_and_predecessor_guards():
     assert '[ -f "${tile}/.tile_complete.ok" ] && continue' in launcher
     assert 'tile_is_owned_by_task "$tile_index"' in launcher
     assert '.window_complete_${TILE_SCOPE}.ok' in launcher
+
+
+def test_old_array_lock_after_targeted_query_error(tmp_path):
+    for index, (listing, status, reclaimed) in enumerate([
+        ("", 0, True),
+        ("12771183_4", 0, True),
+        ("12771183_5", 0, False),
+        ("", 1, False),
+        ("12850304_0", 1, False),
+    ]):
+        case = tmp_path / str(index)
+        tile = case / "tile"
+        lock = tile / ".tile_running.lock"
+        lock.mkdir(parents=True)
+        (lock / "job_id").write_text("12771183\n")
+        old_token = "12771183_5_3092055"
+        (lock / "token").write_text(old_token + "\n")
+        result = _run_lock_scenario(case, f"""
+squeue() {{
+    if [[ " $* " == *" -j "* ]]; then
+        echo "slurm_load_jobs error: Invalid job id specified" >&2
+        return 1
+    fi
+    printf '%s\\n' '{listing}'
+    return {status}
+}}
+JOB_ID=12850304
+ARRAY_ID=0
+if token=$(try_claim_tile "{tile}"); then
+    echo RECLAIMED
+else
+    echo RETAINED
+fi
+""")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == ("RECLAIMED" if reclaimed else "RETAINED")
+        assert "Invalid job id specified" in result.stderr
+        if reclaimed:
+            assert (lock / "job_id").read_text().strip() == "12850304_0"
+        else:
+            assert (lock / "token").read_text().strip() == old_token
+        if status:
+            assert "retaining tile lock" in result.stderr
+
+
+def test_incomplete_tile_diagnostics(tmp_path):
+    tile = tmp_path / "tile"
+    lock = tile / ".tile_running.lock"
+    lock.mkdir(parents=True)
+    (lock / "job_id").write_text("12771183\n")
+    (lock / "token").write_text("12771183_5_3092055\n")
+    done = tmp_path / "done"
+    done.mkdir()
+    (done / ".tile_complete.ok").touch()
+    tile_list = tmp_path / "tiles"
+    tile_list.write_text(f"{tile}\n{done}\n{tmp_path / 'unlocked'}\n")
+    result = _run_lock_scenario(tmp_path, f'report_incomplete_tiles "{tile_list}"')
+    assert result.returncode == 0, result.stderr
+    assert "lock owner=12771183 | token=12771183_5_3092055" in result.stderr
+    assert "no lock directory" in result.stderr
+    assert str(done) not in result.stderr
+    assert not result.stdout
