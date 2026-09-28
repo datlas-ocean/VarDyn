@@ -70,7 +70,7 @@ class _TileState:
         return xr.Dataset({"sla": (("y", "x"), self.values)})
 
 
-def test_date_merge_uses_compact_support_and_renormalizes_missing_tile():
+def test_date_merge_excludes_land_from_support_and_normalization():
     target = SimpleNamespace(ny=2, nx=3, mask=None)
     first_indices = np.array([0, 1, 3, 4], dtype=np.int32)
     second_indices = np.array([1, 2, 4, 5], dtype=np.int32)
@@ -93,10 +93,12 @@ def test_date_merge_uses_compact_support_and_renormalizes_missing_tile():
     )["sla"]
     np.testing.assert_allclose(merged, [[1, 2, 3], [1, 2, 3]])
 
+    land = _TileState(fail=True)
+    land.mask = np.ones((2, 2), dtype=bool)
     partial = _merge_date_arrays(
         None,
         target,
-        [_TileState(np.ones((2, 2))), _TileState(fail=True)],
+        [_TileState(np.ones((2, 2))), land],
         ["sla"],
         runtime,
         no_coverage,
@@ -104,3 +106,60 @@ def test_date_merge_uses_compact_support_and_renormalizes_missing_tile():
     )["sla"]
     np.testing.assert_allclose(partial[:, :2], 1.0)
     assert np.isnan(partial[:, 2]).all()
+
+
+def test_missing_ocean_output_is_fatal():
+    target = SimpleNamespace(ny=2, nx=2, mask=None)
+    with pytest.raises(RuntimeError, match="Required ocean tile"):
+        _merge_date_arrays("2024-07-27", target, [_TileState(fail=True)],
+                           ["sla"], [(None, np.ones((2, 2)), None)],
+                           np.zeros((2, 2), dtype=bool), np.float32)
+
+
+def test_missing_required_variable_is_fatal():
+    target = SimpleNamespace(ny=2, nx=2, mask=None)
+    with pytest.raises(RuntimeError, match="Required variable ug missing"):
+        _merge_date_arrays(None, target, [_TileState(np.ones((2, 2)))],
+                           ["ug"], [(None, np.ones((2, 2)), None)],
+                           np.zeros((2, 2), dtype=bool), np.float32)
+
+
+def test_parallel_merge_aborts_on_first_reported_failure(monkeypatch):
+    from src import run_assimilation as module
+
+    class Process:
+        def __init__(self, **kwargs):
+            self.alive = False
+            self.terminated = False
+        def start(self):
+            self.alive = True
+        def is_alive(self):
+            return self.alive
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+        def join(self, timeout):
+            pass
+
+    class Context:
+        def __init__(self):
+            self.processes = []
+            self.reads = 0
+        def Queue(self):
+            return self
+        def get(self, timeout):
+            self.reads += 1
+            assert self.reads == 1, "must not wait for the other worker"
+            return {"kind": "result", "worker": 0, "error": "missing ocean output"}
+        def Process(self, **kwargs):
+            process = Process(**kwargs)
+            self.processes.append(process)
+            return process
+
+    context = Context()
+    monkeypatch.setattr(module.mp, "get_context", lambda method: context)
+    with pytest.raises(RuntimeError, match="missing ocean output"):
+        module.parallel_merge([1, 2], None, [None, None], ["sla"],
+                              None, None, None, None, num_workers=2)
+    assert len(context.processes) == 2
+    assert all(p.terminated for p in context.processes)

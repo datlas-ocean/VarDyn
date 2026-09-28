@@ -1361,21 +1361,23 @@ def _merge_date_arrays(date, State, list_State, name_var_save,
 
     for (_State, (output_indices, blend_weight, interpolator)) in zip(
             list_State, runtime_tiles):
-        try:
-            dataset = _State.load_output(date)
-        except Exception as exc:
-            print(
-                f'[merge worker] tile failed for {date}: {exc}',
-                flush=True)
+        # Land tiles intentionally have no trajectory. Remove their weights
+        # from the denominator too, including for legacy prepared states.
+        if getattr(_State, 'mask', None) is not None and _State.mask.all():
             for name in name_var_save:
                 mark_missing(name, output_indices, blend_weight)
             continue
+        try:
+            dataset = _State.load_output(date)
+        except Exception as exc:
+            raise RuntimeError(
+                f'Required ocean tile output unavailable at {date}: {exc}') from exc
 
         try:
             for name in name_var_save:
                 if name not in dataset.data_vars:
-                    mark_missing(name, output_indices, blend_weight)
-                    continue
+                    raise RuntimeError(
+                        f'Required variable {name} missing at {date}')
                 try:
                     values = dataset[name].values
                     if values.shape == (_State.ny, _State.nx + 1):
@@ -1403,10 +1405,8 @@ def _merge_date_arrays(date, State, list_State, name_var_save,
                         mark_missing(
                             name, output_indices, blend_weight, ~finite)
                 except Exception as exc:
-                    print(
-                        f'[merge worker] variable {name} failed for '
-                        f'{date}: {exc}', flush=True)
-                    mark_missing(name, output_indices, blend_weight)
+                    raise RuntimeError(
+                        f'Required variable {name} failed at {date}: {exc}') from exc
         finally:
             dataset.close()
 
@@ -1681,6 +1681,7 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel,
         p.start()
         procs.append(p)
 
+    completed = False
     try:
         results = []
         last_progress = time.monotonic()
@@ -1700,19 +1701,23 @@ def parallel_merge(dates, State, list_State, name_var_save, kernel,
                         f'no merge-worker progress for {worker_stall_timeout} s')
                 continue
             last_progress = time.monotonic()
+            if item.get('error') is not None:
+                raise RuntimeError(
+                    f"merge worker {item['worker']} failed: {item['error']}")
             if item.get('kind') == 'result':
                 results.append(item)
-        failures = [item for item in results if item['error'] is not None]
-        if failures:
-            first = failures[0]
-            raise RuntimeError(
-                f"merge worker {first['worker']} failed: {first['error']}")
+        completed = True
     finally:
+        # On failure stop every peer before waiting; no more partial dates.
+        if not completed:
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
         for p in procs:
-            p.join(timeout=30)
+            p.join(timeout=10)
             if p.is_alive():
-                p.terminate()
-                p.join(timeout=30)
+                p.kill()
+                p.join(timeout=10)
 
 
 def _add_diagnosed_output_names(config, name_var_save):

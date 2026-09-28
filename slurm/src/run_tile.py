@@ -77,7 +77,7 @@ def run_tile(tile_dir: Path, restart:bool):
     # core will hard-fail on an all-zero mask.
     if getattr(State, 'mask', None) is not None and State.mask.all():
         print(f"[SKIP] Tile is all land (no ocean points), skipping: {tile_dir}")
-        write_orchestration_marker(orchestration_marker, "all-land tile\n")
+        write_orchestration_marker(orchestration_marker, "SKIPPED_LAND\n")
         return
 
     print(f"Running inversion, output path: {config.EXP.path_save}")
@@ -103,13 +103,13 @@ def run_tile(tile_dir: Path, restart:bool):
         )
         tmp_marker.replace(success_marker)
         write_orchestration_marker(
-            orchestration_marker, f"completed: {datetime.now().isoformat()}\n")
+            orchestration_marker, f"COMPLETED {datetime.now().isoformat()}\n")
 
         print(f"[{datetime.now()}] Finished tile: {tile_dir}")
     else:
         write_orchestration_marker(
             orchestration_marker,
-            f"already completed: {datetime.now().isoformat()}\n")
+            f"COMPLETED {datetime.now().isoformat()} (reused)\n")
         print(f"[{datetime.now()}] Non-processed tile: {tile_dir}")
         print(f"Because you did not ask for restart and {success_marker} exists.")
 

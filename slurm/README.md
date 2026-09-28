@@ -8,7 +8,7 @@ Large-scale SSH mapping with MASSH (e.g. global VarDyn runs) is parallelised ove
 - **Space** — the domain is split into overlapping spatial tiles
 - **Time** — the time period is split into overlapping time windows
 
-Each running SLURM array task (one GPU) claims a dynamic subset of tiles. For Zarr output, spatial-merge date shards are also dynamically claimed: each active task uses its own CPU allocation to create an independent rank archive. One task then assembles the validated rank archives into the single archive for that temporal window. Finally, one task merges all temporal windows into the full output.
+Each running SLURM array task (one GPU) processes its deterministic shard of the sorted tile list. For Zarr output, spatial-merge date shards are also dynamically claimed: each active task uses its own CPU allocation to create an independent rank archive. One task then assembles the validated rank archives into the single archive for that temporal window. Finally, one task merges all temporal windows into the full output.
 
 ```
 sbatch slurm/run/VarDyn_GLO.sh [--skip-prepare] [--restart] [--force-merge] [--tile-scope all|equatorial] [--name_exp <name>]
@@ -35,7 +35,7 @@ prepare_VarDyn.py (one dynamic owner)
                  │
                  ▼
 for each temporal window:
-  dynamic assimilation-tile queue across active GPU tasks
+  deterministic assimilation-tile shards (one owner per tile)
                  │
                  ▼
   dynamic spatial-merge rank queue
@@ -71,7 +71,9 @@ Example SLURM submission script — copy and edit the **USER SETTINGS** block fo
 | `TIME_WIN`, `TIME_OVERLAP` | Temporal window size and overlap (days) |
 | `FLAG_INIT` / `FLAG_BACKGROUND` / `NAME_EXP` | Initialise from / use background from a previous experiment |
 | `NAME_EXP_BACKGROUND` | Source experiment for the inversion background; alternatively pass `--name_exp_background` |
-| `BARRIER_TIMEOUT` | Seconds between incomplete-tile waiting diagnostics |
+| `BARRIER_TIMEOUT` | Maximum barrier wait or interval without tile completion progress, in seconds (default: 7200) |
+| `TILE_TIMEOUT` | Maximum runtime of one tile in seconds (default: 172800); timeout stops its process group |
+| `STAGE_TIMEOUT` | Maximum runtime of one preparation/merge command in seconds (default: 172800) |
 | `ZARR_OUTPUT` | If this shell option or `EXP.saveoutputs_zarr` is `true`, store each merged temporal window in one Zarr archive and the final experiment in one global Zarr archive |
 | `OUTPUT_FLOAT64` | If `true`, save merged floating-point data as float64; otherwise float32 (default: false) |
 | `CLEANUP_TILE_ZARR` | If `true` (default), compact validated tile trajectories to the single record needed to restart the following window |
@@ -107,13 +109,29 @@ fallback source name when background mode is enabled without
 `NAME_EXP_BACKGROUND`.
 
 **Barrier robustness** (Lustre/GPFS):
-- `mkdir -p` for the barrier directory is retried up to 5 times with backoff
-- `touch` inside `barrier_wait` is similarly retried
-- `BARRIER_TIMEOUT` controls periodic "still running" diagnostics while a
-  task waits for slower assimilation tiles. It does not terminate the task or
-  submit a continuation.
-- Spatial merge ranks and finalization wait until an explicit failure or the Slurm wall-time signal
-- `--force-merge` applies to the submitted run only and is not propagated to automatic continuations, so completed windows are not repeatedly recomputed
+- Barrier directory creation is retried up to five times with backoff.
+- Preparation, queue publication, merge parts, finalization and final merge
+  waits stop on a shared failure, a confirmed dead owner, or `BARRIER_TIMEOUT`.
+- Assimilation waits reset their deadline only when the number of incomplete
+  tiles changes. Pending owners are not replaced by another worker. Set
+  `BARRIER_TIMEOUT` above the expected gap between tile completions/startups.
+- Slurm queries have a 30-second timeout (plus 5 seconds to force termination).
+  A failed targeted query falls back to the full active-task listing, including
+  for `--predecessor-job`. Unknown ownership never authorizes stealing a lock.
+- A tile failure stops new launches and propagates to other tasks through
+  generation-specific `run.failed` and window failure markers. Running tile
+  and stage process groups are terminated and reaped before releasing tile
+  locks; TERM is followed by KILL after a ten-second grace period if needed.
+- Successful tiles remain resumable. Previous `.tile_failed` markers are
+  cleared once during queue publication for the next generation, before any
+  workers are released. Barriers are retained for diagnostics after completion.
+- Deterministic failures do not submit automatic continuations. The Slurm
+  wall-time warning still submits a dependent continuation.
+- `--force-merge` applies to the submitted run only and is not propagated to
+  automatic continuations.
+
+The launcher requires `setsid` and GNU `timeout` on the compute nodes.
+All three timeouts can be overridden in the experiment shell config.
 
 Automatic continuations carry the preceding array ID in an internal
 `--predecessor-job` argument. The continuation checks `squeue` before doing any
@@ -142,13 +160,24 @@ Reads the MASSH config files and generates the pickle tree under `DIR_SAVE_PICKL
 
 ### `run_tile.py`
 
-Loads one `subwindow_<space>` pickle directory and runs the full MASSH assimilation (forward + inverse). Writes `Xres.nc` on completion.
+Loads one `subwindow_<space>` pickle directory and runs the full MASSH assimilation (forward + inverse). Writes `Xres.nc` on completion. The atomic `.tile_complete.ok` contains
+`COMPLETED` for calculated/reused output or `SKIPPED_LAND` for a tile whose
+entire state mask is land. Land tiles intentionally have no trajectory.
+The fusion checks the state mask too, so old prepared states and completion
+markers remain compatible.
 
 ### `merge_outputs.py`
 
 Two-stage merge:
 1. **Spatial merge**: distributes timestamp shards over dynamically claimed ranks. Each rank uses `NUM_MERGE_WORKERS` CPU processes and writes an independent temporary Zarr archive; the validated parts are then atomically assembled into one `<name_exp>.zarr` archive for the temporal window.
 2. **Time-window merge** (one task only): combines spatial merges across all time windows and validates every expected timestamp.
+
+Spatial fusion excludes all-land tiles from both contributions and weight
+normalization. An unreadable ocean trajectory, missing requested variable or
+variable read/projection error fails the merge. Other merge workers are stopped
+on the first reported error; no window-success marker is published. Existing
+merged products are still reused normally: use `--force-merge` to rebuild a
+previously generated product after auditing its inputs.
 
 New Zarr stores use explicit Zstd/bitshuffle compression and configurable
 time/spatial chunks. After the next window has completed and the current

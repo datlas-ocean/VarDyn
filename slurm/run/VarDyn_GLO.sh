@@ -67,7 +67,11 @@ CLEANUP_TILE_ZARR="${CLEANUP_TILE_ZARR:-true}"
 ZARR_TIME_CHUNK="${ZARR_TIME_CHUNK:-4}"
 ZARR_SPATIAL_CHUNK="${ZARR_SPATIAL_CHUNK:-256}"
 ZARR_COMPRESSION_LEVEL="${ZARR_COMPRESSION_LEVEL:-3}"
+# Maximum barrier wait / interval without tile completion progress.
 BARRIER_TIMEOUT="${BARRIER_TIMEOUT:-7200}"
+# Separate ceiling for one tile, which may legitimately take several hours.
+TILE_TIMEOUT="${TILE_TIMEOUT:-172800}"
+STAGE_TIMEOUT="${STAGE_TIMEOUT:-172800}"
 FLAG_INIT_FROM_PREVIOUS="${FLAG_INIT_FROM_PREVIOUS:---flag_init_from_previous}"
 FLAG_INIT="${FLAG_INIT:-false}"
 FLAG_BACKGROUND="${FLAG_BACKGROUND:-false}"
@@ -81,8 +85,8 @@ if ! [[ "$NUM_TILES_PER_GPU" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: NUM_TILES_PER_GPU must be a positive integer (got '$NUM_TILES_PER_GPU')" >&2
     exit 1
 fi
-if ! [[ "$BARRIER_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
-    echo "ERROR: BARRIER_TIMEOUT must be a positive integer (got '$BARRIER_TIMEOUT')" >&2
+if ! [[ "$BARRIER_TIMEOUT" =~ ^[1-9][0-9]*$ && "$TILE_TIMEOUT" =~ ^[1-9][0-9]*$ && "$STAGE_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: BARRIER_TIMEOUT, TILE_TIMEOUT and STAGE_TIMEOUT must be positive integers" >&2
     exit 1
 fi
 if [ "$CLEANUP_TILE_ZARR" != "true" ] && \
@@ -166,6 +170,37 @@ fi
 BASE_DIR="${DIR_SAVE_PICKLE}/${EXP_NAME}"
 CONFIG_PATH="${BASE_DIR}/config.pkl"
 
+_slurm_query() {
+    timeout --kill-after=5 30 squeue "$@"
+}
+
+slurm_task_is_active() {
+    local task_id="$1"
+    local active_tasks
+    if active_tasks=$(_slurm_query -r -h -j "$task_id" -o '%i'); then
+        # A targeted query can return a canonical array ID for a raw job ID.
+        [ -n "$active_tasks" ]
+        return
+    fi
+    # Finished jobs can make a targeted query fail with "Invalid job id".
+    # Only a successful full listing can establish that an array task is gone.
+    if ! active_tasks=$(_slurm_query -r -h -o '%i'); then
+        echo "WARNING: cannot determine Slurm owner ${task_id}; retaining tile lock" >&2
+        return 0
+    fi
+    local active_task
+    while read -r active_task; do
+        [ "$active_task" = "$task_id" ] && return 0
+        [[ "$task_id" != *_* && "$active_task" == "${task_id}_"* ]] && return 0
+    done <<< "$active_tasks"
+    if [[ ! "$task_id" =~ ^[0-9]+_[0-9]+$ && "$task_id" != "${PREDECESSOR_JOB:-}" ]]; then
+        # A legacy raw ID may appear under a different canonical array ID.
+        echo "WARNING: unresolved legacy Slurm owner ${task_id}; retaining tile lock" >&2
+        return 0
+    fi
+    return 1
+}
+
 # -------------------- TIME-LIMIT CONTINUATION --------------------
 # Slurm sends USR1 300 seconds before the wall-time limit. The first task
 # obtaining the submission lock creates a continuation; completed work is
@@ -210,23 +245,19 @@ submit_continuation() {
     fi
 }
 
-release_stage_lock() {
-    if [ -n "$OWNED_STAGE_LOCK" ]; then
-        rmdir "$OWNED_STAGE_LOCK" 2>/dev/null || true
-    fi
-}
-
 handle_timeout() {
-    release_stage_lock
+    declare -F stop_tile_workers >/dev/null && stop_tile_workers
+    declare -F stop_process_group >/dev/null && stop_process_group "${STAGE_PID:-}"
     echo "$(date '+%F %T') | Slurm wall-time signal received; requesting continuation"
     submit_continuation
-    exit 0
+    exit 124
 }
 
 handle_cancel() {
-    release_stage_lock
+    declare -F stop_tile_workers >/dev/null && stop_tile_workers
+    declare -F stop_process_group >/dev/null && stop_process_group "${STAGE_PID:-}"
     echo "$(date '+%F %T') | Cancellation signal received; no continuation will be submitted"
-    exit 0
+    exit 143
 }
 
 trap handle_timeout USR1
@@ -326,6 +357,7 @@ echo " SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-N/A}"
 echo " SLURM_CPUS_ON_NODE=${SLURM_CPUS_ON_NODE:-N/A}"
 echo " NUM_MERGE_WORKERS=${NUM_MERGE_WORKERS}"
 echo " NUM_TILES_PER_GPU=${NUM_TILES_PER_GPU}"
+echo " BARRIER_TIMEOUT=${BARRIER_TIMEOUT}s TILE_TIMEOUT=${TILE_TIMEOUT}s STAGE_TIMEOUT=${STAGE_TIMEOUT}s"
 echo " TILE_SCOPE=${TILE_SCOPE}"
 echo " CLEANUP_TILE_ZARR=${CLEANUP_TILE_ZARR}"
 echo " ZARR chunks=${ZARR_TIME_CHUNK}x${ZARR_SPATIAL_CHUNK}x${ZARR_SPATIAL_CHUNK}, zstd level=${ZARR_COMPRESSION_LEVEL}"
@@ -335,18 +367,13 @@ if [ -n "$PREDECESSOR_JOB" ]; then
         echo "$(date '+%F %T') | ERROR: cannot guard continuation against predecessor ${PREDECESSOR_JOB}: squeue is unavailable" >&2
         exit 1
     fi
-    predecessor_waited=0
-    while true; do
-        if ! predecessor_tasks=$(squeue -h -j "$PREDECESSOR_JOB" -o '%i' 2>/dev/null); then
-            echo "$(date '+%F %T') | ERROR: failed to query predecessor array ${PREDECESSOR_JOB}" >&2
+    predecessor_started=$SECONDS
+    while slurm_task_is_active "$PREDECESSOR_JOB"; do
+        if (( SECONDS - predecessor_started >= BARRIER_TIMEOUT )); then
+            echo "ERROR: predecessor ${PREDECESSOR_JOB} still active or unknown after ${BARRIER_TIMEOUT}s" >&2
             exit 1
         fi
-        [ -z "$predecessor_tasks" ] && break
-        if [ "$predecessor_waited" -eq 0 ] || [ $((predecessor_waited % 300)) -eq 0 ]; then
-            echo "$(date '+%F %T') | Waiting for predecessor array ${PREDECESSOR_JOB} to finish"
-        fi
-        sleep 15
-        predecessor_waited=$((predecessor_waited + 15))
+        sleep 5
     done
     echo "$(date '+%F %T') | Predecessor array ${PREDECESSOR_JOB} is no longer active"
 fi
@@ -359,6 +386,98 @@ if [ -f "$FINAL_MARKER" ] && ! $FORCE_MERGE && ! $MERGE_ONLY; then
     exit 0
 fi
 
+
+# Waits are bounded in elapsed time, including scheduler query time.
+wait_for_marker() {
+    local marker="$1" failed="$2" lock="$3"
+    local started=$SECONDS owner
+    while [ ! -f "$marker" ]; do
+        [ -f "$failed" ] || [ -f "${BARRIER_DIR}/run.failed" ] && return 1
+        owner=$(cat "$lock/owner" 2>/dev/null) || owner=""
+        if [ -n "$owner" ] && ! slurm_task_is_active "$owner"; then
+            echo "ERROR: stage owner $owner disappeared while waiting for $marker" >&2
+            return 1
+        fi
+        if (( SECONDS - started >= BARRIER_TIMEOUT )); then
+            echo "ERROR: timed out waiting for $marker (owner=${owner:-unknown})" >&2
+            return 1
+        fi
+        sleep 5
+    done
+    [ ! -f "$failed" ] && [ ! -f "${BARRIER_DIR}/run.failed" ]
+}
+
+stop_process_group() {
+    local pid="$1"
+    [ -n "$pid" ] || return 0
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    local deadline=$((SECONDS + 10))
+    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do sleep 1; done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+STAGE_PID=""
+run_stage() {
+    [ ! -f "${BARRIER_DIR}/run.failed" ] || return 1
+    setsid timeout --kill-after=10 "$STAGE_TIMEOUT" "$@" &
+    STAGE_PID=$!
+    while kill -0 "$STAGE_PID" 2>/dev/null; do
+        if [ -f "${BARRIER_DIR}/run.failed" ]; then
+            stop_process_group "$STAGE_PID"
+            STAGE_PID=""
+            return 1
+        fi
+        sleep 1
+    done
+    local status=0
+    wait "$STAGE_PID" || status=$?
+    stop_process_group "$STAGE_PID"
+    [ -f "${BARRIER_DIR}/run.failed" ] && status=1
+    STAGE_PID=""
+    return "$status"
+}
+
+# Reap all workers, including a worker killed before publishing its failure.
+wait_tile_workers() {
+    local maximum="$1" pid
+    local remaining=()
+    while true; do
+        [ ! -f "${BARRIER_DIR}/run.failed" ] || return 1
+        remaining=()
+        for pid in "${ACTIVE_TILE_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                remaining+=("$pid")
+            else
+                wait "$pid" || return 1
+            fi
+        done
+        ACTIVE_TILE_PIDS=("${remaining[@]}")
+        (( ${#ACTIVE_TILE_PIDS[@]} <= maximum )) && return 0
+        sleep 1
+    done
+}
+
+ACTIVE_TILE_PIDS=()
+stop_tile_workers() {
+    local pid
+    for pid in "${ACTIVE_TILE_PIDS[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+    for pid in "${ACTIVE_TILE_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    ACTIVE_TILE_PIDS=()
+}
+launcher_exit() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+        touch "${BARRIER_DIR}/run.failed"
+    fi
+    stop_tile_workers
+    stop_process_group "$STAGE_PID"
+    # Keep stage locks and diagnostics. A dependent new generation uses
+    # its own barrier directory; peers must not restart an interrupted stage.
+    exit "$status"
+}
+trap launcher_exit EXIT
 
 # -------------------- PREPARE SUBWINDOWS (one atomic owner) --------------------
 # Pickles alone are not sufficient for a continuation: scratch directories
@@ -402,6 +521,7 @@ PY_CHECK
 
 if mkdir "${BARRIER_DIR}/prepare.lock" 2>/dev/null; then
     OWNED_STAGE_LOCK="${BARRIER_DIR}/prepare.lock"
+    printf '%s\n' "${JOB_ID}_${ARRAY_ID}" > "$OWNED_STAGE_LOCK/owner"
     if $SKIP_PREPARE && preparation_state_is_complete; then
         echo "$(date '+%F %T') | Skipping preparation (--skip-prepare, pickles and tile scratch directories exist)"
     else
@@ -409,7 +529,7 @@ if mkdir "${BARRIER_DIR}/prepare.lock" 2>/dev/null; then
             echo "$(date '+%F %T') | --skip-prepare requested, but tile scratch state is incomplete; preparing again"
         fi
         echo "$(date '+%F %T') | Preparing subwindows and saving pickles"
-        MPLBACKEND=Agg python -u "${SRC_DIR}/prepare_VarDyn.py" "$PATH_CONFIG" "$PATH_CONFIG_EQ" $PREPARE_ARGS
+        MPLBACKEND=Agg run_stage python -u "${SRC_DIR}/prepare_VarDyn.py" "$PATH_CONFIG" "$PATH_CONFIG_EQ" $PREPARE_ARGS
         if [ $? -ne 0 ]; then
             echo "$(date '+%F %T') | ERROR: Preparation failed!"
             OWNED_STAGE_LOCK=""
@@ -423,9 +543,7 @@ if mkdir "${BARRIER_DIR}/prepare.lock" 2>/dev/null; then
     OWNED_STAGE_LOCK=""
 else
     echo "$(date '+%F %T') | Waiting for preparation to complete..."
-    while [ ! -f "${BARRIER_DIR}/prepared" ] && [ ! -f "${BARRIER_DIR}/prepare_failed" ]; do
-        sleep 5
-    done
+    wait_for_marker "${BARRIER_DIR}/prepared" "${BARRIER_DIR}/prepare_failed" "${BARRIER_DIR}/prepare.lock" || exit 1
     if [ -f "${BARRIER_DIR}/prepare_failed" ]; then
         echo "$(date '+%F %T') | ERROR: Preparation failed on the stage owner, aborting"
         exit 1
@@ -434,31 +552,6 @@ else
 fi
 
 # -------------------- TILE CLAIMING (atomic mkdir, works on Lustre/GPFS) --------------------
-slurm_task_is_active() {
-    local task_id="$1"
-    local active_tasks
-    if active_tasks=$(squeue -r -h -j "$task_id" -o '%i'); then
-        # A targeted query can return a canonical array ID for a raw job ID.
-        [ -n "$active_tasks" ]
-        return
-    fi
-    # Finished jobs can make a targeted query fail with "Invalid job id".
-    # Only a successful full listing can establish that an array task is gone.
-    if ! active_tasks=$(squeue -r -h -o '%i'); then
-        echo "WARNING: cannot determine Slurm owner ${task_id}; retaining tile lock" >&2
-        return 0
-    fi
-    local active_task
-    while read -r active_task; do
-        [ "$active_task" = "$task_id" ] && return 0
-    done <<< "$active_tasks"
-    if [[ ! "$task_id" =~ ^[0-9]+_[0-9]+$ ]]; then
-        # A legacy raw ID may appear under a different canonical array ID.
-        echo "WARNING: unresolved legacy Slurm owner ${task_id}; retaining tile lock" >&2
-        return 0
-    fi
-    return 1
-}
 
 try_claim_tile() {
     local tile="$1"
@@ -569,19 +662,13 @@ window_tile_state() {
 wait_for_spatial_merge_parts() {
     local iw="$1"
     local rank_count="$2"
-    while true; do
-        if [ -f "${BARRIER_DIR}/spatial_merge_iw${iw}.failed" ]; then
-            return 1
-        fi
-        local complete=0
-        local merge_rank
-        for ((merge_rank = 0; merge_rank < rank_count; merge_rank++)); do
-            [ -f "${BARRIER_DIR}/spatial_merge_iw${iw}_rank${merge_rank}.ok" ] \
-                && complete=$((complete + 1))
-        done
-        [ "$complete" -eq "$rank_count" ] && return 0
-        sleep 10
+    local merge_rank
+    for ((merge_rank = 0; merge_rank < rank_count; merge_rank++)); do
+        wait_for_marker "${BARRIER_DIR}/spatial_merge_iw${iw}_rank${merge_rank}.ok" \
+            "${BARRIER_DIR}/spatial_merge_iw${iw}.failed" \
+            "${BARRIER_DIR}/merge_iw${iw}_rank${merge_rank}.lock" || return 1
     done
+
 }
 
 # -------------------- TILE WORKER --------------------
@@ -589,8 +676,9 @@ run_single_tile() {
     local TILE="$1"
     local IW="$2"
     local CLAIM_TOKEN="$3"
-    trap 'release_tile_claim "$TILE" "$CLAIM_TOKEN"' EXIT TERM INT
-    trap 'exit 143' TERM INT
+    local child_pid=""
+    trap - EXIT USR1
+    trap 'stop_process_group "$child_pid"; release_tile_claim "$TILE" "$CLAIM_TOKEN"; exit 143' TERM INT
     local TILE_BASENAME=$(basename "$TILE")
     local TILE_PARENT=$(basename "$(dirname "$TILE")")
     local LOG_SUBDIR="${LOGDIR}/${TILE_PARENT}"
@@ -598,9 +686,25 @@ run_single_tile() {
     local TILE_LOG="${LOG_SUBDIR}/${TILE_BASENAME}_${GPU_LOG_ID}.log"
 
     echo "$(date '+%F %T') | GPU ${ARRAY_ID} | START tile ${TILE}" >> "$TILE_LOG"
+    if [ -f "${BARRIER_DIR}/run.failed" ]; then
+        release_tile_claim "$TILE" "$CLAIM_TOKEN"
+        trap - TERM INT
+        return 1
+    fi
     rm -f "${TILE}/.tile_failed"
-    OMP_NUM_THREADS=1 python "${SRC_DIR}/run_tile.py" "$TILE" $RESTART >> "$TILE_LOG" 2>&1
+    OMP_NUM_THREADS=1 setsid timeout --kill-after=10 "$TILE_TIMEOUT" python "${SRC_DIR}/run_tile.py" "$TILE" $RESTART >> "$TILE_LOG" 2>&1 &
+    child_pid=$!
+    wait "$child_pid"
     local status=$?
+    stop_process_group "$child_pid"
+    child_pid=""
+    if [ "$status" -eq 0 ] && [ ! -f "${TILE}/.tile_complete.ok" ]; then
+        echo "ERROR: tile returned success without completion marker" >> "$TILE_LOG"
+        status=2
+    fi
+    if [ "$status" -ne 0 ]; then
+        touch "${BARRIER_DIR}/window_iw${IW}.failed" "${BARRIER_DIR}/run.failed"
+    fi
     if [ $status -eq 0 ]; then
         rm -f "${TILE}/.tile_failed"
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | DONE  tile ${TILE}" >> "$TILE_LOG"
@@ -620,6 +724,7 @@ run_single_tile() {
     fi
     release_tile_claim "$TILE" "$CLAIM_TOKEN"
     trap - EXIT TERM INT
+    return "$status"
 }
 
 process_available_tiles() {
@@ -627,14 +732,15 @@ process_available_tiles() {
     local iw="$2"
     local tile
     local claim_token
-    local tile_pid
     local tile_index=0
-    local tile_pids=()
+    ACTIVE_TILE_PIDS=()
+    local pass_status=0
     TILES_PROCESSED_IN_PASS=0
 
     while IFS= read -r tile; do
         [ -z "$tile" ] && continue
 
+        if [ -f "${BARRIER_DIR}/run.failed" ]; then pass_status=1; break; fi
         # Stable round-robin ownership prevents two array tasks from ever
         # launching the same tile, independently of distributed lock
         # visibility and Slurm job-ID normalization.
@@ -649,19 +755,26 @@ process_available_tiles() {
 
         claim_token=$(try_claim_tile "$tile") || continue
         run_single_tile "$tile" "$iw" "$claim_token" &
-        tile_pids+=("$!")
+        ACTIVE_TILE_PIDS+=("$!")
         TILES_PROCESSED_IN_PASS=$((TILES_PROCESSED_IN_PASS + 1))
-        echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Active tiles: ${#tile_pids[@]}/${NUM_TILES_PER_GPU}"
+        echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Active tiles: ${#ACTIVE_TILE_PIDS[@]}/${NUM_TILES_PER_GPU}"
 
-        if (( ${#tile_pids[@]} >= NUM_TILES_PER_GPU )); then
-            wait "${tile_pids[0]}"
-            tile_pids=("${tile_pids[@]:1}")
+        if ! wait_tile_workers "$((NUM_TILES_PER_GPU - 1))"; then
+            pass_status=1
+            break
         fi
     done < "$tile_list"
 
-    for tile_pid in "${tile_pids[@]}"; do
-        wait "$tile_pid"
-    done
+    if (( pass_status == 0 )); then
+        wait_tile_workers 0 || pass_status=1
+    fi
+    if (( pass_status != 0 )); then
+        touch "${BARRIER_DIR}/run.failed"
+        stop_tile_workers
+        return 1
+    fi
+    ACTIVE_TILE_PIDS=()
+    return 0
 }
 
 # --------------- SEQUENTIAL TIME WINDOWS, DETERMINISTIC TILE DISPATCH ---------------
@@ -682,6 +795,7 @@ for TIME_DIR in $TIME_WINDOWS; do
     TILE_LIST="${BARRIER_DIR}/tiles_iw${IW}"
     if mkdir "${BARRIER_DIR}/queue_iw${IW}.lock" 2>/dev/null; then
         OWNED_STAGE_LOCK="${BARRIER_DIR}/queue_iw${IW}.lock"
+        printf '%s\n' "${JOB_ID}_${ARRAY_ID}" > "$OWNED_STAGE_LOCK/owner"
         if [ "$TILE_SCOPE" = "equatorial" ]; then
             if ! python3 - "$TIME_DIR" > "${TILE_LIST}.tmp" <<'PY_TILE_SCOPE'
 import os
@@ -723,18 +837,17 @@ PY_TILE_SCOPE
         mv "${TILE_LIST}.tmp" "$TILE_LIST"
         TOTAL_TILES=$(wc -l < "$TILE_LIST")
         echo "$(date '+%F %T') | Found ${TOTAL_TILES} ${TILE_SCOPE} tiles for time window ${IW}"
-        if [ -n "$RESTART" ]; then
-            while IFS= read -r tile; do
-                [ -z "$tile" ] && continue
-                rm -f "${tile}/.tile_complete.ok"
-                rm -f "${tile}/.tile_failed"
-            done < "$TILE_LIST"
-        fi
+        # Failures belong to an attempt. Clear them once, before releasing
+        # this generation's workers; successful tiles remain resumable.
+        while IFS= read -r tile; do
+            [ -z "$tile" ] && continue
+            [ -n "$RESTART" ] && rm -f "${tile}/.tile_complete.ok"
+            rm -f "${tile}/.tile_failed"
+        done < "$TILE_LIST"
         touch "${BARRIER_DIR}/queue_ready_iw${IW}"
         OWNED_STAGE_LOCK=""
     fi
-    while [ ! -f "${BARRIER_DIR}/queue_ready_iw${IW}" ] && \
-          [ ! -f "${BARRIER_DIR}/queue_failed_iw${IW}" ]; do sleep 1; done
+    wait_for_marker "${BARRIER_DIR}/queue_ready_iw${IW}" "${BARRIER_DIR}/queue_failed_iw${IW}" "${BARRIER_DIR}/queue_iw${IW}.lock" || exit 1
     if [ -f "${BARRIER_DIR}/queue_failed_iw${IW}" ]; then
         exit 1
     fi
@@ -747,7 +860,8 @@ PY_TILE_SCOPE
     # solely as protection against overlapping job generations.
     if ! $MERGE_ONLY; then
         tiles_done=0
-        window_waited=0
+        window_started=$SECONDS
+        previous_missing=-1
         while true; do
             if ! process_available_tiles "$TILE_LIST" "$IW"; then
                 exit 1
@@ -761,13 +875,30 @@ PY_TILE_SCOPE
             fi
             [ "$WINDOW_TILES_MISSING" -eq 0 ] && break
 
-            if [ "$window_waited" -ge "$BARRIER_TIMEOUT" ]; then
-                echo "$(date '+%F %T') | Window still running: ${WINDOW_TILES_MISSING} tile(s) incomplete; rescanning deterministic shards" >&2
-                report_incomplete_tiles "$TILE_LIST"
-                window_waited=0
+            if [ "$WINDOW_TILES_MISSING" -ne "$previous_missing" ]; then
+                window_started=$SECONDS
+                previous_missing=$WINDOW_TILES_MISSING
             fi
+            if (( SECONDS - window_started >= BARRIER_TIMEOUT )); then
+                echo "$(date '+%F %T') | Window timed out without completion progress: ${WINDOW_TILES_MISSING} tile(s) incomplete; rescanning deterministic shards" >&2
+                report_incomplete_tiles "$TILE_LIST"
+                exit 1
+            fi
+            tile_index=0
+            checked_owners=" "
+            while IFS= read -r tile; do
+                owner_rank=$((tile_index % NUM_ARRAY))
+                tile_index=$((tile_index + 1))
+                [ -f "$tile/.tile_complete.ok" ] && continue
+                [[ "$checked_owners" == *" $owner_rank "* ]] && continue
+                checked_owners+="$owner_rank "
+                if ! slurm_task_is_active "${JOB_ID}_${owner_rank}"; then
+                    echo "ERROR: owner of incomplete tile $tile is no longer active" >&2
+                    exit 1
+                fi
+            done < "$TILE_LIST"
             sleep 10
-            window_waited=$((window_waited + 10))
+
         done
         echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Processed ${tiles_done} tiles in time window ${IW}"
     else
@@ -795,8 +926,9 @@ PY_TILE_SCOPE
             PART_LOCK="${BARRIER_DIR}/merge_iw${IW}_rank${MERGE_RANK}.lock"
             if mkdir "$PART_LOCK" 2>/dev/null; then
                 OWNED_STAGE_LOCK="$PART_LOCK"
+                printf '%s\n' "${JOB_ID}_${ARRAY_ID}" > "$OWNED_STAGE_LOCK/owner"
                 echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Spatial merge part ${MERGE_RANK}/${NUM_ARRAY} for window ${IW}"
-                if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+                if run_stage python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
                     --dir_save_pickle "$DIR_SAVE_PICKLE" \
                     --name_var_save "$NAME_VAR" \
                     --num_workers "$NUM_MERGE_WORKERS" \
@@ -827,8 +959,9 @@ PY_TILE_SCOPE
         FINALIZE_LOCK="${BARRIER_DIR}/merge_iw${IW}_finalize.lock"
         if mkdir "$FINALIZE_LOCK" 2>/dev/null; then
             OWNED_STAGE_LOCK="$FINALIZE_LOCK"
+            printf '%s\n' "${JOB_ID}_${ARRAY_ID}" > "$OWNED_STAGE_LOCK/owner"
             echo "$(date '+%F %T') | Finalizing ${NUM_ARRAY} Zarr parts for time window ${IW}"
-            if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+            if run_stage python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
                 --dir_save_pickle "$DIR_SAVE_PICKLE" \
                 --name_var_save "$NAME_VAR" \
                 --num_workers "$NUM_MERGE_WORKERS" \
@@ -852,17 +985,15 @@ PY_TILE_SCOPE
             fi
         else
             echo "$(date '+%F %T') | Waiting for spatial merge finalization ${IW}"
-            while [ ! -f "$MERGE_MARKER" ] && [ ! -f "$MERGE_FAILED" ]; do
-                sleep 10
-            done
-            [ -f "$MERGE_FAILED" ] && exit 1
+            wait_for_marker "$MERGE_MARKER" "$MERGE_FAILED" "$FINALIZE_LOCK" || exit 1
         fi
     else
         # NetCDF files are independent per date; retain the single-owner path.
         if mkdir "${BARRIER_DIR}/merge_iw${IW}.lock" 2>/dev/null; then
             OWNED_STAGE_LOCK="${BARRIER_DIR}/merge_iw${IW}.lock"
+            printf '%s\n' "${JOB_ID}_${ARRAY_ID}" > "$OWNED_STAGE_LOCK/owner"
             echo "$(date '+%F %T') | Spatial NetCDF merge for time window ${IW}"
-            if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+            if run_stage python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
                 --dir_save_pickle "$DIR_SAVE_PICKLE" \
                 --name_var_save "$NAME_VAR" \
                 --num_workers "$NUM_MERGE_WORKERS" \
@@ -882,10 +1013,7 @@ PY_TILE_SCOPE
                 exit 1
             fi
         else
-            while [ ! -f "$MERGE_MARKER" ] && [ ! -f "$MERGE_FAILED" ]; do
-                sleep 10
-            done
-            [ -f "$MERGE_FAILED" ] && exit 1
+            wait_for_marker "$MERGE_MARKER" "$MERGE_FAILED" "${BARRIER_DIR}/merge_iw${IW}.lock" || exit 1
         fi
     fi
 
@@ -895,8 +1023,9 @@ done
 # Final: exactly one running task merges all time windows.
 if mkdir "${BARRIER_DIR}/final_merge.lock" 2>/dev/null; then
     OWNED_STAGE_LOCK="${BARRIER_DIR}/final_merge.lock"
+    printf '%s\n' "${JOB_ID}_${ARRAY_ID}" > "$OWNED_STAGE_LOCK/owner"
     echo "$(date '+%Y-%m-%d %H:%M:%S') | Merging all time windows"
-    if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+    if run_stage python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
         --dir_save_pickle "$DIR_SAVE_PICKLE" \
         --name_var_save "$NAME_VAR" \
         --num_workers "$NUM_MERGE_WORKERS" \
@@ -906,6 +1035,7 @@ if mkdir "${BARRIER_DIR}/final_merge.lock" 2>/dev/null; then
         tmp_marker="${FINAL_MARKER}.tmp-${SLURM_JOB_ID:-$$}"
         printf 'Experiment completed: %s\n' "$(date -Is)" > "$tmp_marker"
         mv -f "$tmp_marker" "$FINAL_MARKER"
+        touch "${BARRIER_DIR}/final_merge.ok"
         OWNED_STAGE_LOCK=""
         echo "$(date '+%Y-%m-%d %H:%M:%S') | All time windows processed"
         echo "$(date '+%Y-%m-%d %H:%M:%S') | Completion marker: $FINAL_MARKER"
@@ -914,7 +1044,7 @@ if mkdir "${BARRIER_DIR}/final_merge.lock" 2>/dev/null; then
         # marker exists. If this cleanup is interrupted, a continuation sees
         # a completed experiment instead of trying to reconstruct full
         # windows from compacted one-record tile checkpoints.
-        if python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
+        if run_stage python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" \
             --dir_save_pickle "$DIR_SAVE_PICKLE" \
             --name_var_save "$NAME_VAR" \
             --num_workers "$NUM_MERGE_WORKERS" \
@@ -929,10 +1059,10 @@ if mkdir "${BARRIER_DIR}/final_merge.lock" 2>/dev/null; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') | ERROR: final time-window merge failed" >&2
         OWNED_STAGE_LOCK=""
         rmdir "${BARRIER_DIR}/final_merge.lock" 2>/dev/null || true
-        submit_continuation
         exit 1
     fi
 
-    # Cleanup barrier files
-    rm -rf "$BARRIER_DIR"
+    # Retain barriers until all peers have observed final completion.
+else
+    wait_for_marker "${BARRIER_DIR}/final_merge.ok" "${BARRIER_DIR}/run.failed" "${BARRIER_DIR}/final_merge.lock" || exit 1
 fi
