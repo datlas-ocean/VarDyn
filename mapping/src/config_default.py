@@ -1078,6 +1078,61 @@ BASIS_BMaux = dict(
 
 )
 
+# Joint u/v/h BMaux basis using a common compact layout and local 3x3 priors.
+BASIS_BMAUX_MULTIVARIATE = BASIS_BMaux | dict(
+
+    component_order = ('u', 'v', 'h'),
+
+    name_mod_var = ('u', 'v', 'h'),
+
+    c_grid_var = ('U', 'V', None),
+
+    compute_velocities = False,
+
+    file_layout = None, # Serialized layout produced by build_common_layout.py
+
+    # Three historical marginal products in u|v|h order. Required by the
+    # union/ragged policy so IND preserves every original BMaux atom.
+    marginal_file_aux = None,
+
+    factdec = 1., # Tdec is already calibrated in the multivariate product
+
+    support_policy = 'intersection', # 'union' preserves component-specific layouts
+
+    # Scientific covariance variants: IND, SCALE, LOCAL-S, or LOCAL.
+    correlation_mode = 'LOCAL',
+
+    # Off-diagonal contraction used only by LOCAL-S (0=IND, 1=LOCAL).
+    local_correlation_strength = 0.5,
+
+    # ADAPTIVE reads a validation-selected contraction field from file_aux.
+    # The field varies with wavelength and dynamical region. Pairwise
+    # correlations are additionally multiplied by the exact overlap of the
+    # component-specific compact temporal kernels when requested.
+    adaptive_strength_variable = 'adaptive_correlation_strength',
+
+    adaptive_correlation_variable = 'adaptive_region_correlation',
+
+    # False when the selected pairwise contractions have already been folded
+    # into adaptive_correlation_variable by the calibration product.
+    adaptive_apply_strength = True,
+
+    adaptive_temporal_overlap = True,
+
+    # Optional spatially multivariate extension for union/ragged layouts.
+    # Centres are partitioned into disjoint clusters of at most this many
+    # nearest wavelets. A value of one reproduces the local-only operator.
+    neighbor_wavelet_count = 1,
+
+    # Convex weight of a Gaussian spatial correlation inside each cluster.
+    # Keeping this in [0, 1] guarantees a positive-definite spatial factor.
+    neighbor_correlation_strength = 0.,
+
+    # Gaussian length scale relative to the median nearest-centre distance.
+    neighbor_length_scale_factor = 1.,
+
+)
+
 # Internal Tides boundary conditions basis (i.e. a set of basis vectors with values at the open boundaries)
 BASIS_HBC = dict(
 

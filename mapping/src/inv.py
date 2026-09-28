@@ -8,6 +8,8 @@ Runs inversion drivers and assimilation orchestration.
 from .config import USE_FLOAT64
 from dataclasses import dataclass
 from typing import Callable
+import hashlib
+import json
 import sys, os
 import time
 import numpy as np
@@ -31,6 +33,7 @@ from jax.lax import scan
 jax.config.update("jax_enable_x64", USE_FLOAT64)
 
 from . import tools as grid
+from .covariance import DiagonalCovariance
 
 
 
@@ -41,8 +44,110 @@ class CrazyGradient(Exception):
     pass
 
 
+_CONTROL_LAYOUT_KEYS = (
+    'control_layout_version',
+    'control_layout_signature',
+    'component_order',
+    'covariance_kind',
+    'covariance_source',
+    'covariance_source_hash',
+    'basis_order',
+)
+
+
+def _multivariate_layout_descriptors(basis, path='basis'):
+    """Describe every multivariate control block in optimizer order."""
+    if (getattr(basis, 'layout_signature', None) is not None
+            and getattr(basis, 'product_signature', None) is not None
+            and hasattr(basis, 'component_order')):
+        return [dict(
+            path=path,
+            size=int(basis.nbasis),
+            signature=str(basis.layout_signature),
+            component_order='|'.join(basis.component_order),
+            covariance_kind=str(getattr(
+                basis, 'covariance_kind',
+                'bmaux_multivariate_local_3x3')),
+            covariance_source=os.fspath(basis.file_aux),
+            covariance_source_hash=str(basis.product_signature),
+            basis_order='|'.join(basis.name_mod_var),
+        )]
+    if hasattr(basis, 'global_basis') and hasattr(basis, 'local_bases'):
+        result = _multivariate_layout_descriptors(
+            basis.global_basis, f'{path}.global')
+        for index, child in enumerate(basis.local_bases):
+            result.extend(_multivariate_layout_descriptors(
+                child, f'{path}.window[{index}]'))
+        return result
+    children = getattr(basis, 'Basis', None)
+    if children is not None:
+        result = []
+        for index, child in enumerate(children):
+            result.extend(_multivariate_layout_descriptors(
+                child, f'{path}.block[{index}]'))
+        return result
+    return []
+
+
+def _control_layout_metadata(basis):
+    """Return portable restart metadata for multivariate control layouts."""
+    descriptors = _multivariate_layout_descriptors(basis)
+    if not descriptors:
+        return {}
+    if len(descriptors) == 1 and descriptors[0]['size'] == int(basis.nbasis):
+        signature = descriptors[0]['signature']
+        covariance_kind = descriptors[0]['covariance_kind']
+    else:
+        payload = json.dumps(
+            descriptors, sort_keys=True, separators=(',', ':')).encode()
+        signature = hashlib.sha256(payload).hexdigest()
+        covariance_kind = 'block_diagonal_with_bmaux_multivariate'
+    values = lambda key: '|'.join(dict.fromkeys(
+        descriptor[key] for descriptor in descriptors))
+    return {
+        'control_layout_version': 1,
+        'control_layout_signature': signature,
+        'component_order': values('component_order'),
+        'covariance_kind': covariance_kind,
+        'covariance_source': values('covariance_source'),
+        'covariance_source_hash': values('covariance_source_hash'),
+        'basis_order': values('basis_order'),
+    }
+
+
+def _attach_control_layout_metadata(dataset, basis):
+    dataset.attrs.update(_control_layout_metadata(basis))
+    return dataset
+
+
+def _validate_multivariate_control_file(dataset, basis, expected_size, label):
+    expected = _control_layout_metadata(basis)
+    if not expected:
+        return
+    missing = [key for key in _CONTROL_LAYOUT_KEYS if key not in dataset.attrs]
+    if missing:
+        raise ValueError(
+            f'Multivariate BMaux {label} predates signed control layouts '
+            f'(missing {missing}); legacy controls cannot be restarted safely.')
+    # The source path is informative and may legitimately change after moving
+    # an experiment. Its content hash and every structural field are strict.
+    strict_keys = tuple(
+        key for key in _CONTROL_LAYOUT_KEYS if key != 'covariance_source')
+    mismatched = [
+        key for key in strict_keys
+        if dataset.attrs.get(key) != expected[key]
+    ]
+    if dataset.res.size != expected_size or mismatched:
+        detail = (f'; mismatched metadata: {mismatched}' if mismatched else '')
+        raise ValueError(
+            f'Multivariate BMaux {label} has an incompatible control layout'
+            f'{detail}. Rebuild the control for this basis and window.')
+
+
 def _validate_windowed_control_file(dataset, basis, expected_size, label):
     """Reject control vectors whose window slices cannot be interpreted here."""
+    _validate_multivariate_control_file(
+        dataset, basis, expected_size, label)
     if not hasattr(basis, 'local_slices'):
         return
     starts = dataset.get('forcing_window_start_day')
@@ -83,7 +188,7 @@ def _analysis_to_minimizer_control(analysis, background, covariance,
     complete_analysis[:analysis.size] = analysis
     increment = complete_analysis - background
     if preconditioned:
-        increment = covariance.invsqr(increment)
+        increment = covariance.inverse_sqrt(increment)
     return np.asarray(increment, dtype=np.float64)
 
 
@@ -1125,7 +1230,9 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         B = Cov(config.INV.sigma_B)
         R = Cov(config.INV.sigma_R)
     else:
-        B = Cov(Q)
+        B = getattr(Basis, 'covariance_operator', None)
+        if B is None:
+            B = Cov(Q)
         R = Cov(config.INV.sigma_R)
     
     # Read Background vector 
@@ -1188,16 +1295,19 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             print('Restart at:',tmp_files[-1])
             try:
                 ds = xr.open_dataset(tmp_files[-1])
-            except:
+            except OSError:
                 if len(tmp_files)>1:
                     ds = xr.open_dataset(tmp_files[-2])
+                else:
+                    raise
             try:
+                _validate_windowed_control_file(
+                    ds, Basis, Xb.size, 'iteration checkpoint')
                 Xopt = ds.res.values
                 maxiter = max(config.INV.maxiter - len(tmp_files), 0)
-                ds.close()
                 initial_control_loaded = True
-            except:
-                Xopt = +Xopt
+            finally:
+                ds.close()
         else:
             # Iteration checkpoints are optional (save_minimization=False),
             # whereas Xres.nc is always written after a successful analysis.
@@ -1247,6 +1357,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             dataset.attrs['control_basis_order'] = '|'.join(
                 Basis.control_basis_order)
             dataset.attrs['completed_cycles'] = cycle
+            _attach_control_layout_metadata(dataset, Basis)
             temporary = block_checkpoint + '.tmp'
             dataset.to_netcdf(temporary)
             dataset.close()
@@ -1378,6 +1489,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             if config.INV.save_minimization:
                 control_host = np.asarray(jax.device_get(control))
                 dataset = xr.Dataset({'res': (('x',), control_host)})
+                _attach_control_layout_metadata(dataset, Basis)
                 dataset.to_netcdf(os.path.join(
                     path_save_control_vectors,
                     'X_it.nc',
@@ -1499,6 +1611,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         def callback(XX):
             if config.INV.save_minimization:
                 ds = xr.Dataset({'res':(('x',),XX)})
+                _attach_control_layout_metadata(ds, Basis)
                 ds.to_netcdf(os.path.join(path_save_control_vectors,'X_it.nc'))
                 ds.close()
                 
@@ -1656,7 +1769,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     
     with var.cost_precision():
         if config.INV.prec:
-            Xa = var.Xb + B.sqr(Xres)
+            Xa = var.Xb + B.sqrt(Xres)
         else:
             Xa = var.Xb + Xres
     Xa_model = jnp.asarray(
@@ -1682,6 +1795,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         ds.attrs['shared_parameter_control_count'] = int(
             Basis.global_basis.nbasis)
         ds.attrs['control_basis_order'] = '|'.join(Basis.control_basis_order)
+    _attach_control_layout_metadata(ds, Basis)
     ds.to_netcdf(os.path.join(path_save_control_vectors, 'Xres.nc'))
     ds.close()
 
@@ -1740,25 +1854,9 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
 
 
 
-class Cov :
-    # case of a simple diagonal covariance matrix
-    def __init__(self,sigma=None):
-        
-        if sigma is None:
-            sigma = 1
-            
-        self.sigma = sigma
-        
-    def inv(self,X):
-        return 1/self.sigma**2 * X    
-    
-    def sqr(self,X):
-        return self.sigma * X
-    
-    def invsqr(self,X):
-        return 1/self.sigma * X
-    
-    
+Cov = DiagonalCovariance
+
+
 class Variational:
     
     def __init__(self, 
@@ -1813,9 +1911,9 @@ class Variational:
 
         with self.cost_precision():
             if self.B is not None:
-                self.B.sigma = jnp.asarray(self.B.sigma, dtype=self.cost_dtype)
+                self.B = self.B.astype(self.cost_dtype)
             if self.R is not None:
-                self.R.sigma = jnp.asarray(self.R.sigma, dtype=self.cost_dtype)
+                self.R = self.R.astype(self.cost_dtype)
         
         # Background state
         with self.cost_precision():
@@ -1896,7 +1994,7 @@ class Variational:
             if self.prec:
                 X = (np.random.random(self.basis.nbasis)-0.5)
             else:
-                X = self.B.sqr(np.random.random(self.basis.nbasis)-0.5) + self.Xb
+                X = self.B.sqrt(np.random.random(self.basis.nbasis)-0.5) + self.Xb
             
             def cost(X):
                 return self.cost_and_grad(X)[0]
@@ -1969,7 +2067,7 @@ class Variational:
         # Background cost function evaluation 
         if self.B is not None:
             if self.prec :
-                X  = self.B.sqr(X0) + self.Xb
+                X  = self.B.sqrt(X0) + self.Xb
                 Jb = X0.dot(X0) # cost of background term
             else:
                 X  = X0 + self.Xb
@@ -2053,7 +2151,7 @@ class Variational:
         
         if self.B is not None:
             if self.prec :
-                X  = self.B.sqr(X0) + self.Xb
+                X  = self.B.sqrt(X0) + self.Xb
                 gb = X0      # gradient of background term
             else:
                 X  = X0 + self.Xb
@@ -2097,7 +2195,7 @@ class Variational:
                 self.H.adj(timestamp,adState,self.R)
 
         if self.prec :
-            adX = np.transpose(self.B.sqr(adX)) 
+            adX = self.B.sqrt_transpose(adX)
         
         g = adX + gb  # total gradient
 
@@ -2145,7 +2243,7 @@ class Variational:
         with self.cost_precision():
             X0 = jnp.asarray(X0, dtype=self.cost_dtype)
             if self.B is not None:
-                X = (self.B.sqr(X0) + self.Xb if self.prec
+                X = (self.B.sqrt(X0) + self.Xb if self.prec
                      else X0 + self.Xb)
             else:
                 X = X0 - self.Xb
@@ -2231,7 +2329,7 @@ class Variational:
             X0 = jnp.asarray(X0, dtype=self.cost_dtype)
             if self.B is not None:
                 if self.prec:
-                    X = self.B.sqr(X0) + self.Xb
+                    X = self.B.sqrt(X0) + self.Xb
                     background = X0
                     Jb = jnp.vdot(X0, X0)
                 else:
@@ -2444,7 +2542,7 @@ class Variational:
         with self.cost_precision():
             adX = jnp.asarray(adX, dtype=self.cost_dtype)
             if self.prec:
-                adX = jnp.transpose(self.B.sqr(adX))
+                adX = self.B.sqrt_transpose(adX)
             G = jnp.asarray(adX + gb, dtype=self.cost_dtype)
 
         return J, G
@@ -2465,7 +2563,7 @@ class Variational:
         with self.cost_precision():
             if self.B is not None:
                 if self.prec :
-                    X  = self.B.sqr(X0) + self.Xb
+                    X  = self.B.sqrt(X0) + self.Xb
                     Jb = jnp.vdot(X0, X0) # cost of background term
                 else:
                     X  = X0 + self.Xb
@@ -2646,7 +2744,7 @@ class Variational:
         with self.cost_precision():
             adX = jnp.asarray(adX, dtype=self.cost_dtype)
             if self.prec :
-                adX = jnp.transpose(self.B.sqr(adX))
+                adX = self.B.sqrt_transpose(adX)
 
             G = jnp.asarray(adX + gb, dtype=self.cost_dtype)
 

@@ -7,6 +7,7 @@ Builds reduced-basis operators and related helper models.
 """
 from .config import USE_FLOAT64
 import os, sys
+import hashlib
 import numpy as np
 import logging
 import datetime 
@@ -16,11 +17,25 @@ from scipy.sparse import csc_matrix
 from scipy.integrate import quad
 import jax.numpy as jnp 
 from jax.experimental import sparse as sparse
+from .bmaux_layout import build_multivariate_layout, read_layout
+from .covariance import (
+    BMauxMultivariateCovariance,
+    BMauxRaggedMultivariateCovariance,
+    BlockDiagonalCovariance,
+    DiagonalCovariance,
+    RaggedCorrelationGroup,
+)
+
 from jax import jit
 import jax
 
 
 jax.config.update("jax_enable_x64", USE_FLOAT64)
+
+# Reused at every BMaux atom location. Computing leggauss inside the spatial
+# loop dominates setup time for the adaptive covariance.
+_TEMPORAL_OVERLAP_NODES, _TEMPORAL_OVERLAP_WEIGHTS = (
+    np.polynomial.legendre.leggauss(24))
 
 
 def _gauss3d_facq_at_scale(field, names, sigma_D):
@@ -337,6 +352,10 @@ def Basis(config, State, verbose=True, multi_mode=False, *args, **kwargs):
 
         elif config.BASIS.super=='BASIS_BMaux':
             basis_obj = Basis_bmaux(config,State,multi_mode=multi_mode)
+
+        elif config.BASIS.super == 'BASIS_BMAUX_MULTIVARIATE':
+            basis_obj = Basis_bmaux_multivariate(
+                config, State, multi_mode=multi_mode)
 
         elif config.BASIS.super == 'BASIS_OFFSET':
             basis_obj = Basis_offset(config,State,multi_mode=multi_mode)
@@ -3055,6 +3074,797 @@ class Basis_bmaux(_StateBackgroundMixin, _Basis_bmaux):
         return adX
 
 
+class _Basis_bmaux_compact(Basis_bmaux):
+    """One physical component of a common ragged BMaux layout."""
+
+    def set_common_layout(self, layout, component_index, time, State=None):
+        self.capture_state_background(State)
+        self.component_index = int(component_index)
+        self.ff = np.asarray(layout.frequency)
+        self.k = 2 * np.pi * self.ff
+        self.theta = np.asarray(layout.theta)
+        self.ntheta = len(self.theta)
+        self.nf = layout.nscale
+        self.DX = np.asarray(layout.radius_km)
+        self.ENSLON = [np.asarray(value) for value in layout.longitude]
+        self.ENSLAT = [np.asarray(value) for value in layout.latitude]
+        self.NP = np.asarray([len(value) for value in self.ENSLON], dtype="int64")
+        self.enst = [np.asarray(value) for value in layout.time_centres]
+        self.tdec = [
+            np.asarray(value[:, self.component_index]) for value in layout.tdec
+        ]
+        self.norm_fact = [
+            value.copy() if self.norm_time else np.ones_like(value)
+            for value in self.tdec
+        ]
+        self.iff_wavebounds = np.asarray(layout.scale_bounds, dtype="int64")
+        self.nbasis = int(layout.control_count_per_component)
+        self.control_time = []
+        self.control_spatial_mode = []
+        self.control_location = []
+        for scale in range(self.nf):
+            centres, spatial_mode, _ = layout.scale_control_coordinates(scale)
+            self.control_time.append(jnp.asarray(centres))
+            self.control_spatial_mode.append(jnp.asarray(
+                spatial_mode, dtype=jnp.int32))
+            self.control_location.append(jnp.asarray(
+                spatial_mode // (2 * self.ntheta), dtype=jnp.int32))
+        self.time = jnp.asarray(time)
+        self.enst_device = [jnp.asarray(value) for value in self.enst]
+        self.Gx, self.Nx = self._compute_component_space()
+        self.Gt, self.Nt = None, None
+
+    def _compact_weights(self, t, scale):
+        location = self.control_location[scale]
+        decay = jnp.asarray(self.tdec[scale])[location]
+        norm = jnp.asarray(self.norm_fact[scale])[location]
+        dt = t - self.control_time[scale]
+        return jnp.where(
+            jnp.abs(dt) <= decay,
+            _window_jax(dt / decay, self.flux) / norm,
+            0.)
+
+    def get_Gt_value(self, t, iff):
+        return self._compact_weights(t, iff)
+
+    def _operg(self, t, X):
+        phi = jnp.zeros((self.nphys,), dtype=X.dtype)
+        for scale in range(self.nf):
+            start = int(self.iff_wavebounds[scale])
+            stop = int(self.iff_wavebounds[scale + 1])
+            weighted = self._compact_weights(t, scale) * X[start:stop]
+            spatial = jnp.zeros((self.Nx[scale],), dtype=X.dtype)
+            spatial = spatial.at[self.control_spatial_mode[scale]].add(weighted)
+            phi = phi + self.Gx[scale] @ spatial
+        return phi.reshape(self.shape_phys)
+
+    def _operg_reduced(self, t, phi_2d):
+        parts = []
+        flat = phi_2d.ravel()
+        for scale in range(self.nf):
+            ad_space = self.GxT[scale] @ flat
+            parts.append(
+                self._compact_weights(t, scale)
+                * ad_space[self.control_spatial_mode[scale]])
+        return jnp.concatenate(parts)
+
+
+class Basis_bmaux_multivariate:
+    """Joint u/v/h BMaux basis with a shared compact control geometry."""
+
+    def __init__(self, config, State, multi_mode=False):
+        order = tuple(config.BASIS.component_order)
+        names = tuple(config.BASIS.name_mod_var)
+        grids = tuple(config.BASIS.c_grid_var)
+        if order != ("u", "v", "h"):
+            raise ValueError("BASIS_BMAUX_MULTIVARIATE component_order must be u|v|h.")
+        if len(names) != 3 or len(grids) != 3:
+            raise ValueError(
+                "BASIS_BMAUX_MULTIVARIATE needs three model names and grids.")
+        if grids != ("U", "V", None):
+            raise ValueError(
+                "BASIS_BMAUX_MULTIVARIATE c_grid_var must be ('U', 'V', None).")
+        if config.BASIS.compute_velocities:
+            raise ValueError(
+                "The joint BMaux basis controls u/v/h directly; "
+                "compute_velocities must be False.")
+
+        self.config = config
+        self.State = State
+        self.component_order = order
+        self.name_mod_var = list(names)
+        self.multi_mode = multi_mode
+        self.file_aux = config.BASIS.file_aux
+        self.file_layout = config.BASIS.file_layout
+        self.support_policy = str(getattr(
+            config.BASIS, 'support_policy', 'intersection')).lower()
+        self.facQ = float(config.BASIS.facQ)
+        self.correlation_mode = str(getattr(
+            config.BASIS, 'correlation_mode', 'LOCAL')).upper()
+        self.local_correlation_strength = float(
+            getattr(config.BASIS, 'local_correlation_strength', 0.5))
+        self.adaptive_strength_variable = str(getattr(
+            config.BASIS, 'adaptive_strength_variable',
+            'adaptive_correlation_strength'))
+        self.adaptive_correlation_variable = str(getattr(
+            config.BASIS, 'adaptive_correlation_variable',
+            'adaptive_region_correlation'))
+        self.adaptive_apply_strength = bool(getattr(
+            config.BASIS, 'adaptive_apply_strength', True))
+        self.adaptive_temporal_overlap = bool(getattr(
+            config.BASIS, 'adaptive_temporal_overlap', True))
+        self.neighbor_wavelet_count = int(getattr(
+            config.BASIS, 'neighbor_wavelet_count', 1))
+        self.neighbor_correlation_strength = float(getattr(
+            config.BASIS, 'neighbor_correlation_strength', 0.0))
+        self.neighbor_length_scale_factor = float(getattr(
+            config.BASIS, 'neighbor_length_scale_factor', 1.0))
+        if self.neighbor_wavelet_count < 1:
+            raise ValueError('BMaux neighbor_wavelet_count must be at least one.')
+        if not 0.0 <= self.neighbor_correlation_strength <= 1.0:
+            raise ValueError(
+                'BMaux neighbor_correlation_strength must lie in [0, 1].')
+        if (not np.isfinite(self.neighbor_length_scale_factor)
+                or self.neighbor_length_scale_factor <= 0.0):
+            raise ValueError(
+                'BMaux neighbor_length_scale_factor must be positive and finite.')
+        if self.neighbor_wavelet_count > 1 and self.support_policy != 'union':
+            raise ValueError(
+                'BMaux neighboring wavelets currently require union support.')
+        if self.correlation_mode == 'ADAPTIVE' and self.support_policy != 'union':
+            raise ValueError(
+                'BMaux ADAPTIVE correlation currently requires union support.')
+        self.covariance_kind = (
+            f'bmaux_multivariate_{self.correlation_mode.lower()}'
+            f';facQ={self.facQ:.17g}'
+            f';local_strength={self.local_correlation_strength:.17g}'
+            f';adaptive_strength={self.adaptive_strength_variable}'
+            f';adaptive_correlation={self.adaptive_correlation_variable}'
+            f';apply_strength={int(self.adaptive_apply_strength)}'
+            f';temporal_overlap={int(self.adaptive_temporal_overlap)}'
+            f';neighbor_count={self.neighbor_wavelet_count}'
+            f';neighbor_strength={self.neighbor_correlation_strength:.17g}'
+            f';neighbor_length={self.neighbor_length_scale_factor:.17g}')
+        self.layout_signature = None
+        self.product_signature = None
+        self.Basis = []
+        shared_space_cache = {}
+        marginal_files = getattr(config.BASIS, 'marginal_file_aux', None)
+        if self.support_policy == 'union':
+            if marginal_files is None or len(marginal_files) != 3:
+                raise ValueError(
+                    "BASIS_BMAUX_MULTIVARIATE union support requires three "
+                    "marginal_file_aux paths in u|v|h order.")
+            marginal_files = tuple(os.fspath(path) for path in marginal_files)
+        elif self.support_policy != 'intersection':
+            raise ValueError("BMaux support_policy must be intersection or union.")
+        for index, (name, grid) in enumerate(zip(names, grids)):
+            child_config = config.copy()
+            child_config.BASIS = config.BASIS.copy()
+            child_config.BASIS.super = "BASIS_BMaux"
+            child_config.BASIS.name_mod_var = name
+            child_config.BASIS.c_grid_var = grid
+            child_config.BASIS.compute_velocities = False
+            child_config.BASIS.path_background = None
+            if self.support_policy == 'union':
+                child_config.BASIS.file_aux = marginal_files[index]
+                child = Basis_bmaux(child_config, State, multi_mode=True)
+            else:
+                child = _Basis_bmaux_compact(
+                    child_config, State, multi_mode=True)
+                child._space_component_cache = shared_space_cache
+            self.Basis.append(child)
+
+    @staticmethod
+    def _nearest_disjoint_pairs(first, second, first_times, second_times,
+                                tolerance):
+        candidates = []
+        for left in first:
+            if not second:
+                break
+            right = min(second, key=lambda item: abs(
+                first_times[left] - second_times[item]))
+            distance = abs(first_times[left] - second_times[right])
+            if distance <= tolerance:
+                candidates.append((distance, left, right))
+        used_first, used_second, result = set(), set(), []
+        for _, left, right in sorted(candidates):
+            if left not in used_first and right not in used_second:
+                result.append((left, right))
+                used_first.add(left)
+                used_second.add(right)
+        return result
+
+    def _matched_time_groups(self, scale, locations, correlation):
+        """Match component-specific temporal atoms without dropping extras."""
+        slots = {}
+        times = {}
+        spacing = {}
+        for component, location in locations.items():
+            row = np.asarray(self.Basis[component].enst[scale][location])
+            valid = np.flatnonzero(np.isfinite(row)).tolist()
+            slots[component] = set(valid)
+            times[component] = row
+            differences = np.diff(row[valid])
+            spacing[component] = (
+                float(np.median(differences)) if differences.size
+                else float(self.Basis[component].tdec[scale][location]
+                           / self.Basis[component].facnlt))
+
+        result = []
+        if len(slots) == 3:
+            anchor = min(slots, key=lambda item: len(slots[item]))
+            others = [item for item in slots if item != anchor]
+            tolerance = 0.51 * max(spacing.values())
+            for anchor_slot in sorted(tuple(slots[anchor])):
+                chosen = {}
+                for component in others:
+                    if not slots[component]:
+                        break
+                    candidate = min(
+                        slots[component],
+                        key=lambda item: abs(
+                            times[anchor][anchor_slot]
+                            - times[component][item]))
+                    if abs(times[anchor][anchor_slot]
+                           - times[component][candidate]) > tolerance:
+                        break
+                    chosen[component] = candidate
+                if len(chosen) == 2:
+                    group = {anchor: anchor_slot, **chosen}
+                    result.append((tuple(sorted(group)), group))
+                    for component, slot in group.items():
+                        slots[component].remove(slot)
+
+        pairs = sorted(
+            ((abs(correlation[a, b]), a, b)
+             for a in slots for b in slots if a < b), reverse=True)
+        for _, first, second in pairs:
+            tolerance = 0.51 * max(spacing[first], spacing[second])
+            matched = self._nearest_disjoint_pairs(
+                sorted(slots[first]), sorted(slots[second]),
+                times[first], times[second], tolerance)
+            for left, right in matched:
+                group = {first: left, second: right}
+                result.append(((first, second), group))
+                slots[first].remove(left)
+                slots[second].remove(right)
+        return result
+
+    @staticmethod
+    def _regularize_correlation(matrix):
+        matrix = 0.5 * (matrix + matrix.T)
+        values, vectors = np.linalg.eigh(matrix)
+        values = np.maximum(values, 1.0e-6)
+        matrix = (vectors * values) @ vectors.T
+        diagonal = np.sqrt(np.diag(matrix))
+        return matrix / (diagonal[:, None] * diagonal[None, :])
+
+    @staticmethod
+    def _temporal_overlap_correlation(widths, quadrature_order=24):
+        """Correlation matrix of integral-normalized cos-squared kernels."""
+        widths = np.asarray(widths, dtype='float64')
+        if widths.shape != (3,) or np.any(~np.isfinite(widths)) or np.any(widths <= 0):
+            raise ValueError('BMaux temporal half-widths must be three positive values.')
+        if quadrature_order == 24:
+            nodes, weights = _TEMPORAL_OVERLAP_NODES, _TEMPORAL_OVERLAP_WEIGHTS
+        else:
+            nodes, weights = np.polynomial.legendre.leggauss(quadrature_order)
+        result = np.eye(3, dtype='float64')
+        for first in range(3):
+            for second in range(first + 1, 3):
+                short = min(widths[first], widths[second])
+                long = max(widths[first], widths[second])
+                ratio = short / long
+                integral = np.sum(
+                    weights * np.cos(0.5 * np.pi * nodes) ** 2
+                    * np.cos(0.5 * np.pi * ratio * nodes) ** 2)
+                cross = integral / long
+                self_product = 9.0 / (16.0 * widths[first] * widths[second])
+                value = cross / np.sqrt(self_product)
+                result[first, second] = result[second, first] = value
+        return result
+
+    @staticmethod
+    def _distance_km(first, second):
+        """Local great-circle approximation for two (lon, lat) keys."""
+        longitude = (float(first[0]) - float(second[0]) + 180.0) % 360.0 - 180.0
+        latitude = float(first[1]) - float(second[1])
+        mean_latitude = 0.5 * (float(first[1]) + float(second[1]))
+        return 111.2 * np.hypot(
+            longitude * np.cos(np.deg2rad(mean_latitude)), latitude)
+
+    @classmethod
+    def _nearest_location_clusters(cls, keys, count):
+        """Greedily partition spatial centres into deterministic nearby clusters."""
+        remaining = set(keys)
+        clusters = []
+        while remaining:
+            anchor = min(remaining)
+            ordered = sorted(
+                remaining - {anchor},
+                key=lambda item: (cls._distance_km(anchor, item), item))
+            cluster = (anchor, *ordered[:max(int(count) - 1, 0)])
+            clusters.append(cluster)
+            remaining.difference_update(cluster)
+        return clusters
+
+    @classmethod
+    def _neighbor_block_correlation(cls, local_correlations, keys,
+                                    strength, length_scale_factor):
+        """SPD multivariate correlation for a cluster of nearby centres.
+
+        Local signed 3x3 component correlations are retained.  A Gaussian
+        spatial correlation mixes their Cholesky factors, which creates all
+        cross-component/cross-centre terms while preserving unit marginals.
+        """
+        local = np.asarray(local_correlations, dtype='float64')
+        count = local.shape[0]
+        if local.shape != (count, 3, 3) or len(keys) != count:
+            raise ValueError('Unexpected neighboring BMaux correlation shape.')
+        distances = np.zeros((count, count), dtype='float64')
+        for first in range(count):
+            for second in range(first + 1, count):
+                value = cls._distance_km(keys[first], keys[second])
+                distances[first, second] = distances[second, first] = value
+        positive = distances[distances > 0.0]
+        spacing = float(np.median([
+            np.min(distances[row][distances[row] > 0.0])
+            for row in range(count) if np.any(distances[row] > 0.0)
+        ])) if positive.size else 1.0
+        length = max(length_scale_factor * spacing, 1.0e-6)
+        kernel = np.exp(-0.5 * (distances / length) ** 2)
+        spatial = ((1.0 - strength) * np.eye(count)
+                   + strength * kernel)
+        transform = scipy.linalg.block_diag(*[
+            np.linalg.cholesky(cls._regularize_correlation(matrix))
+            for matrix in local])
+        correlation = transform @ np.kron(spatial, np.eye(3)) @ transform.T
+        return cls._regularize_correlation(correlation)
+
+    def _matched_cluster_slots(self, scale, cluster_locations):
+        """Match one temporal atom for every component and cluster centre."""
+        labels, slots, times, spacing = [], {}, {}, {}
+        for site, locations in enumerate(cluster_locations):
+            for component, location in locations.items():
+                label = (site, component)
+                row = np.asarray(self.Basis[component].enst[scale][location])
+                valid = np.flatnonzero(np.isfinite(row)).tolist()
+                if not valid:
+                    return []
+                labels.append(label)
+                slots[label] = set(valid)
+                times[label] = row
+                differences = np.diff(row[valid])
+                spacing[label] = (
+                    float(np.median(differences)) if differences.size
+                    else float(self.Basis[component].tdec[scale][location]
+                               / self.Basis[component].facnlt))
+        anchor = min(labels, key=lambda item: len(slots[item]))
+        tolerance = 0.51 * max(spacing.values())
+        result = []
+        for anchor_slot in sorted(tuple(slots[anchor])):
+            chosen = {anchor: anchor_slot}
+            for label in labels:
+                if label == anchor:
+                    continue
+                if not slots[label]:
+                    break
+                candidate = min(
+                    slots[label], key=lambda item: abs(
+                        times[anchor][anchor_slot] - times[label][item]))
+                if abs(times[anchor][anchor_slot]
+                       - times[label][candidate]) > tolerance:
+                    break
+                chosen[label] = candidate
+            if len(chosen) == len(labels):
+                result.append(chosen)
+                for label, slot in chosen.items():
+                    slots[label].remove(slot)
+        return result
+
+    def _ragged_neighbor_covariance(self, marginal_q):
+        """Build disjoint multivariate blocks spanning nearby wavelet centres."""
+        offsets = np.asarray(
+            [control_slice.start for control_slice in self.slice_basis],
+            dtype='int64')
+        accumulators = {}
+        with xr.open_dataset(self.file_aux) as dataset:
+            self.product_signature = str(
+                dataset.attrs.get('layout_signature', 'unknown'))
+            grid_lat = np.asarray(dataset.lat.values, dtype='float64')
+            grid_lon = np.asarray(dataset.lon.values, dtype='float64')
+            product_frequency = np.asarray(dataset.f.values, dtype='float64')
+            correlation_variable = (
+                self.adaptive_correlation_variable
+                if self.correlation_mode == 'ADAPTIVE' else 'correlation')
+            if correlation_variable not in dataset:
+                raise ValueError(
+                    f'BMaux neighboring covariance requires '
+                    f'{correlation_variable!r} in {self.file_aux}.')
+            interpolators = []
+            strength_interpolators = []
+            for frequency in np.asarray(self.Basis[0].ff):
+                source = int(np.argmin(np.abs(product_frequency - frequency)))
+                matrices = np.asarray(
+                    dataset[correlation_variable].isel(f=source).values,
+                    dtype='float64')
+                interpolators.append([
+                    scipy.interpolate.RegularGridInterpolator(
+                        (grid_lat, grid_lon), matrices[..., first, second],
+                        bounds_error=False,
+                        fill_value=1.0 if first == second else 0.0)
+                    for first in range(3) for second in range(3)
+                ])
+                if self.correlation_mode == 'ADAPTIVE' and self.adaptive_apply_strength:
+                    if self.adaptive_strength_variable not in dataset:
+                        raise ValueError(
+                            f'ADAPTIVE BMaux covariance requires '
+                            f'{self.adaptive_strength_variable!r}.')
+                    strength_interpolators.append(
+                        scipy.interpolate.RegularGridInterpolator(
+                            (grid_lat, grid_lon),
+                            np.asarray(dataset[self.adaptive_strength_variable]
+                                       .isel(f=source).values, dtype='float64'),
+                            bounds_error=False, fill_value=0.0))
+
+            for scale in range(self.Basis[0].nf):
+                location_maps = [{
+                    (round(float(lon), 8), round(float(lat), 8)): index
+                    for index, (lon, lat) in enumerate(zip(
+                        self.Basis[component].ENSLON[scale],
+                        self.Basis[component].ENSLAT[scale]))
+                } for component in range(3)]
+                common_keys = set.intersection(
+                    *(set(mapping) for mapping in location_maps))
+                clusters = self._nearest_location_clusters(
+                    common_keys, self.neighbor_wavelet_count)
+                for keys in clusters:
+                    cluster_locations = [{
+                        component: location_maps[component][key]
+                        for component in range(3)} for key in keys]
+                    local_correlations = []
+                    for key, locations in zip(keys, cluster_locations):
+                        point = np.asarray([[key[1], key[0]]])
+                        values = np.asarray([
+                            float(interpolator(point)[0])
+                            for interpolator in interpolators[scale]
+                        ]).reshape(3, 3)
+                        correlation = self._regularize_correlation(values)
+                        if self.correlation_mode == 'LOCAL-S':
+                            correlation = self._regularize_correlation(
+                                np.eye(3) + self.local_correlation_strength
+                                * (correlation - np.eye(3)))
+                        elif self.correlation_mode == 'ADAPTIVE':
+                            if self.adaptive_temporal_overlap:
+                                widths = [
+                                    self.Basis[component].tdec[scale][locations[component]]
+                                    for component in range(3)]
+                                correlation *= self._temporal_overlap_correlation(widths)
+                            if self.adaptive_apply_strength:
+                                adaptive = float(np.clip(
+                                    strength_interpolators[scale](point)[0], 0.0, 1.0))
+                                correlation = (np.eye(3) + adaptive
+                                               * (correlation - np.eye(3)))
+                            correlation = self._regularize_correlation(correlation)
+                        local_correlations.append(correlation)
+                    correlation = self._neighbor_block_correlation(
+                        local_correlations, keys,
+                        self.neighbor_correlation_strength,
+                        self.neighbor_length_scale_factor)
+                    size = 3 * len(keys)
+                    accumulator = accumulators.setdefault(size, [[], [], []])
+                    for temporal_slots in self._matched_cluster_slots(
+                            scale, cluster_locations):
+                        base_indices, sigmas = [], []
+                        for site, locations in enumerate(cluster_locations):
+                            for component in range(3):
+                                base = self.Basis[component]
+                                location = locations[component]
+                                slot = temporal_slots[(site, component)]
+                                local = (int(base.iff_wavebounds[scale])
+                                         + (slot * int(base.NP[scale]) + location)
+                                         * (2 * base.ntheta))
+                                base_indices.append(offsets[component] + local)
+                                sigmas.append(marginal_q[offsets[component] + local])
+                        block = (np.asarray(sigmas)[:, None]
+                                 * np.linalg.cholesky(correlation))
+                        block_index = len(accumulator[2])
+                        accumulator[2].append(block)
+                        for direction_phase in range(2 * self.Basis[0].ntheta):
+                            accumulator[0].append(
+                                [index + direction_phase for index in base_indices])
+                            accumulator[1].append(block_index)
+
+        groups = tuple(RaggedCorrelationGroup(
+            np.asarray(indices, dtype='int32'),
+            np.asarray(block_index, dtype='int32'),
+            np.asarray(blocks, dtype='float64'))
+            for _, (indices, block_index, blocks) in sorted(accumulators.items())
+            if indices)
+        return BMauxRaggedMultivariateCovariance(
+            np.asarray(marginal_q, dtype='float64'), groups)
+
+    def _ragged_covariance(self, marginal_q):
+        if self.correlation_mode == 'IND':
+            return BMauxRaggedMultivariateCovariance(marginal_q)
+        if (self.neighbor_wavelet_count > 1
+                and self.neighbor_correlation_strength > 0.0):
+            return self._ragged_neighbor_covariance(marginal_q)
+
+        offsets = np.asarray(
+            [control_slice.start for control_slice in self.slice_basis],
+            dtype='int64')
+        accumulators = {
+            (0, 1): [[], [], []], (0, 2): [[], [], []],
+            (1, 2): [[], [], []], (0, 1, 2): [[], [], []],
+        }
+        with xr.open_dataset(self.file_aux) as dataset:
+            self.product_signature = str(
+                dataset.attrs.get('layout_signature', 'unknown'))
+            grid_lat = np.asarray(dataset.lat.values, dtype='float64')
+            grid_lon = np.asarray(dataset.lon.values, dtype='float64')
+            product_frequency = np.asarray(dataset.f.values, dtype='float64')
+            interpolators = []
+            scale_correlations = []
+            strength_interpolators = []
+            if self.correlation_mode == 'ADAPTIVE':
+                if (self.adaptive_apply_strength
+                        and self.adaptive_strength_variable not in dataset):
+                    raise ValueError(
+                        f'ADAPTIVE BMaux covariance requires '
+                        f'{self.adaptive_strength_variable!r} in {self.file_aux}.')
+                if self.adaptive_correlation_variable not in dataset:
+                    raise ValueError(
+                        f'ADAPTIVE BMaux covariance requires '
+                        f'{self.adaptive_correlation_variable!r} in {self.file_aux}.')
+            correlation_variable = (
+                self.adaptive_correlation_variable
+                if self.correlation_mode == 'ADAPTIVE' else 'correlation')
+            for frequency in np.asarray(self.Basis[0].ff):
+                source = int(np.argmin(np.abs(product_frequency - frequency)))
+                matrices = np.asarray(
+                    dataset[correlation_variable].isel(f=source).values,
+                    dtype='float64')
+                interpolators.append([
+                    scipy.interpolate.RegularGridInterpolator(
+                        (grid_lat, grid_lon), matrices[..., first, second],
+                        bounds_error=False,
+                        fill_value=1.0 if first == second else 0.0)
+                    for first in range(3) for second in range(3)
+                ])
+                support = np.asarray(
+                    dataset.common_support.isel(f=source).values, dtype=bool)
+                selected = matrices[support]
+                scale_correlations.append(self._regularize_correlation(
+                    np.median(selected, axis=0) if selected.size else np.eye(3)))
+                if self.correlation_mode == 'ADAPTIVE' and self.adaptive_apply_strength:
+                    strength_interpolators.append(
+                        scipy.interpolate.RegularGridInterpolator(
+                            (grid_lat, grid_lon),
+                            np.asarray(dataset[self.adaptive_strength_variable]
+                                       .isel(f=source).values, dtype='float64'),
+                            bounds_error=False, fill_value=0.0))
+
+            for scale in range(self.Basis[0].nf):
+                location_maps = []
+                for component in range(3):
+                    location_maps.append({
+                        (round(float(lon), 8), round(float(lat), 8)): index
+                        for index, (lon, lat) in enumerate(zip(
+                            self.Basis[component].ENSLON[scale],
+                            self.Basis[component].ENSLAT[scale]))
+                    })
+                keys = set().union(*(mapping for mapping in location_maps))
+                for key in sorted(keys):
+                    locations = {
+                        component: mapping[key]
+                        for component, mapping in enumerate(location_maps)
+                        if key in mapping
+                    }
+                    if len(locations) < 2:
+                        continue
+                    if self.correlation_mode == 'SCALE':
+                        correlation = scale_correlations[scale]
+                    else:
+                        point = np.asarray([[key[1], key[0]]])
+                        values = np.asarray([
+                            float(interpolator(point)[0])
+                            for interpolator in interpolators[scale]
+                        ]).reshape(3, 3)
+                        correlation = self._regularize_correlation(values)
+                        if self.correlation_mode == 'LOCAL-S':
+                            correlation = self._regularize_correlation(
+                                np.eye(3) + self.local_correlation_strength
+                                * (correlation - np.eye(3)))
+                        elif self.correlation_mode == 'ADAPTIVE':
+                            if self.adaptive_temporal_overlap:
+                                widths = np.ones(3, dtype='float64')
+                                for component, location in locations.items():
+                                    widths[component] = float(
+                                        self.Basis[component].tdec[scale][location])
+                                correlation = correlation * self._temporal_overlap_correlation(
+                                    widths)
+                            if self.adaptive_apply_strength:
+                                strength = float(np.clip(
+                                    strength_interpolators[scale](point)[0],
+                                    0.0, 1.0))
+                                correlation = (np.eye(3) + strength
+                                               * (correlation - np.eye(3)))
+                            correlation = self._regularize_correlation(correlation)
+                    time_groups = self._matched_time_groups(
+                        scale, locations, correlation)
+                    blocks_at_location = {}
+                    for subset, temporal_slots in time_groups:
+                        subcorrelation = correlation[np.ix_(subset, subset)]
+                        if np.max(np.abs(
+                                subcorrelation - np.eye(len(subset)))) < 1.0e-10:
+                            continue
+                        if subset not in blocks_at_location:
+                            local_indices = []
+                            sigmas = []
+                            for component in subset:
+                                location = locations[component]
+                                base = self.Basis[component]
+                                slot = temporal_slots[component]
+                                local = (int(base.iff_wavebounds[scale])
+                                         + (slot * int(base.NP[scale]) + location)
+                                         * (2 * base.ntheta))
+                                local_indices.append(local)
+                                sigmas.append(marginal_q[offsets[component] + local])
+                            block = (np.asarray(sigmas)[:, None]
+                                     * np.linalg.cholesky(subcorrelation))
+                            blocks_at_location[subset] = len(
+                                accumulators[subset][2])
+                            accumulators[subset][2].append(block)
+                        block_index = blocks_at_location[subset]
+                        for direction_phase in range(2 * self.Basis[0].ntheta):
+                            indices = []
+                            for component in subset:
+                                location = locations[component]
+                                base = self.Basis[component]
+                                slot = temporal_slots[component]
+                                local = (int(base.iff_wavebounds[scale])
+                                         + (slot * int(base.NP[scale]) + location)
+                                         * (2 * base.ntheta) + direction_phase)
+                                indices.append(offsets[component] + local)
+                            accumulators[subset][0].append(indices)
+                            accumulators[subset][1].append(block_index)
+
+        groups = []
+        for subset, (indices, block_index, blocks) in accumulators.items():
+            if indices:
+                groups.append(RaggedCorrelationGroup(
+                    np.asarray(indices, dtype='int32'),
+                    np.asarray(block_index, dtype='int32'),
+                    np.asarray(blocks, dtype='float64')))
+        return BMauxRaggedMultivariateCovariance(
+            np.asarray(marginal_q, dtype='float64'), tuple(groups))
+
+    def _set_union_basis(self, time, return_q=False, State=None):
+        backgrounds, marginals = [], []
+        self.slice_basis = []
+        offset = 0
+        digest = hashlib.sha256(b'bmaux-ragged-union-v1')
+        for component in self.Basis:
+            background, marginal = component.set_basis(
+                time, return_q=True, State=State)
+            self.slice_basis.append(slice(offset, offset + component.nbasis))
+            offset += component.nbasis
+            backgrounds.append(np.asarray(background))
+            marginals.append(np.asarray(marginal))
+            digest.update(np.asarray(component.ff).tobytes())
+            for values in component.ENSLON + component.ENSLAT + component.enst:
+                digest.update(np.asarray(values).tobytes())
+        self.nbasis = offset
+        background = np.concatenate(backgrounds)
+        marginal_q = np.concatenate(marginals)
+        self.layout_signature = digest.hexdigest()
+        self.covariance_operator = self._ragged_covariance(marginal_q)
+        if self.product_signature is None:
+            with xr.open_dataset(self.file_aux) as dataset:
+                self.product_signature = str(
+                    dataset.attrs.get('layout_signature', 'unknown'))
+        if self.config.BASIS.path_background is not None:
+            with xr.open_dataset(self.config.BASIS.path_background) as dataset:
+                loaded = np.asarray(
+                    dataset[self.config.BASIS.var_background].values).ravel()
+            if loaded.size != self.nbasis:
+                raise ValueError(
+                    "Multivariate BMaux background control size does not "
+                    "match the ragged union layout.")
+            background = loaded
+        if return_q:
+            return background, marginal_q
+
+    def _make_layout(self, time):
+        if self.file_layout is not None:
+            layout = read_layout(self.file_layout)
+        else:
+            layout = build_multivariate_layout(
+                self.file_aux, time,
+                lon_min=self.State.lon_min, lon_max=self.State.lon_max,
+                lat_min=self.State.lat_min, lat_max=self.State.lat_max,
+                epoch_offset_days=(
+                    self.config.EXP.init_date
+                    - datetime.datetime(1950, 1, 1)).total_seconds() / 86400.,
+                facns=self.config.BASIS.facns,
+                facnlt=self.config.BASIS.facnlt,
+                npsp=self.config.BASIS.npsp,
+                facpsp=self.config.BASIS.facpsp,
+                lmin=self.config.BASIS.lmin,
+                lmax=self.config.BASIS.lmax,
+                tdecmin=self.config.BASIS.tdecmin,
+                tdecmax=self.config.BASIS.tdecmax,
+                support_policy=self.config.BASIS.support_policy)
+        values = np.asarray(time, dtype="float64")
+        if not np.isclose(layout.time_min, values[0]) or not np.isclose(
+                layout.time_max, values[-1]):
+            raise ValueError(
+                "Serialized BMaux layout time range does not match this "
+                "assimilation window.")
+        return layout
+
+    def set_basis(self, time, return_q=False, State=None, **kwargs):
+        if self.support_policy == 'union':
+            return self._set_union_basis(
+                time, return_q=return_q, State=State)
+        layout = self._make_layout(time)
+        self.layout = layout
+        self.layout_signature = layout.signature
+        self.product_signature = layout.product_signature
+        self.slice_basis = []
+        backgrounds = []
+        offset = 0
+        for index, component in enumerate(self.Basis):
+            component.set_common_layout(layout, index, time, State=State)
+            self.slice_basis.append(slice(offset, offset + component.nbasis))
+            backgrounds.append(np.zeros(component.nbasis, dtype="float64"))
+            offset += component.nbasis
+        self.nbasis = offset
+        self.covariance_operator = BMauxMultivariateCovariance.from_layout(
+            layout, facq=self.facQ,
+            correlation_mode=self.correlation_mode,
+            local_strength=self.local_correlation_strength)
+        marginal_q = np.concatenate([
+            self.facQ * layout.q_vector(component)
+            for component in self.component_order
+        ])
+        background = np.concatenate(backgrounds)
+        if self.config.BASIS.path_background is not None:
+            with xr.open_dataset(self.config.BASIS.path_background) as dataset:
+                loaded = np.asarray(
+                    dataset[self.config.BASIS.var_background].values).ravel()
+            if loaded.size != self.nbasis:
+                raise ValueError(
+                    "Multivariate BMaux background control size does not "
+                    "match the common layout.")
+            background = loaded
+        if return_q:
+            return background, marginal_q
+
+    def operg(self, t, X, State=None):
+        if State is not None:
+            for name in self.name_mod_var:
+                State[name] = jnp.zeros_like(State[name])
+        output = []
+        for component, control_slice in zip(self.Basis, self.slice_basis):
+            value = component.operg(t, X[control_slice], State=State)
+            if State is None:
+                output.append(value)
+        if State is None:
+            return jnp.concatenate([jnp.ravel(value) for value in output])
+
+    def operg_transpose(self, t, adState):
+        parts = [
+            component.operg_transpose(t, adState)
+            for component in self.Basis
+        ]
+        for name in self.name_mod_var:
+            adState[name] = _cached_zero_like(self, adState[name])
+        return jnp.concatenate(parts)
+
+
 ###############################################################################
 #                            Internal-tides                                   #
 ###############################################################################   
@@ -3864,6 +4674,20 @@ class Basis_windowed_forcing:
         self.name_mod_var = list(dict.fromkeys(
             self.global_basis.name_mod_var +
             self.local_bases[0].name_mod_var))
+        covariance_bases = [self.global_basis] + self.local_bases
+        covariance_operators = [
+            getattr(basis, 'covariance_operator', None)
+            for basis in covariance_bases
+        ]
+        if any(operator is not None for operator in covariance_operators):
+            covariance_operators = [
+                operator if operator is not None
+                else DiagonalCovariance(q)
+                for operator, q in zip(covariance_operators, q_parts)
+            ]
+            self.covariance_operator = BlockDiagonalCovariance.from_sizes(
+                covariance_operators,
+                [basis.nbasis for basis in covariance_bases])
         if self.verbose:
             print(f'Windowed forcing: {len(self.local_bases)} windows, '
                   f'{self.global_basis.nbasis} shared parameter controls, '
@@ -4116,6 +4940,10 @@ class Basis_multi:
             for component in self.Basis
         ]
 
+        covariance_operators = []
+        covariance_sizes = []
+        has_implicit_covariance = False
+
         for B, (_Xb, _Q) in zip(self.Basis, results):
             self.slice_basis.append(
                 slice(self.nbasis, self.nbasis + B.nbasis)
@@ -4125,6 +4953,16 @@ class Basis_multi:
             if return_q:
                 Xb = np.concatenate((Xb, _Xb))
                 Q = np.concatenate((Q, _Q))
+                operator = getattr(B, 'covariance_operator', None)
+                has_implicit_covariance |= operator is not None
+                covariance_operators.append(
+                    operator if operator is not None
+                    else DiagonalCovariance(_Q))
+                covariance_sizes.append(B.nbasis)
+
+        if return_q and has_implicit_covariance:
+            self.covariance_operator = BlockDiagonalCovariance.from_sizes(
+                covariance_operators, covariance_sizes)
         
         if return_q:
             return Xb,Q
