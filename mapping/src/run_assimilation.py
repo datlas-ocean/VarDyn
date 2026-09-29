@@ -663,19 +663,20 @@ def prepare_process(config, config_eq, State,
                 with open(f'{path_pickle}/config.pkl', 'wb') as f:
                     pickle.dump(_config, f)
 
-            if flag_assim and (flag_assim_restart
-                               or not os.path.exists(f'{_config.INV.path_save_control_vectors}/Xres.nc')):
-                worker = partial(inv.Inv_4Dvar, config=_config, State=_State,
-                                 verbose=0)
-                if flag_init_from_previous:
-                    list_processes[i].append(worker)
-                else:
-                    list_processes[0].append(worker)
-            elif i == 0:
-                if not flag_assim_restart:
-                    print('Assimilation already done for this subwindow, skipping (use flag_assim_restart=True to re-run)')
-                if not flag_assim:
-                    print('Assimilation not requested for this subwindow, skipping (use flag_assim=True to run)')
+            if flag_assim:
+                if (flag_assim_restart
+                        or not os.path.exists(
+                            f'{_config.INV.path_save_control_vectors}/Xres.nc')):
+                    worker = partial(
+                        inv.Inv_4Dvar, config=_config, State=_State, verbose=0)
+                    if flag_init_from_previous:
+                        list_processes[i].append(worker)
+                    else:
+                        list_processes[0].append(worker)
+                elif i == 0:
+                    print(
+                        'Assimilation already done for this subwindow, '
+                        'skipping (use flag_assim_restart=True to re-run)')
 
         iproc += iproc_tw
 
