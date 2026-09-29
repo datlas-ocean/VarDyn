@@ -1246,6 +1246,8 @@ class Obsop_interp_l4(Obsop_interp):
             raise NotImplementedError(
                 'lax.scan does not yet support gradient-form L4 observations'
             )
+        if self.varobs_arr.shape[0] == 0:
+            return 0
         return int(np.prod(self.varobs_arr.shape[1:]))
 
     def scan_misfit(self, t, State_var):
@@ -1254,6 +1256,10 @@ class Obsop_interp_l4(Obsop_interp):
             raise NotImplementedError(
                 'lax.scan does not yet support gradient-form L4 observations'
             )
+        # A static shape guard prevents tracing an invalid gather on the
+        # empty time axis. jnp.where cannot protect that gather under scan.
+        if self.varobs_arr.shape[0] == 0:
+            return jnp.zeros((0,), dtype=self.varobs_arr.dtype)
         field = self._observation_model_field(State_var)
         raw = self._misfit(t, self._to_observation_grid(field))
         return jnp.where(self.is_obs_time_jax(t), raw, jnp.zeros_like(raw))
@@ -1264,6 +1270,8 @@ class Obsop_interp_l4(Obsop_interp):
             raise NotImplementedError(
                 'lax.scan does not yet support gradient-form L4 observations'
             )
+        if self.varobs_arr.shape[0] == 0:
+            return adState_var
         idt = jnp.where(self.t_obs_jax == t, size=1)[0]
         inverr = 1 / self.errobs_arr[idt]
         increment = jnp.where(
