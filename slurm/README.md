@@ -8,7 +8,7 @@ Large-scale SSH mapping with MASSH (e.g. global VarDyn runs) is parallelised ove
 - **Space** — the domain is split into overlapping spatial tiles
 - **Time** — the time period is split into overlapping time windows
 
-Each running SLURM array task (one GPU) processes its deterministic shard of the sorted tile list. For Zarr output, spatial-merge date shards are also dynamically claimed: each active task uses its own CPU allocation to create an independent rank archive. One task then assembles the validated rank archives into the single archive for that temporal window. Finally, one task merges all temporal windows into the full output.
+Each running SLURM array task (one GPU) first processes its deterministic shard of the sorted tile list, then claims unfinished tiles assigned to tasks reported as PENDING by Slurm. Atomic tile locks protect against concurrent borrowers and owners that start late. For Zarr output, spatial-merge date shards are also dynamically claimed: each active task uses its own CPU allocation to create an independent rank archive. One task then assembles the validated rank archives into the single archive for that temporal window. Finally, one task merges all temporal windows into the full output.
 
 ```
 sbatch slurm/run/VarDyn_GLO.sh [--skip-prepare] [--restart] [--force-merge] [--tile-scope all|equatorial] [--name_exp <name>]
@@ -35,7 +35,7 @@ prepare_VarDyn.py (one dynamic owner)
                  │
                  ▼
 for each temporal window:
-  deterministic assimilation-tile shards (one owner per tile)
+  assimilation-tile shards + borrowing from pending tasks
                  │
                  ▼
   dynamic spatial-merge rank queue
@@ -54,7 +54,7 @@ merge_time_windows (one task) → final <name>.zarr
 
 ### `VarDyn_GLO.sh`
 
-Example SLURM submission script — copy and edit the **USER SETTINGS** block for each experiment.
+Reusable SLURM launcher. Supply experiment settings with `--config path/to/config.sh`; relative Python config paths resolve beside that shell config. Unknown options and missing values fail before environment setup.
 
 | Variable | Description |
 |---|---|
@@ -113,11 +113,20 @@ fallback source name when background mode is enabled without
 - Preparation, queue publication, merge parts, finalization and final merge
   waits stop on a shared failure, a confirmed dead owner, or `BARRIER_TIMEOUT`.
 - Assimilation waits reset their deadline only when the number of incomplete
-  tiles changes. Pending owners are not replaced by another worker. Set
-  `BARRIER_TIMEOUT` above the expected gap between tile completions/startups.
+  tiles changes. Active workers borrow unlocked tiles from pending owners,
+  using one scheduler snapshot per dispatch pass. Running or unknown owners
+  are not selected for borrowing; failed queries disable borrowing for that
+  pass. Completed tiles are checked again after acquiring their lock, so a
+  late owner cannot repeat work completed by a borrower. Set `BARRIER_TIMEOUT`
+  above the expected gap between tile completions.
 - Slurm queries have a 30-second timeout (plus 5 seconds to force termination).
   A failed targeted query falls back to the full active-task listing, including
   for `--predecessor-job`. Unknown ownership never authorizes stealing a lock.
+  Incomplete borrowed tiles are monitored through their actual lock owner.
+- Stale tile leases are moved with `mv -T` to a nonempty, retained
+  `.tile_running.lock.stale-<old-token>` directory. This prevents competing
+  reclaimers from moving a newly acquired lease. Keep these small diagnostic
+  directories while jobs may still access the tile.
 - A tile failure stops new launches and propagates to other tasks through
   generation-specific `run.failed` and window failure markers. Running tile
   and stage process groups are terminated and reaped before releasing tile
@@ -128,7 +137,12 @@ fallback source name when background mode is enabled without
 - Deterministic failures do not submit automatic continuations. The Slurm
   wall-time warning still submits a dependent continuation.
 - `--force-merge` applies to the submitted run only and is not propagated to
-  automatic continuations.
+  automatic continuations. Experiment and background-name CLI overrides are
+  carried forward; failed submissions can be retried.
+- Merge arguments are initialized before scanning windows, including when
+  every spatial window is already complete. Paths are passed as Bash array
+  arguments. Durable markers must be published successfully before a stage
+  reports success; intermediate outputs are removed only after final completion.
 
 The launcher requires `setsid` and GNU `timeout` on the compute nodes.
 All three timeouts can be overridden in the experiment shell config.

@@ -2,6 +2,9 @@ import os
 import re
 from pathlib import Path
 import subprocess
+import shlex
+
+import pytest
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -14,7 +17,9 @@ def _tile_lock_functions() -> str:
              "release_tile_claim", "tile_is_owned_by_task", "report_incomplete_tiles",
              "wait_for_marker", "stop_process_group", "run_stage", "wait_tile_workers",
              "stop_tile_workers", "run_single_tile",
-             "process_available_tiles", "wait_for_spatial_merge_parts")
+             "process_available_tiles", "pending_array_tasks", "wait_for_spatial_merge_parts",
+             "init_merge_args", "merge_outputs", "publish_marker", "claim_stage",
+             "finish_merge_stage", "submit_continuation", "incomplete_owners_are_active")
     return "\n".join(re.search(
         rf"^{name}\(\) \{{.*?^\}}", launcher, re.M | re.S).group()
         for name in names)
@@ -138,7 +143,7 @@ def test_launcher_has_resume_and_predecessor_guards():
     launcher = LAUNCHER.read_text(encoding="utf-8")
     assert '--predecessor-job "${dependency}"' in launcher
     assert '[ -f "${tile}/.tile_complete.ok" ] && continue' in launcher
-    assert 'tile_is_owned_by_task "$tile_index"' in launcher
+    assert 'tile_is_owned_by_task "$((tile_index - 1))"' in launcher
     assert '.window_complete_${TILE_SCOPE}.ok' in launcher
 
 
@@ -375,3 +380,298 @@ assert not (root / "outputs").exists()
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_pending_snapshot_excludes_running_unknown_and_failed_queries(tmp_path):
+    result = _run_lock_scenario(tmp_path, r'''
+JOB_ID=404
+_slurm_query() {
+    printf '%s\n' '404_1 PENDING' '404_2 RUNNING' '404_3 CONFIGURING' \
+        '404_4 UNKNOWN' '405_5 PENDING' '404_[6-9] PENDING'
+}
+test "$(pending_array_tasks)" = 1 || exit 1
+_slurm_query() { printf '%s\n' '404_1 PENDING'; return 1; }
+test -z "$(pending_array_tasks)" || exit 2
+''')
+    assert result.returncode == 0, result.stderr
+
+
+def test_pending_sixth_task_shard_finishes_without_owner(tmp_path):
+    result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
+NUM_ARRAY=6
+NUM_TILES_PER_GPU=4
+: > "$BARRIER_DIR/tiles"
+for i in $(seq 0 135); do
+    tile="$BARRIER_DIR/work$i"
+    mkdir "$tile"
+    printf '%s\n' "$tile" >> "$BARRIER_DIR/tiles"
+    # Ranks 1-4 have completed; rank 0 must finish its own and rank 5's work.
+    if (( i % 6 != 0 && i % 6 != 5 )); then touch "$tile/.tile_complete.ok"; fi
+done
+_slurm_query() { printf '%s\n' '404_0 RUNNING' '404_5 PENDING'; }
+run_single_tile() {
+    printf '%s\n' "$1" >> "$BARRIER_DIR/executed"
+    touch "$1/.tile_complete.ok"
+    release_tile_claim "$1" "$3"
+}
+process_available_tiles "$BARRIER_DIR/tiles" 0 || exit 1
+test "$TILES_PROCESSED_IN_PASS" -eq 45 || exit 2
+while read -r tile; do test -f "$tile/.tile_complete.ok" || exit 3; done < "$BARRIER_DIR/tiles"
+# The late owner must skip every borrowed tile.
+ARRAY_ID=5
+process_available_tiles "$BARRIER_DIR/tiles" 0 || exit 4
+test "$TILES_PROCESSED_IN_PASS" -eq 0 || exit 5
+test "$(wc -l < "$BARRIER_DIR/executed")" -eq 45
+''')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("Borrowing tile") == 22
+
+
+def test_concurrent_borrowers_and_late_owner_run_tile_once(tmp_path):
+    result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
+NUM_ARRAY=3
+touch "$BARRIER_DIR/tile0/.tile_complete.ok" "$BARRIER_DIR/tile1/.tile_complete.ok"
+_slurm_query() { printf '%s\n' '404_2 PENDING'; }
+cat > "$BARRIER_DIR/bin/python" <<'SH'
+#!/bin/bash
+tile="$2"
+printf '%s\n' started >> "$tile/executed"
+touch "$tile/started"
+sleep 1
+touch "$tile/.tile_complete.ok"
+SH
+chmod +x "$BARRIER_DIR/bin/python"
+(ARRAY_ID=0; process_available_tiles "$BARRIER_DIR/tiles" 0) &
+first=$!
+(ARRAY_ID=1; process_available_tiles "$BARRIER_DIR/tiles" 0) &
+second=$!
+for i in $(seq 1 100); do
+    [ -f "$BARRIER_DIR/tile2/started" ] && break
+    sleep 0.05
+done
+test -f "$BARRIER_DIR/tile2/started" || exit 1
+ARRAY_ID=2
+process_available_tiles "$BARRIER_DIR/tiles" 0 || exit 2
+wait "$first" || exit 3
+wait "$second" || exit 4
+process_available_tiles "$BARRIER_DIR/tiles" 0 || exit 5
+test "$(wc -l < "$BARRIER_DIR/tile2/executed")" -eq 1 || exit 6
+test ! -d "$BARRIER_DIR/tile2/.tile_running.lock"
+''')
+    assert result.returncode == 0, result.stderr
+
+
+def test_tile_completed_between_check_and_claim_is_not_relaunched(tmp_path):
+    result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
+# Simulate another worker finishing and releasing the lock just before mkdir.
+eval "$(declare -f try_claim_tile | sed '1s/try_claim_tile/original_claim/')"
+try_claim_tile() {
+    touch "$1/.tile_complete.ok"
+    original_claim "$1"
+}
+run_single_tile() { touch "$BARRIER_DIR/should_not_run"; }
+process_available_tiles "$BARRIER_DIR/tiles" 0 || exit 1
+test "$TILES_PROCESSED_IN_PASS" -eq 0 || exit 2
+test ! -f "$BARRIER_DIR/should_not_run" || exit 3
+for i in 0 1 2; do test ! -d "$BARRIER_DIR/tile$i/.tile_running.lock" || exit 4; done
+''')
+    assert result.returncode == 0, result.stderr
+
+
+def test_concurrent_stale_reclaim_cannot_move_new_lease(tmp_path):
+    tile = tmp_path / 'tile'
+    lock = tile / '.tile_running.lock'
+    lock.mkdir(parents=True)
+    (lock / 'job_id').write_text('303_5\n')
+    (lock / 'token').write_text('303_5_old\n')
+    result = _run_lock_scenario(tmp_path, f'''
+JOB_ID=404
+tile={shlex.quote(str(tile))}
+slurm_task_is_active() {{
+    touch "$tile/seen_$ARRAY_ID"
+    for i in $(seq 1 100); do
+        [ -f "$tile/seen_0" ] && [ -f "$tile/seen_1" ] && break
+        sleep 0.02
+    done
+    if [ "$ARRAY_ID" = 1 ]; then
+        for i in $(seq 1 100); do
+            [ -f "$tile/winner" ] && break
+            sleep 0.02
+        done
+    fi
+    return 1
+}}
+(ARRAY_ID=0; try_claim_tile "$tile" > "$tile/winner_token" && touch "$tile/winner") &
+first=$!
+(ARRAY_ID=1; if try_claim_tile "$tile"; then exit 9; fi) &
+second=$!
+wait "$first" || exit 1
+wait "$second" || exit 2
+test "$(cat "$tile/.tile_running.lock/token")" = "$(cat "$tile/winner_token")"
+''')
+    assert result.returncode == 0, result.stderr
+    assert (tile / '.tile_running.lock.stale-303_5_old' / 'job_id').read_text().strip() == '303_5'
+
+
+def test_borrowed_tile_health_uses_claimant_not_nominal_owner(tmp_path):
+    result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
+NUM_ARRAY=3
+touch "$BARRIER_DIR/tile0/.tile_complete.ok" "$BARRIER_DIR/tile1/.tile_complete.ok"
+mkdir "$BARRIER_DIR/tile2/.tile_running.lock"
+printf '404_0\n' > "$BARRIER_DIR/tile2/.tile_running.lock/job_id"
+slurm_task_is_active() { [ "$1" = 404_0 ]; }
+incomplete_owners_are_active "$BARRIER_DIR/tiles" || exit 1
+slurm_task_is_active() { return 1; }
+if incomplete_owners_are_active "$BARRIER_DIR/tiles"; then exit 2; fi
+''')
+    assert result.returncode == 0, result.stderr
+    assert 'owner 404_0' in result.stderr
+
+
+@pytest.mark.parametrize('zarr', [False, True])
+@pytest.mark.parametrize('already_done', [False, True])
+def test_merge_flow_preserves_options_and_publication_order(tmp_path, zarr, already_done):
+    base = tmp_path / 'experiment with spaces'
+    window = base / 'subwindow_2023-01-26'
+    (window / 'subwindow_0_0').mkdir(parents=True)
+    if already_done:
+        (window / '.window_complete_all.ok').touch()
+    main = LAUNCHER.read_text().split('\ninit_merge_args\n', 1)[1]
+    setup = f'''
+die() {{ echo "$*" >&2; exit 1; }}
+BASE_DIR={shlex.quote(str(base))}
+BARRIER_DIR={shlex.quote(str(tmp_path))}
+DIR_SAVE_PICKLE="$BASE_DIR"
+CONFIG_PATH="$BASE_DIR/config.pkl"
+SRC_DIR="$BASE_DIR/source code"
+FINAL_MARKER="$BASE_DIR/experiment_complete.ok"
+NAME_VAR=sla,ug
+JOB_ID=404
+ARRAY_ID=0
+NUM_ARRAY=3
+NUM_MERGE_WORKERS=4
+ZARR_TIME_CHUNK=10
+ZARR_SPATIAL_CHUNK=128
+ZARR_COMPRESSION_LEVEL=3
+ZARR_OUTPUT={str(zarr).lower()}
+OUTPUT_FLOAT64=true
+CLEANUP_TILE_ZARR=true
+FORCE_ARGS=()
+RESTART=""
+FORCE_MERGE=false
+MERGE_ONLY=true
+TILE_SCOPE=all
+BARRIER_TIMEOUT=1
+run_stage() {{
+    printf '%s\\n' CALL "$@" >> "$BARRIER_DIR/calls"
+    if [[ " $* " == *" --cleanup_subwindow_outputs "* ]]; then
+        test -f "$FINAL_MARKER" || exit 99
+    fi
+}}
+init_merge_args
+'''
+    result = _run_lock_scenario(tmp_path, setup + main)
+    assert result.returncode == 0, result.stderr
+    calls = (tmp_path / 'calls').read_text().split('CALL\n')[1:]
+    args = [call.splitlines() for call in calls]
+    assert len(args) == (2 if already_done else (6 if zarr else 3))
+    for call in args:
+        assert str(base / 'source code' / 'merge_outputs.py') in call
+        assert call[call.index('--dir_save_pickle') + 1] == str(base)
+        assert '--output_float64' in call
+        assert ('--zarr_output' in call) == zarr
+        assert call[call.index('--zarr_time_chunk') + 1] == '10'
+    assert '--merge_time_windows' in args[-2]
+    assert '--cleanup_tile_zarr' in args[-2]
+    assert '--cleanup_subwindow_outputs' in args[-1]
+    assert '--cleanup_tile_zarr' not in args[-1]
+    assert (base / 'experiment_complete.ok').is_file()
+    assert (tmp_path / 'final_merge.ok').is_file()
+    assert (window / '.window_complete_all.ok').is_file()
+
+
+@pytest.mark.parametrize('failure', ['merge', 'publication'])
+def test_failed_merge_stage_never_publishes_success(tmp_path, failure):
+    result = _run_lock_scenario(tmp_path, f'''
+die() {{ exit 1; }}
+JOB_ID=404
+ARRAY_ID=0
+merge_outputs() {{ return {1 if failure == 'merge' else 0}; }}
+{'publish_marker() { return 1; }' if failure == 'publication' else ''}
+finish_merge_stage "{tmp_path}/ok" "{tmp_path}/failed" "{tmp_path}/durable"
+''')
+    assert result.returncode == 1
+    assert (tmp_path / 'failed').exists()
+    assert not (tmp_path / 'ok').exists()
+    assert not (tmp_path / 'durable').exists()
+
+
+def test_continuation_retries_failed_submission_and_preserves_background(tmp_path):
+    result = _run_lock_scenario(tmp_path, f'''
+BASE_DIR={shlex.quote(str(tmp_path))}
+JOB_ID=404
+SLURM_JOB_ID=404
+FINAL_MARKER="$BASE_DIR/final"
+CONTINUATION_SUBMITTED=false
+CONFIG_FILE="config with spaces.sh"
+CONTINUATION_SCRIPT=launcher.sh
+RESTART=""
+FORCE_MERGE=false
+MERGE_ONLY=false
+TILE_SCOPE=all
+NAME_EXP_OVERRIDE="experiment name"
+NAME_EXP_BACKGROUND_OVERRIDE="background name"
+sbatch() {{
+    if [ ! -f "$BASE_DIR/retry" ]; then touch "$BASE_DIR/retry"; return 1; fi
+    printf '%s\\n' "$@" > "$BASE_DIR/submission"
+    echo 505
+}}
+scontrol() {{ echo 'Dependency=afterany:404'; }}
+submit_continuation
+[ "$CONTINUATION_SUBMITTED" = false ] || exit 1
+submit_continuation
+[ "$CONTINUATION_SUBMITTED" = true ] || exit 2
+''')
+    assert result.returncode == 0, result.stderr
+    args = (tmp_path / 'submission').read_text().splitlines()
+    assert args[args.index('--name_exp_background') + 1] == 'background name'
+    assert args[args.index('--name_exp') + 1] == 'experiment name'
+    assert args[args.index('--config') + 1] == 'config with spaces.sh'
+    assert '--dependency=afterany:404' in args
+
+
+@pytest.mark.parametrize('args', [
+    ['--config'], ['--config='], ['--typo'], ['--restart=yes'],
+    ['--config', '--skip-prepare'], ['--name_exp'],
+])
+def test_cli_rejects_bad_options_before_environment_setup(args):
+    result = subprocess.run(['bash', str(LAUNCHER), *args], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'ERROR:' in result.stderr
+    assert 'conda' not in result.stderr
+
+
+def test_cli_and_prepare_arguments_preserve_spaces_and_quotes(tmp_path):
+    config = tmp_path / 'experiment settings.sh'
+    pyconfig = tmp_path / "user's config.py"
+    pyconfig.write_text("name_experiment = 'sample experiment'\n")
+    config.write_text('\n'.join([
+        f'MASH_DIR={shlex.quote(str(tmp_path))}',
+        f'DIR_SAVE_PICKLE={shlex.quote(str(tmp_path / "pickle files"))}',
+        f'PATH_CONFIG={shlex.quote(pyconfig.name)}',
+        f'PATH_CONFIG_EQ={shlex.quote(pyconfig.name)}',
+        'INIT_DATE=2023-01-01', 'FINAL_DATE=2023-02-01',
+    ]))
+    prefix = LAUNCHER.read_text().split('# -------------------- ENVIRONMENT')[0]
+    script = tmp_path / 'prefix.sh'
+    script.write_text(prefix + '\nprintf "%s\\n" "$EXP_NAME" "${PREPARE_ARGS[@]}"\n')
+    result = subprocess.run(
+        ['bash', str(script), '--config', str(config), '--name_exp_background=background with spaces'],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    args = result.stdout.splitlines()
+    assert args[0] == 'sample experiment'
+    assert args[args.index('--dir_save_pickle') + 1] == str(tmp_path / 'pickle files')
+    assert args[args.index('--name_exp_background') + 1] == 'background with spaces'
+    assert '--flag_background' in args
