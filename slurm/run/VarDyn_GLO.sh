@@ -13,7 +13,7 @@
 #SBATCH --partition=gpu_std
 #SBATCH --time=48:00:00
 #SBATCH --signal=B:USR1@300
-#SBATCH --mem=90G
+#SBATCH --mem=60G
 #SBATCH --account=swot_duacs
 #SBATCH --export=none
 
