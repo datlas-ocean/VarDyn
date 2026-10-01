@@ -60,13 +60,19 @@ class _TileState:
     ny = 2
     nx = 2
 
-    def __init__(self, values=None, fail=False):
+    def __init__(self, values=None, fail=False, variables=None):
         self.values = values
         self.fail = fail
+        self.variables = variables
 
     def load_output(self, date):
         if self.fail:
             raise OSError("missing tile")
+        if self.variables is not None:
+            return xr.Dataset({
+                name: (("y", "x"), values)
+                for name, values in self.variables.items()
+            })
         return xr.Dataset({"sla": (("y", "x"), self.values)})
 
 
@@ -116,12 +122,37 @@ def test_missing_ocean_output_is_fatal():
                            np.zeros((2, 2), dtype=bool), np.float32)
 
 
-def test_missing_required_variable_is_fatal():
-    target = SimpleNamespace(ny=2, nx=2, mask=None)
-    with pytest.raises(RuntimeError, match="Required variable ug missing"):
-        _merge_date_arrays(None, target, [_TileState(np.ones((2, 2)))],
-                           ["ug"], [(None, np.ones((2, 2)), None)],
-                           np.zeros((2, 2), dtype=bool), np.float32)
+def test_missing_variable_is_nan_on_that_tile_footprint():
+    target = SimpleNamespace(ny=2, nx=3, mask=None)
+    first_indices = np.array([0, 1, 3, 4], dtype=np.int32)
+    second_indices = np.array([1, 2, 4, 5], dtype=np.int32)
+    runtime = [
+        (first_indices, np.array([1, 0.5, 1, 0.5]),
+         _IdentityProjection()),
+        (second_indices, np.array([0.5, 1, 0.5, 1]),
+         _IdentityProjection()),
+    ]
+    merged = _merge_date_arrays(
+        None,
+        target,
+        [
+            _TileState(variables={
+                "sla": np.ones((2, 2)),
+            }),
+            _TileState(variables={
+                "sla": np.full((2, 2), 3.0),
+                "diagnostic": np.full((2, 2), 4.0),
+            }),
+        ],
+        ["sla", "diagnostic"],
+        runtime,
+        np.zeros((2, 3), dtype=bool),
+        np.float32,
+    )
+
+    np.testing.assert_allclose(merged["sla"], [[1, 2, 3], [1, 2, 3]])
+    assert np.isnan(merged["diagnostic"][:, :2]).all()
+    np.testing.assert_allclose(merged["diagnostic"][:, 2], 4.0)
 
 
 def test_parallel_merge_aborts_on_first_reported_failure(monkeypatch):

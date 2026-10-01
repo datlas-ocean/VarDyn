@@ -1346,6 +1346,7 @@ def _merge_date_arrays(date, State, list_State, name_var_save,
     # Missing coverage is exceptional.  Allocate its global arrays lazily so
     # the normal path uses half the former accumulator memory.
     missing = {name: None for name in name_var_save}
+    absent = {name: None for name in name_var_save}
 
     def mark_missing(name, output_indices, blend_weight, valid=None):
         if missing[name] is None:
@@ -1359,6 +1360,16 @@ def _merge_date_arrays(date, State, list_State, name_var_save,
             missing[name].ravel()[valid] += values
         else:
             _add_compact(missing[name], indexes, values)
+
+    def mark_absent(name, output_indices, blend_weight):
+        if absent[name] is None:
+            absent[name] = np.zeros((ny, nx), dtype=bool)
+        covered = np.asarray(blend_weight) > 1e-12
+        if output_indices is None:
+            absent[name] |= covered
+        else:
+            indexes = np.asarray(output_indices)[covered.reshape(-1)]
+            absent[name].ravel()[indexes] = True
 
     for (_State, (output_indices, blend_weight, interpolator)) in zip(
             list_State, runtime_tiles):
@@ -1377,8 +1388,9 @@ def _merge_date_arrays(date, State, list_State, name_var_save,
         try:
             for name in name_var_save:
                 if name not in dataset.data_vars:
-                    raise RuntimeError(
-                        f'Required variable {name} missing at {date}')
+                    mark_missing(name, output_indices, blend_weight)
+                    mark_absent(name, output_indices, blend_weight)
+                    continue
                 try:
                     values = dataset[name].values
                     if values.shape == (_State.ny, _State.nx + 1):
@@ -1418,6 +1430,8 @@ def _merge_date_arrays(date, State, list_State, name_var_save,
             usable = (~no_coverage) & (available > 1e-6)
             array[usable] /= available[usable]
             array[~usable] = np.nan
+        if absent[name] is not None:
+            array[absent[name]] = np.nan
         if State.mask is not None and np.any(State.mask):
             array[State.mask] = np.nan
     return result
