@@ -1119,18 +1119,6 @@ BASIS_BMAUX_MULTIVARIATE = BASIS_BMaux | dict(
 
     adaptive_temporal_overlap = True,
 
-    # Optional spatially multivariate extension for union/ragged layouts.
-    # Centres are partitioned into disjoint clusters of at most this many
-    # nearest wavelets. A value of one reproduces the local-only operator.
-    neighbor_wavelet_count = 1,
-
-    # Convex weight of a Gaussian spatial correlation inside each cluster.
-    # Keeping this in [0, 1] guarantees a positive-definite spatial factor.
-    neighbor_correlation_strength = 0.,
-
-    # Gaussian length scale relative to the median nearest-centre distance.
-    neighbor_length_scale_factor = 1.,
-
 )
 
 # Internal Tides boundary conditions basis (i.e. a set of basis vectors with values at the open boundaries)
