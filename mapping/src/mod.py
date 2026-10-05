@@ -138,7 +138,8 @@ class _BcFields:
                 ds = ds.assign_coords({config_bc.name_lon: ((config_bc.name_lon, ds[config_bc.name_lon].data % 360))})
             elif np.sign(ds[config_bc.name_lon].data.min()) >= 0 and State.lon_unit == '-180_180':
                 ds = ds.assign_coords({config_bc.name_lon: ((config_bc.name_lon, (ds[config_bc.name_lon].data + 180) % 360 - 180))})
-            ds = ds.sortby(ds[config_bc.name_lon])
+            if config_bc.name_lon in ds.dims:
+                ds = ds.sortby(ds[config_bc.name_lon])
         except Exception:
             print("Warning: can't convert longitude coordinates in " + config_bc.file)
 
@@ -185,7 +186,7 @@ class _BcFields:
             self.var[name] = ds[config_bc.name_var[name]].load()
         ds.close()
 
-    def interp(self, time):
+    def interp(self, time): 
         if self.time_bc is not None and self.time_bc.size > 1:
             if len(time.shape) == 0:
                 time = np.array([time])
@@ -452,7 +453,11 @@ def Model(config, State, verbose=True):
         if verbose:
             print(config.MOD)
         if config.MOD.super=='MOD_DIFF':
-            return Model_diffusion(config,State)
+            return Model_diffusion(config,State)  
+        if config.MOD.super=='MOD_DIFF_MULTIVAR':
+            return Model_diffusion_multivar(config,State) 
+        if config.MOD.super=='MOD_DIFF_FISD':
+            return Model_diffusion_fisd(config,State) 
         elif config.MOD.super=='MOD_QG1L':
             return Model_qg1l(config,State)
         elif config.MOD.super=='MOD_CSW1L':
@@ -463,6 +468,10 @@ def Model(config, State, verbose=True):
             return Model_bmit(config,State)
         elif config.MOD.super=='MOD_drift_initflux':
             return Model_drift_initflux(config,State)
+        elif config.MOD.super=='MOD_drift_initflux_multivar':
+            return Model_drift_initflux_multivar(config,State)
+        elif config.MOD.super=='MOD_drift_initflux_fisd':
+            return Model_drift_initflux_fisd_fast(config,State)
         else:
             sys.exit(config.MOD.super + ' not implemented yet')
     else:
@@ -787,6 +796,8 @@ class Model_diffusion(M):
         self.dx = State.DX
         self.dy = State.DY
 
+        self.positivity_flag = False
+
         # Initialization 
         if (config.GRID.super == 'GRID_FROM_FILE') and (config.MOD.name_init_var is not None):
             dsin = xr.open_dataset(config.GRID.path_init_grid)
@@ -797,12 +808,12 @@ class Model_diffusion(M):
                         var_init = var_init[0,:,:]
                     if config.GRID.subsampling is not None:
                         var_init = var_init[::config.GRID.subsampling,::config.GRID.subsampling]
-                    dsin.close()
-                    del dsin
                     var_init.data[np.isnan(var_init)] = 0.
                     State.var[self.name_var[name]] = var_init.values
                 else:
                     State.var[self.name_var[name]] = np.zeros((State.ny,State.nx))
+            dsin.close()
+            del dsin
         else:
             for name in self.name_var:  
                 State.var[self.name_var[name]] = np.zeros((State.ny,State.nx))
@@ -897,48 +908,94 @@ class Model_diffusion(M):
                 params = State.params[self.name_var[name]]
                 var1 = var1 + nstep*self.dt/(3600*24) * params
 
+             
+            if self.positivity_flag and name == 'sd' :
+                if isinstance(var1, np.ndarray): 
+                    var1[var1<0] = 0
+                elif isinstance(var1, jnp.ndarray): 
+                    var1 = var1.at[var1<0].set(0)
+
             State.setvar(var1, self.name_var[name])
         
 
 
-    def step_tgl(self,dState,State,nstep=1,t=None):
+    def step_tgl(self, dState, State, nstep=1, t=None):
 
-        # Loop on model variables
         for name in self.name_var:
 
-            # Get state variable
-            var0 = jnp.asarray(dState.getvar(self.name_var[name]))
-            
-            # Init
-            var1 = +var0
-            
-            # Time propagation
+            var0  = jnp.asarray(State.getvar(self.name_var[name]))
+            dvar0 = jnp.asarray(dState.getvar(self.name_var[name]))
+            var1  = +var0
+            dvar1 = +dvar0
+
             if self.Kdiffus>0:
                 for _ in range(nstep):
                     tendency = self.dt*self.Kdiffus*(\
                         (var1[1:-1,2:]+var1[1:-1,:-2]-2*var1[1:-1,1:-1])/(self.dx[1:-1,1:-1]**2) +\
                         (var1[2:,1:-1]+var1[:-2,1:-1]-2*var1[1:-1,1:-1])/(self.dy[1:-1,1:-1]**2))
                     var1 = var1.at[1:-1,1:-1].add(tendency)
-            
 
-            # Update state
+                    dtendency = self.dt*self.Kdiffus*(\
+                        (dvar1[1:-1,2:]+dvar1[1:-1,:-2]-2*dvar1[1:-1,1:-1])/(self.dx[1:-1,1:-1]**2) +\
+                        (dvar1[2:,1:-1]+dvar1[:-2,1:-1]-2*dvar1[1:-1,1:-1])/(self.dy[1:-1,1:-1]**2))
+                    dvar1 = dvar1.at[1:-1,1:-1].add(dtendency)
+
+            if self.name_var[name] in State.params:
+                var1 = var1 + nstep*self.dt/(3600*24) * State.params[self.name_var[name]]
             if self.name_var[name] in dState.params:
-                params = dState.params[self.name_var[name]]
-                var1 = var1 + nstep*self.dt/(3600*24) * params
+                dvar1 = dvar1 + nstep*self.dt/(3600*24) * dState.params[self.name_var[name]]
 
-            dState.setvar(var1,self.name_var[name])
+            if self.positivity_flag and name == 'sd':
+                if isinstance(dvar1, np.ndarray):
+                    dvar1[var1<0] = 0
+                elif isinstance(dvar1, jnp.ndarray):
+                    dvar1 = dvar1.at[var1<0].set(0)
+
+            dState.setvar(dvar1, self.name_var[name])
         
-    def step_adj(self,adState,State,nstep=1,t=None):
+    def step_adj(self, adState, State, nstep=1, t=None):
 
-        # Loop on model variables
         for name in self.name_var:
 
-            # Get state variable
+            var0 = jnp.asarray(State.getvar(self.name_var[name]))
+
+            # Recompute the forward, pre-clip trajectory exactly as step()
+            # does. The positivity mask must be evaluated on this value
+            # (post-diffusion, post-flux, pre-clip), not on var0.
+            var1 = +var0
+            if self.Kdiffus>0:
+                for _ in range(nstep):
+                    tendency = self.dt*self.Kdiffus*(\
+                        (var1[1:-1,2:]+var1[1:-1,:-2]-2*var1[1:-1,1:-1])/(self.dx[1:-1,1:-1]**2) +\
+                        (var1[2:,1:-1]+var1[:-2,1:-1]-2*var1[1:-1,1:-1])/(self.dy[1:-1,1:-1]**2))
+                    var1 = var1.at[1:-1,1:-1].add(tendency)
+            if self.name_var[name] in State.params:
+                var1 = var1 + nstep*self.dt/(3600*24) * State.params[self.name_var[name]]
+
+            # Adjoint of the output (NaN-safe)
             ad_output = jnp.asarray(adState.getvar(self.name_var[name]))
             ad_output = jnp.where(jnp.isnan(ad_output), 0, ad_output)
-            advar1 = ad_output
 
-            # Time propagation
+            # --- 1) Adjoint of positivity clip (outermost forward op -> first here) ---
+            advar1 = ad_output
+            if self.positivity_flag and name == 'sd':
+                if isinstance(advar1, np.ndarray):
+                    advar1[var1<0] = 0
+                elif isinstance(advar1, jnp.ndarray):
+                    advar1 = advar1.at[var1<0].set(0)
+
+            # --- 2) Adjoint of flux addition ---
+            if self.name_var[name] in State.params:
+                adState.params[self.name_var[name]] = (
+                    adState.params[self.name_var[name]]
+                    + nstep*self.dt/(3600*24) * advar1
+                )
+            # gradient wrt the pre-flux (post-diffusion) value is unchanged by
+            # an addition, so advar1 carries straight through to step 3.
+
+            # --- 3) Adjoint of diffusion (reverse nstep loop) ---
+            # Linear, constant-coefficient operator -> no trajectory needed,
+            # same transpose-stencil code as before.
             if self.Kdiffus>0:
                 for _ in range(nstep):
                     advar0 = advar1
@@ -950,19 +1007,291 @@ class Model_diffusion(M):
                     advar1 = advar1.at[2:,1:-1].add(y_weight)
                     advar1 = advar1.at[:-2,1:-1].add(y_weight)
                     advar1 = advar1.at[1:-1,1:-1].add(-2*y_weight)
-                    
-                
 
-            # Update state and parameters
-            if self.name_var[name] in State.params:
-                adState.params[self.name_var[name]] = (
-                    adState.params[self.name_var[name]]
-                    + nstep*self.dt/(3600*24) * ad_output
-                )
+            adState.setvar(advar1, self.name_var[name])
+
+
+
+class Model_diffusion_multivar(Model_diffusion):
+    """
+    Diffusion model for three coupled variables:
+        - fbku : radar freeboard   (CryoSat)
+        - fbka : laser freeboard   (IceSat)
+        - sd   : snow depth        (diagnosed from fbku & fbka)
+
+    fbku and fbka are advanced independently (identity or diffusion,
+    same as Model_diffusion). sd is not stepped dynamically — it is
+    recomputed at the end of every step/init from the diagnostic relation:
+
+        sd = (fbka - fbku) / (Sros * (PR_KU - PR_KA))
+
+    so it always stays consistent with the two freeboards, including
+    after any BC nudging or param correction applied to them.
+    """
+
+    def __init__(self, config, State):
+
+        super().__init__(config, State)
+
+        # --- Snow-depth diagnostic relation parameters ---
+        res = get_densities(hem='nh')   # or whatever your hemisphere key is
+        self.Sros = res['densities']['snow_speed_ratio']  
+        self.PR_KU = config.MOD.PR_KU
+        self.PR_KA = config.MOD.PR_KA
+        self._sd_denom = self.Sros * (self.PR_KU - self.PR_KA)
+
+        # Safety checks: sd relation only makes sense if fbku/fbka exist
+        assert 'fbku' in self.name_var, "Model_diffusion_multivar requires 'fbku' in name_var"
+        assert 'fbka' in self.name_var, "Model_diffusion_multivar requires 'fbka' in name_var"
+        assert 'sd' in self.name_var, "Model_diffusion_multivar requires 'sd' in name_var"
+
+        # sd should never carry its own flux/bias param — it's fully diagnosed
+        if self.name_var['sd'] in State.params:
+            import warnings
+            warnings.warn(
+                "'sd' has an entry in State.params but Model_diffusion_multivar "
+                "overwrites sd diagnostically every step; this param will have no effect."
+            )
+
+        # Enforce consistency on the initial condition too
+        self._diagnose_sd(State)
+
+        # --- Per-variable boundary conditions (CryoSat -> fbku, IceSat -> fbka) ---
+        # NOT implemented yet: BC is currently only handled generically by
+        # M.__init__ / Model_diffusion.set_bc through a single self._bc_fields.
+        # For this model we eventually want two independent sources, e.g.:
+        #
+        #   self._bc_fields = {
+        #       'fbku': _BcFields(<cryosat bc config>, State),
+        #       'fbka': _BcFields(<icesat bc config>, State),
+        #   }
+        #
+        # and an override of set_bc() that loops over self._bc_fields.items()
+        # and fills self.bc['fbku'] / self.bc['fbka'] independently (sd stays
+        # empty, since it has no direct observation operator).
+        #
+        # Left unimplemented for now since init_from_bc is not used yet.
+
+    def init(self, State, t0=0):
+        super().init(State, t0=t0)
+        self._diagnose_sd(State)
+
+    def step(self, State, nstep=1, t=None):
+        super().step(State, nstep=nstep, t=t)
+        self._diagnose_sd(State)
+
+    def step_tgl(self, dState, State, nstep=1, t=None):
+        super().step_tgl(dState, State, nstep=nstep, t=t)
+        self._diagnose_sd_tgl(dState,State)
+
+    def step_adj(self, adState, State, nstep=1, t=None):
+        # Adjoint = reverse order of forward step, so the diagnostic
+        # (applied last in step()) is handled FIRST here, redirecting
+        # sd's adjoint sensitivity back into fbku/fbka before the base
+        # class propagates their adjoints through diffusion/params.
+        self._diagnose_sd_adj(adState,State)
+        super().step_adj(adState, State, nstep=nstep, t=t)
+
+    # ----------------
+    # --- Snow depth diagnostic + linear TLM/ADJ
+    # ----------------
+    def _diagnose_sd(self, State):
+        fbka = State.getvar(self.name_var['fbka'])
+        fbku = State.getvar(self.name_var['fbku'])
+        sd = (fbka - fbku) / self._sd_denom 
+        if isinstance(sd, np.ndarray): 
+            sd[sd<0] = 0
+        elif isinstance(sd, jnp.ndarray): 
+            sd = sd.at[sd<0].set(0)
+        State.setvar(sd, self.name_var['sd'])
+
+    def _diagnose_sd_tgl(self, dState,State):
+        dfbka = dState.getvar(self.name_var['fbka'])
+        dfbku = dState.getvar(self.name_var['fbku'])
+        sd = State.getvar(self.name_var['sd'])
+        dsd = (dfbka - dfbku) / self._sd_denom 
+        if isinstance(dsd, np.ndarray): 
+            dsd[sd<0] = 0.
+        elif isinstance(dsd, jnp.ndarray): 
+            dsd = dsd.at[sd<0].set(0)
+        dState.setvar(dsd, self.name_var['sd'])
+
+    def _diagnose_sd_adj(self, adState,State):
+        ad_sd = adState.getvar(self.name_var['sd'])
+        sd = State.getvar(self.name_var['sd'])
+        ad_fbka = adState.getvar(self.name_var['fbka']) + ad_sd / self._sd_denom
+        ad_fbku = adState.getvar(self.name_var['fbku']) - ad_sd / self._sd_denom
+        if isinstance(ad_sd, np.ndarray): 
+            ad_sd[sd<0] = 0.
+        elif isinstance(ad_sd, jnp.ndarray): 
+            ad_sd = ad_sd.at[sd<0].set(0)
+        adState.setvar(ad_fbka, self.name_var['fbka'])
+        adState.setvar(ad_fbku, self.name_var['fbku'])
+        adState.setvar(ad_sd * 0, self.name_var['sd'])  # zero it out, it's fully absorbed above
+
+        
+class Model_diffusion_fisd(Model_diffusion):
+    """
+    Diffusion model for three coupled variables:
+        - fbku : radar freeboard   (CryoSat)
+        - fbka : laser freeboard   (IceSat)
+        - sd   : snow depth        (diagnosed from fbku & fbka)
+
+    fbku and fbka are advanced independently (identity or diffusion,
+    same as Model_diffusion). sd is not stepped dynamically — it is
+    recomputed at the end of every step/init from the diagnostic relation:
+
+        sd = (fbka - fbku) / (Sros * (PR_KU - PR_KA))
+
+    so it always stays consistent with the two freeboards, including
+    after any BC nudging or param correction applied to them.
+    """
+
+    def __init__(self, config, State):
+
+        super().__init__(config, State)
+
+        # --- Snow-depth diagnostic relation parameters ---
+        res = get_densities(hem='nh')   # or whatever your hemisphere key is
+        self.Sros = res['densities']['snow_speed_ratio']  
+        self.PR_KU = config.MOD.PR_KU
+        self.PR_KA = config.MOD.PR_KA
+        self._sd_denom = self.Sros * (self.PR_KU - self.PR_KA)
+
+        # Safety checks: sd relation only makes sense if fbku/fbka exist
+        assert 'fi' in self.name_var, "Model_diffusion_multivar requires 'fi' in name_var"
+        assert 'sd' in self.name_var, "Model_diffusion_multivar requires 'sd' in name_var" 
+  
+        if True: 
+            self._init_fi_sd_from_raw(State, config) 
+
+        # Enforce consistency on the initial condition too
+        #self._diagnose_sd(State)
+
+        # --- Per-variable boundary conditions (CryoSat -> fbku, IceSat -> fbka) ---
+        # NOT implemented yet: BC is currently only handled generically by
+        # M.__init__ / Model_diffusion.set_bc through a single self._bc_fields.
+        # For this model we eventually want two independent sources, e.g.:
+        #
+        #   self._bc_fields = {
+        #       'fbku': _BcFields(<cryosat bc config>, State),
+        #       'fbka': _BcFields(<icesat bc config>, State),
+        #   }
+        #
+        # and an override of set_bc() that loops over self._bc_fields.items()
+        # and fills self.bc['fbku'] / self.bc['fbka'] independently (sd stays
+        # empty, since it has no direct observation operator).
+        #
+        # Left unimplemented for now since init_from_bc is not used yet.
+
+    def init(self, State, t0=0):
+        super().init(State, t0=t0)
+        #self._diagnose_sd(State)
+
+    def _init_fi_sd_from_raw(self, State, config):
+        """Overwrite the zero-filled fi/sd from the parent __init__ with
+        values derived from the two raw freeboard fields, using the same
+        fi/sd <-> fbka/fbku relation as the observation operator.
+        """
+        if not (config.GRID.super == 'GRID_FROM_FILE'):
+            return  # nothing to load, fi/sd stay at zero as before
+
+        dsin = xr.open_dataset(config.GRID.path_init_grid)
+ 
+
+        def _load(raw_name):
+            v = dsin[raw_name]
+            if len(v.shape) == 3:
+                v = v[0, :, :]
+            if config.GRID.subsampling is not None:
+                v = v[::config.GRID.subsampling, ::config.GRID.subsampling]
+            v = v.values.astype(float)
+            v[np.isnan(v)] = np.nan  # keep NaNs for now, handled below
+            return v
+
+        try : 
+            radar_fb = _load('radar_freeboard_filled')  # -> fbku equation
+            laser_fb = _load('laser_fb_filled')          # -> fbka equation
+
+            sd = (laser_fb - radar_fb) / self._sd_denom
+            fi = radar_fb - (1 - self.Sros * self.PR_KU) * sd
+
+            sd = np.where(np.isnan(sd), 0., sd)
+            fi = np.where(np.isnan(fi), 0., fi)
+            sd[sd < 0] = 0.
+
+            State.var[self.name_var['fi']] = fi
+            State.var[self.name_var['sd']] = sd
             
-            adState.setvar(advar1,self.name_var[name])
+            print('Initialization with radar_freeboard_filled and laser_fb_filled')
+        except : 
+            try : 
+                State.var[self.name_var['fi']] = _load('ice_freeboard')
+                sd = _load('snow_depth')
+                sd[sd < 0] = 0.
+                State.var[self.name_var['sd']] = sd
 
+                print('Initialization with ice_freeboard and snow_depth')
+            except : 
+                print('Error initialization')
 
+        dsin.close()
+        del dsin
+
+    def step(self, State, nstep=1, t=None):
+        super().step(State, nstep=nstep, t=t)
+        #self._diagnose_sd(State)
+
+    def step_tgl(self, dState, State, nstep=1, t=None):
+        super().step_tgl(dState, State, nstep=nstep, t=t)
+        #self._diagnose_sd_tgl(dState,State)
+
+    def step_adj(self, adState, State, nstep=1, t=None):
+        # Adjoint = reverse order of forward step, so the diagnostic
+        # (applied last in step()) is handled FIRST here, redirecting
+        # sd's adjoint sensitivity back into fbku/fbka before the base
+        # class propagates their adjoints through diffusion/params.
+        #self._diagnose_sd_adj(adState,State)
+        super().step_adj(adState, State, nstep=nstep, t=t)
+
+    # ----------------
+    # --- Snow depth diagnostic + linear TLM/ADJ
+    # ----------------
+    def _diagnose_sd(self, State):
+        fbka = State.getvar(self.name_var['fbka'])
+        fbku = State.getvar(self.name_var['fbku'])
+        sd = (fbka - fbku) / self._sd_denom 
+        if isinstance(sd, np.ndarray): 
+            sd[sd<0] = 0
+        elif isinstance(sd, jnp.ndarray): 
+            sd = sd.at[sd<0].set(0)
+        State.setvar(sd, self.name_var['sd'])
+
+    def _diagnose_sd_tgl(self, dState,State):
+        dfbka = dState.getvar(self.name_var['fbka'])
+        dfbku = dState.getvar(self.name_var['fbku'])
+        sd = State.getvar(self.name_var['sd'])
+        dsd = (dfbka - dfbku) / self._sd_denom 
+        if isinstance(dsd, np.ndarray): 
+            dsd[sd<0] = 0.
+        elif isinstance(dsd, jnp.ndarray): 
+            dsd = dsd.at[sd<0].set(0)
+        dState.setvar(dsd, self.name_var['sd'])
+
+    def _diagnose_sd_adj(self, adState,State):
+        ad_sd = adState.getvar(self.name_var['sd'])
+        sd = State.getvar(self.name_var['sd'])
+        ad_fbka = adState.getvar(self.name_var['fbka']) + ad_sd / self._sd_denom
+        ad_fbku = adState.getvar(self.name_var['fbku']) - ad_sd / self._sd_denom
+        if isinstance(ad_sd, np.ndarray): 
+            ad_sd[sd<0] = 0.
+        elif isinstance(ad_sd, jnp.ndarray): 
+            ad_sd = ad_sd.at[sd<0].set(0)
+        adState.setvar(ad_fbka, self.name_var['fbka'])
+        adState.setvar(ad_fbku, self.name_var['fbku'])
+        adState.setvar(ad_sd * 0, self.name_var['sd'])  # zero it out, it's fully absorbed above
+
+        
 ###############################################################################
 #                       Quasi-Geostrophic Models                              #
 ###############################################################################
@@ -6845,8 +7174,456 @@ class Model_bmit(_ITOpenBoundaryExtensionMixin, M):
             adState.params['hbcy'] = adh_WE
 
 
+class Model_drift_initflux_scan(M):
 
-class Model_drift_initflux(M):
+    def __init__(self, config, State):
+
+        super().__init__(config, State)
+
+        # --- Precision ---
+        if config.EXP.precision == "float64":
+            self.dtype = jnp.float64
+            self.np_dtype = np.float64
+        else:
+            self.dtype = jnp.float32
+            self.np_dtype = np.float32
+ 
+        # --- Initialization from file or zeros ---
+        if (config.GRID.super == 'GRID_FROM_FILE') and (config.MOD.name_init_var is not None):
+            dsin = xr.open_dataset(config.GRID.path_init_grid)
+            for name in self.name_var:
+                if name in config.MOD.name_init_var:
+                    var_init = dsin[config.MOD.name_init_var[name]]
+                    if len(var_init.shape) == 3:
+                        var_init = var_init[0, :, :]
+                    if config.GRID.subsampling is not None:
+                        var_init = var_init[::config.GRID.subsampling, ::config.GRID.subsampling]
+                    dsin.close()
+                    del dsin
+                    State.var[self.name_var[name]] = (var_init.values.astype(self.np_dtype))
+                else:
+                    State.var[self.name_var[name]] = np.zeros((State.ny, State.nx), dtype=self.np_dtype)
+        else:
+            for name in self.name_var:
+                State.var[self.name_var[name]] = np.zeros((State.ny, State.nx), dtype=self.np_dtype)
+
+        self.clip_flag = config.MOD.clip_flag
+        
+        # --- Drift file ---
+        if config.MOD.file_drift is not None: 
+            dsdrift = xr.open_mfdataset(config.MOD.file_drift)
+            dsdrift = dsdrift.astype(self.np_dtype)
+
+            dsdrift = dsdrift.sel(time=slice(config.EXP.init_date,config.EXP.final_date+timedelta(hours=1)))
+
+            dsdrift[config.MOD.name_var_drift['lon']].data = (dsdrift[config.MOD.name_var_drift['lon']].data + 180) % 360 - 180
+            
+            dsdrift = dsdrift.where((dsdrift[config.MOD.name_var_drift['lon']] >= config.GRID.lon_min) & (dsdrift[config.MOD.name_var_drift['lon']] <= config.GRID.lon_max), drop=True)
+            dsdrift = dsdrift.where((dsdrift[config.MOD.name_var_drift['lat']] >= config.GRID.lat_min) & (dsdrift[config.MOD.name_var_drift['lat']] <= config.GRID.lat_max), drop=True)
+            self.udrift_all = jnp.asarray(dsdrift[config.MOD.name_var_drift['uvar']],dtype=self.dtype)
+            self.vdrift_all = jnp.asarray(dsdrift[config.MOD.name_var_drift['vvar']],dtype=self.dtype)
+            self.dX = jnp.asarray(dsdrift['dX'],dtype=self.dtype)
+            self.dY = jnp.asarray(dsdrift['dY'],dtype=self.dtype)
+            self.smoothuv = config.MOD.smoothuv
+
+            self.dx1d = jnp.asarray(dsdrift.xc.values, dtype=self.dtype)
+            self.dy1d = jnp.asarray(dsdrift.yc.values, dtype=self.dtype) 
+            print('Start smoothing the drift')
+            for itime in range(len(dsdrift.time)): 
+                dXsmooth, dYsmooth = self.dX[itime], self.dY[itime] 
+                self.dX = self.dX.at[itime].set(dXsmooth)
+                self.dY = self.dY.at[itime].set(dYsmooth)
+            print('Finished smoothing the drift')
+
+            self.cutoff_km = config.MOD.cutoff_km
+
+            self.tdrift_all = jnp.asarray((dsdrift['time'].values - np.datetime64(config.EXP.init_date))/ np.timedelta64(1, 's'),dtype=self.dtype)
+
+            if self.cutoff_km != 0:  
+                for it in range(len(dsdrift.time)): 
+
+                    from skimage import filters
+
+                    im_lpf = filters.butterworth(
+                                    np.array(self.udrift_all[it], dtype=self.np_dtype),
+                                    cutoff_frequency_ratio=1/self.cutoff_km*10,
+                                    order=2,
+                                    high_pass=False,
+                                    squared_butterworth=True,
+                                    npad=0,
+                                ) 
+    
+                    im_lpf[np.isnan(np.array(self.udrift_all[it]))] = np.nan 
+                    im_lpf[np.array(self.udrift_all[it])==0] = 0 
+
+                    self.udrift_all = self.udrift_all.at[it].set(jnp.array(im_lpf, dtype=self.dtype) ) 
+
+                    im_lpf = filters.butterworth(
+                                    np.array(self.vdrift_all[it], dtype=self.np_dtype),
+                                    cutoff_frequency_ratio=1/self.cutoff_km*10,
+                                    order=2,
+                                    high_pass=False,
+                                    squared_butterworth=True,
+                                    npad=0,
+                                ) 
+    
+                    im_lpf[np.isnan(np.array(self.vdrift_all[it], dtype=self.np_dtype))] = np.nan 
+                    im_lpf[np.array(self.vdrift_all[it], dtype=self.np_dtype)==0] = 0 
+
+                    self.vdrift_all = self.vdrift_all.at[it].set(jnp.array(im_lpf, dtype=self.dtype) )  
+
+            # --- Precompute smoothed drift once, at load time -------------
+            # Previously this Gaussian filtering ran per-step inside
+            # _get_filtered_drift, converting self.udrift_all[index_drift]
+            # (a jax array, possibly traced under lax.scan) to numpy via
+            # np.array(...) and back. That conversion requires a concrete
+            # value and breaks tracing. Since the smoothing depends only on
+            # the static loaded drift dataset (not on model state or t),
+            # it's equivalent and scan-safe to do it once here instead.
+            if self.smoothuv != 0:
+                print('Precomputing smoothed drift fields')
+
+                def _filter_nan_gaussian_conserving(arr, sigma):
+                    nan_msk = np.isnan(arr)
+                    loss = np.zeros(arr.shape, dtype=self.np_dtype)
+                    loss[nan_msk] = 1
+                    loss = ndimage.gaussian_filter(loss, sigma=sigma, mode='constant', cval=1)
+                    gauss = arr.copy()
+                    gauss[nan_msk] = 0
+                    gauss = ndimage.gaussian_filter(gauss, sigma=sigma, mode='constant', cval=0)
+                    gauss[nan_msk] = np.nan
+                    gauss += loss * arr
+                    return gauss
+
+                udrift_np = np.asarray(self.udrift_all, dtype=self.np_dtype)
+                vdrift_np = np.asarray(self.vdrift_all, dtype=self.np_dtype)
+                for it in range(udrift_np.shape[0]):
+                    udrift_np[it] = _filter_nan_gaussian_conserving(udrift_np[it], self.smoothuv)
+                    vdrift_np[it] = _filter_nan_gaussian_conserving(vdrift_np[it], self.smoothuv)
+                self.udrift_all = jnp.asarray(udrift_np, dtype=self.dtype)
+                self.vdrift_all = jnp.asarray(vdrift_np, dtype=self.dtype)
+
+            self.lon = jnp.asarray(dsdrift[config.MOD.name_var_drift['lon']],dtype=self.dtype)
+            self.lat = jnp.asarray(dsdrift[config.MOD.name_var_drift['lat']],dtype=self.dtype)
+
+            X, Y = proj(self.lon, self.lat)          # pyproj (CPU)
+            dx, dy = dxdy_from_xy_jax(X, Y)
+
+            # Convert to JAX
+            self.dx = jnp.asarray(dx,dtype=self.dtype)
+            self.dy = jnp.asarray(dy,dtype=self.dtype)
+ 
+        self.name_params = config.MOD.name_params
+        # Model Parameters (Flux)
+        for name in self.name_params:
+            State.params[name] = np.zeros((State.ny,State.nx),dtype=self.np_dtype)
+
+        self.refreeze = config.MOD.refreeze
+
+        # --- BC dictionary ---
+        self.bc = {name: {} for name in self.name_var}
+        self.init_from_bc = config.MOD.init_from_bc
+        self.compute_bc = config.BC is not None
+        # Scan-compatible BC lookup arrays, populated by set_bc().
+        self.bc_times_jax = {}
+        self.bc_values_jax = {}
+        if config.MOD.dist_sponge_bc is not None:
+            lon2d = np.array(State.lon)
+            lat2d = np.array(State.lat)
+            statemask = np.array(+State.mask)
+            Wbc = grid.compute_weight_map(lon2d, lat2d, statemask, config.MOD.dist_sponge_bc, 
+                                          lon_min=config.GRID.lon_min, lat_min=config.GRID.lat_min, lon_max=config.GRID.lon_max, lat_max=config.GRID.lat_max)
+        else:
+            Wbc = np.zeros((State.ny, State.nx), dtype=self.np_dtype)
+        self.Wbc = Wbc
+ 
+        # --- Advection scheme ---
+        self.scheme = config.MOD.scheme.lower()  # e.g., "upwind" or "semi_lagrangian"
+
+        # --- Tests ---
+        if config.INV is not None and config.INV.super == 'INV_4DVAR' and config.INV.compute_test:
+            print('Tangent test t0:')
+            tangent_test(self, State, nstep=10, t0=0)
+            print('Adjoint test t0:')
+            adjoint_test(self, State, nstep=10, t0=0)
+
+    # ----------------
+    # --- BC methods
+    # ----------------
+    def init(self, State, t0=0):
+        for name in self.name_var:
+            if t0 in self.bc[name] and self.init_from_bc:
+                State.setvar(self.bc[name][t0], self.name_var[name])
+
+    def set_bc(self, time_bc, var_bc=None, **kwargs):
+        # NOTE: boundary-condition ingestion for this model is still WIP
+        # upstream (left disabled with `if False:` originally). Left as-is
+        # here — only the *lookup* side (_apply_bc) has been made
+        # scan-compatible, so this feature works correctly once ingestion
+        # is enabled, without needing another pass through this file.
+        if False:
+            if var_bc is None:
+                var_bc = self._bc_fields.interp(time_bc)
+
+            for _name_var_bc in var_bc:
+                for _name_var_mod in self.name_var:
+                    if _name_var_bc == _name_var_mod:
+                        for i, t in enumerate(time_bc):
+                            self.bc[_name_var_mod][t] = var_bc[_name_var_bc][i]
+
+        # Build fixed jnp time axes per variable so lookups never need a
+        # Python dict keyed by a (possibly traced) t. Safe to call even
+        # when self.bc is still empty (as above) — it's just a no-op then.
+        self.bc_times_jax = {}
+        self.bc_values_jax = {}
+        for name in self.name_var:
+            if len(self.bc[name]) > 0:
+                times = sorted(self.bc[name].keys())
+                self.bc_times_jax[name] = jnp.asarray(times, dtype=self.dtype)
+                self.bc_values_jax[name] = jnp.asarray(
+                    np.stack([self.bc[name][tt] for tt in times]),
+                    dtype=self.dtype,
+                )
+
+    def _apply_bc(self, t, name):
+        """Return the boundary field for `name` nearest to time t, or None
+        if no boundary condition is configured for this variable.
+
+        Previously this indexed a Python dict with `int(t + ...)`, which
+        requires a concrete value and raises under lax.scan tracing. This
+        version compares t against a precomputed jnp time axis instead, so
+        it works whether t is concrete (minimizer='python') or traced
+        (cost_and_grad_schedule='scan').
+        """
+        if not self.compute_bc or name not in self.bc_values_jax:
+            return None
+        times = self.bc_times_jax[name]
+        idx = jnp.argmin(jnp.abs(times - t))
+        return self.bc_values_jax[name][idx]
+
+    # ----------------
+    # --- Step methods
+    # ----------------
+    def step(self, State, nstep=1, t=0, **kwargs):
+        """Forward step."""
+        for name in self.name_var:
+
+            # --- Initial state ---
+            # t==0 branch selected via jnp.where instead of a Python `if`,
+            # since t may be a traced value inside lax.scan.
+            if 'param_init' in self.name_params:
+                var0 = jnp.where(
+                    t == 0,
+                    State.getvar(self.name_var[name]) + State.params['param_init'],
+                    State.getvar(self.name_var[name]),
+                )
+            else:
+                var0 = State.getvar(self.name_var[name])
+
+            # --- BC ---
+            t_end = t + nstep * self.dt
+            varbc = self._apply_bc(t_end, name)
+
+            # --- Drift ---
+            # jnp.argmin (not np.argmin) so this stays traceable under scan.
+            index_drift = jnp.argmin(jnp.abs(t - self.tdrift_all))
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+
+            dX_smooth = self.dX[index_drift]
+            dY_smooth = self.dY[index_drift]
+
+            var = jnp.asarray(var0)
+
+            # --- Time loop (nstep is a static Python int per compiled
+            # scan step, so this ordinary Python loop is fine — it
+            # unrolls at trace time, same as in the other model classes) ---
+            for it in range(nstep):
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3
+                    )
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(var, dX_smooth/nstep, dY_smooth/nstep, jnp.isfinite(var0), self.dx1d, self.dy1d)
+                else:
+                    raise ValueError(f"Unknown scheme: {self.scheme}")
+
+                var = var * (1 + self.refreeze)
+
+            # --- Flux params ---
+            var1 = var
+            if 'param_fluxes' in self.name_params:
+                params = State.params['param_fluxes']
+                flux_term = (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * params
+                # Zero the flux contribution at t==0 instead of skipping it
+                # with a Python `if t != 0`.
+                var1 = var1 + jnp.where(t == 0, jnp.zeros_like(flux_term), flux_term)
+
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            if self.clip_flag:
+                var1 = jnp.clip(var1, 0.0, 1.0)
+
+            State.setvar(var1, self.name_var[name])
+
+    def step_tgl(self, dState, State, nstep=1, t=0, **kwargs):
+        for name in self.name_var:
+            index_drift = jnp.argmin(jnp.abs(t - self.tdrift_all))
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+            dX_smooth = self.dX[index_drift]
+            dY_smooth = self.dY[index_drift]
+
+            # --- Reference trajectory: exactly matches step ---
+            if 'param_init' in self.name_params:
+                var0 = jnp.where(
+                    t == 0,
+                    State.getvar(self.name_var[name]) + State.params['param_init'],
+                    State.getvar(self.name_var[name]),
+                )
+            else:
+                var0 = State.getvar(self.name_var[name])
+
+            var = jnp.asarray(var0)
+            trajectory = []
+            for it in range(nstep):
+                trajectory.append(var)
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(var, dX_smooth/nstep, dY_smooth/nstep, jnp.isfinite(var0), self.dx1d, self.dy1d)
+                var = var * (1 + self.refreeze)
+
+            # --- Tangent perturbation ---
+            if 'param_init' in self.name_params:
+                dvar = jnp.where(
+                    t == 0,
+                    jnp.asarray(dState.params['param_init']),
+                    jnp.asarray(dState.getvar(self.name_var[name])),
+                )
+            else:
+                dvar = jnp.asarray(dState.getvar(self.name_var[name]))
+
+            for it in range(nstep):
+                if self.scheme == "upwind":
+                    dvar = advection_diffusion_step_upwind123_jax_tlm(trajectory[it], dvar, self.lon, self.lat, udrift, vdrift, self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    dvar = semi_lagrangian_advect_jax_tlm(trajectory[it], dvar, dX_smooth/nstep, dY_smooth/nstep, jnp.isfinite(var0), self.dx1d, self.dy1d)
+                dvar = dvar * (1 + self.refreeze)
+
+            # --- Reference trajectory with BC / flux (for clip mask) ---
+            var1 = var
+            if 'param_fluxes' in self.name_params:
+                flux_term = (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params['param_fluxes']
+                var1 = var1 + jnp.where(t == 0, jnp.zeros_like(flux_term), flux_term)
+
+            t_end = t + nstep * self.dt
+            varbc = self._apply_bc(t_end, name)
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            # --- TGL of flux addition ---
+            dvar1 = dvar
+            if 'param_fluxes' in self.name_params:
+                dflux_term = (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * dState.params['param_fluxes']
+                dvar1 = dvar1 + jnp.where(t == 0, jnp.zeros_like(dflux_term), dflux_term)
+
+            if varbc is not None:
+                dvar1 = (1 - self.Wbc) * dvar1
+
+            # --- TGL of clip ---
+            if self.clip_flag:
+                mask = (var1 >= 0) & (var1 <= 1)
+                dvar1 = dvar1 * mask
+
+            dState.setvar(dvar1, self.name_var[name])
+
+    def step_adj(self, adState, State, nstep=1, t=0, **kwargs):
+        for name in self.name_var:
+            index_drift = jnp.argmin(jnp.abs(t - self.tdrift_all))
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+            dX_smooth = self.dX[index_drift]
+            dY_smooth = self.dY[index_drift]
+
+            # --- Reference trajectory: exactly matches step ---
+            if 'param_init' in self.name_params:
+                var0 = jnp.where(
+                    t == 0,
+                    State.getvar(self.name_var[name]) + State.params['param_init'],
+                    State.getvar(self.name_var[name]),
+                )
+            else:
+                var0 = State.getvar(self.name_var[name])
+
+            var = jnp.asarray(var0, dtype=self.dtype)
+            trajectory = []
+            for it in range(nstep):
+                trajectory.append(var)
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(var, dX_smooth/nstep, dY_smooth/nstep, jnp.isfinite(var0), self.dx1d, self.dy1d)
+                var = var * (1 + self.refreeze)
+
+            # --- Adjoint: reverse order of step ---
+            var1 = var
+            if 'param_fluxes' in self.name_params:
+                flux_term = (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params['param_fluxes']
+                var1 = var1 + jnp.where(t == 0, jnp.zeros_like(flux_term), flux_term)
+
+            t_end = t + nstep * self.dt
+            varbc = self._apply_bc(t_end, name)
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            advar = jnp.asarray(adState.getvar(self.name_var[name]), dtype=self.dtype)
+            if self.clip_flag:
+                mask = (var1 >= 0) & (var1 <= 1)
+                advar = advar * mask
+
+            if varbc is not None:
+                advar = (1 - self.Wbc) * advar
+
+            if 'param_fluxes' in self.name_params:
+                dflux_adj = (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * advar
+                adState.params['param_fluxes'] = (
+                    adState.params['param_fluxes']
+                    + jnp.where(t == 0, jnp.zeros_like(dflux_adj), dflux_adj)
+                )
+
+            for it in reversed(range(nstep)):
+                advar = advar * (1 + self.refreeze)
+                if self.scheme == "upwind":
+                    advar = advection_diffusion_step_upwind123_jax_adj(trajectory[it], advar, self.lon, self.lat, udrift, vdrift, self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    advar = semi_lagrangian_advect_jax_adj(trajectory[it], advar, dX_smooth/nstep, dY_smooth/nstep, jnp.isfinite(var0), self.dx1d, self.dy1d)
+
+            # --- Accumulate into params/state ---
+            # Both destinations are always updated; jnp.where selects which
+            # one actually receives the nonzero adjoint, replacing the
+            # earlier `if t == 0: ... else: ...` dict-mutation branch.
+            if 'param_init' in self.name_params:
+                adState.params['param_init'] = (
+                    adState.params['param_init']
+                    + jnp.where(t == 0, advar, jnp.zeros_like(advar))
+                )
+                adState.setvar(
+                    jnp.where(t == 0, advar * 0, advar),
+                    self.name_var[name],
+                )
+            else:
+                adState.setvar(advar, self.name_var[name])
+
+    # ----------------
+    # --- Helper
+    # ----------------
+    def _get_filtered_drift(self, index_drift):
+        """Return drift fields at index_drift. Smoothing (if any) is
+        precomputed once in __init__, so this is a plain, scan-safe gather."""
+        return self.udrift_all[index_drift], self.vdrift_all[index_drift]
+
+
+class Model_drift_initflux_nobc(M):
 
     def __init__(self, config, State):
 
@@ -7014,7 +7791,7 @@ class Model_drift_initflux(M):
                 State.setvar(self.bc[name][t0], self.name_var[name])
 
     def set_bc(self, time_bc, var_bc=None,**kwargs):
-        if False : 
+        if True : 
             if var_bc is None : 
                 var_bc = self._bc_fields.interp(t_bc)
 
@@ -7245,6 +8022,1728 @@ class Model_drift_initflux(M):
             vdrift = self.vdrift_all[index_drift]
         return udrift, vdrift
     
+class Model_drift_initflux(M):
+
+    def __init__(self, config, State):
+
+        super().__init__(config, State)
+
+        # --- Precision ---
+        if config.EXP.precision == "float64":
+            self.dtype = jnp.float64
+            self.np_dtype = np.float64
+        else:
+            self.dtype = jnp.float32
+            self.np_dtype = np.float32
+ 
+        # --- Initialization from file or zeros ---
+        if (config.GRID.super == 'GRID_FROM_FILE') and (config.MOD.name_init_var is not None):
+            dsin = xr.open_dataset(config.GRID.path_init_grid)
+            for name in self.name_var:
+                if name in config.MOD.name_init_var:
+                    var_init = dsin[config.MOD.name_init_var[name]]
+                    if len(var_init.shape) == 3:
+                        var_init = var_init[0, :, :]
+                    if config.GRID.subsampling is not None:
+                        var_init = var_init[::config.GRID.subsampling, ::config.GRID.subsampling]
+                    State.var[self.name_var[name]] = (var_init.values.astype(self.np_dtype))
+                else:
+                    State.var[self.name_var[name]] = np.zeros((State.ny, State.nx), dtype=self.np_dtype)
+            dsin.close()
+            del dsin
+        else:
+            for name in self.name_var:
+                State.var[self.name_var[name]] = np.zeros((State.ny, State.nx), dtype=self.np_dtype)
+
+        self.clip_flag = config.MOD.clip_flag
+
+
+        self.positivity_flag = False
+        
+        # --- Drift file ---
+        if config.MOD.file_drift is not None: 
+            dsdrift = xr.open_mfdataset(config.MOD.file_drift)
+            dsdrift = dsdrift.astype(self.np_dtype)
+
+            dsdrift = dsdrift.sel(time=slice(config.EXP.init_date,config.EXP.final_date+timedelta(hours=1)))
+
+            dsdrift[config.MOD.name_var_drift['lon']].data = (dsdrift[config.MOD.name_var_drift['lon']].data + 180) % 360 - 180
+            
+            dsdrift = dsdrift.where((dsdrift[config.MOD.name_var_drift['lon']] >= config.GRID.lon_min) & (dsdrift[config.MOD.name_var_drift['lon']] <= config.GRID.lon_max), drop=True)
+            dsdrift = dsdrift.where((dsdrift[config.MOD.name_var_drift['lat']] >= config.GRID.lat_min) & (dsdrift[config.MOD.name_var_drift['lat']] <= config.GRID.lat_max), drop=True)
+            self.udrift_all = jnp.asarray(dsdrift[config.MOD.name_var_drift['uvar']],dtype=self.dtype)
+            self.vdrift_all = jnp.asarray(dsdrift[config.MOD.name_var_drift['vvar']],dtype=self.dtype)
+            self.dX = jnp.asarray(dsdrift['dX'],dtype=self.dtype)
+            self.dY = jnp.asarray(dsdrift['dY'],dtype=self.dtype)
+            self.smoothuv = config.MOD.smoothuv
+
+
+            ## Scaling drift when, for example, it is a 48h drift and a one day model time step 
+            #print('Drift offset =',config.MOD.drift_offset,'hours')
+            #self.dX = self.dX / ((config.MOD.drift_offset*3600)/config.MOD.dtmodel)
+            #self.dY = self.dY / ((config.MOD.drift_offset*3600)/config.MOD.dtmodel)
+
+            # Scaling drift from its native accumulation window (drift_offset hours)
+            # to one assimilation/checkpoint interval. This must NOT depend on
+            # dtmodel (the model's internal sub-stepping), only on the fixed
+            # checkpoint cadence, so that refining dtmodel (more sub-steps per
+            # checkpoint) doesn't change the total drift applied per checkpoint.
+            checkpoint_seconds = config.EXP.assimilation_time_step.total_seconds()
+            print('Drift offset =', config.MOD.drift_offset, 'hours')
+            self.dX = self.dX / ((config.MOD.drift_offset*3600) / checkpoint_seconds)
+            self.dY = self.dY / ((config.MOD.drift_offset*3600) / checkpoint_seconds)
+
+
+            self.dx1d = jnp.asarray(dsdrift.xc.values, dtype=self.dtype)
+            self.dy1d = jnp.asarray(dsdrift.yc.values, dtype=self.dtype)  
+            for itime in range(len(dsdrift.time)): 
+                dXsmooth, dYsmooth = self.dX[itime], self.dY[itime] 
+                self.dX = self.dX.at[itime].set(dXsmooth)
+                self.dY = self.dY.at[itime].set(dYsmooth) 
+
+            self.cutoff_km = config.MOD.cutoff_km
+
+            self.tdrift_all = jnp.asarray((dsdrift['time'].values - np.datetime64(config.EXP.init_date))/ np.timedelta64(1, 's'),dtype=self.dtype)
+
+            if self.cutoff_km != 0:  
+                for it in range(len(dsdrift.time)): 
+
+                    from skimage import filters
+
+                    im_lpf = filters.butterworth(
+                                    np.array(self.udrift_all[it], dtype=self.np_dtype),
+                                    cutoff_frequency_ratio=1/self.cutoff_km*10,
+                                    order=2,
+                                    high_pass=False,
+                                    squared_butterworth=True,
+                                    npad=0,
+                                ) 
+    
+                    im_lpf[np.isnan(np.array(self.udrift_all[it]))] = np.nan 
+                    im_lpf[np.array(self.udrift_all[it])==0] = 0 
+
+                    self.udrift_all = self.udrift_all.at[it].set(jnp.array(im_lpf, dtype=self.dtype) ) 
+
+                    im_lpf = filters.butterworth(
+                                    np.array(self.vdrift_all[it], dtype=self.np_dtype),
+                                    cutoff_frequency_ratio=1/self.cutoff_km*10,
+                                    order=2,
+                                    high_pass=False,
+                                    squared_butterworth=True,
+                                    npad=0,
+                                ) 
+    
+                    im_lpf[np.isnan(np.array(self.vdrift_all[it], dtype=self.np_dtype))] = np.nan 
+                    im_lpf[np.array(self.vdrift_all[it], dtype=self.np_dtype)==0] = 0 
+
+                    self.vdrift_all = self.vdrift_all.at[it].set(jnp.array(im_lpf, dtype=self.dtype) )  
+
+            self.lon = jnp.asarray(dsdrift[config.MOD.name_var_drift['lon']],dtype=self.dtype)
+            self.lat = jnp.asarray(dsdrift[config.MOD.name_var_drift['lat']],dtype=self.dtype)
+
+            X, Y = proj(self.lon, self.lat)          # pyproj (CPU)
+            dx, dy = dxdy_from_xy_jax(X, Y)
+
+            # Convert to JAX
+            self.dx = jnp.asarray(dx,dtype=self.dtype)
+            self.dy = jnp.asarray(dy,dtype=self.dtype)
+ 
+        self.name_params = config.MOD.name_params
+        # Model Parameters (Flux)
+        for name in self.name_params:
+            State.params[name] = np.zeros((State.ny,State.nx),dtype=self.np_dtype)
+
+        self.refreeze = config.MOD.refreeze
+
+        # --- BC dictionary ---
+        self.bc = {name: {} for name in self.name_var}
+        self.init_from_bc = config.MOD.init_from_bc
+
+        # --- Load boundary conditions from the top-level config.BC block ---
+        # Unlike Model_qg1l/Model_qgsw (which build _bc_fields from
+        # config.MOD.bc_file / bc_files, handled generically by M.__init__),
+        # this model's config supplies boundary conditions via a separate
+        # top-level config.BC block (super='BC_EXT'), matching the historical
+        # behaviour where BC was set "outside" this model. We wrap it in the
+        # same lightweight adapter M.__init__ uses internally, and feed it
+        # into the same shared _BcFields loader — so config.BC.file,
+        # name_lon, name_lat, name_time, name_var (e.g. {'SSH': 'freeboard'})
+        # are read exactly like any other BC source in this file.  
+        bc_config = type('BC_Config', (), {
+            'file': config.MOD.bc_file,
+            'name_lon': config.MOD.bc_name_lon,
+            'name_lat': config.MOD.bc_name_lat,
+            'name_time': config.MOD.bc_name_time,
+            'name_var': config.MOD.bc_name_var,
+            'c_grid': getattr(config.MOD, 'bc_c_grid', False),
+            '_config': config,
+        })()
+
+        self.compute_bc = None
+ 
+
+        if config.MOD.dist_sponge_bc is not None:
+
+            print(bc_config)
+            try: 
+                self._bc_fields = _BcFields(bc_config, State) 
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Failed to load boundary conditions from {config.BC.file}: {e}")
+                self._bc_fields = None
+                
+            self.compute_bc = self._bc_fields is not None
+
+            lon2d = np.array(State.lon)
+            lat2d = np.array(State.lat)
+            statemask = np.array(+State.mask)
+            Wbc = grid.compute_weight_map(lon2d, lat2d, statemask, config.MOD.dist_sponge_bc, 
+                                          lon_min=config.GRID.lon_min, lat_min=config.GRID.lat_min, lon_max=config.GRID.lon_max, lat_max=config.GRID.lat_max)
+        else:
+            Wbc = np.zeros((State.ny, State.nx), dtype=self.np_dtype)
+        self.Wbc = Wbc
+
+        plt.title('Wbc')
+        plt.imshow(self.Wbc)
+        plt.colorbar()
+        plt.show()
+        
+        # --- Advection scheme ---
+        self.scheme = config.MOD.scheme.lower()  # e.g., "upwind" or "semi_lagrangian"
+
+        # --- Tests ---
+        if config.INV is not None and config.INV.super == 'INV_4DVAR' and config.INV.compute_test:
+            print('Tangent test t0:')
+            tangent_test(self, State, nstep=10, t0=0)
+            print('Adjoint test t0:')
+            adjoint_test(self, State, nstep=10, t0=0)
+
+    # ----------------
+    # --- BC methods
+    # ----------------
+    def init(self, State, t0=0):
+        for name in self.name_var:
+            if t0 in self.bc[name] and self.init_from_bc:
+                State.setvar(self.bc[name][t0], self.name_var[name])
+
+    def set_bc(self, time_bc, var_bc=None, t_bc=None, **kwargs):
+        """Interpolate config.BC onto model timestamps and cache per-t fields.
+
+        time_bc: np.datetime64 array — passed straight to _BcFields.interp,
+                 which expects real calendar times.
+        t_bc   : matching float-seconds array (model.T convention) — used as
+                 the dict keys so _apply_bc's lookups line up with the `t`
+                 values step()/step_tgl()/step_adj() actually receive.
+        """
+        if var_bc is None and self._bc_fields is not None:
+            var_bc = self._bc_fields.interp(time_bc)
+
+        if var_bc is None:
+            return
+
+        time_keys = t_bc if t_bc is not None else time_bc
+
+        for _name_var_bc in var_bc:
+            for _name_var_mod in self.name_var:
+                if _name_var_bc == _name_var_mod:
+                    for i, t in enumerate(time_keys):
+                        var_bc_t = +var_bc[_name_var_bc][i]
+                        var_bc_t = np.nan_to_num(var_bc_t, nan=0.0)
+                        self.bc[_name_var_mod][t] = var_bc_t
+
+    def _apply_bc(self, t):
+        """Return the boundary field nearest to time t, or None if no BC is
+        configured / no BC has been loaded for any model variable yet.
+
+        Falls back to the closest available time (same pattern used by
+        Model_qg1l._apply_bc / Model_qgsw._apply_bc) instead of requiring an
+        exact dict-key match, since t may not land exactly on a BC timestamp.
+        """
+        for name in self.name_var:
+            if len(self.bc[name]) == 0:
+                continue
+            if t in self.bc[name]:
+                return self.bc[name][t]
+            times = np.asarray(list(self.bc[name].keys()))
+            idx_closest = np.argmin(np.abs(times - t))
+            return self.bc[name][times[idx_closest]]
+        return None
+
+    # ----------------
+    # --- Step methods
+    # ----------------
+    def step(self, State, nstep=1, t=0, **kwargs):
+        """Forward step."""
+        for name in self.name_var:
+
+            # --- Initial state ---
+            if t == 0 and 'param_init' in self.name_params:
+                var0 = State.getvar(self.name_var[name]) + State.params['param_init']
+            else:
+                var0 = State.getvar(self.name_var[name])
+
+            # --- BC ---
+            varbc = self._apply_bc(t + nstep * self.dt) if self.compute_bc else None
+
+            # --- Drift ---
+            index_drift = np.argmin(np.abs(t - self.tdrift_all))
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+
+            dX_smooth = self.dX[index_drift]
+            dY_smooth = self.dY[index_drift]
+            
+            var = jnp.asarray(var0)
+            self.trajectory = [var]
+ 
+
+            # --- Time loop ---
+            for it in range(nstep):
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3
+                    )
+                elif self.scheme == "semi_lagrangian": 
+                    var, _ = semi_lagrangian_advect_jax(var, dX_smooth/nstep, dY_smooth/nstep, jnp.isfinite(var0), self.dx1d, self.dy1d)
+                else:
+                    raise ValueError(f"Unknown scheme: {self.scheme}")
+
+                var *= (1 + self.refreeze) 
+                self.trajectory.append(var)
+
+            # --- Flux params ---
+            var1 = var
+            if t != 0 and 'param_fluxes' in self.name_params:
+                params = State.params['param_fluxes']
+                var1 += (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * params
+
+            if varbc is not None:
+                var1 += self.Wbc * (varbc - var1)
+  
+            if self.clip_flag :
+                if isinstance(var1, np.ndarray): 
+                    var1 = np.clip(var1, 0.0, 1.0)
+                elif isinstance(var1, jnp.ndarray): 
+                    var1 = jnp.clip(var1, 0.0, 1.0)
+
+            if self.positivity_flag and name == 'sd' :
+                if isinstance(var1, np.ndarray): 
+                    var1[var1<0] = 0
+                elif isinstance(var1, jnp.ndarray): 
+                    var1 = var1.at[var1<0].set(0)
+
+            State.setvar(var1, self.name_var[name])
+
+ 
+    def step_tgl(self, dState, State, nstep=1, t=0, **kwargs):
+        for name in self.name_var:
+            index_drift = np.argmin(np.abs(t - self.tdrift_all))
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+            dX_smooth = self.dX[index_drift]
+            dY_smooth = self.dY[index_drift]
+            
+            # --- Reference trajectory: exactly matches step ---
+            if t == 0 and 'param_init' in self.name_params:
+                var0 = State.getvar(self.name_var[name]) + State.params['param_init']
+            else:
+                var0 = State.getvar(self.name_var[name])
+
+            var = jnp.asarray(var0)
+            trajectory = []
+            for it in range(nstep):
+                trajectory.append(var)
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(var, dX_smooth/nstep, dY_smooth/nstep, jnp.isfinite(var0), self.dx1d, self.dy1d)
+                var *= (1 + self.refreeze) 
+ 
+
+            # --- Tangent perturbation ---
+            if t == 0 and 'param_init' in self.name_params:
+                dvar = jnp.asarray(dState.params['param_init'])
+            else:
+                dvar = jnp.asarray(dState.getvar(self.name_var[name]))
+
+            # Step 1: TGL of advection loop
+            for it in range(nstep):
+                if self.scheme == "upwind":
+                    dvar = advection_diffusion_step_upwind123_jax_tlm(trajectory[it], dvar, self.lon, self.lat, udrift, vdrift, self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    dvar = semi_lagrangian_advect_jax_tlm(trajectory[it], dvar, dX_smooth/nstep, dY_smooth/nstep, jnp.isfinite(var0), self.dx1d, self.dy1d)
+                dvar *= (1 + self.refreeze)
+
+            # Step 2: TGL of flux addition
+            dvar1 = dvar
+            if t != 0 and 'param_fluxes' in self.name_params:
+                dvar1 = dvar + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * dState.params['param_fluxes']
+
+            varbc = self._apply_bc(t + nstep * self.dt) if self.compute_bc else None
+            if varbc is not None:
+                dvar1 = (1 - self.Wbc) * dvar1
+
+            # Step 2b: BC nudging on reference trajectory
+            var1 = var
+            if t != 0 and 'param_fluxes' in self.name_params:
+                var1 = var + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params['param_fluxes']
+
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)  # reference trajectory with BC
+
+            # Step 3: TGL of clip — now using correct reference 
+            if self.clip_flag :
+                mask = (var1 >= 0) & (var1 <= 1)
+                dvar1 = dvar1 * mask
+
+            if self.positivity_flag and name == 'sd':
+                if isinstance(dvar1, np.ndarray):
+                    dvar1[var1<0] = 0
+                elif isinstance(dvar1, jnp.ndarray):
+                    dvar1 = dvar1.at[var1<0].set(0)
+
+            dState.setvar(dvar1, self.name_var[name])
+
+
+    def step_adj(self, adState, State, nstep=1, t=0, **kwargs):
+        for name in self.name_var:
+            index_drift = np.argmin(np.abs(t - self.tdrift_all))
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+            dX_smooth = self.dX[index_drift]
+            dY_smooth = self.dY[index_drift]
+            
+            # --- Reference trajectory: exactly matches step ---
+            if t == 0 and 'param_init' in self.name_params:
+                var0 = State.getvar(self.name_var[name]) + State.params['param_init']
+            else:
+                var0 = State.getvar(self.name_var[name])
+
+            var = jnp.asarray(var0, dtype=self.dtype)
+            trajectory = []
+            for it in range(nstep):
+                trajectory.append(var)
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(var, dX_smooth/nstep, dY_smooth/nstep, jnp.isfinite(var0), self.dx1d, self.dy1d)
+                var *= (1 + self.refreeze) 
+                
+            # --- Adjoint: reverse order of step --- 
+
+            var1 = var
+            if t != 0 and 'param_fluxes' in self.name_params:
+                var1 = var + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params['param_fluxes']
+
+            varbc = self._apply_bc(t + nstep * self.dt) if self.compute_bc else None
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)  # reference trajectory with BC
+
+            # Step 3 adjoint: clip mask using correct reference
+            advar = jnp.asarray(adState.getvar(self.name_var[name]), dtype=self.dtype)
+            if self.clip_flag : 
+                mask = (var1 >= 0) & (var1 <= 1)
+                advar = advar * mask
+
+            # --- 1) Adjoint of positivity clip (outermost forward op -> first here) --- 
+            if self.positivity_flag and name == 'sd':
+                if isinstance(advar, np.ndarray):
+                    advar[var1<0] = 0
+                elif isinstance(advar, jnp.ndarray):
+                    advar = advar.at[var1<0].set(0)
+
+            # Step 2 adjoint: flux addition
+            if varbc is not None:
+                advar = (1 - self.Wbc) * advar
+
+            if t != 0 and 'param_fluxes' in self.name_params:
+                adState.params['param_fluxes'] += (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * advar
+
+            # Step 1 adjoint: advection loop (reversed)
+            for it in reversed(range(nstep)):
+                advar *= (1 + self.refreeze)
+                if self.scheme == "upwind":
+                    advar = advection_diffusion_step_upwind123_jax_adj(trajectory[it], advar, self.lon, self.lat, udrift, vdrift, self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    advar = semi_lagrangian_advect_jax_adj(trajectory[it], advar, dX_smooth/nstep, dY_smooth/nstep, jnp.isfinite(var0), self.dx1d, self.dy1d)
+                
+
+            # Accumulate into params/state
+            if t == 0 and 'param_init' in self.name_params:
+                adState.params['param_init'] += advar
+                adState.setvar(advar * 0, self.name_var[name])
+            else:
+                adState.setvar(advar, self.name_var[name])
+
+    # ----------------
+    # --- Helper
+    # ----------------
+    def _get_filtered_drift(self, index_drift):
+        """Return drift fields, optionally smoothed."""
+        def filter_nan_gaussian_conserving(arr, sigma):
+            nan_msk = np.isnan(arr)
+            loss = np.zeros(arr.shape, dtype=self.np_dtype)
+            loss[nan_msk] = 1
+            loss = ndimage.gaussian_filter(loss, sigma=sigma, mode='constant', cval=1)
+            gauss = arr.copy()
+            gauss[nan_msk] = 0
+            gauss = ndimage.gaussian_filter(gauss, sigma=sigma, mode='constant', cval=0)
+            gauss[nan_msk] = np.nan
+            gauss += loss * arr
+            return gauss
+
+        if self.smoothuv != 0:
+            udrift = jnp.array(filter_nan_gaussian_conserving(np.array(self.udrift_all[index_drift]), self.smoothuv))
+            vdrift = jnp.array(filter_nan_gaussian_conserving(np.array(self.vdrift_all[index_drift]), self.smoothuv))
+        else:
+            udrift = self.udrift_all[index_drift]
+            vdrift = self.vdrift_all[index_drift]
+        return udrift, vdrift
+
+
+class Model_drift_initflux_multivar(Model_drift_initflux):
+    """
+    Multivariable ice-drift model:
+        - fbku : radar freeboard  (CryoSat)
+        - fbka : laser freeboard  (IceSat)
+        - sd   : snow depth
+
+    All three variables share the SAME drift field (self.udrift_all /
+    self.vdrift_all, loaded once by the parent __init__) and the SAME
+    spatial weight map self.Wbc. Each variable gets its own additive
+    flux parameter (State.params[<physical name>], matching the basis
+    blocks' name_mod_var) and its own boundary-condition series (from
+    one shared bc_file, one entry per variable in bc_name_var).
+    """
+
+    def __init__(self, config, State):
+
+        super().__init__(config, State)
+
+        # --- Per-variable flux parameters ---
+        # config.MOD.name_params should be [] for this model: we don't use
+        # the parent's generic name_params mechanism. Instead we create one
+        # flux field per PHYSICAL variable name, matching the basis blocks
+        # (name_mod_var='radar_freeboard' / 'laser_freeboard' / 'snow_depth').
+        for name in self.name_var:
+            State.params[self.name_var[name]] = np.zeros(
+                (State.ny, State.nx), dtype=self.np_dtype
+            )
+
+        # --- Snow-depth diagnostic relation parameters ---
+        res = get_densities(hem='nh')   # or whatever your hemisphere key is
+        self.Sros = res['densities']['snow_speed_ratio']  
+        self.PR_KU = config.MOD.PR_KU
+        self.PR_KA = config.MOD.PR_KA
+        self._sd_denom = self.Sros * (self.PR_KU - self.PR_KA)
+
+        # Enforce consistency on the initial condition too
+        self._diagnose_sd(State)
+
+    # ----------------
+    # --- BC methods
+    # ----------------
+    def _apply_bc(self, name, t):
+        """Return the BC field for variable `name` nearest to time t, or
+        None if no BC is loaded for it.
+
+        FIX vs parent: the parent version ignored which variable was being
+        processed and always returned the first variable's BC series --
+        harmless with one variable, wrong with three independent ones.
+        """
+        if name not in self.bc or len(self.bc[name]) == 0:
+            return None
+        if t in self.bc[name]:
+            return self.bc[name][t]
+        times = np.asarray(list(self.bc[name].keys()))
+        idx_closest = np.argmin(np.abs(times - t))
+        return self.bc[name][times[idx_closest]]
+
+    # ----------------
+    # --- Step methods
+    # ----------------
+    def step(self, State, nstep=1, t=0, **kwargs):
+        for name in self.name_var:
+            pname = self.name_var[name]
+            var0 = State.getvar(pname)
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+
+            index_drift = np.argmin(np.abs(t - self.tdrift_all))
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+            dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]
+
+            var = jnp.asarray(var0)
+            self.trajectory = [var]
+            for it in range(nstep):
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(
+                        var, dX_smooth / nstep, dY_smooth / nstep,
+                        jnp.isfinite(var0), self.dx1d, self.dy1d)
+                else:
+                    raise ValueError(f"Unknown scheme: {self.scheme}")
+                var *= (1 + self.refreeze)
+                self.trajectory.append(var)
+
+            var1 = var
+            if pname in State.params:
+                var1 = var1 + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params[pname]
+
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            if self.clip_flag:
+                if isinstance(var1, np.ndarray):
+                    var1 = np.clip(var1, 0.0, 1.0)
+                elif isinstance(var1, jnp.ndarray):
+                    var1 = jnp.clip(var1, 0.0, 1.0)
+
+            State.setvar(var1, pname)
+
+        self._diagnose_sd(State)
+
+    def step_tgl(self, dState, State, nstep=1, t=0, **kwargs):
+        for name in self.name_var:
+            pname = self.name_var[name]
+
+            index_drift = np.argmin(np.abs(t - self.tdrift_all))
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+            dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]
+
+            var0 = State.getvar(pname)
+            var = jnp.asarray(var0)
+            trajectory = []
+            for it in range(nstep):
+                trajectory.append(var)
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(
+                        var, dX_smooth / nstep, dY_smooth / nstep,
+                        jnp.isfinite(var0), self.dx1d, self.dy1d)
+                var *= (1 + self.refreeze)
+
+            dvar = jnp.asarray(dState.getvar(pname))
+            for it in range(nstep):
+                if self.scheme == "upwind":
+                    dvar = advection_diffusion_step_upwind123_jax_tlm(
+                        trajectory[it], dvar, self.lon, self.lat, udrift, vdrift,
+                        self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    dvar = semi_lagrangian_advect_jax_tlm(
+                        trajectory[it], dvar, dX_smooth / nstep, dY_smooth / nstep,
+                        jnp.isfinite(var0), self.dx1d, self.dy1d)
+                dvar *= (1 + self.refreeze)
+
+            dvar1 = dvar
+            if pname in dState.params:
+                dvar1 = dvar + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * dState.params[pname]
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+            if varbc is not None:
+                dvar1 = (1 - self.Wbc) * dvar1
+
+            # reference trajectory (with flux + BC) needed for the clip mask
+            var1 = var
+            if pname in State.params:
+                var1 = var + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params[pname]
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            if self.clip_flag:
+                mask = (var1 >= 0) & (var1 <= 1)
+                dvar1 = dvar1 * mask
+
+            dState.setvar(dvar1, pname)
+
+        self._diagnose_sd_tgl(dState, State)
+
+
+    def step_adj(self, adState, State, nstep=1, t=0, **kwargs):
+
+        self._diagnose_sd_adj(adState, State)
+
+        for name in self.name_var:
+            pname = self.name_var[name]
+
+            index_drift = np.argmin(np.abs(t - self.tdrift_all))
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+            dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]
+
+            var0 = State.getvar(pname)
+            var = jnp.asarray(var0, dtype=self.dtype)
+            trajectory = []
+            for it in range(nstep):
+                trajectory.append(var)
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(
+                        var, dX_smooth / nstep, dY_smooth / nstep,
+                        jnp.isfinite(var0), self.dx1d, self.dy1d)
+                var *= (1 + self.refreeze)
+
+            var1 = var
+            if pname in State.params:
+                var1 = var + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params[pname]
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            advar = jnp.asarray(adState.getvar(pname), dtype=self.dtype)
+
+            if self.clip_flag:
+                mask = (var1 >= 0) & (var1 <= 1)
+                advar = advar * mask
+
+            if varbc is not None:
+                advar = (1 - self.Wbc) * advar
+
+            if pname in State.params:
+                adState.params[pname] = adState.params[pname] + \
+                    (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * advar
+
+            for it in reversed(range(nstep)):
+                advar *= (1 + self.refreeze)
+                if self.scheme == "upwind":
+                    advar = advection_diffusion_step_upwind123_jax_adj(
+                        trajectory[it], advar, self.lon, self.lat, udrift, vdrift,
+                        self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    advar = semi_lagrangian_advect_jax_adj(
+                        trajectory[it], advar, dX_smooth / nstep, dY_smooth / nstep,
+                        jnp.isfinite(var0), self.dx1d, self.dy1d)
+
+            adState.setvar(advar, pname)
+
+    def _diagnose_sd(self, State):
+        fbka = State.getvar(self.name_var['fbka'])
+        fbku = State.getvar(self.name_var['fbku'])
+        sd = (fbka - fbku) / self._sd_denom
+        #if isinstance(sd, np.ndarray):
+        #    sd[sd < 0] = 0
+        #elif isinstance(sd, jnp.ndarray):
+        #    sd = sd.at[sd < 0].set(0)
+        State.setvar(sd, self.name_var['sd'])
+
+    def _diagnose_sd_tgl(self, dState, State):
+        dfbka = dState.getvar(self.name_var['fbka'])
+        dfbku = dState.getvar(self.name_var['fbku'])
+        sd = State.getvar(self.name_var['sd'])   # post-clip sd, used as the mask reference
+        dsd = (dfbka - dfbku) / self._sd_denom
+        #if isinstance(dsd, np.ndarray):
+        #    dsd[sd <= 0] = 0.
+        #elif isinstance(dsd, jnp.ndarray):
+        #    dsd = dsd.at[sd <= 0].set(0)
+        dState.setvar(dsd, self.name_var['sd'])
+
+    def _diagnose_sd_adj(self, adState, State):
+        ad_sd = adState.getvar(self.name_var['sd'])
+        sd = State.getvar(self.name_var['sd'])
+        # FIX: mask ad_sd BEFORE using it to build ad_fbka/ad_fbku, not after.
+        #if isinstance(ad_sd, np.ndarray):
+        #    ad_sd[sd <= 0] = 0.
+        #elif isinstance(ad_sd, jnp.ndarray):
+        #    ad_sd = ad_sd.at[sd <= 0].set(0)
+
+        ad_fbka = adState.getvar(self.name_var['fbka']) + ad_sd / self._sd_denom
+        ad_fbku = adState.getvar(self.name_var['fbku']) - ad_sd / self._sd_denom
+
+        adState.setvar(ad_fbka, self.name_var['fbka'])
+        adState.setvar(ad_fbku, self.name_var['fbku'])
+        adState.setvar(ad_sd * 0, self.name_var['sd'])
+
+
+class Model_drift_initflux_fisd(Model_drift_initflux):
+    """
+    Multivariable ice-drift model:
+        - fi : ice freeboard
+        - sd : snow depth
+
+    Both variables share the SAME drift field (self.udrift_all /
+    self.vdrift_all, loaded once by the parent __init__) and the SAME
+    spatial weight map self.Wbc, exactly as in Model_drift_initflux_multivar.
+    Each variable gets its own additive flux parameter (State.params[...])
+    and its own boundary-condition series.
+
+    Unlike Model_drift_initflux_multivar, fi and sd are directly-stepped
+    state variables — sd is NOT diagnosed from two freeboards, so there
+    is no _diagnose_sd* logic here at all. Sros / PR_KU / PR_KA are kept
+    only because Obsop_interp_l3_fisd needs them to build H from fi/sd;
+    they play no role in this forward model.
+    """
+
+
+
+    def __init__(self, config, State):
+
+        super().__init__(config, State)
+
+        # --- Per-variable flux parameters ---
+        # One additive flux field per PHYSICAL variable name, matching the
+        # basis blocks (name_mod_var='ice_freeboard' / 'snow_depth', or
+        # whatever your name_var values are).
+        for name in self.name_var:
+            State.params[self.name_var[name]] = np.zeros(
+                (State.ny, State.nx), dtype=self.np_dtype
+            )
+
+        # --- Parameters needed by the observation operator only ---
+        # (H in Obsop_interp_l3_fisd needs Sros/PR_KU/PR_KA to combine
+        # fi/sd into fbku-/fbka-equivalent observations. Not used below.)
+        res = get_densities(hem='nh')   # or whatever your hemisphere key is
+        self.Sros = res['densities']['snow_speed_ratio']
+        self.PR_KU = config.MOD.PR_KU
+        self.PR_KA = config.MOD.PR_KA
+        self._sd_denom = self.Sros * (self.PR_KU - self.PR_KA)
+
+        assert 'fi' in self.name_var, "Model_drift_initflux_fisd requires 'fi' in name_var"
+        assert 'sd' in self.name_var, "Model_drift_initflux_fisd requires 'sd' in name_var"
+
+        self._init_fi_sd_from_raw(State, config)
+
+        self.positivity_flag = False
+
+    def _init_fi_sd_from_raw(self, State, config):
+        """Overwrite the zero-filled fi/sd from the parent __init__ with
+        values derived from the two raw freeboard fields, using the same
+        fi/sd <-> fbka/fbku relation as the observation operator.
+        """
+        if not (config.GRID.super == 'GRID_FROM_FILE'):
+            return  # nothing to load, fi/sd stay at zero as before
+
+        dsin = xr.open_dataset(config.GRID.path_init_grid)
+
+        print("Start initialization")
+
+        def _load(raw_name):
+            v = dsin[raw_name]
+            if len(v.shape) == 3:
+                v = v[0, :, :]
+            if config.GRID.subsampling is not None:
+                v = v[::config.GRID.subsampling, ::config.GRID.subsampling]
+            v = v.values.astype(float)
+            v[np.isnan(v)] = np.nan  # keep NaNs for now, handled below
+            return v
+
+        try : 
+            radar_fb = _load('radar_freeboard_filled')  # -> fbku equation
+            laser_fb = _load('laser_fb_filled')          # -> fbka equation
+
+            sd = (laser_fb - radar_fb) / self._sd_denom
+            fi = radar_fb - (1 - self.Sros * self.PR_KU) * sd
+
+            sd = np.where(np.isnan(sd), 0., sd)
+            fi = np.where(np.isnan(fi), 0., fi)
+            sd[sd < 0] = 0.
+
+            State.var[self.name_var['fi']] = fi
+            State.var[self.name_var['sd']] = sd
+            
+            print('Initialization with radar_freeboard_filled and laser_fb_filled')
+        except : 
+            try : 
+                State.var[self.name_var['fi']] = _load('ice_freeboard')
+                sd = _load('snow_depth')
+                sd[sd < 0] = 0.
+                State.var[self.name_var['sd']] = sd
+
+                print('Initialization with ice_freeboard and snow_depth')
+            except : 
+                print('Error initialization')
+
+        dsin.close()
+        del dsin
+
+    # ----------------
+    # --- BC methods
+    # ----------------
+    def _apply_bc(self, name, t):
+        """Return the BC field for variable `name` nearest to time t, or
+        None if no BC is loaded for it.
+
+        Carried over from Model_drift_initflux_multivar: the grandparent
+        (Model_drift_initflux) version ignores which variable is being
+        processed and always returns the first variable's BC series --
+        harmless with one variable, wrong with two independent ones.
+        """
+        if name not in self.bc or len(self.bc[name]) == 0:
+            return None
+        if t in self.bc[name]:
+            return self.bc[name][t]
+        times = np.asarray(list(self.bc[name].keys()))
+        idx_closest = np.argmin(np.abs(times - t))
+        return self.bc[name][times[idx_closest]]
+
+    # ----------------
+    # --- Step methods
+    # ----------------
+
+    def step(self, State, nstep=1, t=0, **kwargs):
+
+        index_drift = np.argmin(np.abs(t - self.tdrift_all))
+        if self.scheme == "upwind":
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+        elif self.scheme == "semi_lagrangian":
+            dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]
+
+        names  = list(self.name_var.keys())
+        pnames = [self.name_var[n] for n in names]
+
+        if self.scheme == "semi_lagrangian":
+            # fi and sd share the same displacement field -> advect them in
+            # ONE batched call so the bicubic tap weights are computed once,
+            # not twice.
+            var0_stack = jnp.stack([jnp.asarray(State.getvar(p)) for p in pnames], axis=0)
+            mask_stack = jnp.isfinite(var0_stack)
+
+            var_stack = var0_stack
+            traj_stack = [var_stack]
+            for it in range(nstep):
+                var_stack, _ = semi_lagrangian_advect_jax_batched(
+                    var_stack, dX_smooth / nstep, dY_smooth / nstep,
+                    mask_stack, self.dx1d, self.dy1d)
+                var_stack = var_stack * (1 + self.refreeze)
+                traj_stack.append(var_stack)
+
+            # Keyed by variable name (fixes the earlier bug where
+            # self.trajectory was silently overwritten each loop iteration).
+            self.trajectory = {name: [tr[i] for tr in traj_stack] for i, name in enumerate(names)}
+            var_by_name = {name: var_stack[i] for i, name in enumerate(names)}
+
+        elif self.scheme == "upwind":
+            # Not batched: this scheme doesn't go through interp2d_bicubic_keys_jax,
+            # so there is no shared weight computation to factor out here.
+            var_by_name = {}
+            self.trajectory = {}
+            for name, pname in zip(names, pnames):
+                var = jnp.asarray(State.getvar(pname))
+                self.trajectory[name] = [var]
+                for it in range(nstep):
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                    var *= (1 + self.refreeze)
+                    self.trajectory[name].append(var)
+                var_by_name[name] = var
+        else:
+            raise ValueError(f"Unknown scheme: {self.scheme}")
+
+        for name, pname in zip(names, pnames):
+            var = var_by_name[name]
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+
+            var1 = var
+            if pname in State.params:
+                var1 = var1 + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params[pname]
+
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            if self.clip_flag:
+                if isinstance(var1, np.ndarray):
+                    var1 = np.clip(var1, 0.0, 1.0)
+                elif isinstance(var1, jnp.ndarray):
+                    var1 = jnp.clip(var1, 0.0, 1.0)
+
+            if self.positivity_flag and name == 'sd' :
+                if isinstance(var1, np.ndarray): 
+                    var1[var1<0] = 0
+                elif isinstance(var1, jnp.ndarray): 
+                    var1 = var1.at[var1<0].set(0)
+
+            State.setvar(var1, pname)
+
+
+    def step_tgl(self, dState, State, nstep=1, t=0, **kwargs):
+
+        index_drift = np.argmin(np.abs(t - self.tdrift_all))
+        if self.scheme == "upwind":
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+        elif self.scheme == "semi_lagrangian":
+            dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]
+
+        names  = list(self.name_var.keys())
+        pnames = [self.name_var[n] for n in names]
+
+        if self.scheme == "semi_lagrangian":
+            var0_stack = jnp.stack([jnp.asarray(State.getvar(p)) for p in pnames], axis=0)
+            mask_stack = jnp.isfinite(var0_stack)
+
+            var_stack = var0_stack
+            traj_stack = [var_stack]
+            for it in range(nstep):
+                var_stack, _ = semi_lagrangian_advect_jax_batched(
+                    var_stack, dX_smooth / nstep, dY_smooth / nstep,
+                    mask_stack, self.dx1d, self.dy1d)
+                var_stack = var_stack * (1 + self.refreeze)
+                traj_stack.append(var_stack)
+
+            dvar0_stack = jnp.stack([jnp.asarray(dState.getvar(p)) for p in pnames], axis=0)
+            dvar_stack = dvar0_stack
+            for it in range(nstep):
+                dvar_stack = semi_lagrangian_advect_jax_batched_tlm(
+                    traj_stack[it], dvar_stack, dX_smooth / nstep, dY_smooth / nstep,
+                    mask_stack, self.dx1d, self.dy1d)
+                dvar_stack = dvar_stack * (1 + self.refreeze)
+
+            var_by_name  = {name: var_stack[i]  for i, name in enumerate(names)}
+            dvar_by_name = {name: dvar_stack[i] for i, name in enumerate(names)}
+
+        elif self.scheme == "upwind":
+            var_by_name, dvar_by_name = {}, {}
+            for name, pname in zip(names, pnames):
+                var0 = State.getvar(pname)
+                var  = jnp.asarray(var0)
+                trajectory = []
+                for it in range(nstep):
+                    trajectory.append(var)
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                    var *= (1 + self.refreeze)
+
+                dvar = jnp.asarray(dState.getvar(pname))
+                for it in range(nstep):
+                    dvar = advection_diffusion_step_upwind123_jax_tlm(
+                        trajectory[it], dvar, self.lon, self.lat, udrift, vdrift,
+                        self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                    dvar *= (1 + self.refreeze)
+
+                var_by_name[name], dvar_by_name[name] = var, dvar
+        else:
+            raise ValueError(f"Unknown scheme: {self.scheme}")
+
+        for name, pname in zip(names, pnames):
+            var, dvar = var_by_name[name], dvar_by_name[name]
+
+            dvar1 = dvar
+            if pname in dState.params:
+                dvar1 = dvar + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * dState.params[pname]
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+            if varbc is not None:
+                dvar1 = (1 - self.Wbc) * dvar1
+
+            var1 = var
+            if pname in State.params:
+                var1 = var + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params[pname]
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            if self.clip_flag:
+                mask = (var1 >= 0) & (var1 <= 1)
+                dvar1 = dvar1 * mask
+
+            if self.positivity_flag and name == 'sd':
+                if isinstance(dvar1, np.ndarray):
+                    dvar1[var1<0] = 0
+                elif isinstance(dvar1, jnp.ndarray):
+                    dvar1 = dvar1.at[var1<0].set(0)
+
+            dState.setvar(dvar1, pname)
+
+    def step_adj(self, adState, State, nstep=1, t=0, **kwargs):
+
+        index_drift = np.argmin(np.abs(t - self.tdrift_all))
+        if self.scheme == "upwind":
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+        elif self.scheme == "semi_lagrangian":
+            dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]
+
+        names  = list(self.name_var.keys())
+        pnames = [self.name_var[n] for n in names]
+
+        if self.scheme == "semi_lagrangian":
+            var0_stack = jnp.stack([jnp.asarray(State.getvar(p), dtype=self.dtype) for p in pnames], axis=0)
+            mask_stack = jnp.isfinite(var0_stack)
+
+            var_stack = var0_stack
+            traj_stack = [var_stack]
+            for it in range(nstep):
+                var_stack, _ = semi_lagrangian_advect_jax_batched(
+                    var_stack, dX_smooth / nstep, dY_smooth / nstep,
+                    mask_stack, self.dx1d, self.dy1d)
+                var_stack = var_stack * (1 + self.refreeze)
+                traj_stack.append(var_stack)
+
+            var_by_name = {name: var_stack[i] for i, name in enumerate(names)}
+
+        else:  # upwind
+            var_by_name, trajectory_by_name = {}, {}
+            for name, pname in zip(names, pnames):
+                var = jnp.asarray(State.getvar(pname), dtype=self.dtype)
+                trajectory = []
+                for it in range(nstep):
+                    trajectory.append(var)
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                    var *= (1 + self.refreeze)
+                var_by_name[name] = var
+                trajectory_by_name[name] = trajectory
+
+        # ---- Per-variable adjoint of clip / BC / flux (independent per channel) ----
+        advar_by_name = {}
+        for name, pname in zip(names, pnames):
+            var = var_by_name[name]
+
+            var1 = var
+            if pname in State.params:
+                var1 = var + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params[pname]
+                
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            advar = jnp.asarray(adState.getvar(pname), dtype=self.dtype)
+
+
+            if self.positivity_flag and name == 'sd':
+                if isinstance(advar, np.ndarray):
+                    advar[var1<0] = 0
+                elif isinstance(advar, jnp.ndarray):
+                    advar = advar.at[var1<0].set(0)
+
+            if self.clip_flag:
+                mask = (var1 >= 0) & (var1 <= 1)
+                advar = advar * mask
+
+            if varbc is not None:
+                advar = (1 - self.Wbc) * advar
+
+            if pname in State.params:
+                adState.params[pname] = adState.params[pname] + \
+                    (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * advar
+
+            advar_by_name[name] = advar
+
+        # ---- Adjoint of advection: batched for semi_lagrangian ----
+        if self.scheme == "semi_lagrangian":
+            advar_stack = jnp.stack([advar_by_name[name] for name in names], axis=0)
+            for it in reversed(range(nstep)):
+                advar_stack = advar_stack * (1 + self.refreeze)
+                advar_stack = semi_lagrangian_advect_jax_batched_adj(
+                    traj_stack[it], advar_stack, dX_smooth / nstep, dY_smooth / nstep,
+                    mask_stack, self.dx1d, self.dy1d)
+            for i, name in enumerate(names):
+                adState.setvar(advar_stack[i], self.name_var[name])
+
+        else:  # upwind, unchanged per-variable path
+            for name, pname in zip(names, pnames):
+                advar = advar_by_name[name]
+                trajectory = trajectory_by_name[name]
+                for it in reversed(range(nstep)):
+                    advar *= (1 + self.refreeze)
+                    advar = advection_diffusion_step_upwind123_jax_adj(
+                        trajectory[it], advar, self.lon, self.lat, udrift, vdrift,
+                        self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                adState.setvar(advar, pname)
+
+    def oldstep(self, State, nstep=1, t=0, **kwargs):
+        for name in self.name_var:
+            pname = self.name_var[name]
+            var0 = State.getvar(pname)
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+
+            index_drift = np.argmin(np.abs(t - self.tdrift_all))
+            if self.scheme == "upwind":
+                udrift, vdrift = self._get_filtered_drift(index_drift)
+            elif self.scheme == "semi_lagrangian":
+                dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]
+
+            var = jnp.asarray(var0)
+            self.trajectory = [var]
+            for it in range(nstep):
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(
+                        var, dX_smooth / nstep, dY_smooth / nstep,
+                        jnp.isfinite(var0), self.dx1d, self.dy1d)
+                else:
+                    raise ValueError(f"Unknown scheme: {self.scheme}")
+                var *= (1 + self.refreeze)
+                self.trajectory.append(var)
+
+            var1 = var
+            if pname in State.params:
+                var1 = var1 + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params[pname]
+
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            if self.clip_flag:
+                if isinstance(var1, np.ndarray):
+                    var1 = np.clip(var1, 0.0, 1.0)
+                elif isinstance(var1, jnp.ndarray):
+                    var1 = jnp.clip(var1, 0.0, 1.0)
+
+            State.setvar(var1, pname)
+
+        # No diagnostic step here: fi and sd are each fully stepped above,
+        # unlike Model_drift_initflux_multivar's sd (there, this line
+        # called self._diagnose_sd(State)).
+
+    def oldstep_tgl(self, dState, State, nstep=1, t=0, **kwargs):
+        for name in self.name_var:
+            pname = self.name_var[name]
+
+            index_drift = np.argmin(np.abs(t - self.tdrift_all))
+
+            if self.scheme == "upwind":
+                udrift, vdrift = self._get_filtered_drift(index_drift)
+            elif self.scheme == "semi_lagrangian":
+                dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]  
+
+            var0 = State.getvar(pname)
+            var = jnp.asarray(var0)
+            trajectory = []
+            for it in range(nstep):
+                trajectory.append(var)
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(
+                        var, dX_smooth / nstep, dY_smooth / nstep,
+                        jnp.isfinite(var0), self.dx1d, self.dy1d)
+                var *= (1 + self.refreeze)
+
+            dvar = jnp.asarray(dState.getvar(pname))
+            for it in range(nstep):
+                if self.scheme == "upwind":
+                    dvar = advection_diffusion_step_upwind123_jax_tlm(
+                        trajectory[it], dvar, self.lon, self.lat, udrift, vdrift,
+                        self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    dvar = semi_lagrangian_advect_jax_tlm(
+                        trajectory[it], dvar, dX_smooth / nstep, dY_smooth / nstep,
+                        jnp.isfinite(var0), self.dx1d, self.dy1d)
+                dvar *= (1 + self.refreeze)
+
+            dvar1 = dvar
+            if pname in dState.params:
+                dvar1 = dvar + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * dState.params[pname]
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+            if varbc is not None:
+                dvar1 = (1 - self.Wbc) * dvar1
+
+            # reference trajectory (with flux + BC) needed for the clip mask
+            var1 = var
+            if pname in State.params:
+                var1 = var + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params[pname]
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            if self.clip_flag:
+                mask = (var1 >= 0) & (var1 <= 1)
+                dvar1 = dvar1 * mask
+
+            dState.setvar(dvar1, pname)
+
+        # No diagnostic TLM here (see step()).
+
+    def oldstep_adj(self, adState, State, nstep=1, t=0, **kwargs):
+
+        # No diagnostic adjoint here: since fi and sd are each fully
+        # stepped, there is no cross-variable sensitivity to redirect
+        # before the per-variable adjoint loop below (unlike
+        # Model_drift_initflux_multivar, which called
+        # self._diagnose_sd_adj(adState, State) first).
+
+        for name in self.name_var:
+            pname = self.name_var[name]
+
+            index_drift = np.argmin(np.abs(t - self.tdrift_all))
+            if self.scheme == "upwind":
+                udrift, vdrift = self._get_filtered_drift(index_drift)
+            elif self.scheme == "semi_lagrangian":
+                dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]  
+
+            var0 = State.getvar(pname)
+            var = jnp.asarray(var0, dtype=self.dtype)
+            trajectory = []
+            for it in range(nstep):
+                trajectory.append(var)
+                if self.scheme == "upwind":
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    var, _ = semi_lagrangian_advect_jax(
+                        var, dX_smooth / nstep, dY_smooth / nstep,
+                        jnp.isfinite(var0), self.dx1d, self.dy1d)
+                var *= (1 + self.refreeze)
+
+            var1 = var
+            if pname in State.params:
+                var1 = var + (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * State.params[pname]
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            advar = jnp.asarray(adState.getvar(pname), dtype=self.dtype)
+
+            if self.clip_flag:
+                mask = (var1 >= 0) & (var1 <= 1)
+                advar = advar * mask
+
+            if varbc is not None:
+                advar = (1 - self.Wbc) * advar
+
+            if pname in State.params:
+                adState.params[pname] = adState.params[pname] + \
+                    (1 - self.Wbc) * nstep * self.dt / (3600 * 24) * advar
+
+            for it in reversed(range(nstep)):
+                advar *= (1 + self.refreeze)
+                if self.scheme == "upwind":
+                    advar = advection_diffusion_step_upwind123_jax_adj(
+                        trajectory[it], advar, self.lon, self.lat, udrift, vdrift,
+                        self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                elif self.scheme == "semi_lagrangian":
+                    advar = semi_lagrangian_advect_jax_adj(
+                        trajectory[it], advar, dX_smooth / nstep, dY_smooth / nstep,
+                        jnp.isfinite(var0), self.dx1d, self.dy1d)
+
+            adState.setvar(advar, pname)
+
+
+ 
+class Model_drift_initflux_fisd_fast(Model_drift_initflux):
+    """
+    Multivariable ice-drift model:
+        - fi : ice freeboard
+        - sd : snow depth
+
+    Both variables share the SAME drift field (self.udrift_all /
+    self.vdrift_all, loaded once by the parent __init__) and the SAME
+    spatial weight map self.Wbc, exactly as in Model_drift_initflux_multivar.
+    Each variable gets its own additive flux parameter (State.params[...])
+    and its own boundary-condition series.
+
+    Unlike Model_drift_initflux_multivar, fi and sd are directly-stepped
+    state variables — sd is NOT diagnosed from two freeboards, so there
+    is no _diagnose_sd* logic here at all. Sros / PR_KU / PR_KA are kept
+    only because Obsop_interp_l3_fisd needs them to build H from fi/sd;
+    they play no role in this forward model.
+    """
+
+
+
+    def __init__(self, config, State):
+
+        super().__init__(config, State)
+
+        # --- Per-variable flux parameters ---
+        # One additive flux field per PHYSICAL variable name, matching the
+        # basis blocks (name_mod_var='ice_freeboard' / 'snow_depth', or
+        # whatever your name_var values are).
+        for name in self.name_var:
+            State.params[self.name_var[name]] = np.zeros(
+                (State.ny, State.nx), dtype=self.np_dtype
+            )
+
+        # --- Parameters needed by the observation operator only ---
+        # (H in Obsop_interp_l3_fisd needs Sros/PR_KU/PR_KA to combine
+        # fi/sd into fbku-/fbka-equivalent observations. Not used below.)
+        res = get_densities(hem='nh')   # or whatever your hemisphere key is
+        self.Sros = res['densities']['snow_speed_ratio']
+        self.PR_KU = config.MOD.PR_KU
+        self.PR_KA = config.MOD.PR_KA
+        self._sd_denom = self.Sros * (self.PR_KU - self.PR_KA)
+
+        assert 'fi' in self.name_var, "Model_drift_initflux_fisd requires 'fi' in name_var"
+        assert 'sd' in self.name_var, "Model_drift_initflux_fisd requires 'sd' in name_var"
+
+        self._init_fi_sd_from_raw(State, config)
+
+        # Static, derived-once quantities reused every step/step_tgl/step_adj call.
+        self._names  = list(self.name_var.keys())
+        self._pnames = [self.name_var[n] for n in self._names]
+
+        self._tdrift_all_np = np.asarray(self.tdrift_all)   # host copy, see point 2
+
+        self._Wbc_comp = 1 - self.Wbc        # avoid redoing this array op every call
+        self._refreeze_factor = 1 + self.refreeze
+
+        self.positivity_flag = False
+
+        self._mask_stack = jnp.isfinite(jnp.stack([jnp.asarray(State.getvar(p)) for p in self._pnames], axis=0))
+
+    def _init_fi_sd_from_raw(self, State, config):
+        """Overwrite the zero-filled fi/sd from the parent __init__ with
+        values derived from the two raw freeboard fields, using the same
+        fi/sd <-> fbka/fbku relation as the observation operator.
+        """
+        if not (config.GRID.super == 'GRID_FROM_FILE'):
+            return  # nothing to load, fi/sd stay at zero as before
+
+        dsin = xr.open_dataset(config.GRID.path_init_grid)
+
+        print("Start initialization")
+
+        def _load(raw_name):
+            v = dsin[raw_name]
+            if len(v.shape) == 3:
+                v = v[0, :, :]
+            if config.GRID.subsampling is not None:
+                v = v[::config.GRID.subsampling, ::config.GRID.subsampling]
+            v = v.values.astype(float)
+            v[np.isnan(v)] = np.nan  # keep NaNs for now, handled below
+            return v
+
+        try : 
+            radar_fb = _load('radar_freeboard_filled')  # -> fbku equation
+            laser_fb = _load('laser_fb_filled')          # -> fbka equation
+
+            sd = (laser_fb - radar_fb) / self._sd_denom
+            fi = radar_fb - (1 - self.Sros * self.PR_KU) * sd
+
+            sd = np.where(np.isnan(sd), 0., sd)
+            fi = np.where(np.isnan(fi), 0., fi)
+            sd[sd < 0] = 0.
+
+            State.var[self.name_var['fi']] = fi
+            State.var[self.name_var['sd']] = sd
+            
+            print('Initialization with radar_freeboard_filled and laser_fb_filled')
+        except : 
+            try : 
+                State.var[self.name_var['fi']] = _load('ice_freeboard')
+                sd = _load('snow_depth')
+                sd[sd < 0] = 0.
+                State.var[self.name_var['sd']] = sd
+
+                print('Initialization with ice_freeboard and snow_depth')
+            except : 
+                print('Error initialization')
+
+        dsin.close()
+        del dsin
+
+    # ----------------
+    # --- BC methods
+    # ----------------
+    def _apply_bc(self, name, t):
+        """Return the BC field for variable `name` nearest to time t, or
+        None if no BC is loaded for it.
+
+        Carried over from Model_drift_initflux_multivar: the grandparent
+        (Model_drift_initflux) version ignores which variable is being
+        processed and always returns the first variable's BC series --
+        harmless with one variable, wrong with two independent ones.
+        """
+        if name not in self.bc or len(self.bc[name]) == 0:
+            return None
+        if t in self.bc[name]:
+            return self.bc[name][t]
+        times = np.asarray(list(self.bc[name].keys()))
+        idx_closest = np.argmin(np.abs(times - t))
+        return self.bc[name][times[idx_closest]]
+
+    def _index_drift(self, t):
+        """Cache a host-side copy of tdrift_all once, so repeated calls to
+        step/step_tgl/step_adj don't force a device->host sync (and the
+        associated full pipeline stall) on every single checkpoint."""
+        if not hasattr(self, '_tdrift_all_np'):
+            self._tdrift_all_np = np.asarray(self.tdrift_all)  # one-time transfer
+        return int(np.argmin(np.abs(t - self._tdrift_all_np)))
+
+    # ----------------
+    # --- Step methods
+    # ----------------
+
+    def step(self, State, nstep=1, t=0, **kwargs):
+
+        index_drift = self._index_drift(t)
+        if self.scheme == "upwind":
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+        elif self.scheme == "semi_lagrangian":
+            dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]
+
+        names, pnames = self._names, self._pnames
+
+        if self.scheme == "semi_lagrangian":
+            # fi and sd share the same displacement field -> advect them in
+            # ONE batched call so the bicubic tap weights are computed once,
+            # not twice.
+            var0_stack = jnp.stack([jnp.asarray(State.getvar(p)) for p in pnames], axis=0) 
+
+            var_stack = var0_stack
+            traj_stack = [var_stack]
+            dX_sub = dX_smooth / nstep
+            dY_sub = dY_smooth / nstep
+            for it in range(nstep):
+                var_stack, _ = semi_lagrangian_advect_jax_batched(
+                    var_stack, dX_sub, dY_sub,
+                    self._mask_stack, self.dx1d, self.dy1d)
+                if self._refreeze_factor != 1 : 
+                    var_stack = var_stack * self._refreeze_factor
+                traj_stack.append(var_stack)
+
+            # Keyed by variable name (fixes the earlier bug where
+            # self.trajectory was silently overwritten each loop iteration).
+            #self.trajectory = {name: [tr[i] for tr in traj_stack] for i, name in enumerate(names)}
+            var_by_name = {name: var_stack[i] for i, name in enumerate(names)}
+
+        elif self.scheme == "upwind":
+            # Not batched: this scheme doesn't go through interp2d_bicubic_keys_jax,
+            # so there is no shared weight computation to factor out here.
+            var_by_name = {}
+            self.trajectory = {}
+            for name, pname in zip(names, pnames):
+                var = jnp.asarray(State.getvar(pname))
+                self.trajectory[name] = [var]
+                for it in range(nstep):
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                    if self._refreeze_factor != 1 : 
+                        var *= self._refreeze_factor
+                    self.trajectory[name].append(var)
+                var_by_name[name] = var
+        else:
+            raise ValueError(f"Unknown scheme: {self.scheme}")
+
+        for name, pname in zip(names, pnames):
+            var = var_by_name[name]
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+
+            var1 = var
+            if pname in State.params:
+                var1 = var1 + self._Wbc_comp * nstep * self.dt / (3600 * 24) * State.params[pname]
+
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            if self.clip_flag:
+                if isinstance(var1, np.ndarray):
+                    var1 = np.clip(var1, 0.0, 1.0)
+                elif isinstance(var1, jnp.ndarray):
+                    var1 = jnp.clip(var1, 0.0, 1.0)
+
+            if self.positivity_flag and name == 'sd' :
+                if isinstance(var1, np.ndarray): 
+                    var1[var1<0] = 0
+                elif isinstance(var1, jnp.ndarray): 
+                    var1 = var1.at[var1<0].set(0)
+
+            State.setvar(var1, pname)
+
+
+    def step_tgl(self, dState, State, nstep=1, t=0, **kwargs):
+
+        index_drift = self._index_drift(t)
+        if self.scheme == "upwind":
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+        elif self.scheme == "semi_lagrangian":
+            dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]
+
+        names, pnames = self._names, self._pnames
+
+        if self.scheme == "semi_lagrangian":
+            var0_stack = jnp.stack([jnp.asarray(State.getvar(p)) for p in pnames], axis=0) 
+
+            var_stack = var0_stack
+            traj_stack = [var_stack]
+            dX_sub = dX_smooth / nstep
+            dY_sub = dY_smooth / nstep
+            for it in range(nstep):
+                var_stack, _ = semi_lagrangian_advect_jax_batched(
+                    var_stack, dX_sub, dY_sub,
+                    self._mask_stack, self.dx1d, self.dy1d)
+                if self._refreeze_factor != 1 : 
+                    var_stack = var_stack * self._refreeze_factor
+                traj_stack.append(var_stack)
+
+            dvar0_stack = jnp.stack([jnp.asarray(dState.getvar(p)) for p in pnames], axis=0)
+            dvar_stack = dvar0_stack
+            
+            for it in range(nstep):
+                dvar_stack = semi_lagrangian_advect_jax_batched_tlm(
+                    traj_stack[it], dvar_stack, dX_sub, dY_sub,
+                    self._mask_stack, self.dx1d, self.dy1d)
+                if self._refreeze_factor != 1 : 
+                    dvar_stack = dvar_stack * self._refreeze_factor
+
+            var_by_name  = {name: var_stack[i]  for i, name in enumerate(names)}
+            dvar_by_name = {name: dvar_stack[i] for i, name in enumerate(names)}
+
+        elif self.scheme == "upwind":
+            var_by_name, dvar_by_name = {}, {}
+            for name, pname in zip(names, pnames):
+                var0 = State.getvar(pname)
+                var  = jnp.asarray(var0)
+                trajectory = []
+                for it in range(nstep):
+                    trajectory.append(var)
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                    if self._refreeze_factor != 1 : 
+                        var *= self._refreeze_factor
+
+                dvar = jnp.asarray(dState.getvar(pname))
+                for it in range(nstep):
+                    dvar = advection_diffusion_step_upwind123_jax_tlm(
+                        trajectory[it], dvar, self.lon, self.lat, udrift, vdrift,
+                        self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                    if self._refreeze_factor != 1 : 
+                        dvar *= self._refreeze_factor
+
+                var_by_name[name], dvar_by_name[name] = var, dvar
+        else:
+            raise ValueError(f"Unknown scheme: {self.scheme}")
+
+        for name, pname in zip(names, pnames):
+            var, dvar = var_by_name[name], dvar_by_name[name]
+
+            dvar1 = dvar
+            if pname in dState.params:
+                dvar1 = dvar + self._Wbc_comp * nstep * self.dt / (3600 * 24) * dState.params[pname]
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+            if varbc is not None:
+                dvar1 = self._Wbc_comp * dvar1
+
+            var1 = var
+            if pname in State.params:
+                var1 = var + self._Wbc_comp * nstep * self.dt / (3600 * 24) * State.params[pname]
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            if self.clip_flag:
+                mask = (var1 >= 0) & (var1 <= 1)
+                dvar1 = dvar1 * mask
+
+            if self.positivity_flag and name == 'sd':
+                if isinstance(dvar1, np.ndarray):
+                    dvar1[var1<0] = 0
+                elif isinstance(dvar1, jnp.ndarray):
+                    dvar1 = dvar1.at[var1<0].set(0)
+
+            dState.setvar(dvar1, pname)
+
+    def step_adj(self, adState, State, nstep=1, t=0, **kwargs):
+
+        index_drift = self._index_drift(t)
+        if self.scheme == "upwind":
+            udrift, vdrift = self._get_filtered_drift(index_drift)
+        elif self.scheme == "semi_lagrangian":
+            dX_smooth, dY_smooth = self.dX[index_drift], self.dY[index_drift]
+
+        names, pnames = self._names, self._pnames
+
+        if self.scheme == "semi_lagrangian":
+            var0_stack = jnp.stack([jnp.asarray(State.getvar(p), dtype=self.dtype) for p in pnames], axis=0) 
+
+            var_stack = var0_stack
+            traj_stack = [var_stack]
+            dX_sub = dX_smooth / nstep
+            dY_sub = dY_smooth / nstep
+            for it in range(nstep):
+                var_stack, _ = semi_lagrangian_advect_jax_batched(
+                    var_stack, dX_sub, dY_sub,
+                    self._mask_stack, self.dx1d, self.dy1d)
+                if self._refreeze_factor != 1 : 
+                    var_stack = var_stack * self._refreeze_factor
+                traj_stack.append(var_stack)
+
+            var_by_name = {name: var_stack[i] for i, name in enumerate(names)}
+
+        else:  # upwind
+            var_by_name, trajectory_by_name = {}, {}
+            for name, pname in zip(names, pnames):
+                var = jnp.asarray(State.getvar(pname), dtype=self.dtype)
+                trajectory = []
+                for it in range(nstep):
+                    trajectory.append(var)
+                    var = advection_diffusion_step_upwind123_jax(
+                        var, self.lon, self.lat, udrift, vdrift, self.dx, self.dy,
+                        D=0, dt=self.dt, upwind=3)
+                    if self._refreeze_factor != 1 : 
+                        var *= self._refreeze_factor
+                var_by_name[name] = var
+                trajectory_by_name[name] = trajectory
+
+        # ---- Per-variable adjoint of clip / BC / flux (independent per channel) ----
+        advar_by_name = {}
+        for name, pname in zip(names, pnames):
+            var = var_by_name[name]
+
+            var1 = var
+            if pname in State.params:
+                var1 = var + self._Wbc_comp * nstep * self.dt / (3600 * 24) * State.params[pname]
+                
+
+            varbc = self._apply_bc(name, t + nstep * self.dt) if self.compute_bc else None
+            if varbc is not None:
+                var1 = var1 + self.Wbc * (varbc - var1)
+
+            advar = jnp.asarray(adState.getvar(pname), dtype=self.dtype)
+
+
+            if self.positivity_flag and name == 'sd':
+                if isinstance(advar, np.ndarray):
+                    advar[var1<0] = 0
+                elif isinstance(advar, jnp.ndarray):
+                    advar = advar.at[var1<0].set(0)
+
+            if self.clip_flag:
+                mask = (var1 >= 0) & (var1 <= 1)
+                advar = advar * mask
+
+            if varbc is not None:
+                advar = self._Wbc_comp * advar
+
+            if pname in State.params:
+                adState.params[pname] = adState.params[pname] + \
+                    self._Wbc_comp * nstep * self.dt / (3600 * 24) * advar
+
+            advar_by_name[name] = advar
+
+        # ---- Adjoint of advection: batched for semi_lagrangian ----
+        if self.scheme == "semi_lagrangian":
+            advar_stack = jnp.stack([advar_by_name[name] for name in names], axis=0)
+            for it in reversed(range(nstep)):
+                if self._refreeze_factor != 1 : 
+                    advar_stack = advar_stack * self._refreeze_factor
+                advar_stack = semi_lagrangian_advect_jax_batched_adj(
+                    traj_stack[it], advar_stack, dX_sub, dY_sub,
+                    self._mask_stack, self.dx1d, self.dy1d)
+            for i, name in enumerate(names):
+                adState.setvar(advar_stack[i], self.name_var[name])
+
+        else:  # upwind, unchanged per-variable path
+            for name, pname in zip(names, pnames):
+                advar = advar_by_name[name]
+                trajectory = trajectory_by_name[name]
+                for it in reversed(range(nstep)):
+                    if self._refreeze_factor != 1 : 
+                        advar *= self._refreeze_factor
+                    advar = advection_diffusion_step_upwind123_jax_adj(
+                        trajectory[it], advar, self.lon, self.lat, udrift, vdrift,
+                        self.dx, self.dy, D=0, dt=self.dt, upwind=3)
+                adState.setvar(advar, pname)
+
 
 
 ###############################################################################
@@ -7724,3 +10223,441 @@ proj = pyproj.Proj(
     lat_ts=70,
     ellps="WGS84"
 )
+
+# DENSITIES DEFAULT VALUES
+DEFAULT_DENSITIES = {
+
+# ARCTIC
+'nh': {
+    'water': {'mean': 1024., 'unc': 0.5, 'comment': "Density of the water and its uncertainty from [Wadhams et al. 1992]  https://doi.org/10.1029/91JC03137"},
+    'snow':  {'all': {'mean': 294., 'unc': 70, 'comment': "Density of the snow from mean of [Mallett et al. 2020] values. Uncertainties = unc 50 + max variation 20 = 70."}, # constants
+              'icetype': {                      # if icetype param provided
+                  'FYI': {'mean': 294., 'unc': 70}, 
+                  'MYI': {'mean': 294., 'unc': 70},
+                  'comment': "Density of the snow from mean of [Mallett et al. 2020] values https://tc.copernicus.org/articles/14/251/2020/. Uncertainties = unc 50 + max variation 20 = 70.",
+              },
+              'time': {'month': [ 1,2,3,4, 10,11,12], # need time param
+                       'mean':  [294.01, 300.51, 307.01, 313.51, 274.51, 281.01, 287.51,],
+                       'unc':   50,
+                       'comment': "Density of the snow from [Mallett et al. 2020] https://tc.copernicus.org/articles/14/251/2020/. Uncertainties = 50kg/m3."
+                       },
+          },
+    'ice':   {'all': {'mean': 900., 'unc': 54., 'comment': "Density of the ice from mean [Alexandrov et al. 2010] values. https://doi.org/10.5194/tc-4-373-2010. Uncertainties = unc max 36 + variation 18 = 54"}, # constants
+              'icetype': {                       # if icetype param provided
+                  'FYI': {'mean': 917., 'unc': 36.}, 
+                  'MYI': {'mean': 882., 'unc': 23.},
+                  'comment': "Density of the ice from [Alexandrov et al. 2010] https://doi.org/10.5194/tc-4-373-2010.",
+              },
+              'time': {'month': [  1,   4,   7,  10], # need time param
+                       'mean':  [900,900,900,900],
+                       'unc':   54,
+                       'comment': "Density of the ice from mean of [Alexandrov et al. 2010] values. https://doi.org/10.5194/tc-4-373-2010. Uncertainties = unc max 36 + variation 18 = 54", },
+              }},
+
+# ANTARCTIC
+'sh': {
+    'water': {'mean': 1024., 'unc': 0.5, 'comment': "Density of the sea water and its uncertainty from [Wadhams et al. 1992]  https://doi.org/10.1029/91JC03137"},
+    'snow':  {'all':   {'mean': 335., 'unc': 75, 'comment': "Density of the snow from [Fons et al. 2023] mean values doi.org/10.5194/tc-17-2487-2023. Uncertainties = unc 50 + variations 25 = 75."}, # constant
+              'icetype': {                        # if icetype param provided
+                  'FYI':   {'mean': 335., 'unc': 75},
+                  'MYI':   {'mean': 335., 'unc': 75},
+                  'comment': "Density of the snow from of [Fons et al. 2023] mean values doi.org/10.5194/tc-17-2487-2023. Uncertainties = unc 50 + variations 25 = 75."
+              },
+              #                   Sum, Fall, Win, Spr
+              'time': {'month': [  1,   4,   7,  10], # need time param
+                       'mean':  [360, 350, 330, 310], # Fons
+                       #'mean':  [350, 340, 330, 320], # Markus
+                       'unc':   50,
+                       'comment': "Density of the snow and its uncertainty from [Fons et al 2023] doi.org/10.5194/tc-17-2487-2023"}},
+    'ice':   {'all': {'mean': 902., 'unc': 47., 'comment': "Density of the ice from [Fons et al 2023] mean values. doi.org/10.5194/tc-17-2487-2023. Uncertainties = unc 20 + max variations 27 = 47"}, # constant
+              'icetype': {                       # if icetype param provided
+                  'FYI': {'mean': 902., 'unc': 47.},
+                  'MYI': {'mean': 902., 'unc': 47.},
+                  'comment': "Density of the ice from [Fons et al 2023] mean values doi.org/10.5194/tc-17-2487-2023. Uncertainties = unc 20 + max variations 27 = 47",
+              },
+              #                   Sum, Fall, Win, Spr
+              'time': {'month': [  1,   4,   7,  10], # need time param
+                       'mean':  [875, 900, 920, 915], 
+                       'unc':   20,
+                       'comment': "Density of the ice and its uncertainty from [Fons et al 2023] doi.org/10.5194/tc-17-2487-2023"},}
+}}
+
+
+
+def get_densities(hem, densities=DEFAULT_DENSITIES, icetype=None, time=None,
+                  time_units=None, ro_i=None, ro_i_unc=None, ro_s=None,
+                  ro_s_unc=None, verbose=0): 
+
+    ULABY = 0.00051 # Ulaby et al. 1986
+
+    res = {}
+    res['densities_comment'] = {}
+    density = densities[hem]
+    # water density
+    ro_w     = density['water']['mean']
+    ro_w_unc = density['water']['unc']
+    res['densities_comment']['water'] = density['water']['comment']
+
+    # ice density
+    if ro_i is None:
+        if icetype is None and time is None:
+            ro_i     = density['ice']['all']['mean']
+            res['densities_comment']['ice'] = density['ice']['all']['comment']
+        elif icetype is not None:
+            if not 'icetype' in density['ice']:
+                print(__doc__)
+                sys.exit("icetype parameter is provided but not the corresponding densities['ice']['icetype'] ")
+            ro_i_fyi = density['ice']['icetype']['FYI']['mean']
+            ro_i_myi = density['ice']['icetype']['MYI']['mean']
+            ro_i     = (1-icetype/2.) * ro_i_fyi     + icetype/2. * ro_i_myi
+            res['densities_comment']['ice'] = density['ice']['icetype']['comment']
+        elif time is not None:
+            if not 'time' in density['ice']:
+                print(__doc__)
+                sys.exit("time parameter is provided but not the corresponding densities['ice']['time'] ")
+            ro_i = interpol_month('ice', density['ice']['time']['month'], 
+                                  density['ice']['time']['mean'], 
+                                  time, time_units, verbose)
+            res['densities_comment']['ice'] = density['ice']['time']['comment']
+
+    # ice density uncertainty
+    if ro_i_unc is None:
+        if icetype is None and time is None:
+            ro_i_unc = density['ice']['all']['unc']
+        elif icetype is None:
+            ro_i_unc = density['ice']['time']['unc']
+        else:
+            ro_i_fyi_unc = density['ice']['icetype']['FYI']['unc']
+            ro_i_myi_unc = density['ice']['icetype']['MYI']['unc']
+            ro_i_unc = (1-icetype/2.) * ro_i_fyi_unc + icetype/2. * ro_i_myi_unc
+
+    # snow density
+    if ro_s is None:
+        if icetype is None and time is None:
+            ro_s = density['snow']['all']['mean']
+            res['densities_comment']['snow'] = density['snow']['all']['comment']
+        elif icetype is not None:
+            if not 'icetype' in density['snow']:
+                print(__doc__)
+                sys.exit("icetype parameter is provided but not the corresponding densities['snow']['icetype'] ")
+            ro_s_fyi = density['snow']['icetype']['FYI']['mean']
+            ro_s_myi = density['snow']['icetype']['MYI']['mean']
+            ro_s     = (1-icetype/2.) * ro_s_fyi     + icetype/2. * ro_s_myi
+            res['densities_comment']['snow'] = density['snow']['icetype']['comment']
+        elif time is not None:
+            if not 'time' in density['snow']:
+                print(__doc__)
+                sys.exit("time parameter is provided but not the corresponding densities['snow']['time'] ")
+            ro_s = interpol_month('snow', density['snow']['time']['month'], 
+                                  density['snow']['time']['mean'], 
+                                  time, time_units, verbose)
+            res['densities_comment']['snow'] = density['snow']['time']['comment']
+
+
+    # snow density uncertainty
+    if ro_s_unc is None:
+        if icetype is None and time is None:
+            ro_s_unc = density['snow']['all']['unc']
+        elif icetype is None:
+            ro_s_unc = density['snow']['time']['unc']
+        else:
+            ro_s_fyi_unc = density['snow']['icetype']['FYI']['unc']
+            ro_s_myi_unc = density['snow']['icetype']['MYI']['unc']
+            ro_s_unc = (1-icetype/2.) * ro_s_fyi_unc + icetype/2. * ro_s_myi_unc
+            
+    # intermed param for Ulaby
+    slow = (1 + ULABY * ro_s)
+    Sros = pow(slow, 1.5)     # = cv/cs
+    dSros = 1.5 * ULABY * pow(slow, 0.5)
+
+    res['densities'] = {}
+    res['densities']['water'] = ro_w 
+    res['densities']['water_unc'] = ro_w_unc 
+    res['densities']['ice'] = ro_i 
+    res['densities']['ice_unc'] = ro_i_unc 
+    res['densities']['snow'] = ro_s 
+    res['densities']['snow_unc'] = ro_s_unc 
+    res['densities']['snow_speed_ratio'] = Sros 
+    res['densities']['snow_speed_ratio_var'] = dSros 
+    
+    return res
+
+
+
+def interp2d_bicubic_keys_jax_batched(var_stack, x, y, Xq, Yq):
+    """
+    Same as interp2d_bicubic_keys_jax, but var_stack carries an extra
+    leading channel axis: var_stack.shape == (nvar, ny, nx).
+
+    Xq, Yq are the SAME shared displacement field for every channel
+    (fi and sd share one drift field), so the tap weights (i0, j0, wx, wy)
+    are computed ONCE per tap and reused for all channels via a single
+    fancy-index gather, instead of being recomputed per channel.
+    """
+    nx, ny = x.shape[0], y.shape[0]
+    dx, dy = x[1] - x[0], y[1] - y[0]
+
+    ix = (Xq - x[0]) / dx
+    iy = (Yq - y[0]) / dy
+
+    i0 = jax.lax.stop_gradient(jnp.floor(ix).astype(int))
+    j0 = jax.lax.stop_gradient(jnp.floor(iy).astype(int))
+
+    result = jnp.zeros((var_stack.shape[0],) + Xq.shape, dtype=var_stack.dtype)
+    for di in range(-1, 3):
+        for dj in range(-1, 3):
+            ii = jnp.clip(i0 + di, 0, nx - 1)
+            jj = jnp.clip(j0 + dj, 0, ny - 1)
+            wx = cubic_kernel(ix - (i0 + di))   # computed ONCE per tap
+            wy = cubic_kernel(iy - (j0 + dj))   # computed ONCE per tap
+            w = wx * wy
+            # Gather for ALL channels at once: shape (nvar, ny, nx)
+            result = result + var_stack[:, jj, ii] * w[None, ...]
+
+    return result
+
+
+def semi_lagrangian_advect_jax_batched(var_stack, dX, dY, mask_stack, x, y, eps=1e-6):
+    """
+    Batched semi-Lagrangian advection for several fields sharing one
+    displacement field (dX, dY). var_stack: (nvar, ny, nx).
+    mask_stack: (nvar, ny, nx) — per-channel validity mask (fi/sd may
+    have different NaN patterns, so it is NOT forced to be shared).
+    """
+    var_stack  = jnp.asarray(var_stack)
+    mask_stack = jnp.asarray(mask_stack)
+    x = jnp.asarray(x)
+    y = jnp.asarray(y)
+    dX = jnp.where(jnp.isnan(dX), 0.0, dX)
+    dY = jnp.where(jnp.isnan(dY), 0.0, dY)
+
+    C_filled = jnp.where(mask_stack, var_stack, 0.0)
+
+    if x.ndim == 1:
+        X, Y = jnp.meshgrid(x, y)
+        X_d = X - dX
+        Y_d = Y - dY
+        C_new = interp2d_bicubic_keys_jax_batched_monotone(C_filled, x, y, X_d, Y_d)
+    else:
+        rows = jnp.arange(var_stack.shape[1], dtype=jnp.float32)
+        cols = jnp.arange(var_stack.shape[2], dtype=jnp.float32)
+        ROW, COL = jnp.meshgrid(rows, cols, indexing='ij')
+
+        dCOL = dX / (x + eps)
+        dROW = dY / (y + eps)
+
+        COL_d = COL - dCOL
+        ROW_d = ROW - dROW
+        C_new = interp2d_bicubic_keys_jax_batched_monotone(C_filled, cols, rows, COL_d, ROW_d)
+
+    #print("var_stack", var_stack.shape, "mask_stack", mask_stack.shape)
+    #print("dX", dX.shape, "dY", dY.shape)
+    #print("x", x.shape, "y", y.shape) 
+    #print("C_new", C_new.shape)
+    C_new = jnp.where(mask_stack, C_new, jnp.nan)
+    return C_new, mask_stack
+
+
+semi_lagrangian_advect_jax_batched = jax.jit(semi_lagrangian_advect_jax_batched)
+
+
+@partial(jax.jit, static_argnames=())
+def semi_lagrangian_advect_jax_batched_tlm(var_ref_stack, dvar_stack, dX, dY, mask_stack, x, y):
+    """Tangent linear model of batched semi-Lagrangian advection."""
+    def forward_var(v):
+        C_new, _ = semi_lagrangian_advect_jax_batched(v, dX, dY, mask_stack, x, y)
+        return C_new
+    _, dvar_out = jax.jvp(forward_var, (var_ref_stack,), (dvar_stack,))
+    return dvar_out
+
+
+@partial(jax.jit, static_argnames=())
+def semi_lagrangian_advect_jax_batched_adj(var_ref_stack, advar_out_stack, dX, dY, mask_stack, x, y):
+    """Adjoint model of batched semi-Lagrangian advection."""
+    def forward_var(v):
+        C_new, _ = semi_lagrangian_advect_jax_batched(v, dX, dY, mask_stack, x, y)
+        return C_new
+    _, pullback = jax.vjp(forward_var, var_ref_stack)
+    (advar_in,) = pullback(advar_out_stack)
+    return advar_in
+
+
+def interp2d_bicubic_keys_jax_batched_monotone(var_stack, x, y, Xq, Yq):
+    """
+    Same as interp2d_bicubic_keys_jax_batched, but with a monotonic
+    (Bermejo-Staniforth-style) limiter: at each output point, the
+    interpolated value is clamped to the min/max of the same 4x4 stencil
+    that produced it, PER CHANNEL independently.
+
+    This is the fix for filamentation: unconstrained cubic interpolation
+    can overshoot beyond the local data range near sharp gradients, and
+    those overshoots compound step after step into streaks. The limiter
+    removes the overshoot without touching the tap-weight sharing that
+    makes this batched version fast.
+
+    var_stack.shape == (nvar, ny, nx). Xq, Yq (and hence i0, j0, wx, wy)
+    are shared across channels; stencil_min/max are tracked per channel
+    since fi and sd can have very different local ranges.
+    """
+    nx, ny = x.shape[0], y.shape[0]
+    dx, dy = x[1] - x[0], y[1] - y[0]
+
+    ix = (Xq - x[0]) / dx
+    iy = (Yq - y[0]) / dy
+
+    i0 = jax.lax.stop_gradient(jnp.floor(ix).astype(int))
+    j0 = jax.lax.stop_gradient(jnp.floor(iy).astype(int))
+
+    out_shape = (var_stack.shape[0],) + Xq.shape
+    result = jnp.zeros(out_shape, dtype=var_stack.dtype)
+    stencil_min = jnp.full(out_shape, jnp.inf, dtype=var_stack.dtype)
+    stencil_max = jnp.full(out_shape, -jnp.inf, dtype=var_stack.dtype)
+
+    for di in range(-1, 3):
+        for dj in range(-1, 3):
+            ii = jnp.clip(i0 + di, 0, nx - 1)
+            jj = jnp.clip(j0 + dj, 0, ny - 1)
+            wx = cubic_kernel(ix - (i0 + di))   # computed ONCE per tap
+            wy = cubic_kernel(iy - (j0 + dj))   # computed ONCE per tap
+            w = wx * wy
+
+            vals = var_stack[:, jj, ii]         # (nvar, ny, nx) gather, shared indices
+            result = result + vals * w[None, ...]
+
+            stencil_min = jnp.minimum(stencil_min, vals)
+            stencil_max = jnp.maximum(stencil_max, vals)
+
+    # Monotonic limiter, applied independently per channel
+    result = jnp.clip(result, stencil_min, stencil_max)
+
+    return result
+ 
+
+def semi_lagrangian_advect_jax_batched_conservative(var_stack, dX, dY, mask_stack, x, y, eps=1e-6):
+    """
+    Conservative flux-form-style semi-Lagrangian advection via forward
+    (push) trajectories + bilinear (Cloud-In-Cell) deposition.
+
+    Unlike semi_lagrangian_advect_jax_batched (backward/pull trajectories
+    + bicubic point interpolation, NOT conservative), this scheme:
+
+      1. For every SOURCE grid cell, computes where its mass is carried
+         TO (forward trajectory: X + dX, not X - dX).
+      2. Deposits that cell's value onto the (up to 4) nearest target
+         cells with bilinear weights that sum to 1 per source particle.
+      3. Sums deposited mass and deposited weight ("coverage") per
+         target cell; C_new = deposited_mass / coverage.
+
+    Because each source cell's weight sums to exactly 1 regardless of
+    the local velocity field, total mass is conserved exactly (up to
+    domain-boundary clamping). Because bilinear weights are always in
+    [0, 1], every target cell's result is a convex combination of
+    contributing source values, so it cannot overshoot the local data
+    range -- this directly removes the interpolation-overshoot mechanism
+    behind filamentation.
+
+    Trade-offs vs the bicubic pull scheme:
+      - More diffusive (bilinear-order smoothing, not cubic-accurate).
+      - Under strong DIVERGENCE, some target cells can end up with very
+        low coverage ("holes" -- no trajectory lands there). These are
+        marked invalid (NaN) here; consider blending with the previous
+        field or with the pull-based scheme in such regions if this
+        matters for your application.
+      - dX, dY are reused here as an approximate FORWARD displacement
+        field (the pull scheme treats the same field as a backward/
+        departure displacement). This is the same small-Courant-number
+        approximation already implicit in reusing one dX/dY across every
+        nstep sub-step in the caller.
+
+    Parameters / returns: identical to semi_lagrangian_advect_jax_batched.
+    """
+    var_stack  = jnp.asarray(var_stack)
+    mask_stack = jnp.asarray(mask_stack)
+    x = jnp.asarray(x)
+    y = jnp.asarray(y)
+    dX = jnp.where(jnp.isnan(dX), 0.0, dX)
+    dY = jnp.where(jnp.isnan(dY), 0.0, dY)
+
+    nvar, ny, nx = var_stack.shape
+    C_filled = jnp.where(mask_stack, var_stack, 0.0)
+    W_source = jnp.where(mask_stack, 1.0, 0.0)   # per-channel source validity weight
+
+    if x.ndim == 1:
+        # Regular grid: x, y are 1-D coordinates [km]
+        dxg, dyg = x[1] - x[0], y[1] - y[0]
+        X, Y = jnp.meshgrid(x, y)
+        X_a = X + dX
+        Y_a = Y + dY
+        ix_a = (X_a - x[0]) / dxg
+        iy_a = (Y_a - y[0]) / dyg
+    else:
+        # Curvilinear grid: x=e1t, y=e2t are local spacings [km/pixel]
+        rows = jnp.arange(ny, dtype=jnp.float32)
+        cols = jnp.arange(nx, dtype=jnp.float32)
+        ROW, COL = jnp.meshgrid(rows, cols, indexing='ij')
+        dCOL = dX / (x + eps)
+        dROW = dY / (y + eps)
+        ix_a = COL + dCOL
+        iy_a = ROW + dROW
+
+    i0f = jax.lax.stop_gradient(jnp.floor(ix_a))
+    j0f = jax.lax.stop_gradient(jnp.floor(iy_a))
+    fi = ix_a - i0f   # fractional part, in [0, 1)
+    fj = iy_a - j0f
+    i0 = i0f.astype(int)
+    j0 = j0f.astype(int)
+
+    numerator   = jnp.zeros_like(var_stack)
+    denominator = jnp.zeros_like(var_stack)
+
+    chan_idx = jnp.broadcast_to(jnp.arange(nvar)[:, None, None], (nvar, ny, nx))
+
+    # Bilinear (CIC) deposition onto the 4 surrounding target cells.
+    for di in (0, 1):
+        for dj in (0, 1):
+            ii = jnp.clip(i0 + di, 0, nx - 1)
+            jj = jnp.clip(j0 + dj, 0, ny - 1)
+            wx = fi if di == 1 else (1.0 - fi)
+            wy = fj if dj == 1 else (1.0 - fj)
+            w = wx * wy                                  # (ny, nx), shared across channels
+
+            w_masked = w[None, ...] * W_source            # (nvar, ny, nx)
+            mass = w_masked * C_filled                    # (nvar, ny, nx)
+
+            jj_b = jnp.broadcast_to(jj[None, ...], (nvar, ny, nx))
+            ii_b = jnp.broadcast_to(ii[None, ...], (nvar, ny, nx))
+
+            numerator   = numerator.at[chan_idx, jj_b, ii_b].add(mass)
+            denominator = denominator.at[chan_idx, jj_b, ii_b].add(w_masked)
+
+    valid = denominator > 0.5   # coverage threshold below which a target is a "hole"; tune as needed
+    C_new = jnp.where(valid, numerator / jnp.where(valid, denominator, 1.0), jnp.nan)
+
+    C_new = jnp.where(mask_stack, C_new, jnp.nan)
+    return C_new, mask_stack
+
+
+semi_lagrangian_advect_jax_batched_conservative = jax.jit(semi_lagrangian_advect_jax_batched_conservative)
+
+
+@partial(jax.jit, static_argnames=())
+def semi_lagrangian_advect_jax_batched_conservative_tlm(var_ref_stack, dvar_stack, dX, dY, mask_stack, x, y):
+    def forward_var(v):
+        C_new, _ = semi_lagrangian_advect_jax_batched_conservative(v, dX, dY, mask_stack, x, y)
+        return C_new
+    _, dvar_out = jax.jvp(forward_var, (var_ref_stack,), (dvar_stack,))
+    return dvar_out
+
+
+@partial(jax.jit, static_argnames=())
+def semi_lagrangian_advect_jax_batched_conservative_adj(var_ref_stack, advar_out_stack, dX, dY, mask_stack, x, y):
+    def forward_var(v):
+        C_new, _ = semi_lagrangian_advect_jax_batched_conservative(v, dX, dY, mask_stack, x, y)
+        return C_new
+    _, pullback = jax.vjp(forward_var, var_ref_stack)
+    (advar_in,) = pullback(advar_out_stack)
+    return advar_in
+
+
+    
+ 
