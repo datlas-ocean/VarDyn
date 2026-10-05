@@ -1598,6 +1598,9 @@ class Variational:
         with self.cost_precision():
             J = jnp.asarray(0.5 * (Jo + Jb), dtype=self.cost_dtype)
 
+            print('Jo =',Jo)
+            print('Jb =',Jb)
+
 
         ########################################
         # GRAD FUNCTION

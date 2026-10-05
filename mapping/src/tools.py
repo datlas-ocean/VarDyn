@@ -244,7 +244,7 @@ def compute_weight_map(lon2d,lat2d,mask,dist_scale,bc=True,slope=10, lon_min=Non
             )
             # Thin boundary points - keep every Nth point
             boundary_indices = np.where(geo_boundary.ravel())[0]
-            thinned = boundary_indices[::5]  # adjust thinning factor
+            thinned = boundary_indices[::1]  # adjust thinning factor
             thinned_mask = np.zeros(lon2d.size, dtype=bool)
             thinned_mask[thinned] = True
             mask = mask | thinned_mask.reshape(lon2d.shape) 

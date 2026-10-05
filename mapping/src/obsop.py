@@ -79,6 +79,9 @@ def Obsop(config, State, dict_obs, Model, verbose=1, *args, **kwargs):
     
     elif config.OBSOP.super=='OBSOP_INTERP_L3':
         return Obsop_interp_l3(config, State, dict_obs, Model)
+
+    elif config.OBSOP.super=='OBSOP_INTERP_L3_FISD':
+        return Obsop_interp_l3_fisd(config, State, dict_obs, Model)
     
     elif config.OBSOP.super=='OBSOP_INTERP_L4':
         return Obsop_interp_l4(config, State, dict_obs, Model)
@@ -644,7 +647,91 @@ class Obsop_interp_l3(Obsop_interp):
 
         # Update adjoint variable
         adState.setvar(advar + adX.reshape(advar.shape), self.name_mod_var[self.name_var])  
-    
+
+
+class Obsop_interp_l3_fisd(Obsop_interp_l3):
+    """
+    L3 observation operator for an ice-freeboard / snow-depth state,
+    where the satellite obs (fbku, fbka) are linear combinations of the
+    model's fi (ice freeboard) and sd (snow depth):
+
+        y = fi + (1 - Sros * PR) * sd
+
+    with PR = PR_KU for the Ku-band (laser-like) obs, PR_KA for Ka-band.
+
+    Everything else (KDTree weights, caching, interpolation) is identical
+    to Obsop_interp_l3, since H is spatially-varying interpolation weights
+    that don't depend on which physical field is projected. Only the
+    "which state field(s) do we project" step changes, so this subclass
+    combines fi/sd into one field before calling the parent's misfit
+    machinery, and splits the adjoint back into fi/sd afterward.
+
+    Config: same as Obsop_interp_l3, plus a required 'PR_name' key naming
+    the attribute on Model to use as PR (e.g. 'PR_KU' or 'PR_KA').
+    """
+
+    def __init__(self, config, State, dict_obs, Model):
+
+        super().__init__(config, State, dict_obs, Model)
+
+        # ---- Which model variables build y, and with which coefficients ----
+        PR_name = getattr(config.OBSOP, 'PR_name', None)
+        if PR_name is None:
+            sys.exit(
+                f"Obsop_interp_l3_fisd requires config.OBSOP.PR_name "
+                f"('PR_KU' or 'PR_KA') to be set for obs '{self.name_var}'"
+            )
+        #PR = float(getattr(Model, PR_name))
+        #Sros = float(Model.Sros)
+
+        if hasattr(Model, 'Models'):
+            PR = float(getattr(Model.Models[0], PR_name))
+            Sros = float(Model.Models[0].Sros)
+        else : 
+            PR = float(getattr(Model, PR_name))
+            Sros = float(Model.Sros)
+
+        self.H_names = ['fi', 'sd']
+        self.H_coefs = [1.0, 1.0 - Sros * PR]
+        self.H_keys = [self.name_mod_var[n] for n in self.H_names]
+
+        self.name_H += f'_fisd_{PR_name}'
+
+    def _combine(self, var):
+        """X_combined = sum_k c_k * X_k, on the model grid (raveled)."""
+        Xc = 0.
+        for key, c in zip(self.H_keys, self.H_coefs):
+            Xc = Xc + c * var[key].ravel()
+        return Xc
+
+    def misfit(self, t, State):
+        X = self._combine(State.var)
+        return self._misfit_jit(t, X)
+
+    def misfit_jax(self, t, State_var):
+        X = self._combine(State_var)
+        return self._misfit_jit(t, X)
+
+    def scan_adj(self, t, adState_var, State_var, misfit):
+        """Pure-pytree L3 adjoint used inside ``lax.scan``, split over fi/sd."""
+        if self.varobs_arr.shape[0] == 0:
+            return adState_var
+        Xc = self._combine(State_var)
+        adXc = self._misfit_reduced_jit(t, misfit, Xc)
+        result = dict(adState_var)
+        for key, c in zip(self.H_keys, self.H_coefs):
+            result[key] = result[key] + c * adXc.reshape(result[key].shape)
+        return result
+
+    def adj(self, t, adState, State, misfit):
+        """Non-scan adjoint, split over fi/sd."""
+        Xc = self._combine(State.var)
+        adXc = self._misfit_reduced_jit(t, misfit, Xc)
+        for key, c in zip(self.H_keys, self.H_coefs):
+            advar = adState.var[key]
+            adState.setvar(advar + c * adXc.reshape(advar.shape), key)
+
+
 class Obsop_interp_l4(Obsop_interp):
 
     def __init__(self,config,State,dict_obs,Model):

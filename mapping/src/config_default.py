@@ -180,6 +180,61 @@ MOD_DIFF = dict(
     bc_c_grid = False,  # Whether BC grid is C-grid (True) or A-grid (False)
 )
 
+MOD_DIFF_MULTIVAR = dict(  
+
+    name_var = {'fbku': 'radar_freeboard', 'fbka': 'laser_freeboard', 'sd': 'snow_depth'},
+
+    name_init_var = {},
+    # no entry for 'sd' -> initialized to zeros by the base __init__, then
+    # immediately overwritten by _diagnose_sd() at the end of __init__/init()
+
+    dtmodel = 300,
+
+    Kdiffus = 0,       # 0 = identity for fbku/fbka; sd is never diffused directly, only diagnosed
+
+    SIC_mod = False,
+
+    init_from_bc = False,   # BC not wired up yet for this model
+
+    dist_sponge_bc = None,
+
+    # snow-depth relation constants
+    Sros  = 1,
+    PR_KU = 1,
+    PR_KA = 0
+
+)
+
+
+MOD_DIFF_FISD = dict(  
+
+    name_var = {'fi': 'ice_freeboard', 'sd': 'snow_depth'},
+
+    name_init_var = {},
+    # no entry for 'sd' -> initialized to zeros by the base __init__, then
+    # immediately overwritten by _diagnose_sd() at the end of __init__/init()
+
+    dtmodel = 300,
+
+    Kdiffus = 0,       # 0 = identity for fbku/fbka; sd is never diffused directly, only diagnosed
+
+    SIC_mod = False,
+
+    init_from_bc = False,   # BC not wired up yet for this model
+
+    dist_sponge_bc = None,
+
+    # snow-depth relation constants
+    Sros  = 1,
+    PR_KU = 1,
+    PR_KA = 0
+
+)
+
+
+
+
+
 MOD_drift_initflux = dict(
 
     name_var = {'SSH':"ssh"},
@@ -212,8 +267,143 @@ MOD_drift_initflux = dict(
 
     refreeze = 0, 
 
-    clip_flag = True
+    clip_flag = True,
+
+    bc_file = None,  # Path to NetCDF file containing boundary conditions
+
+    bc_files = None,  # Optional dict mapping model variable names to BC files or per-variable BC source dicts
+
+    bc_name_lon = 'lon',  # Name of longitude coordinate in BC file
+
+    bc_name_lat = 'lat',  # Name of latitude coordinate in BC file
+
+    bc_name_time = 'time',  # Name of time coordinate in BC file
+
+    bc_name_var = {},  # Dict mapping variable names to names in BC file
+
+    bc_c_grid = True,  # Whether BC grid is C-grid (True) or A-grid (False)
+
+    drift_offset = 48
+
 )
+
+
+MOD_drift_initflux_multivar = dict(
+
+    name_var = {'fbku': 'radar_freeboard', 'fbka': 'laser_freeboard', 'sd': 'snow_depth'},
+
+    name_params = [ ], # Unused now
+
+    var_to_save = None,
+
+    name_init_var = {},
+
+    file_drift = None,  # netcdf file(s) in whihch the boundary conditions fields are stored
+
+    name_var_drift = {'lon':'','lat':'','var':''},
+
+    cutoff_km = 0, # drift resolution cutoff in km (no cutoff if cutoff_km set to 0)
+
+    dtmodel = 300, # model timestep
+
+    Kdiffus = 0, # coefficient of diffusion. Set to 0 for Identity model
+
+    SIC_mod = False, # flag to activate variable limits [0,100] (i.e., for sea ice concentration)
+
+    init_from_bc = False,
+
+    dist_sponge_bc = None,  # distance (in km) for which boundary fields are spatially spread close to the borders
+
+    scheme = 'upwind', 
+
+    smoothuv = 0,
+
+    refreeze = 0, 
+
+    clip_flag = True,
+
+    bc_file = None,  # Path to NetCDF file containing boundary conditions
+
+    bc_files = None,  # Optional dict mapping model variable names to BC files or per-variable BC source dicts
+
+    bc_name_lon = 'lon',  # Name of longitude coordinate in BC file
+
+    bc_name_lat = 'lat',  # Name of latitude coordinate in BC file
+
+    bc_name_time = 'time',  # Name of time coordinate in BC file
+
+    bc_name_var = {},  # Dict mapping variable names to names in BC file
+
+    bc_c_grid = True,  # Whether BC grid is C-grid (True) or A-grid (False)
+    
+    # snow-depth relation constants
+    Sros  = 1,
+    PR_KU = 1,
+    PR_KA = 0,
+
+    drift_offset=48
+
+)
+
+
+MOD_drift_initflux_fisd = dict(
+
+    name_var = {'fi': 'ice_freeboard', 'sd': 'snow_depth'},
+
+    name_params = [ ], # Unused now
+
+    var_to_save = None,
+
+    name_init_var = {},
+
+    file_drift = None,  # netcdf file(s) in whihch the boundary conditions fields are stored
+
+    name_var_drift = {'lon':'','lat':'','var':''},
+
+    cutoff_km = 0, # drift resolution cutoff in km (no cutoff if cutoff_km set to 0)
+
+    dtmodel = 300, # model timestep
+
+    Kdiffus = 0, # coefficient of diffusion. Set to 0 for Identity model
+
+    SIC_mod = False, # flag to activate variable limits [0,100] (i.e., for sea ice concentration)
+
+    init_from_bc = False,
+
+    dist_sponge_bc = None,  # distance (in km) for which boundary fields are spatially spread close to the borders
+
+    scheme = 'upwind', 
+
+    smoothuv = 0,
+
+    refreeze = 0, 
+
+    clip_flag = True,
+
+    bc_file = None,  # Path to NetCDF file containing boundary conditions
+
+    bc_files = None,  # Optional dict mapping model variable names to BC files or per-variable BC source dicts
+
+    bc_name_lon = 'lon',  # Name of longitude coordinate in BC file
+
+    bc_name_lat = 'lat',  # Name of latitude coordinate in BC file
+
+    bc_name_time = 'time',  # Name of time coordinate in BC file
+
+    bc_name_var = {},  # Dict mapping variable names to names in BC file
+
+    bc_c_grid = True,  # Whether BC grid is C-grid (True) or A-grid (False)
+    
+    # snow-depth relation constants
+    Sros  = 1,
+    PR_KU = 1,
+    PR_KA = 0,
+
+    drift_offset=48
+
+)
+
+
 
 # 1.5-layer Quasi-Geostrophic models
 MOD_QG1L = dict(
@@ -801,6 +991,28 @@ OBSOP_INTERP_L3 = dict(
 
 )
 
+
+OBSOP_INTERP_L3_FISD = dict(
+
+    name_obs = None, # List of observation class names. If None, all observation will be considered. 
+
+    name_var = 'SSH',
+
+    write_op = False, # Write operator data to *path_save*
+
+    path_save = None, # Directory where to save observational operator
+
+    compute_op = True, # Force computing H 
+
+    Npix = 4, # Number of pixels to perform projection y=Hx
+
+    mask_borders = False,
+
+    PR_name = None
+
+)
+ 
+
 OBSOP_INTERP_L4 = dict(
 
     name_obs = None, # List of observation class names. If None, all observation will be considered. 
@@ -913,6 +1125,60 @@ BASIS_GAUSS3D = dict(
 
 ) 
 
+BASIS_GAUSSV2 = dict( 
+
+    name_mod_var = None, # Name of the related model variable 
+    
+    flux = False, # Whether making a component signature in space appear/disappear in time. For dynamical mapping, use flux=False
+
+    facns = 1., #factor for wavelet spacing in space
+
+    facnlt = 2., #factor for wavelet spacing in time
+
+    npsp = 3.5, # Defines the wavelet shape
+
+    facpsp = 1.5, # factor to fix df between wavelets
+
+    lmin = 80, # minimal wavelength (in km)
+
+    lmax = 970., # maximal wavelength (in km)
+
+    lmeso = 300, # Largest mesoscale wavelenght 
+
+    tmeso = 20, # Largest mesoscale time of decorrelation 
+
+    sloptdec = -1.28, # Slope such as tdec = lambda^slope where lamda is the wavelength
+
+    factdec = 0.5, # factor to be multiplied to the computed time of decorrelation 
+
+    tdecmin = 2.5, # minimum time of decorrelation 
+
+    tdecmax = 40., # maximum time of decorrelation 
+
+    facQ = 1, # factor to be multiplied to the estimated Q
+
+    Qmax = 1e-3, # Maximim Q, such as lambda>lmax => Q=Qmax where lamda is the wavelength
+
+    slopQ = -5, # Slope such as Q = lambda^slope where lamda is the wavelength,
+
+    file_depth = None, # Name of netcdf file for ocean depth field. If prescribed, wavelet components will be attenuated for small depth considering arguments depth1 & depth2
+
+    name_var_depth = {'lon':'', 'lat':'', 'var':''}, # Name of longitude,latitude and variable of depth netcdf file
+
+    l_largescale = 1500, # factor to be multiplied to the estimated Q
+
+    facQ_largescale = 1, # factor to be multiplied to the estimated Q
+
+    depth1 = 0.,
+
+    depth2 = 30.,
+
+    path_background = None, # path netcdf file of a basis vector (e.g. coming from a previous run) to use as background
+
+    var_background = None # name of the variable of the basis vector
+
+)
+
 # Balanced Motions with auxilliary data 
 BASIS_BMaux = dict(
 
@@ -976,6 +1242,135 @@ BASIS_BMaux = dict(
 
 )
 
+# Balanced Motions 
+BASIS_BM = dict(
+
+    name_mod_var = None, # Name of the related model variable 
+    
+    flux = False, # Whether making a component signature in space appear/disappear in time. For dynamical mapping, use flux=False
+
+    facns = 1., #factor for wavelet spacing in space
+
+    facnlt = 2., #factor for wavelet spacing in time
+
+    npsp = 3.5, # Defines the wavelet shape
+
+    facpsp = 1.5, # factor to fix df between wavelets
+
+    lmin = 80, # minimal wavelength (in km)
+
+    lmax = 970., # maximal wavelength (in km)
+
+    lmeso = 300, # Largest mesoscale wavelenght 
+
+    tmeso = 20, # Largest mesoscale time of decorrelation 
+
+    sloptdec = -1.28, # Slope such as tdec = lambda^slope where lamda is the wavelength
+
+    factdec = 0.5, # factor to be multiplied to the computed time of decorrelation 
+
+    tdecmin = 2.5, # minimum time of decorrelation 
+
+    tdecmax = 40., # maximum time of decorrelation 
+
+    facQ = 1, # factor to be multiplied to the estimated Q
+
+    Qmax = 1e-3, # Maximim Q, such as lambda>lmax => Q=Qmax where lamda is the wavelength
+
+    slopQ = -5, # Slope such as Q = lambda^slope where lamda is the wavelength,
+
+    norm_time = True, # Whether to normalize the time component of the basis vectors (set True for dynamical forcings)
+
+    file_depth = None, # Name of netcdf file for ocean depth field. If prescribed, wavelet components will be attenuated for small depth considering arguments depth1 & depth2
+
+    name_var_depth = {'lon':'', 'lat':'', 'var':''}, # Name of longitude,latitude and variable of depth netcdf file
+
+    depth1 = 0.,
+
+    depth2 = 30.,
+
+    l_largescale = 1500, # factor to be multiplied to the estimated Q
+
+    facQ_largescale = 1, # factor to be multiplied to the estimated Q
+
+    path_background = None, # path netcdf file of a basis vector (e.g. coming from a previous run) to use as background
+
+    var_background = None, # name of the variable of the basis vector
+
+    lon_min_bm = None,
+
+    lon_max_bm = None,
+
+    lat_min_bm = None,
+
+    lat_max_bm = None,
+
+    window_type = None
+
+)
+
+
+BASIS_BM_JAX = dict(
+
+    name_mod_var = None, # Name of the related model variable 
+    
+    flux = False, # Whether making a component signature in space appear/disappear in time. For dynamical mapping, use flux=False
+
+    facns = 1., #factor for wavelet spacing in space
+
+    facnlt = 2., #factor for wavelet spacing in time
+
+    npsp = 3.5, # Defines the wavelet shape
+
+    facpsp = 1.5, # factor to fix df between wavelets
+
+    lmin = 80, # minimal wavelength (in km)
+
+    lmax = 970., # maximal wavelength (in km)
+
+    lmeso = 300, # Largest mesoscale wavelenght 
+
+    tmeso = 20, # Largest mesoscale time of decorrelation 
+
+    sloptdec = -1.28, # Slope such as tdec = lambda^slope where lamda is the wavelength
+
+    factdec = 0.5, # factor to be multiplied to the computed time of decorrelation 
+
+    tdecmin = 2.5, # minimum time of decorrelation 
+
+    tdecmax = 40., # maximum time of decorrelation 
+
+    facQ = 1, # factor to be multiplied to the estimated Q
+
+    Qmax = 1e-3, # Maximim Q, such as lambda>lmax => Q=Qmax where lamda is the wavelength
+
+    slopQ = -5, # Slope such as Q = lambda^slope where lamda is the wavelength,
+
+    norm_time = True, # Whether to normalize the time component of the basis vectors (set True for dynamical forcings)
+
+    file_depth = None, # Name of netcdf file for ocean depth field. If prescribed, wavelet components will be attenuated for small depth considering arguments depth1 & depth2
+
+    name_var_depth = {'lon':'', 'lat':'', 'var':''}, # Name of longitude,latitude and variable of depth netcdf file
+
+    depth1 = 0.,
+
+    depth2 = 30.,
+
+    path_background = None, # path netcdf file of a basis vector (e.g. coming from a previous run) to use as background
+
+    var_background = None, # name of the variable of the basis vector
+
+    lon_min_bm = None,
+
+    lon_max_bm = None,
+
+    lat_min_bm = None,
+
+    lat_max_bm = None,
+
+    window_type = None
+
+)
 
 # Wavelet 3D
 BASIS_WAVELET3D = dict(
@@ -1111,12 +1506,6 @@ INV_4DVAR = dict(
     path_background = None, # Path of a control vector from another experiment to use as the background 
 
     anomaly_from_bc = False, # Whether to perform the minimization with anomalies from boundary condition field(s)
-
-    minimizer = 'scipy',
-
-    jit_cost_and_grad = False, # Compile one complete forward/misfit/adjoint cost-gradient evaluation on GPU.
-
-    cost_and_grad_schedule = 'scan', # Roll monthly forward/adjoint checkpoint loops with lax.scan; use 'python' for the previous formulation.
  
  
 )
