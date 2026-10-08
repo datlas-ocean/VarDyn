@@ -342,15 +342,6 @@ if [ -n "$PREDECESSOR_JOB" ]; then
     done
     echo "$(date '+%F %T') | Predecessor array ${PREDECESSOR_JOB} is no longer active"
 fi
-if [ -n "$RESTART" ] && [ -f "$FINAL_MARKER" ]; then
-    rm -f "$FINAL_MARKER"
-    echo "$(date '+%F %T') | Removed stale completion marker for explicit restart"
-fi
-if [ -f "$FINAL_MARKER" ] && ! $FORCE_MERGE && ! $MERGE_ONLY; then
-    echo "$(date '+%F %T') | Experiment already complete; exiting late array task"
-    exit 0
-fi
-
 # Waits are bounded in elapsed time, including scheduler query time.
 wait_for_marker() {
     local marker="$1" failed="$2" lock="$3"
@@ -448,6 +439,37 @@ claim_stage() {
     mkdir "$1" 2>/dev/null || return 1
     printf '%s\n' "${JOB_ID}_${ARRAY_ID}" > "$1/owner" || die "Cannot record stage owner: $1"
 }
+
+# Invalidate products once per generation, before releasing any workers.
+# Persistent requests survive wall-time continuations, which do not repeat
+# the CLI restart/force flags and must retain already completed tile work.
+initialize_run_state() {
+    if claim_stage "${BARRIER_DIR}/initialize.lock"; then
+        if [ -n "$RESTART" ] || $FORCE_MERGE; then
+            rm -f "$FINAL_MARKER" || return 1
+            local window
+            while IFS= read -r -d '' window; do
+                touch "$window/.window_rebuild_${TILE_SCOPE}.required" || return 1
+                rm -f "$window/.window_complete_${TILE_SCOPE}.ok" \
+                    "$window/.window_complete_all.ok" || return 1
+                if [ -n "$RESTART" ]; then
+                    touch "$window/.window_restart_${TILE_SCOPE}.required" || return 1
+                    rm -f "$window/.window_restart_${TILE_SCOPE}.prepared" || return 1
+                fi
+            done < <(find "$BASE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'subwindow_*' -print0)
+        fi
+        touch "${BARRIER_DIR}/initialized" || return 1
+    else
+        wait_for_marker "${BARRIER_DIR}/initialized" "${BARRIER_DIR}/run.failed" \
+            "${BARRIER_DIR}/initialize.lock" || return 1
+    fi
+}
+
+initialize_run_state || exit 1
+if [ -f "$FINAL_MARKER" ] && ! $MERGE_ONLY; then
+    echo "$(date '+%F %T') | Experiment already complete; exiting late array task"
+    exit 0
+fi
 
 # -------------------- PREPARE SUBWINDOWS (one atomic owner) --------------------
 # Pickles alone are not sufficient for a continuation: scratch directories
@@ -583,26 +605,6 @@ release_tile_claim() {
     rmdir "$lock_dir" 2>/dev/null || true
 }
 
-tile_is_owned_by_task() {
-    local tile_index="$1"
-    (( tile_index % NUM_ARRAY == ARRAY_ID ))
-}
-
-# Only an explicit PENDING state authorizes borrowing another task's shard.
-# Refresh once per dispatch pass, not per tile, to limit scheduler traffic.
-# A task may start after this snapshot: tile locks still arbitrate ownership.
-pending_array_tasks() {
-    local listing task_id state
-    listing=$(_slurm_query -r -h -j "$JOB_ID" -o '%i %T') || return 0
-    while read -r task_id state; do
-        if [[ "$task_id" == "${JOB_ID}_"* && "$state" == PENDING ]]; then
-            local rank="${task_id#${JOB_ID}_}"
-            [[ "$rank" =~ ^[0-9]+$ ]] && printf '%s\n' "$rank"
-        fi
-    done <<< "$listing"
-    return 0
-}
-
 report_incomplete_tiles() {
     local tile_list="$1"
     local tile owner token
@@ -619,8 +621,7 @@ report_incomplete_tiles() {
     done < "$tile_list"
 }
 
-# Inspect completed work across every deterministic shard rather than
-# inferring completion from the number of running array elements.
+# Inspect the entire shared queue, regardless of the number of running tasks.
 window_tile_state() {
     local tile_list="$1"
     WINDOW_TILES_MISSING=0
@@ -635,17 +636,17 @@ window_tile_state() {
 }
 
 incomplete_owners_are_active() {
-    local tile index=0 owner checked=" "
+    local tile owner checked=" "
+    WINDOW_ACTIVE_CLAIMS=0
     while IFS= read -r tile; do
         [ -z "$tile" ] && continue
-        owner="${JOB_ID}_$((index % NUM_ARRAY))"
-        index=$((index + 1))
         [ -f "$tile/.tile_complete.ok" ] && continue
-        # A borrowed tile belongs to its actual claimant, not its pending rank.
-        if [ -d "$tile/.tile_running.lock" ]; then
-            owner=$(cat "$tile/.tile_running.lock/job_id" 2>/dev/null) || continue
-            [ -n "$owner" ] || continue
-        fi
+        # Unclaimed work has no assigned owner: any GPU may take it on the
+        # next pass. Only an actual claim authorizes checking owner health.
+        [ -d "$tile/.tile_running.lock" ] || continue
+        owner=$(cat "$tile/.tile_running.lock/job_id" 2>/dev/null) || continue
+        [ -n "$owner" ] || continue
+        WINDOW_ACTIVE_CLAIMS=$((WINDOW_ACTIVE_CLAIMS + 1))
         [[ "$checked" == *" $owner "* ]] && continue
         if ! slurm_task_is_active "$owner"; then
             [ -f "$tile/.tile_complete.ok" ] && continue
@@ -690,7 +691,7 @@ run_single_tile() {
         return 1
     fi
     rm -f "${TILE}/.tile_failed"
-    OMP_NUM_THREADS=1 setsid timeout --kill-after=10 "$TILE_TIMEOUT" python "${SRC_DIR}/run_tile.py" "$TILE" $RESTART >> "$TILE_LOG" 2>&1 &
+    OMP_NUM_THREADS=1 setsid timeout --kill-after=10 "$TILE_TIMEOUT" python "${SRC_DIR}/run_tile.py" "$TILE" ${WINDOW_RESTART:-$RESTART} >> "$TILE_LOG" 2>&1 &
     child_pid=$!
     wait "$child_pid"
     local status=$?
@@ -730,56 +731,34 @@ process_available_tiles() {
     local iw="$2"
     local tile
     local claim_token
-    local tile_index=0 owner_rank dispatch_mode
-    local pending_ranks=" "
     ACTIVE_TILE_PIDS=()
     local pass_status=0
     TILES_PROCESSED_IN_PASS=0
 
-    # Prefer our own shard, then help owners still pending in Slurm.
-    for dispatch_mode in own pending; do
-        tile_index=0
-        if [ "$dispatch_mode" = pending ]; then
-            pending_ranks=" $(pending_array_tasks | tr '\n' ' ') "
+    # Every GPU scans the same queue. Claim only when a local slot is free,
+    # so queued work remains available to peers even if they are RUNNING.
+    # Atomic tile claims arbitrate concurrent tasks and job generations.
+    while IFS= read -r tile; do
+        [ -z "$tile" ] && continue
+        [ -f "${tile}/.tile_complete.ok" ] && continue
+        if ! wait_tile_workers "$((NUM_TILES_PER_GPU - 1))"; then
+            pass_status=1
+            break
         fi
-        while IFS= read -r tile; do
-            [ -z "$tile" ] && continue
 
-            if [ -f "${BARRIER_DIR}/run.failed" ]; then pass_status=1; break; fi
-            owner_rank=$((tile_index % NUM_ARRAY))
-            tile_index=$((tile_index + 1))
-            if [ "$dispatch_mode" = own ]; then
-                tile_is_owned_by_task "$((tile_index - 1))" || continue
-            else
-                (( owner_rank != ARRAY_ID )) || continue
-                [[ "$pending_ranks" == *" $owner_rank "* ]] || continue
-            fi
-
-            # A previous pass or job generation may already have completed it.
-            [ -f "${tile}/.tile_complete.ok" ] && continue
-
-            claim_token=$(try_claim_tile "$tile") || continue
-            # Another worker may have finished between our first check and mkdir.
-            # Recheck under the claim before launching, including late owners.
-            if [ -f "${tile}/.tile_complete.ok" ]; then
-                release_tile_claim "$tile" "$claim_token"
-                continue
-            fi
-            if [ "$dispatch_mode" = pending ]; then
-                echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Borrowing tile ${tile} from pending task ${JOB_ID}_${owner_rank}"
-            fi
-            run_single_tile "$tile" "$iw" "$claim_token" &
-            ACTIVE_TILE_PIDS+=("$!")
-            TILES_PROCESSED_IN_PASS=$((TILES_PROCESSED_IN_PASS + 1))
-            echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Active tiles: ${#ACTIVE_TILE_PIDS[@]}/${NUM_TILES_PER_GPU}"
-
-            if ! wait_tile_workers "$((NUM_TILES_PER_GPU - 1))"; then
-                pass_status=1
-                break
-            fi
-        done < "$tile_list"
-        (( pass_status == 0 )) || break
-    done
+        # A peer may have completed this tile while we waited for capacity.
+        [ -f "${tile}/.tile_complete.ok" ] && continue
+        claim_token=$(try_claim_tile "$tile") || continue
+        # Recheck under the claim before launching, including late owners.
+        if [ -f "${tile}/.tile_complete.ok" ]; then
+            release_tile_claim "$tile" "$claim_token"
+            continue
+        fi
+        run_single_tile "$tile" "$iw" "$claim_token" &
+        ACTIVE_TILE_PIDS+=("$!")
+        TILES_PROCESSED_IN_PASS=$((TILES_PROCESSED_IN_PASS + 1))
+        echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Active tiles: ${#ACTIVE_TILE_PIDS[@]}/${NUM_TILES_PER_GPU}"
+    done < "$tile_list"
 
     if (( pass_status == 0 )); then
         wait_tile_workers 0 || pass_status=1
@@ -835,9 +814,16 @@ IW=0
 
 for TIME_DIR in "${TIME_WINDOWS[@]}"; do
     DURABLE_WINDOW_MARKER="${TIME_DIR}/.window_complete_${TILE_SCOPE}.ok"
+    REBUILD_REQUEST="${TIME_DIR}/.window_rebuild_${TILE_SCOPE}.required"
+    RESTART_REQUEST="${TIME_DIR}/.window_restart_${TILE_SCOPE}.required"
+    RESTART_PREPARED="${TIME_DIR}/.window_restart_${TILE_SCOPE}.prepared"
+    WINDOW_RESTART=""
+    if [ -n "$RESTART" ] || [ -f "$RESTART_REQUEST" ]; then WINDOW_RESTART=--restart; fi
+    WINDOW_FORCE_ARGS=("${FORCE_ARGS[@]}")
+    if [ -n "$WINDOW_RESTART" ] || [ -f "$REBUILD_REQUEST" ]; then WINDOW_FORCE_ARGS=(--force); fi
     echo "$(date '+%F %T') | GPU ${ARRAY_ID} | Time window ${IW}: $TIME_DIR"
 
-    if [ -z "$RESTART" ] && ! $FORCE_MERGE && [ -f "$DURABLE_WINDOW_MARKER" ]; then
+    if [ -f "$DURABLE_WINDOW_MARKER" ] && [ ! -f "$REBUILD_REQUEST" ]; then
         echo "$(date '+%F %T') | Time window ${IW} already complete; skipping assimilation and spatial merge"
         IW=$((IW + 1))
         continue
@@ -846,6 +832,11 @@ for TIME_DIR in "${TIME_WINDOWS[@]}"; do
     # One actually-running task publishes the tile list atomically.
     TILE_LIST="${BARRIER_DIR}/tiles_iw${IW}"
     if claim_stage "${BARRIER_DIR}/queue_iw${IW}.lock"; then
+        if [ -n "$WINDOW_RESTART" ]; then
+            touch "$RESTART_REQUEST" "$REBUILD_REQUEST" || exit 1
+        elif $FORCE_MERGE; then
+            touch "$REBUILD_REQUEST" || exit 1
+        fi
         if [ "$TILE_SCOPE" = "equatorial" ]; then
             if ! python3 - "$TIME_DIR" > "${TILE_LIST}.tmp" <<'PY_TILE_SCOPE'
 import os
@@ -889,9 +880,12 @@ PY_TILE_SCOPE
         # this generation's workers; successful tiles remain resumable.
         while IFS= read -r tile; do
             [ -z "$tile" ] && continue
-            [ -n "$RESTART" ] && rm -f "${tile}/.tile_complete.ok"
+            if [ -n "$WINDOW_RESTART" ] && [ ! -f "$RESTART_PREPARED" ]; then
+                rm -f "${tile}/.tile_complete.ok" || exit 1
+            fi
             rm -f "${tile}/.tile_failed"
         done < "$TILE_LIST"
+        [ -z "$WINDOW_RESTART" ] || touch "$RESTART_PREPARED" || exit 1
         touch "${BARRIER_DIR}/queue_ready_iw${IW}"
     fi
     wait_for_marker "${BARRIER_DIR}/queue_ready_iw${IW}" "${BARRIER_DIR}/queue_failed_iw${IW}" "${BARRIER_DIR}/queue_iw${IW}.lock" || exit 1
@@ -900,8 +894,8 @@ PY_TILE_SCOPE
         exit 1
     fi
 
-    # Prefer each task's shard and borrow pending owners' tiles. Atomic claims
-    # protect concurrent borrowers, late owners and overlapping generations.
+    # All active GPUs consume the shared queue. Atomic claims protect
+    # concurrent workers, late starters and overlapping generations.
     if ! $MERGE_ONLY; then
         tiles_done=0
         window_started=$SECONDS
@@ -917,16 +911,19 @@ PY_TILE_SCOPE
             fi
             [ "$WINDOW_TILES_MISSING" -eq 0 ] && break
 
+            incomplete_owners_are_active "$TILE_LIST" || exit 1
             if [ "$WINDOW_TILES_MISSING" -ne "$previous_missing" ]; then
                 window_started=$SECONDS
                 previous_missing=$WINDOW_TILES_MISSING
             fi
+            # A healthy remote tile can exceed BARRIER_TIMEOUT. Its runtime
+            # is bounded by TILE_TIMEOUT in the owning launcher instead.
+            if (( WINDOW_ACTIVE_CLAIMS > 0 )); then window_started=$SECONDS; fi
             if (( SECONDS - window_started >= BARRIER_TIMEOUT )); then
-                echo "$(date '+%F %T') | Window timed out without completion progress: ${WINDOW_TILES_MISSING} tile(s) incomplete after scanning own and pending shards" >&2
+                echo "$(date '+%F %T') | Window timed out without completion progress: ${WINDOW_TILES_MISSING} tile(s) incomplete after scanning shared queue" >&2
                 report_incomplete_tiles "$TILE_LIST"
                 exit 1
             fi
-            incomplete_owners_are_active "$TILE_LIST" || exit 1
             sleep 10
 
         done
@@ -937,7 +934,7 @@ PY_TILE_SCOPE
 
     MERGE_MARKER="${BARRIER_DIR}/spatial_merge_iw${IW}.ok"
     MERGE_FAILED="${BARRIER_DIR}/spatial_merge_iw${IW}.failed"
-    WINDOW_ARGS=(--iw_start "$IW" --iw_end "$((IW + 1))" "${FORCE_ARGS[@]}")
+    WINDOW_ARGS=(--iw_start "$IW" --iw_end "$((IW + 1))" "${WINDOW_FORCE_ARGS[@]}")
     MERGE_LOCK="${BARRIER_DIR}/merge_iw${IW}.lock"
     FINALIZE_ARGS=(--rank 0 --world 1)
     if $ZARR_OUTPUT; then
@@ -961,6 +958,7 @@ PY_TILE_SCOPE
     else
         wait_for_marker "$MERGE_MARKER" "$MERGE_FAILED" "$MERGE_LOCK" || exit 1
     fi
+    rm -f "$REBUILD_REQUEST" "$RESTART_REQUEST" "$RESTART_PREPARED" || exit 1
     ((IW++))
 done
 

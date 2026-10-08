@@ -8,7 +8,7 @@ Large-scale SSH mapping with MASSH (e.g. global VarDyn runs) is parallelised ove
 - **Space** — the domain is split into overlapping spatial tiles
 - **Time** — the time period is split into overlapping time windows
 
-Each running SLURM array task (one GPU) first processes its deterministic shard of the sorted tile list, then claims unfinished tiles assigned to tasks reported as PENDING by Slurm. Atomic tile locks protect against concurrent borrowers and owners that start late. For Zarr output, spatial-merge date shards are also dynamically claimed: each active task uses its own CPU allocation to create an independent rank archive. One task then assembles the validated rank archives into the single archive for that temporal window. Finally, one task merges all temporal windows into the full output.
+Each running SLURM array task (one GPU) consumes the same sorted queue of unfinished tiles. Whenever a local worker slot becomes free, it claims the next available tile, up to `NUM_TILES_PER_GPU` concurrent workers. Tiles are not reserved for array ranks, so free GPUs can take work while other tasks are still running or have not started. Atomic tile locks protect against concurrent consumers, late starters and overlapping job generations. For Zarr output, spatial-merge date shards are also dynamically claimed: each active task uses its own CPU allocation to create an independent rank archive. One task then assembles the validated rank archives into the single archive for that temporal window. Finally, one task merges all temporal windows into the full output.
 
 ```
 sbatch slurm/run/VarDyn_GLO.sh [--skip-prepare] [--restart] [--force-merge] [--tile-scope all|equatorial] [--name_exp <name>]
@@ -35,7 +35,7 @@ prepare_VarDyn.py (one dynamic owner)
                  │
                  ▼
 for each temporal window:
-  assimilation-tile shards + borrowing from pending tasks
+  shared assimilation-tile queue (all active GPUs)
                  │
                  ▼
   dynamic spatial-merge rank queue
@@ -71,7 +71,7 @@ Reusable SLURM launcher. Supply experiment settings with `--config path/to/confi
 | `TIME_WIN`, `TIME_OVERLAP` | Temporal window size and overlap (days) |
 | `FLAG_INIT` / `FLAG_BACKGROUND` / `NAME_EXP` | Initialise from / use background from a previous experiment |
 | `NAME_EXP_BACKGROUND` | Source experiment for the inversion background; alternatively pass `--name_exp_background` |
-| `BARRIER_TIMEOUT` | Maximum barrier wait or interval without tile completion progress, in seconds (default: 7200) |
+| `BARRIER_TIMEOUT` | Maximum stage-barrier wait or assimilation wait without progress or an active tile claim, in seconds (default: 7200) |
 | `TILE_TIMEOUT` | Maximum runtime of one tile in seconds (default: 172800); timeout stops its process group |
 | `STAGE_TIMEOUT` | Maximum runtime of one preparation/merge command in seconds (default: 172800) |
 | `ZARR_OUTPUT` | If this shell option or `EXP.saveoutputs_zarr` is `true`, store each merged temporal window in one Zarr archive and the final experiment in one global Zarr archive |
@@ -86,7 +86,7 @@ Reusable SLURM launcher. Supply experiment settings with `--config path/to/confi
 | Flag | Effect |
 |---|---|
 | `--skip-prepare` | Skip `prepare_VarDyn.py` if pickles already exist |
-| `--restart` | Pass `--restart` to `run_tile.py` (resume from checkpoint) |
+| `--restart` | Restart selected tiles from checkpoints and rebuild their spatial and temporal merges |
 | `--force-merge` | Force re-merge even if output files already exist |
 | `--merge-only` | Skip preparation and assimilation, only run spatial and time-window merges |
 | `--tile-scope all\|equatorial` | Restrict assimilation dispatch to all tiles (default) or only tiles crossing latitude 0; spatial and temporal merges still use every tile output |
@@ -112,17 +112,19 @@ fallback source name when background mode is enabled without
 - Barrier directory creation is retried up to five times with backoff.
 - Preparation, queue publication, merge parts, finalization and final merge
   waits stop on a shared failure, a confirmed dead owner, or `BARRIER_TIMEOUT`.
-- Assimilation waits reset their deadline only when the number of incomplete
-  tiles changes. Active workers borrow unlocked tiles from pending owners,
-  using one scheduler snapshot per dispatch pass. Running or unknown owners
-  are not selected for borrowing; failed queries disable borrowing for that
-  pass. Completed tiles are checked again after acquiring their lock, so a
-  late owner cannot repeat work completed by a borrower. Set `BARRIER_TIMEOUT`
-  above the expected gap between tile completions.
+- Assimilation waits reset their deadline when the number of incomplete
+  tiles changes or an incomplete tile has an active claimant. Healthy remote
+  tiles are bounded by `TILE_TIMEOUT`, even when they take longer than
+  `BARRIER_TIMEOUT`. All workers consume the shared queue without querying Slurm
+  to assign unlocked tiles. A GPU waits for a free slot before claiming work,
+  leaving queued tiles available to peers. Completed tiles are checked again
+  after acquiring their lock, so a late starter cannot repeat completed work.
+  Unclaimed work without progress remains bounded by `BARRIER_TIMEOUT`.
 - Slurm queries have a 30-second timeout (plus 5 seconds to force termination).
   A failed targeted query falls back to the full active-task listing, including
   for `--predecessor-job`. Unknown ownership never authorizes stealing a lock.
-  Incomplete borrowed tiles are monitored through their actual lock owner.
+  Incomplete claimed tiles are monitored through their actual lock owner;
+  unclaimed tiles have no assigned owner.
 - Stale tile leases are moved with `mv -T` to a nonempty, retained
   `.tile_running.lock.stale-<old-token>` directory. This prevents competing
   reclaimers from moving a newly acquired lease. Keep these small diagnostic
@@ -136,9 +138,12 @@ fallback source name when background mode is enabled without
   workers are released. Barriers are retained for diagnostics after completion.
 - Deterministic failures do not submit automatic continuations. The Slurm
   wall-time warning still submits a dependent continuation.
-- `--force-merge` applies to the submitted run only and is not propagated to
-  automatic continuations. Experiment and background-name CLI overrides are
-  carried forward; failed submissions can be retried.
+- Restart and forced-merge requests invalidate completion markers once per
+  generation, before workers start. Persistent per-window requests carry
+  unfinished work into automatic continuations without repeating completed
+  tiles. Spatial products are forcibly rebuilt after a restart. Requests are
+  cleared after successful spatial publication. Experiment and background-name
+  CLI overrides are carried forward; failed submissions can be retried.
 - Merge arguments are initialized before scanning windows, including when
   every spatial window is already complete. Paths are passed as Bash array
   arguments. Durable markers must be published successfully before a stage
@@ -157,7 +162,8 @@ exits and are reclaimed only after their owning array is no longer active.
 After spatial merging succeeds, each time window receives a durable
 `.window_complete_<scope>.ok` marker. Normal continuation runs skip these
 windows before launching tile or merge subprocesses. Explicit `--restart` and
-`--force-merge` runs bypass the marker.
+`--force-merge` runs invalidate the markers once; late tasks cannot invalidate
+newly completed products from their own generation.
 
 ### `prepare_VarDyn.py`
 

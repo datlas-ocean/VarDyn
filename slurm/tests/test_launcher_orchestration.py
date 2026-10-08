@@ -14,12 +14,13 @@ LAUNCHER = REPOSITORY / "slurm" / "run" / "VarDyn_GLO.sh"
 def _tile_lock_functions() -> str:
     launcher = LAUNCHER.read_text(encoding="utf-8")
     names = ("_slurm_query", "slurm_task_is_active", "try_claim_tile",
-             "release_tile_claim", "tile_is_owned_by_task", "report_incomplete_tiles",
+             "release_tile_claim", "report_incomplete_tiles",
              "wait_for_marker", "stop_process_group", "run_stage", "wait_tile_workers",
              "stop_tile_workers", "run_single_tile",
-             "process_available_tiles", "pending_array_tasks", "wait_for_spatial_merge_parts",
+             "process_available_tiles", "wait_for_spatial_merge_parts",
              "init_merge_args", "merge_outputs", "publish_marker", "claim_stage",
-             "finish_merge_stage", "submit_continuation", "incomplete_owners_are_active")
+             "finish_merge_stage", "submit_continuation", "incomplete_owners_are_active",
+             "initialize_run_state", "window_tile_state")
     return "\n".join(re.search(
         rf"^{name}\(\) \{{.*?^\}}", launcher, re.M | re.S).group()
         for name in names)
@@ -120,30 +121,10 @@ test ! -d "$tile/.tile_running.lock"
     assert result.returncode == 0, result.stderr
 
 
-def test_deterministic_tile_shards_are_disjoint_and_complete(tmp_path):
-    result = _run_lock_scenario(
-        tmp_path,
-        """
-NUM_ARRAY=6
-for tile_index in $(seq 0 135); do
-    owners=0
-    for ARRAY_ID in $(seq 0 $((NUM_ARRAY - 1))); do
-        if tile_is_owned_by_task "$tile_index"; then
-            owners=$((owners + 1))
-        fi
-    done
-    test "$owners" -eq 1 || exit 1
-done
-""",
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_launcher_has_resume_and_predecessor_guards():
     launcher = LAUNCHER.read_text(encoding="utf-8")
     assert '--predecessor-job "${dependency}"' in launcher
     assert '[ -f "${tile}/.tile_complete.ok" ] && continue' in launcher
-    assert 'tile_is_owned_by_task "$((tile_index - 1))"' in launcher
     assert '.window_complete_${TILE_SCOPE}.ok' in launcher
 
 
@@ -382,21 +363,7 @@ assert not (root / "outputs").exists()
     assert result.returncode == 0, result.stderr
 
 
-def test_pending_snapshot_excludes_running_unknown_and_failed_queries(tmp_path):
-    result = _run_lock_scenario(tmp_path, r'''
-JOB_ID=404
-_slurm_query() {
-    printf '%s\n' '404_1 PENDING' '404_2 RUNNING' '404_3 CONFIGURING' \
-        '404_4 UNKNOWN' '405_5 PENDING' '404_[6-9] PENDING'
-}
-test "$(pending_array_tasks)" = 1 || exit 1
-_slurm_query() { printf '%s\n' '404_1 PENDING'; return 1; }
-test -z "$(pending_array_tasks)" || exit 2
-''')
-    assert result.returncode == 0, result.stderr
-
-
-def test_pending_sixth_task_shard_finishes_without_owner(tmp_path):
+def test_shared_queue_finishes_work_without_other_tasks(tmp_path):
     result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
 NUM_ARRAY=6
 NUM_TILES_PER_GPU=4
@@ -405,10 +372,10 @@ for i in $(seq 0 135); do
     tile="$BARRIER_DIR/work$i"
     mkdir "$tile"
     printf '%s\n' "$tile" >> "$BARRIER_DIR/tiles"
-    # Ranks 1-4 have completed; rank 0 must finish its own and rank 5's work.
+    # Resume a partial window: the sole consumer finishes all remaining work.
     if (( i % 6 != 0 && i % 6 != 5 )); then touch "$tile/.tile_complete.ok"; fi
 done
-_slurm_query() { printf '%s\n' '404_0 RUNNING' '404_5 PENDING'; }
+_slurm_query() { echo "dispatch must not query Slurm" >&2; exit 99; }
 run_single_tile() {
     printf '%s\n' "$1" >> "$BARRIER_DIR/executed"
     touch "$1/.tile_complete.ok"
@@ -417,21 +384,20 @@ run_single_tile() {
 process_available_tiles "$BARRIER_DIR/tiles" 0 || exit 1
 test "$TILES_PROCESSED_IN_PASS" -eq 45 || exit 2
 while read -r tile; do test -f "$tile/.tile_complete.ok" || exit 3; done < "$BARRIER_DIR/tiles"
-# The late owner must skip every borrowed tile.
+# A late starter must skip all completed tiles.
 ARRAY_ID=5
 process_available_tiles "$BARRIER_DIR/tiles" 0 || exit 4
 test "$TILES_PROCESSED_IN_PASS" -eq 0 || exit 5
 test "$(wc -l < "$BARRIER_DIR/executed")" -eq 45
 ''')
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("Borrowing tile") == 22
 
 
-def test_concurrent_borrowers_and_late_owner_run_tile_once(tmp_path):
+def test_concurrent_consumers_and_late_starter_run_tile_once(tmp_path):
     result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
 NUM_ARRAY=3
 touch "$BARRIER_DIR/tile0/.tile_complete.ok" "$BARRIER_DIR/tile1/.tile_complete.ok"
-_slurm_query() { printf '%s\n' '404_2 PENDING'; }
+_slurm_query() { echo "dispatch must not query Slurm" >&2; exit 99; }
 cat > "$BARRIER_DIR/bin/python" <<'SH'
 #!/bin/bash
 tile="$2"
@@ -459,6 +425,124 @@ test "$(wc -l < "$BARRIER_DIR/tile2/executed")" -eq 1 || exit 6
 test ! -d "$BARRIER_DIR/tile2/.tile_running.lock"
 ''')
     assert result.returncode == 0, result.stderr
+
+
+def test_free_slot_takes_other_running_tasks_work_before_slow_worker_finishes(tmp_path):
+    result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
+NUM_ARRAY=3
+# All tasks are RUNNING; tile1 and tile2 formerly belonged to other ranks.
+_slurm_query() { printf '%s\n' '404_0 RUNNING' '404_1 RUNNING' '404_2 RUNNING'; }
+cat > "$BARRIER_DIR/bin/python" <<'SH'
+#!/bin/bash
+tile="$2"
+root="$(dirname "$tile")"
+if [[ "$tile" == *tile0 ]]; then
+    touch "$tile/started"
+    for i in $(seq 1 200); do
+        [ -f "$root/tile2/started" ] && break
+        sleep 0.02
+    done
+    test -f "$root/tile2/started" || exit 9
+elif [[ "$tile" == *tile2 ]]; then
+    test ! -f "$root/tile0/.tile_complete.ok" || exit 8
+    touch "$tile/started"
+fi
+touch "$tile/.tile_complete.ok"
+SH
+chmod +x "$BARRIER_DIR/bin/python"
+process_available_tiles "$BARRIER_DIR/tiles" 0 || exit 1
+test "$TILES_PROCESSED_IN_PASS" -eq 3 || exit 2
+for i in 0 1 2; do
+    test -f "$BARRIER_DIR/tile$i/.tile_complete.ok" || exit 3
+done
+''')
+    assert result.returncode == 0, result.stderr
+
+
+def test_full_gpu_does_not_reserve_waiting_work_from_free_peer(tmp_path):
+    result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
+NUM_ARRAY=2
+NUM_TILES_PER_GPU=1
+touch "$BARRIER_DIR/tile2/.tile_complete.ok"
+cat > "$BARRIER_DIR/bin/python" <<'SH'
+#!/bin/bash
+tile="$2"
+root="$(dirname "$tile")"
+printf '%s\n' "$ARRAY_ID" >> "$tile/executed"
+if [[ "$tile" == *tile0 ]]; then
+    touch "$tile/started"
+    for i in $(seq 1 200); do
+        [ -f "$root/tile1/.tile_complete.ok" ] && break
+        sleep 0.02
+    done
+    test -f "$root/tile1/.tile_complete.ok" || exit 9
+fi
+touch "$tile/.tile_complete.ok"
+SH
+chmod +x "$BARRIER_DIR/bin/python"
+export ARRAY_ID
+(ARRAY_ID=0; process_available_tiles "$BARRIER_DIR/tiles" 0) &
+first=$!
+for i in $(seq 1 100); do
+    [ -f "$BARRIER_DIR/tile0/started" ] && break
+    sleep 0.02
+done
+test -f "$BARRIER_DIR/tile0/started" || exit 1
+ARRAY_ID=1
+process_available_tiles "$BARRIER_DIR/tiles" 0 || exit 2
+wait "$first" || exit 3
+test "$(cat "$BARRIER_DIR/tile0/executed")" = 0 || exit 4
+test "$(cat "$BARRIER_DIR/tile1/executed")" = 1 || exit 5
+''')
+    assert result.returncode == 0, result.stderr
+
+
+def test_six_gpu_consumers_complete_shared_queue_once_with_capacity_limits(tmp_path):
+    result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
+NUM_ARRAY=6
+NUM_TILES_PER_GPU=4
+: > "$BARRIER_DIR/tiles"
+for i in $(seq 0 135); do
+    mkdir "$BARRIER_DIR/work$i"
+    printf '%s\n' "$BARRIER_DIR/work$i" >> "$BARRIER_DIR/tiles"
+done
+run_single_tile() {
+    printf 'START %s\n' "$1" >> "$BARRIER_DIR/events_$ARRAY_ID"
+    printf '%s\n' "$ARRAY_ID" >> "$1/executed"
+    sleep 0.03
+    touch "$1/.tile_complete.ok"
+    printf 'END %s\n' "$1" >> "$BARRIER_DIR/events_$ARRAY_ID"
+    release_tile_claim "$1" "$3"
+}
+pids=()
+for rank in $(seq 0 5); do
+    (ARRAY_ID=$rank; process_available_tiles "$BARRIER_DIR/tiles" 0) &
+    pids+=("$!")
+done
+for pid in "${pids[@]}"; do wait "$pid" || exit 1; done
+while read -r tile; do
+    test -f "$tile/.tile_complete.ok" || exit 2
+    test "$(wc -l < "$tile/executed")" -eq 1 || exit 3
+    test ! -d "$tile/.tile_running.lock" || exit 4
+done < "$BARRIER_DIR/tiles"
+''')
+    assert result.returncode == 0, result.stderr
+    for events in tmp_path.glob('events_*'):
+        active = 0
+        for line in events.read_text().splitlines():
+            active += 1 if line.startswith('START ') else -1
+            assert 0 <= active <= 4
+        assert active == 0
+
+
+def test_unclaimed_shared_work_has_no_nominal_owner_to_check(tmp_path):
+    result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
+NUM_ARRAY=6
+slurm_task_is_active() { echo "unexpected owner check" >&2; return 1; }
+incomplete_owners_are_active "$BARRIER_DIR/tiles" || exit 1
+''')
+    assert result.returncode == 0, result.stderr
+    assert not result.stderr
 
 
 def test_tile_completed_between_check_and_claim_is_not_relaunched(tmp_path):
@@ -513,7 +597,7 @@ test "$(cat "$tile/.tile_running.lock/token")" = "$(cat "$tile/winner_token")"
     assert (tile / '.tile_running.lock.stale-303_5_old' / 'job_id').read_text().strip() == '303_5'
 
 
-def test_borrowed_tile_health_uses_claimant_not_nominal_owner(tmp_path):
+def test_shared_queue_health_checks_actual_claimant(tmp_path):
     result = _run_lock_scenario(tmp_path, _worker_setup(tmp_path) + r'''
 NUM_ARRAY=3
 touch "$BARRIER_DIR/tile0/.tile_complete.ok" "$BARRIER_DIR/tile1/.tile_complete.ok"
@@ -526,6 +610,149 @@ if incomplete_owners_are_active "$BARRIER_DIR/tiles"; then exit 2; fi
 ''')
     assert result.returncode == 0, result.stderr
     assert 'owner 404_0' in result.stderr
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def test_initialization_invalidates_products_once(tmp_path, restart):
+    window = tmp_path / 'experiment' / 'subwindow_2024-04-10'
+    window.mkdir(parents=True)
+    (window / '.window_complete_all.ok').touch()
+    result = _run_lock_scenario(tmp_path, f'''
+die() {{ exit 99; }}
+BASE_DIR={shlex.quote(str(window.parent))}
+BARRIER_DIR={shlex.quote(str(tmp_path / 'barrier'))}
+mkdir "$BARRIER_DIR"
+FINAL_MARKER="$BASE_DIR/experiment_complete.ok"
+JOB_ID=404
+ARRAY_ID=0
+TILE_SCOPE=all
+RESTART={'--restart' if restart else '""'}
+FORCE_MERGE={'false' if restart else 'true'}
+BARRIER_TIMEOUT=1
+touch "$FINAL_MARKER"
+initialize_run_state || exit 1
+test ! -f "$FINAL_MARKER" || exit 2
+test ! -f "{window}/.window_complete_all.ok" || exit 3
+test -f "{window}/.window_rebuild_all.required" || exit 4
+# A late task must not invalidate fresh completion.
+touch "$FINAL_MARKER" "{window}/.window_complete_all.ok"
+ARRAY_ID=1
+initialize_run_state || exit 5
+test -f "$FINAL_MARKER" || exit 6
+test -f "{window}/.window_complete_all.ok" || exit 7
+''')
+    assert result.returncode == 0, result.stderr
+    assert (window / '.window_restart_all.required').exists() == restart
+
+
+@pytest.mark.parametrize('claimed', [False, True])
+def test_idle_gpu_waits_for_healthy_remote_tile_but_bounds_unclaimed_work(tmp_path, claimed):
+    launcher = LAUNCHER.read_text()
+    loop = re.split(r'^        echo .*Processed', launcher.split(
+        '        tiles_done=0\n', 1)[1], maxsplit=1, flags=re.M)[0]
+    scenario = _worker_setup(tmp_path) + r'''
+BARRIER_TIMEOUT=1
+TILE_LIST="$BARRIER_DIR/tiles"
+IW=0
+touch "$BARRIER_DIR/tile0/.tile_complete.ok" "$BARRIER_DIR/tile1/.tile_complete.ok"
+process_available_tiles() { TILES_PROCESSED_IN_PASS=0; }
+slurm_task_is_active() { [ "$1" = 404_1 ]; }
+ticks=0
+sleep() {
+    SECONDS=$((SECONDS + 5))
+    ticks=$((ticks + 1))
+    if (( ticks == 3 )); then touch "$BARRIER_DIR/tile2/.tile_complete.ok"; fi
+}
+tiles_done=0
+'''
+    if claimed:
+        scenario += '''
+mkdir "$BARRIER_DIR/tile2/.tile_running.lock"
+printf '404_1\n' > "$BARRIER_DIR/tile2/.tile_running.lock/job_id"
+'''
+    result = _run_lock_scenario(tmp_path, scenario + loop)
+    assert result.returncode == (0 if claimed else 1), result.stderr
+    if claimed:
+        assert (tmp_path / 'tile2' / '.tile_complete.ok').exists()
+    else:
+        assert 'timed out without completion progress' in result.stderr
+
+
+def test_restart_continuation_keeps_completed_tiles_and_rebuilds_every_window(tmp_path):
+    main = LAUNCHER.read_text().split('\ninit_merge_args\n', 1)[1]
+    setup = _worker_setup(tmp_path) + r'''
+die() { echo "$*" >&2; exit 99; }
+BASE_DIR="$BARRIER_DIR/experiment"
+mkdir -p "$BASE_DIR/subwindow_2024-04-10/subwindow_0_0" \
+    "$BASE_DIR/subwindow_2024-04-10/subwindow_1_0" "$BASE_DIR/subwindow_2024-05-20/subwindow_0_0"
+FINAL_MARKER="$BASE_DIR/experiment_complete.ok"
+for window in "$BASE_DIR"/subwindow_*; do
+    touch "$window/.window_complete_all.ok"
+    for tile in "$window"/subwindow_*; do touch "$tile/.tile_complete.ok"; done
+done
+touch "$FINAL_MARKER"
+DIR_SAVE_PICKLE="$BASE_DIR"
+CONFIG_PATH="$BASE_DIR/config.pkl"
+NAME_VAR=sla
+NUM_ARRAY=1
+NUM_TILES_PER_GPU=1
+NUM_MERGE_WORKERS=1
+ZARR_TIME_CHUNK=4
+ZARR_SPATIAL_CHUNK=128
+ZARR_COMPRESSION_LEVEL=3
+ZARR_OUTPUT=true
+OUTPUT_FLOAT64=false
+CLEANUP_TILE_ZARR=false
+FORCE_ARGS=()
+RESTART=--restart
+FORCE_MERGE=false
+MERGE_ONLY=false
+TILE_SCOPE=all
+BARRIER_TIMEOUT=1
+BARRIER_DIR="$BASE_DIR/barrier-first"
+mkdir "$BARRIER_DIR"
+run_single_tile() {
+    if [ "$PHASE" = first ] && [[ "$1" == *subwindow_1_0 ]]; then
+        release_tile_claim "$1" "$3"
+        return 7
+    fi
+    printf '%s %s\n' "$1" "$WINDOW_RESTART" >> "$BASE_DIR/executed"
+    touch "$1/.tile_complete.ok"
+    release_tile_claim "$1" "$3"
+}
+run_stage() {
+    printf '%s\n' "$*" >> "$BASE_DIR/merges"
+}
+PHASE=first
+initialize_run_state || exit 1
+init_merge_args
+'''
+    resume = r'''
+test "$?" -ne 0 || exit 2
+test -f "$BASE_DIR/subwindow_2024-04-10/subwindow_0_0/.tile_complete.ok" || exit 3
+test ! -f "$BASE_DIR/subwindow_2024-05-20/.window_complete_all.ok" || exit 4
+PHASE=second
+JOB_ID=505
+RESTART=""
+BARRIER_DIR="$BASE_DIR/barrier-second"
+mkdir "$BARRIER_DIR"
+initialize_run_state || exit 5
+init_merge_args
+'''
+    result = _run_lock_scenario(tmp_path, setup + '\n(\n' + main + '\n)\n' + resume + main)
+    assert result.returncode == 0, result.stderr
+    executed = (tmp_path / 'experiment' / 'executed').read_text().splitlines()
+    assert len(executed) == 3
+    assert len(set(executed)) == 3
+    assert all(line.endswith(' --restart') for line in executed)
+    calls = (tmp_path / 'experiment' / 'merges').read_text().splitlines()
+    spatial = [line for line in calls if '--iw_start' in line]
+    assert len(spatial) == 4  # One rank and one finalization per window.
+    assert all('--force' in line for line in spatial)
+    for window in (tmp_path / 'experiment').glob('subwindow_*'):
+        assert (window / '.window_complete_all.ok').exists()
+        assert not list(window.glob('.window_*.required'))
+    assert (tmp_path / 'experiment' / 'experiment_complete.ok').exists()
 
 
 @pytest.mark.parametrize('zarr', [False, True])
