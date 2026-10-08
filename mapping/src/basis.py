@@ -18,6 +18,7 @@ from scipy.integrate import quad
 import jax.numpy as jnp 
 from jax.experimental import sparse as sparse
 from .bmaux_layout import build_multivariate_layout, read_layout
+from .sw_forcing_basis import Basis_sw_forcing
 from .covariance import (
     BMauxMultivariateCovariance,
     BMauxRaggedMultivariateCovariance,
@@ -343,6 +344,17 @@ def Basis(config, State, verbose=True, multi_mode=False, *args, **kwargs):
 
         if config.BASIS.super=='BASIS_GAUSS3D':
             basis_obj = Basis_gauss3d(config,State,multi_mode=multi_mode)
+
+        elif config.BASIS.super == 'BASIS_SW_DAILY':
+            from .sw_daily_forcing import DailySWForcing
+            basis_obj = DailySWForcing(config, State, multi_mode=multi_mode)
+
+        elif config.BASIS.super == 'BASIS_SW_FORCING':
+            if getattr(config.BASIS, 'calibration_file', None):
+                from .sw_forcing_calibrated import CalibratedSWForcing
+                basis_obj = CalibratedSWForcing(config, State, multi_mode=multi_mode)
+            else:
+                basis_obj = Basis_sw_forcing(config, State, multi_mode=multi_mode)
 
         elif config.BASIS.super=='BASIS_GAUSS2D':
             basis_obj = Basis_gauss2d(config,State,multi_mode=multi_mode)

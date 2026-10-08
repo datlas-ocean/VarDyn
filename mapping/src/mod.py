@@ -3075,10 +3075,17 @@ class Model_qgsw(M):
             self.height_representation == 'interface_displacement'
         )
         self._configured_name_params = config.MOD.name_params if config.MOD.name_params is not None else []
-        if 'c' in self._configured_name_params:
-            raise ValueError(
-                "MOD_QGSW phase speed c is diagnosed from H and g_prime; "
-                "control H and/or g_prime instead of configuring 'c' in name_params.")
+        self._controls_c = 'c' in self._configured_name_params
+        if self._controls_c and {'H', 'g_prime'}.intersection(self._configured_name_params):
+            raise ValueError("Control c with fixed g_prime; do not also control H or g_prime.")
+        self._depth_control_name = 'c' if self._controls_c else 'H'
+        self.c_control_max_ratio = float(getattr(config.MOD, 'c_control_max_ratio', 2.))
+        if self._controls_c:
+            if not np.isfinite(self.c_control_max_ratio) or self.c_control_max_ratio <= 1.:
+                raise ValueError('c_control_max_ratio must be finite and greater than one.')
+            if any(getattr(config.MOD, key, None) is not None
+                   for key in ('H_min', 'H_max', 'H_floor')):
+                raise ValueError('For c control use c_control_max_ratio instead of H bounds.')
         self._controls_H = 'H' in self._configured_name_params
         self._controls_g_prime = 'g_prime' in self._configured_name_params
         self._controls_diff_coef = 'diff_coef' in self._configured_name_params
@@ -3099,7 +3106,7 @@ class Model_qgsw(M):
         # inside a traced step cannot distinguish a prescribed h_wind from an
         # absent h_wind control.
         self._wind_depth_from_H = (
-            self._controls_H
+            (self._controls_H or self._controls_c)
             and not self._controls_h_wind
             and not self._prescribes_h_wind
             and not self.wind_use_instantaneous_top_depth
@@ -3492,9 +3499,11 @@ class Model_qgsw(M):
             # Apply the constraint locally.  The extrema of the grid spacing
             # and wave speed need not occur at the same cell, so
             # min(grid_spacing) / max(c) is overly restrictive in general.
-            dt_x = np.nanmin(np.asarray(State.DX) / self.c)
-            dt_y = np.nanmin(np.asarray(State.DY) / self.c)
-            c_max = float(np.nanmax(self.c))
+            # A static timestep must remain safe for every admissible c control.
+            c_cfl = self.c * (self.c_control_max_ratio if self._controls_c else 1.)
+            dt_x = np.nanmin(np.asarray(State.DX) / c_cfl)
+            dt_y = np.nanmin(np.asarray(State.DY) / c_cfl)
+            c_max = float(np.nanmax(c_cfl))
             dt = config.MOD.cfl * min(dt_x, dt_y)
             divisors = [i for i in range(1, 3600 + 1) if 3600 % i == 0]  # Find all divisors of one hour in seconds
             lower_divisors = [d for d in divisors if d <= dt]
@@ -3718,7 +3727,7 @@ class Model_qgsw(M):
             'barotropic_filter_spectral': False,
             'sponge_coef': self.sponge_coef,
             'forcing_momentum': getattr(config.MOD, 'forcing_momentum', 'direct'),
-            'H_min': None if self._controls_H else getattr(config.MOD, 'H_min', None),
+            'H_min': None if (self._controls_H or self._controls_c) else getattr(config.MOD, 'H_min', None),
             'H_max': getattr(config.MOD, 'H_max', None),
             'diff_coef_trac': getattr(config.MOD, 'diff_coef_trac', 0.),
             'time_scheme':    getattr(config.MOD, 'time_scheme',    'rk3'),
@@ -3852,19 +3861,19 @@ class Model_qgsw(M):
         if config.GRID.super == 'GRID_FROM_FILE' and not isinstance(load_controls_from_file, (bool, np.bool_)):
             raise ValueError(
                 'GRID_FROM_FILE.load_control_parameters_from_file must be a boolean.')
-        if 'H' in self.name_params:
+        if self._depth_control_name in self.name_params:
             if (config.GRID.super == 'GRID_FROM_FILE'
                     and load_controls_from_file):
                 dsin = grid.open_grid_restart(config)
-                if 'H_control' in dsin:
-                    State.params['H'] = dsin['H_control'].values.squeeze()
-                    State.params['H'][np.isnan(State.params['H'])] = 0.
+                if self._depth_control_name + '_control' in dsin:
+                    State.params[self._depth_control_name] = dsin[self._depth_control_name + '_control'].values.squeeze()
+                    State.params[self._depth_control_name][np.isnan(State.params[self._depth_control_name])] = 0.
                 else:
-                    State.params['H'] = np.zeros((State.ny, State.nx))
+                    State.params[self._depth_control_name] = np.zeros((State.ny, State.nx))
                 dsin.close()
                 del dsin
             else:
-                State.params['H'] = np.zeros((State.ny,State.nx))
+                State.params[self._depth_control_name] = np.zeros((State.ny,State.nx))
 
         if 'g_prime' in self.name_params:
             if (config.GRID.super == 'GRID_FROM_FILE'
@@ -4182,6 +4191,13 @@ class Model_qgsw(M):
     def _H_control_to_total(self, H_control, apply_bounds=True):
         H_control_sw = self._H_control_to_sw(H_control)
         H_ref = jnp.asarray(self.H0, dtype=self.dtype)
+        if getattr(self, '_controls_c', False):
+            # The existing depth argument carries alpha_c in this mode.
+            # c = c_ref * exp(L*tanh(alpha_c/L)); H = c**2/g_prime.
+            # Smooth bounds give positive speeds, slope d(log c)/dalpha=1
+            # at the prior, and a fixed CFL envelope throughout minimization.
+            limit = jnp.log(self.c_control_max_ratio)
+            return H_ref * jnp.exp(2. * limit * jnp.tanh(H_control_sw / limit))
         H_floor = jnp.asarray(self.H_floor, dtype=self.dtype)
         H_total = H_floor + (H_ref - H_floor) * jnp.exp(H_control_sw)
         if apply_bounds and self.H_max_bound is not None:
@@ -4229,7 +4245,7 @@ class Model_qgsw(M):
 
     def _controlled_phase_speed_state(self, State):
         """Diagnose c=sqrt(g_prime*H) in State's (ny, nx) layout."""
-        H_control = State.params['H'] if 'H' in self.name_params else None
+        H_control = State.params[self._depth_control_name] if self._depth_control_name in self.name_params else None
         g_control = State.params['g_prime'] if 'g_prime' in self.name_params else None
         H_total = (self._H_control_to_total(H_control) if H_control is not None
                    else jnp.asarray(self.H0, dtype=self.dtype))
@@ -4528,10 +4544,11 @@ class Model_qgsw(M):
             for name in self.tracer_names:
                 _name_var.append(self.name_var[name])
 
-        if 'H' in self.name_params:
-            State0.var['H'] = self._H_control_to_total_state(State.params['H'])
-            State0.var['H_control'] = +State.params['H']
-            _name_var += ['H', 'H_control']
+        if self._depth_control_name in self.name_params:
+            State0.var['H'] = self._H_control_to_total_state(State.params[self._depth_control_name])
+            control_name = self._depth_control_name + '_control'
+            State0.var[control_name] = +State.params[self._depth_control_name]
+            _name_var += ['H', control_name]
         elif 'H' in self.parameter_maps:
             State0.var['H'] = self._H_control_to_total_state(None)
             _name_var += ['H']
@@ -4540,7 +4557,7 @@ class Model_qgsw(M):
                 State.params['g_prime'])
             State0.var['g_prime_control'] = +State.params['g_prime']
             _name_var += ['g_prime', 'g_prime_control']
-        if ('H' in self.name_params or 'g_prime' in self.name_params
+        if (self._depth_control_name in self.name_params or 'g_prime' in self.name_params
                 or 'H' in self.parameter_maps):
             State0.var['c'] = self._controlled_phase_speed_state(State)
             _name_var += ['c']
@@ -5257,8 +5274,8 @@ class Model_qgsw(M):
         Fu = State.params[self.name_var['U']]
         Fv = State.params[self.name_var['V']]
         Fh = State.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
-            H = State.params['H']
+        if self._depth_control_name in self.name_params:
+            H = State.params[self._depth_control_name]
             H = jnp.expand_dims(H.astype(self.dtype).T, axis=0)
         else:
             H = None
@@ -5357,9 +5374,9 @@ class Model_qgsw(M):
         dFu = dState.params[self.name_var['U']]
         dFv = dState.params[self.name_var['V']]
         dFh = dState.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
-            H = State.params['H']
-            dH = dState.params['H']
+        if self._depth_control_name in self.name_params:
+            H = State.params[self._depth_control_name]
+            dH = dState.params[self._depth_control_name]
             H = jnp.expand_dims(H.astype(self.dtype ).T, axis=0)
             dH = jnp.expand_dims(dH.astype(self.dtype).T, axis=0)
         else:
@@ -5489,8 +5506,8 @@ class Model_qgsw(M):
         Fu = State.params[self.name_var['U']]
         Fv = State.params[self.name_var['V']]
         Fh = State.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
-            H = State.params['H']
+        if self._depth_control_name in self.name_params:
+            H = State.params[self._depth_control_name]
             H = jnp.expand_dims(H.astype(self.dtype).T, axis=0)
         else:
             H = None
@@ -5516,8 +5533,8 @@ class Model_qgsw(M):
         adFu = adState.params[self.name_var['U']]
         adFv = adState.params[self.name_var['V']]
         adFh = adState.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
-            adH = adState.params['H']
+        if self._depth_control_name in self.name_params:
+            adH = adState.params[self._depth_control_name]
             adH = jnp.expand_dims(adH.astype(self.dtype).T, axis=0)
         else:
             adH = None
@@ -5650,9 +5667,9 @@ class Model_qgsw(M):
         adState.setvar(adv,self.name_var['V'])
         adState.setvar(adh,self.name_var['SSH'])
 
-        if 'H' in self.name_params:
+        if self._depth_control_name in self.name_params:
             adH = adH[0].T
-            adState.params['H'] = adH
+            adState.params[self._depth_control_name] = adH
         if 'g_prime' in self.name_params:
             adState.params['g_prime'] = adg_prime[0].T
         if 'h_wind' in self.name_params:
@@ -5730,7 +5747,7 @@ class Model_qgsw(M):
         v0 = v0 * mask_v
         h0 = h0 * mask_h
 
-        has_H = 'H' in self.name_params
+        has_H = self._depth_control_name in self.name_params
         if has_H:
             key, H = rand(key, H_shape)
         else:

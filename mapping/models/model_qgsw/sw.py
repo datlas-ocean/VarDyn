@@ -425,14 +425,15 @@ class SW:
         # HBM bandwidth pressure. Keep True (current default is optimal).
         self.scan_checkpoint = True
 
-    def _compute_ref_values(self, H):
+    def _compute_ref_values(self, H, g_prime=None):
         """Pure functional computation of reference values.
         Returns (h_ref, h_ref_ugrid, h_ref_vgrid, dx_p_ref, dy_p_ref).
         No mutation — safe for JAX AD.
         """
         h_ref = H * self.area
         eta_ref = -H.sum(axis=-3) + reverse_cumsum(H, dim=-3)
-        p_ref = jnp.cumsum(self.g_prime * eta_ref, axis=-3)
+        gravity = self.g_prime if g_prime is None else g_prime
+        p_ref = jnp.cumsum(gravity * eta_ref, axis=-3)
 
         # When H is spatially uniform (nx=1, ny=1), padding the 1-element
         # spatial axes produces wrong shapes: (nl,1,1) → (nl,3,1) → h_ref_ugrid
@@ -1087,7 +1088,8 @@ class SW:
 
         return omega
 
-    def compute_diagnostic_variables(self, u, v, h, h_ref_ugrid=None, h_ref_vgrid=None):
+    def compute_diagnostic_variables(self, u, v, h, h_ref_ugrid=None, h_ref_vgrid=None,
+                                     g_prime=None):
         """
         Compute the model's diagnostic variables given the prognostic
         variables self.u, self.v, self.h .
@@ -1097,7 +1099,8 @@ class SW:
 
         omega = self.compute_omega(u, v)
         eta = reverse_cumsum(h / self.area, dim=-3)
-        p = jnp.cumsum(self.g_prime * eta, axis=-3)
+        gravity = self.g_prime if g_prime is None else g_prime
+        p = jnp.cumsum(gravity * eta, axis=-3)
         U = u / self.dx_ugrid**2
         V = v / self.dy_vgrid**2
         U_m = self.interp_TP(U)
@@ -1147,7 +1150,7 @@ class SW:
 
     def compute_time_derivatives(self, u, v, h, ref_vals=None, taux=None, tauy=None,
                                  h_wind=None, wind_strength=None,
-                                 diff_coef=None, visc_coef=None, **kwargs):
+                                 diff_coef=None, visc_coef=None, g_prime=None, **kwargs):
         """
         Computes the state variables derivatives dt_u, dt_v, dt_h.
         ref_vals: optional tuple (h_ref, h_ref_ugrid, h_ref_vgrid, dx_p_ref, dy_p_ref)
@@ -1163,7 +1166,8 @@ class SW:
             h_ref = h_ref_ugrid = h_ref_vgrid = dx_p_ref = dy_p_ref = None
 
         omega, eta, p, U, V, U_m, V_m, k_energy, h_tot_ugrid, h_tot_vgrid = \
-            self.compute_diagnostic_variables(u, v, h, h_ref_ugrid, h_ref_vgrid)
+            self.compute_diagnostic_variables(u, v, h, h_ref_ugrid, h_ref_vgrid,
+                                              g_prime=g_prime)
         dt_h = self.advection_h(U, V, h, h_ref) + self.add_h_diffusion(h, diff_coef)
         dt_u, dt_v = self.advection_momentum(
             u, v, omega, U_m, V_m, k_energy, p, h_tot_ugrid, h_tot_vgrid,
@@ -1193,6 +1197,7 @@ class SW:
         wind_strength=None,
         diff_coef=None,
         visc_coef=None,
+        g_prime=None,
     ):
         """
         Performs nstep time-integration with RK3-SSP scheme.
@@ -1233,7 +1238,7 @@ class SW:
             H_total = jnp.maximum(H_total, self.H_min)
         if self.H_max is not None:
             H_total = jnp.minimum(H_total, self.H_max)
-        ref_vals = self._compute_ref_values(H_total)
+        ref_vals = self._compute_ref_values(H_total, g_prime=g_prime)
         _h_ref = ref_vals[0]  # h_ref for h_floor
 
         # Resolve wind stress: prefer argument, fall back to self
@@ -1267,6 +1272,7 @@ class SW:
                     u_, v_, h_, ref_vals, taux=_taux, tauy=_tauy,
                     h_wind=_h_wind, wind_strength=wind_strength,
                     diff_coef=diff_coef, visc_coef=visc_coef,
+                    g_prime=g_prime,
                     h_b=_h_b if h_b is not None else None)
                 dtu = dtu + _gamma_u * (_u_b - u_)
                 dtv = dtv + _gamma_v * (_v_b - v_)
@@ -1417,6 +1423,7 @@ class SW:
         wind_strength=None,
         diff_coef=None,
         visc_coef=None,
+        g_prime=None,
     ):
         """
         Performs nstep time-integration for (u, v, h) *and* passive tracer c.
@@ -1460,7 +1467,7 @@ class SW:
             H_total = jnp.maximum(H_total, self.H_min)
         if self.H_max is not None:
             H_total = jnp.minimum(H_total, self.H_max)
-        ref_vals = self._compute_ref_values(H_total)
+        ref_vals = self._compute_ref_values(H_total, g_prime=g_prime)
 
         _taux = taux if taux is not None else self.taux
         _tauy = tauy if tauy is not None else self.tauy
@@ -1478,7 +1485,8 @@ class SW:
             second diagnostic call per RK3 stage.
             """
             omega, eta, p, U, V, U_m, V_m, k_energy, h_tot_ugrid, h_tot_vgrid = \
-                self.compute_diagnostic_variables(u, v, h, ref_vals[1], ref_vals[2])
+                self.compute_diagnostic_variables(u, v, h, ref_vals[1], ref_vals[2],
+                                                  g_prime=g_prime)
             dt_h = self.advection_h(U, V, h, ref_vals[0]) + self.add_h_diffusion(h, diff_coef)
             dt_u, dt_v = self.advection_momentum(
                 u, v, omega, U_m, V_m, k_energy, p,

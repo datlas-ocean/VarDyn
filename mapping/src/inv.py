@@ -57,6 +57,9 @@ _CONTROL_LAYOUT_KEYS = (
 
 def _multivariate_layout_descriptors(basis, path='basis'):
     """Describe every multivariate control block in optimizer order."""
+    descriptor = getattr(basis, 'control_layout_descriptor', None)
+    if callable(descriptor):
+        return [descriptor(path)]
     if (getattr(basis, 'layout_signature', None) is not None
             and getattr(basis, 'product_signature', None) is not None
             and hasattr(basis, 'component_order')):

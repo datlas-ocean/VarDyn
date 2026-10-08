@@ -34,6 +34,17 @@ The time mean of a Model-Error Forcing over its calibration period, stored
 separately from the zero-mean covariance represented by BMaux.
 _Avoid_: Mean BMaux coefficient, background state
 
+**Analyzed-Forcing Calibration**:
+The estimation of Model-Error Forcing statistics from corrections inferred by
+variational analysis. These statistics describe regularized analyzed corrections,
+not an unbiased model-error covariance or equation defects evaluated on reference states.
+_Avoid_: Direct GLORYS residual calibration, observed physical forcing
+
+**Prescribed Forcing Bias**:
+The learned temporal mean of Model-Error Forcing applied as a fixed background
+correction, separately from the covariance of centered forcing fluctuations.
+_Avoid_: Zero-mean constant control, bias standard deviation
+
 **BMaux Temporal Scale**:
 The local half-width of a compact temporal basis function, calibrated from the
 autocovariance of zero-mean Model-Error Forcing at one spatial scale.
@@ -59,6 +70,25 @@ The vertical Model-Error Forcing expressed in the SW model's interface
 coordinate, distinct from physical sea-surface-height forcing.
 _Avoid_: SSH tendency, sea-level forcing
 
+**Basin-Mean Height Forcing**:
+The area-weighted spatial mean of Interface-Displacement Forcing within each
+connected basin, which may vary in time. Its spatially uniform contribution is
+distinct from the remaining zero-integral height forcing and from a temporal Forcing Bias.
+_Avoid_: Temporal mean forcing, physical SSH forcing
+
+**Local Multiscale SW Forcing Calibration**:
+The estimation of spatially varying amplitudes and temporal scales for
+divergent, rotational, and zero-integral height Model-Error Forcing at multiple
+coexisting spatial scales. Basin-Mean Height Forcing is characterized separately
+for each connected basin.
+_Avoid_: Homogeneous forcing calibration, single local spatial scale
+
+**SW Forcing Wavelength**:
+The spatial scale of a forcing component identified by the peak of variance
+per logarithmic wavenumber interval. It is distinct from the compact support
+radius of the potential or compensated-height function that represents it.
+_Avoid_: Potential radius, compact half-width
+
 **BMaux Auxiliary Set**:
 The three variable-specific auxiliary files that jointly define the covariance
 of zonal, meridional, and interface-displacement Model-Error Forcing.
@@ -73,6 +103,20 @@ _Avoid_: Scaled Tdec, heuristic decorrelation factor
 The covariance of temporally centered Model-Error Forcing over the calibration
 period, without removing a trend or seasonal harmonic.
 _Avoid_: Seasonal covariance, detrended forcing covariance
+
+**SW Coefficient Decorrelation Time**:
+The lag at which the modeled temporal correlation of SW forcing coefficients
+reaches `1/e`. The original daily AR1 model uses an exponential. The reduced
+local MAP2 fits the covariance induced by its actual temporal-window bank,
+matching temporal centering in the empirical ACF; its reported `tdec` is the
+1/e crossing before sample-mean subtraction. Window width and node spacing
+are separate quantities.
+_Avoid_: Temporal node spacing, cosine-envelope half-width
+
+**SW Coefficient Standard Deviation**:
+The stationary standard deviation of centered SW forcing coefficients at
+temporal control nodes, for a specified spatial-function normalization.
+_Avoid_: Innovation standard deviation, pointwise forcing amplitude
 
 **Coupled Spectral Calibration**:
 The joint inference of BMaux component variances and temporal scales from
@@ -138,3 +182,48 @@ _Avoid_: Full-GPU solver, JAXopt mode
 An Analysis Window whose accepted cost changes satisfy the configured relative
 cost tolerance for the required consecutive iterations.
 _Avoid_: Small-gradient analysis, exhausted iteration budget
+
+**Annual Shared Forcing Statistics**:
+The spatially local forcing-coefficient mean, stationary standard deviation,
+and temporal decay scale inferred jointly from the year's Analysis Windows.
+They are common across windows, rather than averages of independently fitted
+window parameters.
+_Avoid_: Monthly parameter average, spatially uniform annual prior
+
+**Window Moment Ownership**:
+The assignment of each analysis date to one Analysis Window for annual
+statistical aggregation. Observations can inform multiple overlapping windows
+while the selected posterior moments contribute only once.
+_Avoid_: Observation exclusion, duplicated annual moments
+
+**Continuous Annual Empirical Calibration**:
+The October 7, 2026 experiment reconstructs one uninterrupted annual trajectory
+with daily forcing controls and a permissive physical prior (tdec 2 days).
+The revised MAP2 learns mean, variance and ACF locally for every spatial atom,
+fits the ACF of compact temporal windows, and reduces temporal centers as their
+width increases. It starts from zero physical forcing controls, with the same
+initial ocean state as MAP1, and performs no posterior covariance solves.
+The earlier pooled-statistics, warm-start MAP2 and its sensitivity chain are
+superseded; their outputs remain archived. See
+`docs/sw_reduced_local_map2_20261007.md` for the revised strategy and
+`docs/sw_annual_empirical_learning.md` for the historical daily strategy.
+_Avoid_: Windowed EM, posterior-corrected variance, assumed prior independence
+
+**Equal Physical Scale Amplitude**:
+A common expected wet-area RMS of the total forcing contribution at each
+wavelength, separately for divergent momentum, rotational momentum and height.
+The coefficient prior accounts for derivatives, masks and overlapping atoms.
+The October 7 experiment uses 0.1 (m/s)/day for each momentum component and
+1 m interface/day for height, with amplitude sensitivity factors 0.5 and 2.
+_Avoid_: Equal potential coefficient std, equal amplitude per isolated atom
+
+**GLORYS-Informed Initial Physical Amplitude**:
+An experiment-specific initialization measured from daily GLORYS equation
+defects with the current fixed Chelton/g'=0.025 model, jointly projected onto
+the daily spatial potential basis. The October 7 configuration
+`config_sw_daily_glorys_prior.py` uses physical RMS values 0.0304 and 0.0198
+(m/s)/day for divergent and rotational forcing, 13.5 m interface/day for
+compensated height and 1.23 m interface/day for basin means, with tdec=2 days.
+Each component keeps the same RMS across wavelengths. These are approximate
+initial amplitudes, not learned posterior uncertainties or SSH standard
+deviations. See `docs/glorys_daily_prior_20261007.md` for support and limitations.

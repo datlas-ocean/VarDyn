@@ -420,7 +420,7 @@ MOD_QGSW = dict(
 
     var_to_save = None,
 
-    name_params = None, # Controlled parameters. 'H', 'g_prime', 'h_wind', 'diff_coef', and 'visc_coef' use dimensionless log-controls.
+    name_params = None, # Controlled parameters. 'c' (bounded log-speed), or 'H'/'g_prime'; 'h_wind', 'diff_coef', and 'visc_coef' use dimensionless log-controls.
 
     nl = 1, # number of layers in the model (for nl>1, set H and g_prime as lists/arrays)
 
@@ -439,6 +439,10 @@ MOD_QGSW = dict(
     cmin = None, # Minimum value of phase velocity to consider
 
     cmax = None, # Maximum value of phase velocity to consider
+
+    # Direct first-baroclinic c control at fixed g_prime, via H=c**2/g_prime.
+    # c/c_ref = exp(log(r)*tanh(alpha/log(r))); also bounds the CFL speed.
+    c_control_max_ratio = 2.,
 
     H = None, # Reference layer depth [m]. With g_prime set, c is diagnosed; otherwise g_prime is diagnosed from c**2/H.
 
@@ -899,6 +903,44 @@ BASIS_GAUSS2D = dict(
 
     var_background = None # Variable name inside *path_background*
 
+)
+
+BASIS_SW_DAILY = dict(
+    name_mod_var=('u', 'v', 'ssh'),
+    wavelengths_km=(971.428571, 680., 476., 333.2, 233.24, 163.268, 114.2876, 80.00132),
+    center_spacing_factor=1.,
+    include_height_mean=True,
+    calibration_file=None,
+    use_state_background=False,
+    # Generic initial values, not the previous learned calibration.
+    # phi/psi: m²/s/day; height: m interface/day, support RMS normalization.
+    initial_std=dict(divergent=1000., rotational=1000., height=1., height_mean=1.),
+    # Optional physical RMS per component, constant across spatial scales.
+    # Converted to coefficient amplitudes using the constructed spatial basis.
+    initial_physical_rms=None,
+    initial_tdec_days=10.,
+    # MAP2 windows fitted to their own ACF; spacing=window_width/facnlt.
+    temporal_facnlt=2,
+    temporal_min_spacing_days=1.,
+)
+
+BASIS_SW_FORCING = dict(
+    name_mod_var=('u', 'v', 'ssh'), # C-grid momentum and model-height forcing targets
+    calibration_file=None, # Optional native-grid local multiscale calibration artifact
+    include_height_mean=True, # Calibrated mode: include basin mean controls and prescribed mean bias
+    use_state_background=False,
+    spatial_radius_km=300., # Compact potential half-width; coefficient RMS normalized
+    height_radius_km=600., # Height uses compensated patches extending to twice this radius
+    center_spacing_factor=1.,
+    slow_halfwidth_days=10.,
+    wave_envelope_halfwidth_days=10.,
+    wave_period_days=(), # Explicitly choose periods after diagnosing the target band
+    # Standard deviations of physical coefficients: (m/s)/day for momentum,
+    # model-height m/day for height. Zero disables the corresponding block.
+    # These illustrative priors require calibration with withheld SSH blocks.
+    slow_std=dict(divergent=.02, rotational=.01, height=.02, height_mean=0.),
+    wave_std=dict(divergent=.02, rotational=.005, height=.005, height_mean=0.),
+    bias_std=dict(divergent=.002, rotational=.001, height=.002, height_mean=0.),
 )
 
 BASIS_GAUSS3D = dict(
