@@ -232,14 +232,19 @@ def _criterion_reached(
     ftol,
     patience,
     minimum_iterations,
+    convergence_mode="any",
+    gradient_reference_norm=None,
 ):
+    if convergence_mode not in ("any", "all"):
+        raise ValueError("Unknown convergence mode")
     iterations_completed = len(cost_history) - 1
     if iterations_completed < minimum_iterations:
         return False
     if len(cost_history) - 1 < patience:
         return False
 
-    initial_gradient_norm = max(float(gradient_norm_history[0]), 1e-30)
+    initial_gradient_norm = max(float(gradient_norm_history[0] if gradient_reference_norm is None
+                                      else gradient_reference_norm), 1e-30)
     criteria = []
     if gtol is not None:
         recent_gradients = gradient_norm_history[-patience:]
@@ -263,7 +268,7 @@ def _criterion_reached(
                 for previous, current in recent_pairs
             )
         )
-    return any(criteria)
+    return bool(criteria) and (all(criteria) if convergence_mode == "all" else any(criteria))
 
 
 def minimize_optax_decoupled(
@@ -281,6 +286,8 @@ def minimize_optax_decoupled(
     initial_value=None,
     initial_gradient=None,
     start_callback=None,
+    convergence_mode="any",
+    gradient_reference_norm=None,
 ):
     """Run L-BFGS on device with a scalar Python Armijo line search.
 
@@ -295,6 +302,10 @@ def minimize_optax_decoupled(
             "minimizer='optax-decoupled' requires the 'optax' package"
         ) from exc
 
+    if convergence_mode not in ("any", "all"):
+        raise ValueError("Unknown convergence mode")
+    if convergence_mode == "all" and (gtol is None or ftol is None):
+        raise ValueError("Strict cost-and-gradient convergence requires ftol and gtol")
     if maxiter < 1:
         raise ValueError("maxiter must be >= 1")
     if history_size < 1:
@@ -507,6 +518,8 @@ def minimize_optax_decoupled(
             ftol=ftol,
             patience=convergence_patience,
             minimum_iterations=minimum_iterations,
+            convergence_mode=convergence_mode,
+            gradient_reference_norm=gradient_reference_norm,
         ):
             converged = True
             status = "convergence criterion reached"

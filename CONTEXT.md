@@ -3,7 +3,66 @@
 VarDyn reconstructs ocean dynamical variables by combining a reduced control
 space, dynamical propagation, observations, and variational inversion.
 
+## Branch-specific context
+
+When the active Git branch is `Dev-SW`, **read
+[CONTEXT_Dev-SW.md](/home/flo/VarDyn/CONTEXT_Dev-SW.md) in addition to this file
+before working on the branch**. It records the GLORYS shallow-water learning,
+MAP1/MAP2 results, active SSH nadir experiments, covariance coupling, and
+follow-up instructions. Recheck its dated run status against the live outputs.
+
 ## Language
+
+**North Atlantic Midlatitude Domain**:
+The Atlantic region from 80°W to 0° and 30°N to 60°N used for the
+GLORYS learning experiment.
+_Avoid_: Tropical Atlantic domain
+
+**North Atlantic Absolute SSH**:
+The GLORYS sea-surface height used without subtraction of a spatial mean in
+the North Atlantic calibration, boundary fields, and synthetic nadirs.
+_Avoid_: North Atlantic SSH anomaly
+
+**Admissible Reference Depth**:
+The uniform initial SW layer depth chosen so the year's absolute GLORYS SSH
+starts with positive total layer thickness throughout the North Atlantic domain.
+_Avoid_: Chelton-derived regional depth, learned final depth
+
+**OSE**:
+An ocean reconstruction experiment assimilating measurements from real observing systems.
+_Avoid_: OSSE, synthetic-observation experiment
+
+**Withheld Real Nadir**:
+Along-track sea-level measurements from a real altimeter mission excluded from the OSE observation cost and used to assess reconstructed SSH.
+_Avoid_: Assimilated nadir, synthetic nadir
+
+**First-Baroclinic-Mode Current**:
+The part of a three-dimensional current associated with the first vertical baroclinic mode, whose shape depends on water-column stratification and bottom depth.
+_Avoid_: Current at a single depth, sub-mixed-layer current
+
+**Sub-Mixed-Layer Target Current**:
+A GLORYS current target averaged over a thin layer immediately below the density-defined mixed layer, rather than sampled at the surface or interpreted as a full-depth baroclinic mode.
+_Avoid_: First-baroclinic-mode current, surface current
+
+**Mixed-Layer-Offset Current**:
+A GLORYS current sampled at a specified depth below the density-defined mixed-layer base, distinct from a mean over a layer beneath that base.
+_Avoid_: First-baroclinic-mode current, fixed-depth current
+
+**OSSE**:
+An ocean reconstruction experiment assimilating observations sampled from a reference simulation.
+_Avoid_: OSE, real-observation experiment
+
+**MAP1-Centered OSE Physical Prior**:
+A prior for real-nadir reconstruction whose physical-parameter fields are centered on the GLORYS-trained MAP1 estimate, with reduced uncertainty so real observations can adjust them.
+_Avoid_: MAP1 physics fixed for OSE, original-reference physical prior
+
+**GLORYS OSE Boundary SLA**:
+A GLORYS height boundary field expressed relative to GLORYS mean dynamic topography, matching the real-nadir SLA convention.
+_Avoid_: Absolute GLORYS height in an SLA analysis
+
+**Direct GLORYS Boundary Current**:
+A GLORYS current boundary field supplied as a full current without subtracting a mean current.
+_Avoid_: Current anomaly
 
 **Analysis Window**:
 The time interval jointly optimized by one 4DVar inversion.

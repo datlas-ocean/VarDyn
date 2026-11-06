@@ -446,6 +446,8 @@ MOD_QGSW = dict(
 
     H = None, # Reference layer depth [m]. With g_prime set, c is diagnosed; otherwise g_prime is diagnosed from c**2/H.
 
+    phase_speed_squared_floor = None, # Optional hard floor on H*g_prime for joint H/g_prime controls [m2 s-2].
+
     constant_H = False, # if True and H is None (nl=1), use the spatial mean of c to derive a
                         # spatially constant H = mean(c)^2 / g_prime instead of the full 2-D field
 
@@ -497,9 +499,11 @@ MOD_QGSW = dict(
 
     cfl = .25,
 
-    bottom_drag_coef = 0.,
+    bottom_drag_coef = 0.,  # s^-1; scalar or h-grid map, optional logarithmic control
 
     slip_coef = 1., # Lateral wall slip coefficient (dimensionless, in [0,1]): 1 = free-slip, 0 = no-slip, in-between = partial slip. Use 1 when use_sponge_on_coast=True so the sponge is the sole near-coast damping mechanism (no double damping).
+
+    open_boundary_x = 'closed', # 'closed' or 'characteristic' on wet west/east outer faces (one-layer SW only).
 
     path_mdt = None, # path of MDT
 
