@@ -456,12 +456,12 @@ MOD_QGSW = dict(
     # Optional static physical-parameter maps.  A file may be one model-output
     # snapshot (including a singleton time dimension) or a glob; for a glob,
     # the lexicographically last file is used.  Mapped values override the
-    # scalar H, h_wind, diff_coef, and visc_coef references below.
+    # scalar H, g_prime, h_wind, diff_coef, and visc_coef references below.
     file_params_aux = None,
 
     name_var_params_aux = {
         'lon': 'lon', 'lat': 'lat', 'time': 'time',
-        'H': 'H', 'h_wind': 'h_wind',
+        'H': 'H', 'g_prime': None, 'h_wind': 'h_wind',
         'diff_coef': 'diff_coef', 'visc_coef': 'visc_coef',
     },
 
@@ -502,6 +502,8 @@ MOD_QGSW = dict(
     bottom_drag_coef = 0.,  # s^-1; scalar or h-grid map, optional logarithmic control
 
     slip_coef = 1., # Lateral wall slip coefficient (dimensionless, in [0,1]): 1 = free-slip, 0 = no-slip, in-between = partial slip. Use 1 when use_sponge_on_coast=True so the sponge is the sole near-coast damping mechanism (no double damping).
+
+    open_boundary_y = 'closed', # 'closed' or 'characteristic' on wet south/north outer faces (one-layer SW only).
 
     open_boundary_x = 'closed', # 'closed' or 'characteristic' on wet west/east outer faces (one-layer SW only).
 
@@ -1124,49 +1126,6 @@ BASIS_BMaux = dict(
 
 )
 
-# Joint u/v/h BMaux basis using a common compact layout and local 3x3 priors.
-BASIS_BMAUX_MULTIVARIATE = BASIS_BMaux | dict(
-
-    component_order = ('u', 'v', 'h'),
-
-    name_mod_var = ('u', 'v', 'h'),
-
-    c_grid_var = ('U', 'V', None),
-
-    compute_velocities = False,
-
-    file_layout = None, # Serialized layout produced by build_common_layout.py
-
-    # Three historical marginal products in u|v|h order. Required by the
-    # union/ragged policy so IND preserves every original BMaux atom.
-    marginal_file_aux = None,
-
-    factdec = 1., # Tdec is already calibrated in the multivariate product
-
-    support_policy = 'intersection', # 'union' preserves component-specific layouts
-
-    # Scientific covariance variants: IND, SCALE, LOCAL-S, or LOCAL.
-    correlation_mode = 'LOCAL',
-
-    # Off-diagonal contraction used only by LOCAL-S (0=IND, 1=LOCAL).
-    local_correlation_strength = 0.5,
-
-    # ADAPTIVE reads a validation-selected contraction field from file_aux.
-    # The field varies with wavelength and dynamical region. Pairwise
-    # correlations are additionally multiplied by the exact overlap of the
-    # component-specific compact temporal kernels when requested.
-    adaptive_strength_variable = 'adaptive_correlation_strength',
-
-    adaptive_correlation_variable = 'adaptive_region_correlation',
-
-    # False when the selected pairwise contractions have already been folded
-    # into adaptive_correlation_variable by the calibration product.
-    adaptive_apply_strength = True,
-
-    adaptive_temporal_overlap = True,
-
-)
-
 # Internal Tides boundary conditions basis (i.e. a set of basis vectors with values at the open boundaries)
 BASIS_HBC = dict(
 
@@ -1211,15 +1170,10 @@ INV_4DVAR = dict(
 
     forcing_window_overlap_days = 0., # Blend neighboring forcing bases over this many days before each window boundary; incompatible with taper.
 
-    minimizer = 'scipy', # 'scipy', 'optax-decoupled', 'optax-full-gpu', or 'block-coordinate'
+    minimizer = 'scipy', # 'scipy', 'optax-decoupled', 'optax-full-gpu',
 
     lbfgs_history_size = 10, # Number of L-BFGS correction pairs retained on device; reduce for very large controls.
 
-    block_outer_cycles = 20, # Block-coordinate sweeps over all forcing windows and shared parameters
-
-    block_inner_maxiter = 10, # L-BFGS iterations for each forcing-window block per sweep
-
-    block_parameter_maxiter = 10, # L-BFGS iterations for shared H/h_wind after each forcing sweep
 
     compute_test = False, # TLM, ADJ & GRAD tests
 

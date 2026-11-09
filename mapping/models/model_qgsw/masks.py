@@ -25,7 +25,7 @@ class Masks:
 
     """
 
-    def __init__(self, mask_hgrid, open_x=False):
+    def __init__(self, mask_hgrid, open_x=False, open_y=False):
         """
         Computes automatically several masks given the binary mask on the h grid.
         as well as the irregulare boundary points
@@ -71,6 +71,9 @@ class Masks:
             # Interior coast faces retain their impermeable mask.
             self.u = self.u.at[..., 0, :].set(self.h[..., 0, :] > 0.5)
             self.u = self.u.at[..., -1, :].set(self.h[..., -1, :] > 0.5)
+        if open_y:
+            self.v = self.v.at[..., :, 0].set(self.h[..., :, 0] > 0.5)
+            self.v = self.v.at[..., :, -1].set(self.h[..., :, -1] > 0.5)
         self.w = avg_pool2d(self.h, (2,2), stride=(1,1), padding=(1,1)) > 1/8
         self.psi = avg_pool2d(self.h, (2,2), stride=(1,1), padding=(1,1)) > 7/8
 

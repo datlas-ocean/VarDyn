@@ -1111,6 +1111,8 @@ class State:
         other.lat_v = self.lat_v
         other.geo_grid = self.geo_grid
         other.preserve_device_arrays = self.preserve_device_arrays
+        if hasattr(self, 'qgsw_reference_g_prime'):
+            other.qgsw_reference_g_prime = self.qgsw_reference_g_prime.copy()
         other._output_var_collector = getattr(
             self, '_output_var_collector', None)
         other._zarr_output_batch = self._zarr_output_batch

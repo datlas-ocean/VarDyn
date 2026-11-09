@@ -184,11 +184,16 @@ class SW:
             print('  - no mask provided, domain assumed to be rectangular')
             mask = jnp.ones((nx, ny), dtype=self.dtype)
         self.open_boundary_x = param.get('open_boundary_x', 'closed')
-        if self.open_boundary_x not in ('closed', 'characteristic'):
-            raise ValueError("open_boundary_x must be 'closed' or 'characteristic'")
-        if self.open_boundary_x == 'characteristic' and self.nl != 1:
-            raise ValueError('characteristic x boundaries require a one-layer SW model')
-        self.masks = Masks(mask, open_x=self.open_boundary_x == 'characteristic')
+        self.open_boundary_y = param.get('open_boundary_y', 'closed')
+        for axis in ('x', 'y'):
+            mode = getattr(self, f'open_boundary_{axis}')
+            if mode not in ('closed', 'characteristic'):
+                raise ValueError(f"open_boundary_{axis} must be 'closed' or 'characteristic'")
+            if mode == 'characteristic' and self.nl != 1:
+                raise ValueError('characteristic boundaries require a one-layer SW model')
+        self.masks = Masks(mask,
+                           open_x=self.open_boundary_x == 'characteristic',
+                           open_y=self.open_boundary_y == 'characteristic')
 
         # boundary conditions
         assert self.slip_coef >= 0 and self.slip_coef <= 1, \
@@ -384,8 +389,8 @@ class SW:
 
         # Open Boundary conditions
         self.flag_obc = param['flag_obc'] if 'flag_obc' in param.keys() else False
-        if self.flag_obc and self.open_boundary_x == 'characteristic':
-            raise ValueError('flag_obc and open_boundary_x cannot be enabled together')
+        if self.flag_obc and 'characteristic' in (self.open_boundary_x, self.open_boundary_y):
+            raise ValueError('flag_obc and characteristic boundaries cannot be enabled together')
         if self.flag_obc:
             self.obc_kind = param['obc_kind'] if 'obc_kind' in param.keys() else '1d'
             self.uS = jnp.zeros((self.nx+1))
@@ -538,21 +543,59 @@ class SW:
         u = u.at[..., -1, :].set(east * dx_e * self.masks.u[..., -1, :])
         return u
 
-    def _divergence_with_open_x(self, flux_x, flux_y, U, q_phys):
-        """Flux divergence including wet exterior x-faces when requested."""
-        if self.open_boundary_x != 'characteristic':
+    def _apply_y_characteristic(self, v, h, v_b, h_b, H_total, g_prime=None):
+        """Set the incoming long-wave characteristic on wet south/north faces."""
+        if self.open_boundary_y != 'characteristic':
+            return v
+        gp = self.g_prime if g_prime is None else jnp.asarray(g_prime)
+        if gp.ndim == 1:
+            gp = gp.reshape((-1, 1, 1))
+        impedance = jnp.sqrt(gp / H_total)
+        dy_s = self.dy_vgrid if self.dy_vgrid.ndim == 0 else self.dy_vgrid[:, 0]
+        dy_n = self.dy_vgrid if self.dy_vgrid.ndim == 0 else self.dy_vgrid[:, -1]
+        area_s = self.area if self.area.ndim == 0 else self.area[:, 0]
+        area_n = self.area if self.area.ndim == 0 else self.area[:, -1]
+        south = (v_b[..., :, 0] / dy_s - impedance[..., :, 0]
+                 * (h[..., :, 0] - h_b[..., :, 0]) / area_s)
+        north = (v_b[..., :, -1] / dy_n + impedance[..., :, -1]
+                 * (h[..., :, -1] - h_b[..., :, -1]) / area_n)
+        v = v.at[..., :, 0].set(south * dy_s * self.masks.v[..., :, 0])
+        return v.at[..., :, -1].set(north * dy_n * self.masks.v[..., :, -1])
+
+    def _divergence_with_open_boundaries(self, flux_x, flux_y, U, V, q_phys, q_boundary=None):
+        """Integrated divergence, using prescribed exterior values on inflow.
+
+        Without an exterior field, use the interior value on both flow signs.
+        Closed faces remain impermeable regardless of supplied boundary data.
+        """
+        if self.open_boundary_x == self.open_boundary_y == 'closed':
             return div_nofluxbc(flux_x, flux_y)
-        area_w = self.area if self.area.ndim == 0 else self.area[0, :]
-        area_e = self.area if self.area.ndim == 0 else self.area[-1, :]
-        west = (area_w * U[..., 0, :] * q_phys[..., 0, :]
-                * self.masks.u[..., 0, :])
-        east = (area_e * U[..., -1, :] * q_phys[..., -1, :]
-                * self.masks.u[..., -1, :])
-        flux_x = jnp.concatenate((west[..., None, :], flux_x,
-                                  east[..., None, :]), axis=-2)
-        flux_y = jnp.pad(flux_y, ((0, 0), (0, 0), (0, 0), (1, 1)), mode='edge')
+        if self.open_boundary_x == 'characteristic':
+            area_w = self.area if self.area.ndim == 0 else self.area[0, :]
+            area_e = self.area if self.area.ndim == 0 else self.area[-1, :]
+            q_west, q_east = q_phys[..., 0, :], q_phys[..., -1, :]
+            if q_boundary is not None:
+                q_west = jnp.where(U[..., 0, :] > 0, q_boundary[..., 0, :], q_west)
+                q_east = jnp.where(U[..., -1, :] < 0, q_boundary[..., -1, :], q_east)
+            west = area_w * U[..., 0, :] * q_west * self.masks.u[..., 0, :]
+            east = area_e * U[..., -1, :] * q_east * self.masks.u[..., -1, :]
+            flux_x = jnp.concatenate((west[..., None, :], flux_x, east[..., None, :]), axis=-2)
+        else:
+            flux_x = jnp.pad(flux_x, ((0, 0), (0, 0), (1, 1), (0, 0)))
+        if self.open_boundary_y == 'characteristic':
+            area_s = self.area if self.area.ndim == 0 else self.area[:, 0]
+            area_n = self.area if self.area.ndim == 0 else self.area[:, -1]
+            q_south, q_north = q_phys[..., :, 0], q_phys[..., :, -1]
+            if q_boundary is not None:
+                q_south = jnp.where(V[..., :, 0] > 0, q_boundary[..., :, 0], q_south)
+                q_north = jnp.where(V[..., :, -1] < 0, q_boundary[..., :, -1], q_north)
+            south = area_s * V[..., :, 0] * q_south * self.masks.v[..., :, 0]
+            north = area_n * V[..., :, -1] * q_north * self.masks.v[..., :, -1]
+            flux_y = jnp.concatenate((south[..., :, None], flux_y, north[..., :, None]), axis=-1)
+        else:
+            flux_y = jnp.pad(flux_y, ((0, 0), (0, 0), (0, 0), (1, 1)))
         return jnp.diff(flux_x, axis=-2) + jnp.diff(flux_y, axis=-1)
-        
+
     def get_print_info(self, u, v, h):
         """
         Returns a string with summary of current variables.
@@ -571,12 +614,14 @@ class SW:
                 f'eta_sur min: {eta[:,0].min():+.5f}, ' \
                 f'max: {eta[:,0].max():.5f}'
 
-    def advection_tracer(self, U, V, c_area):
+    def advection_tracer(self, U, V, c_area, c_b=None):
         """
         Advective-form RHS for a passive scalar tracer on the h-grid.
 
         c_area: (1, n_trac, nx, ny)  tracer scaled by cell area
                 (c_area = c_phys * area — same storage convention as h)
+        c_b: prescribed exterior tracer in the same area-scaled convention;
+             used only on incoming open faces. None extrapolates the interior.
         U: (1, nl, nx+1, ny)  u_phys/dx  from compute_diagnostic_variables
         V: (1, nl, nx, ny+1)  v_phys/dy  from compute_diagnostic_variables
 
@@ -616,6 +661,7 @@ class SW:
         U_surf = U[:, 0:1, :, :]   # (1, 1, nx+1, ny)
         V_surf = V[:, 0:1, :, :]   # (1, 1, nx, ny+1)
         # Physical tracer — small magnitudes safe for WENO in float32
+        c_boundary = c_b / self.area if c_b is not None else None
         c_phys = c_area / self.area
         # Face-averaged cell area on u- and v-faces (guard for scalar/0-d area).
         if self.area.ndim >= 2:
@@ -626,13 +672,13 @@ class SW:
             area_y = self.area
         # Area-scaled velocity divergence at h-cells: area * div(u_phys).
         # Needed for advective-form correction regardless of scheme.
-        vel_div_area = self._divergence_with_open_x(
+        vel_div_area = self._divergence_with_open_boundaries(
             area_x * U_surf[..., 1:-1, :], area_y * V_surf[..., 1:-1],
-            U_surf, jnp.ones_like(c_phys[:, :1]))
+            U_surf, V_surf, jnp.ones_like(c_phys[:, :1]))
         if self.tracer_adv_scheme in ('rusanov1', 'upwind1'):
             c_flux_y = area_y * self._h_flux_rusanov1(c_phys, V_surf[..., 1:-1], dim=-1)
             c_flux_x = area_x * self._h_flux_rusanov1(c_phys, U_surf[..., 1:-1, :], dim=-2)
-            dt_c_fluxdiv = -self._divergence_with_open_x(c_flux_x, c_flux_y, U_surf, c_phys)
+            dt_c_fluxdiv = -self._divergence_with_open_boundaries(c_flux_x, c_flux_y, U_surf, V_surf, c_phys, c_boundary)
             return (dt_c_fluxdiv + c_phys * vel_div_area) * self.masks.h
         if self.tracer_adv_scheme in ('linear_upwind3', 'linear3'):
             c_flux_y = area_y * flux(
@@ -649,7 +695,7 @@ class SW:
                 mask_2=self.masks.u_sten_hx_eq2[..., 1:-1, :],
                 mask_4=self.masks.u_sten_hx_eq4[..., 1:-1, :],
                 mask_6=self.masks.u_sten_hx_gt6[..., 1:-1, :])
-            dt_c_fluxdiv = -self._divergence_with_open_x(c_flux_x, c_flux_y, U_surf, c_phys)
+            dt_c_fluxdiv = -self._divergence_with_open_boundaries(c_flux_x, c_flux_y, U_surf, V_surf, c_phys, c_boundary)
             return (dt_c_fluxdiv + c_phys * vel_div_area) * self.masks.h
         if self.tracer_adv_scheme in ('linear_upwind5', 'linear5'):
             c_flux_y = area_y * flux(
@@ -666,14 +712,14 @@ class SW:
                 mask_2=self.masks.u_sten_hx_eq2[..., 1:-1, :],
                 mask_4=self.masks.u_sten_hx_eq4[..., 1:-1, :],
                 mask_6=self.masks.u_sten_hx_gt6[..., 1:-1, :])
-            dt_c_fluxdiv = -self._divergence_with_open_x(c_flux_x, c_flux_y, U_surf, c_phys)
+            dt_c_fluxdiv = -self._divergence_with_open_boundaries(c_flux_x, c_flux_y, U_surf, V_surf, c_phys, c_boundary)
             return (dt_c_fluxdiv + c_phys * vel_div_area) * self.masks.h
         # WENO upwind reconstruction of c_phys at faces times face velocity.
         c_flux_y = area_y * self.h_flux_y(c_phys, V_surf[..., 1:-1])   # (1, n_trac, nx, ny-1)
         c_flux_x = area_x * self.h_flux_x(c_phys, U_surf[..., 1:-1, :]) # (1, n_trac, nx-1, ny)
         # Flux-divergence tendency (would be correct for h*c, contains
         # spurious c*div(u) term for c alone).
-        dt_c_fluxdiv = -self._divergence_with_open_x(c_flux_x, c_flux_y, U_surf, c_phys)
+        dt_c_fluxdiv = -self._divergence_with_open_boundaries(c_flux_x, c_flux_y, U_surf, V_surf, c_phys, c_boundary)
         # Cancel spurious c*div(u_phys) source -> pure advective form.
         return (dt_c_fluxdiv + c_phys * vel_div_area) * self.masks.h
 
@@ -750,7 +796,7 @@ class SW:
         if self.h_adv_scheme in ('rusanov1', 'upwind1'):
             h_tot_flux_y = area_y * self._h_flux_rusanov1(h_tot_phys, V[..., 1:-1], dim=-1)
             h_tot_flux_x = area_x * self._h_flux_rusanov1(h_tot_phys, U[..., 1:-1, :], dim=-2)
-            return -self._divergence_with_open_x(h_tot_flux_x, h_tot_flux_y, U, h_tot_phys) * self.masks.h
+            return -self._divergence_with_open_boundaries(h_tot_flux_x, h_tot_flux_y, U, V, h_tot_phys) * self.masks.h
         if self.h_adv_scheme in ('linear_upwind3', 'linear3'):
             h_tot_flux_y = area_y * flux(
                 h_tot_phys, V[..., 1:-1], dim=-1, n_points=4,
@@ -766,7 +812,7 @@ class SW:
                 mask_2=self.masks.u_sten_hx_eq2[..., 1:-1, :],
                 mask_4=self.masks.u_sten_hx_eq4[..., 1:-1, :],
                 mask_6=self.masks.u_sten_hx_gt6[..., 1:-1, :])
-            return -self._divergence_with_open_x(h_tot_flux_x, h_tot_flux_y, U, h_tot_phys) * self.masks.h
+            return -self._divergence_with_open_boundaries(h_tot_flux_x, h_tot_flux_y, U, V, h_tot_phys) * self.masks.h
         if self.h_adv_scheme in ('linear_upwind5', 'linear5'):
             h_tot_flux_y = area_y * flux(
                 h_tot_phys, V[..., 1:-1], dim=-1, n_points=6,
@@ -782,11 +828,11 @@ class SW:
                 mask_2=self.masks.u_sten_hx_eq2[..., 1:-1, :],
                 mask_4=self.masks.u_sten_hx_eq4[..., 1:-1, :],
                 mask_6=self.masks.u_sten_hx_gt6[..., 1:-1, :])
-            return -self._divergence_with_open_x(h_tot_flux_x, h_tot_flux_y, U, h_tot_phys) * self.masks.h
+            return -self._divergence_with_open_boundaries(h_tot_flux_x, h_tot_flux_y, U, V, h_tot_phys) * self.masks.h
         # WENO fluxes on h_tot_phys, then re-scale by face area
         h_tot_flux_y = area_y * self.h_flux_y(h_tot_phys, V[..., 1:-1])
         h_tot_flux_x = area_x * self.h_flux_x(h_tot_phys, U[..., 1:-1, :])
-        return -self._divergence_with_open_x(h_tot_flux_x, h_tot_flux_y, U, h_tot_phys) * self.masks.h
+        return -self._divergence_with_open_boundaries(h_tot_flux_x, h_tot_flux_y, U, V, h_tot_phys) * self.masks.h
 
     def _h_flux_rusanov1(self, h_tot_phys, velocity, dim):
         """
@@ -1274,8 +1320,8 @@ class SW:
 
         _u_b, _v_b, _h_b = self.set_input_uvh(
             u_b if u_b is not None else (jnp.zeros_like(u0) if self.open_boundary_x == 'characteristic' else u0),
-            v_b if v_b is not None else v0,
-            h_b if h_b is not None else (jnp.zeros_like(h0) if self.open_boundary_x == 'characteristic' else h0),
+            v_b if v_b is not None else (jnp.zeros_like(v0) if self.open_boundary_y == 'characteristic' else v0),
+            h_b if h_b is not None else (jnp.zeros_like(h0) if 'characteristic' in (self.open_boundary_x, self.open_boundary_y) else h0),
         )
 
         _Fu, _Fv, _Fh = self.set_input_uvh(
@@ -1325,6 +1371,8 @@ class SW:
                 """Tendency + sponge at current state."""
                 u_ = self._apply_x_characteristic(
                     u_, h_, _u_b, _h_b, H_total, g_prime)
+                v_ = self._apply_y_characteristic(
+                    v_, h_, _v_b, _h_b, H_total, g_prime)
                 dtu, dtv, dth = self.compute_time_derivatives(
                     u_, v_, h_, ref_vals, taux=_taux, tauy=_tauy,
                     h_wind=_h_wind, wind_strength=wind_strength,
@@ -1396,6 +1444,7 @@ class SW:
             v = v + self.dt * _Fv
             h = h + self.dt * _Fh
             u = self._apply_x_characteristic(u, h, _u_b, _h_b, H_total, g_prime)
+            v = self._apply_y_characteristic(v, h, _v_b, _h_b, H_total, g_prime)
 
             return (u, v, h), None
 
@@ -1506,8 +1555,8 @@ class SW:
 
         _u_b, _v_b, _h_b = self.set_input_uvh(
             u_b if u_b is not None else (jnp.zeros_like(u0) if self.open_boundary_x == 'characteristic' else u0),
-            v_b if v_b is not None else v0,
-            h_b if h_b is not None else (jnp.zeros_like(h0) if self.open_boundary_x == 'characteristic' else h0),
+            v_b if v_b is not None else (jnp.zeros_like(v0) if self.open_boundary_y == 'characteristic' else v0),
+            h_b if h_b is not None else (jnp.zeros_like(h0) if 'characteristic' in (self.open_boundary_x, self.open_boundary_y) else h0),
         )
         _Fu, _Fv, _Fh = self.set_input_uvh(
             Fu if Fu is not None else jnp.zeros_like(u0),
@@ -1557,7 +1606,8 @@ class SW:
                 dt_u, dt_v, dt_h = self.filter_barotropic_waves(
                     dt_u, dt_v, dt_h, u, v, h_tot_ugrid, h_tot_vgrid)
             # Tracer: reuse U, V from above — no extra diagnostic call
-            dt_c = self.advection_tracer(U, V, c) + self.add_tracer_diffusion(c)
+            dt_c = self.advection_tracer(
+                U, V, c, c_b=_c_b if c_b is not None else None) + self.add_tracer_diffusion(c)
             return dt_u, dt_v, dt_h, dt_c
 
         def single_step(carry, _):
@@ -1572,6 +1622,8 @@ class SW:
                 """Tendency + sponge at current state."""
                 u_ = self._apply_x_characteristic(
                     u_, h_, _u_b, _h_b, H_total, g_prime)
+                v_ = self._apply_y_characteristic(
+                    v_, h_, _v_b, _h_b, H_total, g_prime)
                 dtu, dtv, dth, dtc = _stage_tendencies(u_, v_, h_, c_)
                 dtu = dtu + _gamma_u * (_u_b - u_)
                 dtv = dtv + _gamma_v * (_v_b - v_)
@@ -1646,6 +1698,7 @@ class SW:
             h = h + self.dt * _Fh
             c = c + self.dt * _Fc
             u = self._apply_x_characteristic(u, h, _u_b, _h_b, H_total, g_prime)
+            v = self._apply_y_characteristic(v, h, _v_b, _h_b, H_total, g_prime)
 
             return (u, v, h, c), None
 

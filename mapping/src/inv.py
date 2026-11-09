@@ -8,8 +8,6 @@ Runs inversion drivers and assimilation orchestration.
 from .config import USE_FLOAT64
 from dataclasses import dataclass
 from typing import Callable
-import hashlib
-import json
 import sys, os
 import time
 import numpy as np
@@ -36,145 +34,11 @@ from . import tools as grid
 from .covariance import DiagonalCovariance
 
 
-
 class ConvergenceReached(Exception):
     pass
 
 class CrazyGradient(Exception):
     pass
-
-
-_CONTROL_LAYOUT_KEYS = (
-    'control_layout_version',
-    'control_layout_signature',
-    'component_order',
-    'covariance_kind',
-    'covariance_source',
-    'covariance_source_hash',
-    'basis_order',
-)
-
-
-def _multivariate_layout_descriptors(basis, path='basis'):
-    """Describe every multivariate control block in optimizer order."""
-    descriptor = getattr(basis, 'control_layout_descriptor', None)
-    if callable(descriptor):
-        return [descriptor(path)]
-    if (getattr(basis, 'layout_signature', None) is not None
-            and getattr(basis, 'product_signature', None) is not None
-            and hasattr(basis, 'component_order')):
-        return [dict(
-            path=path,
-            size=int(basis.nbasis),
-            signature=str(basis.layout_signature),
-            component_order='|'.join(basis.component_order),
-            covariance_kind=str(getattr(
-                basis, 'covariance_kind',
-                'bmaux_multivariate_local_3x3')),
-            covariance_source=os.fspath(basis.file_aux),
-            covariance_source_hash=str(basis.product_signature),
-            basis_order='|'.join(basis.name_mod_var),
-        )]
-    if hasattr(basis, 'global_basis') and hasattr(basis, 'local_bases'):
-        result = _multivariate_layout_descriptors(
-            basis.global_basis, f'{path}.global')
-        for index, child in enumerate(basis.local_bases):
-            result.extend(_multivariate_layout_descriptors(
-                child, f'{path}.window[{index}]'))
-        return result
-    children = getattr(basis, 'Basis', None)
-    if children is not None:
-        result = []
-        for index, child in enumerate(children):
-            result.extend(_multivariate_layout_descriptors(
-                child, f'{path}.block[{index}]'))
-        return result
-    return []
-
-
-def _control_layout_metadata(basis):
-    """Return portable restart metadata for multivariate control layouts."""
-    descriptors = _multivariate_layout_descriptors(basis)
-    if not descriptors:
-        return {}
-    if len(descriptors) == 1 and descriptors[0]['size'] == int(basis.nbasis):
-        signature = descriptors[0]['signature']
-        covariance_kind = descriptors[0]['covariance_kind']
-    else:
-        payload = json.dumps(
-            descriptors, sort_keys=True, separators=(',', ':')).encode()
-        signature = hashlib.sha256(payload).hexdigest()
-        covariance_kind = 'block_diagonal_with_bmaux_multivariate'
-    values = lambda key: '|'.join(dict.fromkeys(
-        descriptor[key] for descriptor in descriptors))
-    return {
-        'control_layout_version': 1,
-        'control_layout_signature': signature,
-        'component_order': values('component_order'),
-        'covariance_kind': covariance_kind,
-        'covariance_source': values('covariance_source'),
-        'covariance_source_hash': values('covariance_source_hash'),
-        'basis_order': values('basis_order'),
-    }
-
-
-def _attach_control_layout_metadata(dataset, basis):
-    dataset.attrs.update(_control_layout_metadata(basis))
-    return dataset
-
-
-def _validate_multivariate_control_file(dataset, basis, expected_size, label):
-    expected = _control_layout_metadata(basis)
-    if not expected:
-        return
-    missing = [key for key in _CONTROL_LAYOUT_KEYS if key not in dataset.attrs]
-    if missing:
-        raise ValueError(
-            f'Multivariate BMaux {label} predates signed control layouts '
-            f'(missing {missing}); legacy controls cannot be restarted safely.')
-    # The source path is informative and may legitimately change after moving
-    # an experiment. Its content hash and every structural field are strict.
-    strict_keys = tuple(
-        key for key in _CONTROL_LAYOUT_KEYS if key != 'covariance_source')
-    mismatched = [
-        key for key in strict_keys
-        if dataset.attrs.get(key) != expected[key]
-    ]
-    if dataset.res.size != expected_size or mismatched:
-        detail = (f'; mismatched metadata: {mismatched}' if mismatched else '')
-        raise ValueError(
-            f'Multivariate BMaux {label} has an incompatible control layout'
-            f'{detail}. Rebuild the control for this basis and window.')
-
-
-def _validate_windowed_control_file(dataset, basis, expected_size, label):
-    """Reject control vectors whose window slices cannot be interpreted here."""
-    _validate_multivariate_control_file(
-        dataset, basis, expected_size, label)
-    if not hasattr(basis, 'local_slices'):
-        return
-    starts = dataset.get('forcing_window_start_day')
-    ends = dataset.get('forcing_window_end_day')
-    matching_bounds = (
-        starts is not None and ends is not None
-        and np.array_equal(starts.values, basis.bounds[:-1])
-        and np.array_equal(ends.values, basis.bounds[1:])
-    )
-    matching_bases = dataset.attrs.get('control_basis_order') == '|'.join(
-        basis.control_basis_order)
-    support = dataset.get('forcing_window_support_start_day')
-    matching_support = (
-        support is not None
-        and np.array_equal(support.values, basis.support_starts)
-    ) if basis.overlap_days else (
-        support is None
-        or np.array_equal(support.values, basis.support_starts)
-    )
-    if (dataset.res.size != expected_size or not matching_bounds
-            or not matching_bases or not matching_support):
-        raise ValueError(
-            f'Windowed forcing {label} has a different control layout; '
-            'use a file created with the same window boundaries and bases.')
 
 
 def _analysis_to_minimizer_control(analysis, background, covariance,
@@ -541,175 +405,6 @@ def minimize_optax_decoupled(
         minimization_seconds=time.perf_counter() - minimization_start,
         line_search_evaluations=line_search_evaluations,
         step_size_history=step_size_history,
-    )
-
-
-def minimize_windowed_blocks(
-    evaluate: Callable,
-    initial_control,
-    *,
-    evaluate_window: Callable | None = None,
-    parameter_slice,
-    forcing_slices,
-    outer_cycles,
-    inner_maxiter=10,
-    parameter_maxiter=1,
-    history_size=10,
-    ftol=None,
-    convergence_patience=1,
-    minimum_cycles=1,
-    gradient_max_norm=None,
-    initial_callback=None,
-    block_callback=None,
-    cycle_callback=None,
-):
-    """Optimize each forcing window locally, then shared parameters globally."""
-    if outer_cycles < 1 or inner_maxiter < 1 or parameter_maxiter < 1:
-        raise ValueError('Block iteration counts must all be positive.')
-    if convergence_patience < 1 or minimum_cycles < 1:
-        raise ValueError('Block convergence counts must be positive.')
-    if history_size < 1:
-        raise ValueError('history_size must be positive.')
-    x = jnp.asarray(initial_control)
-    forcing_slices = tuple(forcing_slices)
-    slices = (parameter_slice,) + forcing_slices
-    if not forcing_slices or parameter_slice.start != 0:
-        raise ValueError('Block optimization requires shared parameters and forcing windows.')
-    position = 0
-    for slc in slices:
-        if slc.start != position or slc.stop <= slc.start:
-            raise ValueError('Block control slices must be contiguous and nonempty.')
-        position = slc.stop
-    if position != x.size:
-        raise ValueError('Block control slices must cover the complete control.')
-
-    start = time.perf_counter()
-    value, gradient = evaluate(x)
-    _block_until_ready((value, gradient))
-    cost = float(np.asarray(jax.device_get(value)))
-    if not np.isfinite(cost) or not bool(np.asarray(jax.device_get(
-            jnp.all(jnp.isfinite(gradient))))):
-        raise ValueError('Initial block cost or gradient is non-finite.')
-    costs = [cost]
-    norms = [float(np.asarray(jax.device_get(jnp.linalg.norm(gradient))))]
-    means = [float(np.asarray(jax.device_get(jnp.mean(jnp.abs(gradient)))))]
-    durations, elapsed = [], [0.]
-    evaluations, evaluation_history = 1, [1]
-    status = 'maximum outer cycles reached'
-    converged = False
-    if initial_callback is not None:
-        initial_callback(x, cost, gradient)
-
-    for cycle in range(1, outer_cycles + 1):
-        cycle_start = time.perf_counter()
-        for window_index, slc in enumerate(forcing_slices):
-            name = f'forcing_{window_index + 1}'
-            base_x = x
-            block_evaluate = (evaluate if evaluate_window is None
-                              else evaluate_window(window_index, base_x))
-            block_value, block_gradient = block_evaluate(base_x)
-            _block_until_ready((block_value, block_gradient))
-            evaluations += 1
-
-            def evaluate_block(block):
-                trial = base_x.at[slc].set(block)
-                trial_value, trial_gradient = block_evaluate(trial)
-                return trial_value, trial_gradient[slc]
-
-            result = minimize_optax_decoupled(
-                evaluate_block,
-                x[slc],
-                maxiter=inner_maxiter,
-                history_size=history_size,
-                gradient_max_norm=gradient_max_norm,
-                initial_value=block_value,
-                initial_gradient=block_gradient[slc],
-            )
-            evaluations += result.function_evaluations - 1
-            if result.iterations_completed:
-                x = x.at[slc].set(result.control)
-            block_cost = result.cost_history[-1]
-            if block_callback is not None:
-                block_callback(cycle, name, x, block_cost, result.control, {
-                    'iterations': result.iterations_completed,
-                    'evaluations': result.function_evaluations - 1,
-                    'cost_scope': 'window',
-                })
-
-        # The global adjoint aggregates every window's contribution to the
-        # shared parameters, including state dependence across boundaries.
-        value, gradient = evaluate(x)
-        _block_until_ready((value, gradient))
-        evaluations += 1
-
-        base_x = x
-
-        def evaluate_parameters(block):
-            trial = base_x.at[parameter_slice].set(block)
-            trial_value, trial_gradient = evaluate(trial)
-            return trial_value, trial_gradient[parameter_slice]
-
-        result = minimize_optax_decoupled(
-            evaluate_parameters,
-            x[parameter_slice],
-            maxiter=parameter_maxiter,
-            history_size=history_size,
-            gradient_max_norm=gradient_max_norm,
-            initial_value=value,
-            initial_gradient=gradient[parameter_slice],
-        )
-        evaluations += result.function_evaluations - 1
-        if result.iterations_completed:
-            x = x.at[parameter_slice].set(result.control)
-        cost = result.cost_history[-1]
-        if block_callback is not None:
-            block_callback(cycle, 'shared_parameters', x, cost,
-                           result.control, {
-                               'iterations': result.iterations_completed,
-                               'evaluations': result.function_evaluations - 1,
-                               'cost_scope': 'global',
-                           })
-
-        durations.append(time.perf_counter() - cycle_start)
-        elapsed.append(time.perf_counter() - start)
-        costs.append(cost)
-        # The full gradient is evaluated before the parameter block. Its
-        # norm is kept for diagnostics without an extra global evaluation.
-        norms.append(float(np.asarray(jax.device_get(jnp.linalg.norm(gradient)))))
-        means.append(float(np.asarray(jax.device_get(jnp.mean(jnp.abs(gradient))))))
-        evaluation_history.append(evaluations)
-        if cycle_callback is not None:
-            cycle_callback(cycle, x, cost, gradient, {
-                'relative_cost_change': (costs[-2] - cost)
-                / max(abs(costs[-2]), abs(cost), 1.),
-                'cycle_seconds': durations[-1],
-                'evaluations': evaluations,
-            })
-        if _criterion_reached(
-            cost_history=costs,
-            gradient_norm_history=norms,
-            gtol=None,
-            ftol=ftol,
-            patience=convergence_patience,
-            minimum_iterations=minimum_cycles,
-        ):
-            converged = True
-            status = 'outer convergence criterion reached'
-            break
-
-    return MinimizationResult(
-        control=x,
-        cost_history=costs,
-        gradient_norm_history=norms,
-        gradient_mean_history=means,
-        iteration_seconds=durations,
-        cumulative_seconds=elapsed,
-        evaluation_count_history=evaluation_history,
-        function_evaluations=evaluations,
-        iterations_completed=len(durations),
-        converged=converged,
-        status=status,
-        minimization_seconds=time.perf_counter() - start,
     )
 
 
@@ -1147,13 +842,13 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
 
     minimizer_name = getattr(config.INV, 'minimizer', 'scipy')
     supported_minimizers = (
-        'scipy', 'optax-decoupled', 'optax-full-gpu', 'block-coordinate')
+        'scipy', 'optax-decoupled', 'optax-full-gpu')
     if minimizer_name not in supported_minimizers:
         raise ValueError(
             f"Unknown 4DVar minimizer {minimizer_name!r}; expected one of "
             f"{supported_minimizers}"
         )
-    if minimizer_name in ('optax-decoupled', 'optax-full-gpu', 'block-coordinate'):
+    if minimizer_name in ('optax-decoupled', 'optax-full-gpu'):
         if not getattr(config.INV, 'jit_cost_and_grad', False):
             raise ValueError(
                 f"minimizer={minimizer_name!r} requires "
@@ -1183,11 +878,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         # initialize Basis
         from . import basis
         Basis = basis.Basis(config, State, verbose=verbose)
-    if minimizer_name == 'block-coordinate' and not hasattr(Basis, 'local_slices'):
-        raise ValueError(
-            "minimizer='block-coordinate' requires INV.forcing_window_days "
-            'and a windowed forcing basis.')
-
     # Process observations
     print('process observation operators')
     Obsop.process_obs()
@@ -1256,7 +946,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         # Read previous minimum 
         print('Read background basis:',config.INV.path_background)
         with xr.open_dataset(config.INV.path_background) as ds:
-            _validate_windowed_control_file(ds, Basis, Xb.size, 'background')
             Xb[:len(ds.res.values)] = ds.res.values
 
     # Variational object initialization
@@ -1274,7 +963,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         # Read previous minimum 
         print('Read previous minimum:',config.INV.path_init_4Dvar)
         with xr.open_dataset(config.INV.path_init_4Dvar) as ds:
-            _validate_windowed_control_file(ds, Basis, Xb.size, 'restart')
             Xopt = _analysis_to_minimizer_control(
                 ds.res.values, var.Xb, B, config.INV.prec)
         initial_control_loaded = True
@@ -1289,23 +977,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         os.makedirs(path_save_control_vectors)
 
     # Restart mode
-    maxiter = (int(config.INV.block_outer_cycles)
-               if minimizer_name == 'block-coordinate'
-               else config.INV.maxiter)
-    completed_cycles = 0
-    block_checkpoint = os.path.join(
-        path_save_control_vectors, 'X_block_latest.nc')
-    if config.INV.restart_4Dvar and minimizer_name == 'block-coordinate':
-        if os.path.exists(block_checkpoint):
-            print('Restart at:', block_checkpoint)
-            with xr.open_dataset(block_checkpoint) as ds:
-                _validate_windowed_control_file(
-                    ds, Basis, Xb.size, 'block checkpoint')
-                completed_cycles = int(ds.attrs['completed_cycles'])
-                Xopt = ds.res.values.copy()
-                initial_control_loaded = True
-            maxiter = max(maxiter - completed_cycles, 0)
-    elif config.INV.restart_4Dvar:
+    maxiter = config.INV.maxiter
+    if config.INV.restart_4Dvar:
         tmp_files = sorted(glob.glob(os.path.join(path_save_control_vectors,'X_it*.nc')))
         if len(tmp_files)>0:
             print('Restart at:',tmp_files[-1])
@@ -1317,8 +990,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
                 else:
                     raise
             try:
-                _validate_windowed_control_file(
-                    ds, Basis, Xb.size, 'iteration checkpoint')
                 Xopt = ds.res.values
                 maxiter = max(config.INV.maxiter - len(tmp_files), 0)
                 initial_control_loaded = True
@@ -1334,8 +1005,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             if os.path.exists(analysis_restart):
                 print('Restart at:', analysis_restart)
                 with xr.open_dataset(analysis_restart) as ds:
-                    _validate_windowed_control_file(
-                        ds, Basis, Xb.size, 'restart')
                     Xopt = _analysis_to_minimizer_control(
                         ds.res.values, var.Xb, B, config.INV.prec)
                 initial_control_loaded = True
@@ -1353,103 +1022,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             'control was loaded. Expected path_init_4Dvar or a control file '
             f'in {path_save_control_vectors!r}.')
 
-    if minimizer_name == 'block-coordinate' and not skip_minimization:
-        print('\n*** Minimization (windowed block coordinates) ***\n')
-        iterations_path = os.path.join(path_save_control_vectors, 'iterations.txt')
-        with open(iterations_path, 'a' if completed_cycles else 'w') as stream:
-            if not completed_cycles:
-                stream.write('Windowed block-coordinate minimization\n')
-
-        def save_block_checkpoint(cycle, control):
-            dataset = xr.Dataset({
-                'res': (('x',), np.asarray(jax.device_get(control))),
-                'forcing_window_start_day': (
-                    ('forcing_window',), Basis.bounds[:-1]),
-                'forcing_window_end_day': (
-                    ('forcing_window',), Basis.bounds[1:]),
-                'forcing_window_support_start_day': (
-                    ('forcing_window',), Basis.support_starts),
-            })
-            dataset.attrs['control_basis_order'] = '|'.join(
-                Basis.control_basis_order)
-            dataset.attrs['completed_cycles'] = cycle
-            _attach_control_layout_metadata(dataset, Basis)
-            temporary = block_checkpoint + '.tmp'
-            dataset.to_netcdf(temporary)
-            dataset.close()
-            os.replace(temporary, block_checkpoint)
-
-        if not completed_cycles:
-            save_block_checkpoint(0, Xopt)
-
-        def initial_callback(control, cost, gradient):
-            line = f'initial J_global={cost:.6E}'
-            print(line, flush=True)
-            with open(iterations_path, 'a') as stream:
-                stream.write(line + '\n')
-
-        def block_callback(cycle, name, control, cost, gradient, diagnostics):
-            cycle += completed_cycles
-            cost_label = ('J_window' if diagnostics['cost_scope'] == 'window'
-                          else 'J_global')
-            line = (
-                f'cycle {cycle}, block {name}, {cost_label}={cost:.6E}, '
-                f'iterations={diagnostics["iterations"]}, '
-                f'evaluations={diagnostics["evaluations"]}')
-            if verbose:
-                print(line, flush=True)
-            with open(iterations_path, 'a') as stream:
-                stream.write(line + '\n')
-
-        def cycle_callback(cycle, control, cost, gradient, diagnostics):
-            cycle += completed_cycles
-            line = (
-                f'cycle {cycle} complete, J={cost:.6E}, '
-                f'relative_change={diagnostics["relative_cost_change"]:.6E}, '
-                f'time={diagnostics["cycle_seconds"]:.3f}s')
-            print(line + '\n', flush=True)
-            with open(iterations_path, 'a') as stream:
-                stream.write(line + '\n\n')
-            save_block_checkpoint(cycle, control)
-
-        patience = getattr(config.INV, 'convergence_nit', None) or 1
-        minimization_result = minimize_windowed_blocks(
-            var.cost_and_grad,
-            jnp.asarray(Xopt, dtype=var.cost_dtype),
-            evaluate_window=var.make_window_evaluator,
-            parameter_slice=slice(0, Basis.global_basis.nbasis),
-            forcing_slices=Basis.local_slices,
-            outer_cycles=maxiter,
-            inner_maxiter=int(config.INV.block_inner_maxiter),
-            parameter_maxiter=int(config.INV.block_parameter_maxiter),
-            history_size=int(getattr(
-                config.INV, 'lbfgs_history_size', None) or 10),
-            ftol=getattr(config.INV, 'ftol', None),
-            convergence_patience=int(patience),
-            minimum_cycles=int(getattr(config.INV, 'minimum_iterations', 1)),
-            gradient_max_norm=getattr(config.INV, 'gradient_max_norm', None),
-            initial_callback=initial_callback,
-            block_callback=block_callback,
-            cycle_callback=cycle_callback,
-        )
-        Xres = minimization_result.control
-        print(f'\nMinimization status: {minimization_result.status}')
-        print(f'\nFinal cost function value: {minimization_result.cost_history[-1]}')
-        print(f'\nNumber of outer cycles: {minimization_result.iterations_completed}')
-        if config.INV.save_minimization:
-            dataset = xr.Dataset({
-                'cost': (('cycle',), np.asarray(
-                    minimization_result.cost_history)),
-                'grad_norm': (('cycle',), np.asarray(
-                    minimization_result.gradient_norm_history)),
-                'grad_mean': (('cycle',), np.asarray(
-                    minimization_result.gradient_mean_history)),
-            })
-            dataset.to_netcdf(os.path.join(
-                path_save_control_vectors, 'minimization_trajectory.nc'))
-            dataset.close()
-
-    elif minimizer_name == 'optax-full-gpu' and not skip_minimization:
+    if minimizer_name == 'optax-full-gpu' and not skip_minimization:
         print('\n*** Minimization (Optax L-BFGS, full GPU) ***\n')
         patience = getattr(config.INV, 'convergence_nit', None)
         if patience is None:
@@ -1505,7 +1078,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             if config.INV.save_minimization:
                 control_host = np.asarray(jax.device_get(control))
                 dataset = xr.Dataset({'res': (('x',), control_host)})
-                _attach_control_layout_metadata(dataset, Basis)
                 dataset.to_netcdf(os.path.join(
                     path_save_control_vectors,
                     'X_it.nc',
@@ -1627,7 +1199,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         def callback(XX):
             if config.INV.save_minimization:
                 ds = xr.Dataset({'res':(('x',),XX)})
-                _attach_control_layout_metadata(ds, Basis)
                 ds.to_netcdf(os.path.join(path_save_control_vectors,'X_it.nc'))
                 ds.close()
                 
@@ -1795,23 +1366,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         
     # Save minimum for next experiments
     ds = xr.Dataset({'res':(('x',), np.asarray(jax.device_get(Xa)))})
-    if hasattr(Basis, 'local_slices'):
-        ds['forcing_window_support_start_day'] = (
-            ('forcing_window',), Basis.support_starts)
-        ds['forcing_window_start_day'] = (
-            ('forcing_window',), Basis.bounds[:-1])
-        ds['forcing_window_end_day'] = (
-            ('forcing_window',), Basis.bounds[1:])
-        ds['forcing_control_start'] = (
-            ('forcing_window',),
-            np.asarray([slc.start for slc in Basis.local_slices]))
-        ds['forcing_control_stop'] = (
-            ('forcing_window',),
-            np.asarray([slc.stop for slc in Basis.local_slices]))
-        ds.attrs['shared_parameter_control_count'] = int(
-            Basis.global_basis.nbasis)
-        ds.attrs['control_basis_order'] = '|'.join(Basis.control_basis_order)
-    _attach_control_layout_metadata(ds, Basis)
     ds.to_netcdf(os.path.join(path_save_control_vectors, 'Xres.nc'))
     ds.close()
 
@@ -1867,7 +1421,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
 # =============================================================================
 # Merged from tools_4Dvar.py
 # =============================================================================
-
 
 
 Cov = DiagonalCovariance
@@ -2254,85 +1807,9 @@ class Variational:
         state.params = dict(params)
         return state
 
-    def _scan_state_at(self, X0, end_index, scan_boundary_conditions):
-        """Forecast the continuous state up to a window's support start."""
-        with self.cost_precision():
-            X0 = jnp.asarray(X0, dtype=self.cost_dtype)
-            if self.B is not None:
-                X = (self.B.sqrt(X0) + self.Xb if self.prec
-                     else X0 + self.Xb)
-            else:
-                X = X0 - self.Xb
-        X_model = jnp.asarray(X, dtype=self.model_control_dtype)
-        initial = self.State.copy()
-
-        def step(carry, inputs):
-            state = self._state_from_scan_trees(*carry)
-            t, basis_active, boundary = inputs
-
-            def project(params):
-                projected = dict(params)
-                self.basis.operg(t / 86400., X_model, State=projected)
-                return projected
-
-            state.params = lax.cond(
-                basis_active, project, lambda params: params, state.params)
-            if self._scan_has_boundary_conditions:
-                self.M.step(t=t, State=state, nstep=self._scan_nstep,
-                            Xb=boundary)
-            else:
-                self.M.step(t=t, State=state, nstep=self._scan_nstep)
-            return (dict(state.var), dict(state.params)), None
-
-        final, _ = lax.scan(
-            step, (dict(initial.var), dict(initial.params)),
-            (self._scan_times[:end_index],
-             self._scan_basis_active[:end_index],
-             jax.tree_util.tree_map(
-                 lambda values: values[:end_index],
-                 scan_boundary_conditions)),
-            unroll=1)
-        return final
-
-    def make_window_evaluator(self, window_index, control):
-        """Bind the entering state once, then evaluate only this window."""
-        if not hasattr(self.basis, 'bounds') or self.cost_and_grad_schedule != 'scan':
-            raise ValueError('Local window evaluation requires a scan schedule.')
-        bounds = np.asarray(self.basis.bounds) * 86400.
-        support_starts = np.asarray(self.basis.support_starts) * 86400.
-        times = np.asarray(jax.device_get(self._scan_times))
-        start = int(np.searchsorted(
-            times, support_starts[window_index], side='left'))
-        end = int(np.searchsorted(times, bounds[window_index + 1], side='left'))
-        if (start >= times.size or end <= start
-                or not np.isclose(times[start], support_starts[window_index])):
-            raise ValueError('Forcing windows must align with scan checkpoints.')
-        control_slice = self.basis.local_slices[window_index]
-        if not hasattr(self, '_window_scan_compiled'):
-            self._window_scan_compiled = {}
-            self._window_prefix_compiled = {}
-        if start not in self._window_prefix_compiled:
-            self._window_prefix_compiled[start] = jax.jit(
-                lambda x, bc: self._scan_state_at(x, start, bc))
-        entering_state = self._window_prefix_compiled[start](
-            jnp.asarray(control, dtype=self.cost_dtype),
-            self._scan_boundary_conditions)
-        _block_until_ready(entering_state)
-        if window_index not in self._window_scan_compiled:
-            self._window_scan_compiled[window_index] = jax.jit(
-                lambda x, state, bc: self._cost_and_grad_scan_impl(
-                    x, scan_boundary_conditions=bc,
-                    scan_start=start, scan_end=end,
-                    initial_scan_state=state, local_control_slice=control_slice))
-        compiled = self._window_scan_compiled[window_index]
-        return lambda x: compiled(
-            jnp.asarray(x, dtype=self.cost_dtype), entering_state,
-            self._scan_boundary_conditions)
 
     def _cost_and_grad_scan_impl(
-        self, X0, scan_boundary_conditions=None, *, scan_start=0,
-        scan_end=None, initial_scan_state=None, local_control_slice=None,
-        cost_only=False,
+        self, X0, scan_boundary_conditions=None, *, cost_only=False,
     ):
         """Cost and explicit adjoint with rolled checkpoint loops.
 
@@ -2346,30 +1823,19 @@ class Variational:
             if self.B is not None:
                 if self.prec:
                     X = self.B.sqrt(X0) + self.Xb
-                    background = X0
                     Jb = jnp.vdot(X0, X0)
                 else:
                     X = X0 + self.Xb
-                    background = self.B.inv(X0)
-                    Jb = jnp.vdot(X0, background)
-                if local_control_slice is not None:
-                    Jb = jnp.vdot(X0[local_control_slice],
-                                  background[local_control_slice])
+                    Jb = jnp.vdot(X0, self.B.inv(X0))
             else:
                 X = X0 - self.Xb
                 Jb = jnp.asarray(0., dtype=self.cost_dtype)
             Jo0 = jnp.asarray(0., dtype=self.cost_dtype)
 
         X_model = jnp.asarray(X, dtype=self.model_control_dtype)
-        if initial_scan_state is None:
-            initial_state = self.State.copy()
-            initial_var = dict(initial_state.var)
-            initial_params = dict(initial_state.params)
-        else:
-            initial_var, initial_params = initial_scan_state
-
-        if scan_end is None:
-            scan_end = len(self.checkpoints) - 1
+        initial_state = self.State.copy()
+        initial_var = dict(initial_state.var)
+        initial_params = dict(initial_state.params)
 
         def project_basis(t, params):
             projected = dict(params)
@@ -2422,11 +1888,9 @@ class Variational:
         if scan_boundary_conditions is None:
             scan_boundary_conditions = self._scan_boundary_conditions
         scan_inputs = (
-            self._scan_times[scan_start:scan_end],
-            self._scan_basis_active[scan_start:scan_end],
-            jax.tree_util.tree_map(
-                lambda values: values[scan_start:scan_end],
-                scan_boundary_conditions),
+            self._scan_times,
+            self._scan_basis_active,
+            scan_boundary_conditions,
         )
         (final_var, final_params, Jo), trajectory = lax.scan(
             forward_body,
@@ -2436,8 +1900,7 @@ class Variational:
         )
         trajectory_var, trajectory_params, trajectory_misfit = trajectory
 
-        final_time = (self._scan_final_time if scan_end == len(self.checkpoints) - 1
-                      else self._scan_times[scan_end])
+        final_time = self._scan_final_time
         final_misfit = self.H.scan_misfit(final_time, final_var)
         with self.cost_precision():
             final_weighted = jnp.asarray(
@@ -2538,11 +2001,9 @@ class Variational:
             return (ad_var, ad_params, ad_control), None
 
         reverse_inputs = (
-            self._scan_times[scan_start:scan_end],
-            self._scan_basis_active[scan_start:scan_end],
-            jax.tree_util.tree_map(
-                lambda values: values[scan_start:scan_end],
-                scan_boundary_conditions),
+            self._scan_times,
+            self._scan_basis_active,
+            scan_boundary_conditions,
             trajectory_var,
             trajectory_params,
             trajectory_misfit,

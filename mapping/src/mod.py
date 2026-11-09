@@ -3115,7 +3115,8 @@ class Model_qgsw(M):
         model = model_sw
         if self._physical_interface_height:
             has_aux_H = self._has_params_aux and self._params_aux_names.get('H')
-            if config.MOD.H is None and config.MOD.g_prime is None and not has_aux_H:
+            has_aux_g_prime = self._has_params_aux and self._params_aux_names.get('g_prime')
+            if config.MOD.H is None and config.MOD.g_prime is None and not (has_aux_H or has_aux_g_prime):
                 raise ValueError(
                     'interface_displacement requires MOD.H or MOD.g_prime; '
                     'the missing field is diagnosed from the reference phase speed.'
@@ -3274,10 +3275,11 @@ class Model_qgsw(M):
 
         # Open Rossby Radius if provided
         H_reference_value = self.parameter_maps.get('H', config.MOD.H)
+        g_prime_reference_value = self.parameter_maps.get('g_prime', config.MOD.g_prime)
         phase_speed_required = not (
             config.MOD.nl == 1
             and H_reference_value is not None
-            and config.MOD.g_prime is not None
+            and g_prime_reference_value is not None
         )
         if (phase_speed_required and config.MOD.filec_aux is not None
                 and os.path.exists(config.MOD.filec_aux)):
@@ -3367,7 +3369,7 @@ class Model_qgsw(M):
             return array
 
         H_configured = H_reference_value is not None
-        g_prime_configured = config.MOD.g_prime is not None
+        g_prime_configured = g_prime_reference_value is not None
         if self.c is not None:
             if self.c.shape != (State.ny, State.nx):
                 raise ValueError(
@@ -3384,7 +3386,7 @@ class Model_qgsw(M):
         else:
             H = None
         if g_prime_configured:
-            g_prime = _reference_field(config.MOD.g_prime, 'g_prime')
+            g_prime = _reference_field(g_prime_reference_value, 'g_prime')
         else:
             g_prime = None
 
@@ -3408,6 +3410,9 @@ class Model_qgsw(M):
         
 
         self.g_prime = np.asarray(g_prime, dtype=float)
+        # Keep the resolved reference in State coordinates for forcing-basis
+        # validation, including maps and references diagnosed from H and c.
+        State.qgsw_reference_g_prime = np.array(self.g_prime[0].T, copy=True)
         if self._physical_interface_height:
             # Both factors have State's (ny, nx) layout. The state stores eta;
             # external BCs, observations, and output use physical SSH.
@@ -3732,6 +3737,7 @@ class Model_qgsw(M):
             "compile": True,
             "slip_coef": config.MOD.slip_coef,
             "open_boundary_x": getattr(config.MOD, 'open_boundary_x', 'closed'),
+            "open_boundary_y": getattr(config.MOD, 'open_boundary_y', 'closed'),
             "visc_coef": self.visc_coef_ref,
             "diff_coef": self.diff_coef_ref,
             "dt": self.dt,
@@ -4028,7 +4034,7 @@ class Model_qgsw(M):
                 ds = ds.sortby(lon_name)
 
             maps = {}
-            for parameter in ('H', 'h_wind', 'diff_coef', 'visc_coef', 'bottom_drag_coef'):
+            for parameter in ('H', 'g_prime', 'h_wind', 'diff_coef', 'visc_coef', 'bottom_drag_coef'):
                 variable = names.get(parameter)
                 if not variable:
                     continue
@@ -4058,13 +4064,15 @@ class Model_qgsw(M):
             if config.EXP.flag_plot >= 1 and maps:
                 units = {
                     'H': 'm',
+                    'g_prime': r'm s$^{-2}$',
+                    'bottom_drag_coef': r's$^{-1}$',
                     'h_wind': 'm',
                     'diff_coef': r'm$^2$ s$^{-1}$',
                     'visc_coef': r'm$^2$ s$^{-1}$',
                 }
-                fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
+                fig, axes = plt.subplots(2, 3, figsize=(18, 8), constrained_layout=True)
                 for axis, parameter in zip(axes.ravel(),
-                                           ('H', 'h_wind', 'diff_coef', 'visc_coef')):
+                                           ('H', 'g_prime', 'h_wind', 'diff_coef', 'visc_coef', 'bottom_drag_coef')):
                     if parameter not in maps:
                         axis.set_visible(False)
                         continue
@@ -4200,6 +4208,13 @@ class Model_qgsw(M):
             f'(1, nl, nx, ny); got {H_control.shape}.'
         )
 
+    def _log_control_to_total(self, reference, control, floor=0., maximum=None):
+        """Apply a dimensionless log-control around a positive reference."""
+        if control is None:
+            return jnp.asarray(reference, dtype=self.dtype)
+        total = floor + (reference - floor) * jnp.exp(control)
+        return total if maximum is None else jnp.minimum(total, maximum)
+
     def _H_control_to_total(self, H_control, apply_bounds=True, g_prime_control=None):
         H_control_sw = self._H_control_to_sw(H_control)
         H_ref = jnp.asarray(self.H0, dtype=self.dtype)
@@ -4218,10 +4233,9 @@ class Model_qgsw(M):
             H_total = product / g_total
             return jnp.maximum(H_total, jnp.asarray(self.H_floor, dtype=self.dtype))
         H_floor = jnp.asarray(self.H_floor, dtype=self.dtype)
-        H_total = H_floor + (H_ref - H_floor) * jnp.exp(H_control_sw)
-        if apply_bounds and self.H_max_bound is not None:
-            H_total = jnp.minimum(H_total, self.H_max_bound)
-        return H_total
+        return self._log_control_to_total(
+            H_ref, H_control_sw, H_floor,
+            self.H_max_bound if apply_bounds else None)
 
     def _H_control_to_model_increment(self, H_control, g_prime_control=None):
         if H_control is None:
@@ -4254,7 +4268,7 @@ class Model_qgsw(M):
         reference = jnp.asarray(self.g_prime, dtype=self.dtype)
         if control is None:
             return reference
-        return reference * jnp.exp(self._g_prime_control_to_sw(control))
+        return self._log_control_to_total(reference, self._g_prime_control_to_sw(control))
 
     def _g_prime_control_to_total_state(self, control):
         total = self._g_prime_control_to_total(control)
@@ -4274,10 +4288,9 @@ class Model_qgsw(M):
     def _h_wind_control_to_total_sw(self, h_wind_control):
         """Map a 2-D logarithmic wind-depth control to total depth in SW layout."""
         h_wind_control = jnp.asarray(h_wind_control, dtype=self.dtype)
-        h_wind_total = self.h_wind_floor_sw + (self.h_wind_ref_sw - self.h_wind_floor_sw) * jnp.exp(h_wind_control)
-        if self.h_wind_max_bound_sw is not None:
-            h_wind_total = jnp.minimum(h_wind_total, self.h_wind_max_bound_sw)
-        return h_wind_total
+        return self._log_control_to_total(
+            self.h_wind_ref_sw, h_wind_control,
+            self.h_wind_floor_sw, self.h_wind_max_bound_sw)
 
     def _h_wind_control_to_model_increment(self, h_wind_control):
         if h_wind_control is None:
@@ -4296,14 +4309,14 @@ class Model_qgsw(M):
         reference = jnp.asarray(getattr(self, f'{name}_ref'), dtype=self.dtype)
         if control is None:
             return reference
-        total = reference * jnp.exp(jnp.asarray(control, dtype=self.dtype))
+        total = self._log_control_to_total(reference, jnp.asarray(control, dtype=self.dtype))
         return jnp.maximum(total, jnp.finfo(self.dtype).tiny)
 
     def _coefficient_control_to_total_state(self, name, control):
         control_sw = jnp.asarray(control, dtype=self.dtype).T
         return np.array(self._coefficient_control_to_total_sw(name, control_sw).T)
 
-    def _wind_depth_to_model(self, H_control, h_wind_control):
+    def _wind_depth_to_model(self, H_control, h_wind_control, g_prime_control=None):
         """Select the one configured wind-forcing depth for the SW kernel.
 
         The returned value is either a total physical depth or an additive
@@ -4320,7 +4333,7 @@ class Model_qgsw(M):
             return None
 
         if self._wind_depth_from_H and H_control is not None:
-            return self._H_control_to_total(H_control)[0]
+            return self._H_control_to_total(H_control, g_prime_control=g_prime_control)[0]
 
         return None
 
@@ -4577,8 +4590,11 @@ class Model_qgsw(M):
                 State.params['g_prime'])
             State0.var['g_prime_control'] = +State.params['g_prime']
             _name_var += ['g_prime', 'g_prime_control']
+        elif 'g_prime' in self.parameter_maps:
+            State0.var['g_prime'] = np.array(self.g_prime[0].T)
+            _name_var += ['g_prime']
         if (self._depth_control_name in self.name_params or 'g_prime' in self.name_params
-                or 'H' in self.parameter_maps):
+                or 'H' in self.parameter_maps or 'g_prime' in self.parameter_maps):
             State0.var['c'] = self._controlled_phase_speed_state(State)
             _name_var += ['c']
 
@@ -4953,7 +4969,7 @@ class Model_qgsw(M):
 
         H_model = self._H_control_to_model_increment(H, g_prime_control)
         h_wind_model = self._wind_depth_to_model(
-            H, h_wind)
+            H, h_wind, g_prime_control)
         diff_coef_model = self._coefficient_control_to_total_sw(
             'diff_coef', diff_coef)
         visc_coef_model = self._coefficient_control_to_total_sw(
@@ -5052,7 +5068,7 @@ class Model_qgsw(M):
 
         H_model = self._H_control_to_model_increment(H, g_prime_control)
         h_wind_model = self._wind_depth_to_model(
-            H, h_wind)
+            H, h_wind, g_prime_control)
         diff_coef_model = self._coefficient_control_to_total_sw(
             'diff_coef', diff_coef)
         visc_coef_model = self._coefficient_control_to_total_sw(
