@@ -1,12 +1,15 @@
 """Reduced local temporal controls: covariance, dimensions and MAP invariants."""
+import pytest
+pytest.importorskip("learning_local.sw_learning", reason="Optional local SW learning sources are absent")
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from unittest.mock import patch
 
-from src.sw_reduced_temporal import (ReducedTemporalBasis, local_statistics,
+from learning_local.sw_reduced_temporal import (ReducedTemporalBasis, local_statistics,
                                     window_matrix, window_acf_table, summarize_local_statistics)
-from src.sw_learning_empirical import map_only, MapOptions
+from learning_local.sw_learning_empirical import map_only, MapOptions
 
 
 def test_local_width_controls_dimension_and_preserves_mean_variance_and_adjoint():

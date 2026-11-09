@@ -31,7 +31,7 @@ from jax.lax import scan
 jax.config.update("jax_enable_x64", USE_FLOAT64)
 
 from . import tools as grid
-from .covariance import DiagonalCovariance
+from .tools import DiagonalCovariance
 
 
 class ConvergenceReached(Exception):

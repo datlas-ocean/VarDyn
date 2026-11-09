@@ -23,7 +23,7 @@ from scipy.spatial import cKDTree
 from scipy.ndimage import label as _label_sw_basins
 import jax.numpy as jnp 
 from jax.experimental import sparse as sparse
-from .covariance import (
+from .tools import (
     BlockDiagonalCovariance,
     CovarianceOperator,
     DiagonalCovariance,

@@ -1,11 +1,14 @@
 """The UpperDyn flux component must reproduce MOD_DIFF's checkpoint integral."""
 
+import pytest
+pytest.importorskip("learning_local.sw_learning", reason="Optional local SW learning sources are absent")
+
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.experimental.sparse import CSR
 
-from src.sw_barotropic_component import BarotropicComponent, cumulative_flux_weights
+from learning_local.sw_barotropic_component import BarotropicComponent, cumulative_flux_weights
 
 
 class _SmallBasis:

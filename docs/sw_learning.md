@@ -7,23 +7,35 @@ source dependency.
 
 ## Source layout
 
+`mapping/src/` contains exactly the 13 Python files tracked by local `main`.
+Its imports never depend on the optional learning sources. The 17 additional
+modules have been moved to `mapping/learning_local/`, which is ignored by Git.
+They remain available in this working copy; a fresh clone does not include them.
+The four tracked CLI drivers use the optional `learning_local` package, and
+learning-specific tests skip when that local package is absent.
+
+The archived `mapping/learning_local/covariance.py` is retained as a local copy;
+active covariance classes are defined only in the tracked `src.tools` module.
+The provenance inventory `sw_learning_source_inventory.json` describes the
+historical integration before this move.
+
 - `mapping/src/basis.py`: daily SW forcing, AR(1) covariance, generic/calibrated
   forcing bases and divergent/rotational/compensated-height spatial operators.
-- `mapping/src/covariance.py`: shared independent covariance operators.
-- `mapping/src/sw_learning_empirical.py`: MAP1, empirical means, standard
+- `mapping/src/tools.py`: shared independent covariance operators.
+- `mapping/learning_local/sw_learning_empirical.py`: MAP1, empirical means, standard
   deviations and temporal statistics; physical RMS normalization.
-- `mapping/src/sw_reduced_temporal.py`: per-atom window ACF fits and compact
+- `mapping/learning_local/sw_reduced_temporal.py`: per-atom window ACF fits and compact
   temporal controls for reduced MAP2.
-- `mapping/src/sw_joint_control.py`, `sw_joint_optax.py` and
+- `mapping/learning_local/sw_joint_control.py`, `sw_joint_optax.py` and
   `sw_learning_joint_forward.py`: joint forcing/physical-parameter controls,
   the existing Optax minimizer and differentiable continuous SW trajectories.
-- `mapping/src/sw_learning.py`, `sw_learning_moments.py`,
+- `mapping/learning_local/sw_learning.py`, `sw_learning_moments.py`,
   `sw_learning_windowed.py`, `sw_learning_forward.py`: historical approximate
   EM / posterior-moment learning and fixed-physics trajectories.
-- `mapping/src/sw_learning_spectral.py`, `sw_learning_host_spectral.py`,
+- `mapping/learning_local/sw_learning_spectral.py`, `sw_learning_host_spectral.py`,
   `sw_learning_cg_audit.py`, `sw_learning_pilot.py`, `sw_learning_profile.py`:
   posterior preconditioning, audits, pilots and GPU resource profiling.
-- `mapping/src/sw_barotropic_component.py` and `sw_barotropic_joint_forward.py`:
+- `mapping/learning_local/sw_barotropic_component.py` and `sw_barotropic_joint_forward.py`:
   optional barotropic SSH component and associated trajectory.
 
 Imports use the classes in `basis.py`; the former `sw_daily_forcing.py`,
@@ -61,3 +73,10 @@ Production GPU checks and detached execution follow `AGENTS.md`.
 The source inventory and verification logs for this integration are in
 `runs/merge_dev_sw_20261109/`. Small synthetic CPU tests validate the learning
 operators and gradients; they do not reproduce annual GLORYS training or an OSE.
+
+The current layout was verified separately: 40 core CPU tests pass with imports
+of the relocated modules explicitly blocked (eight optional test files skip),
+and 43 local learning tests pass with the local package available. Static import
+auditing finds no core dependency on the relocated modules. All 34 source/driver
+files compile; all four CLI help commands succeed. Details and the move inventory
+are in `runs/src_main_layout_20261109/`.

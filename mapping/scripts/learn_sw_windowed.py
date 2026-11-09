@@ -41,8 +41,8 @@ def main():
     import numpy as np
     import xarray as xr
     from src import exp
-    from src.sw_learning import LearningOptions
-    from src.sw_learning_windowed import learn_windows, partition_windows
+    from learning_local.sw_learning import LearningOptions
+    from learning_local.sw_learning_windowed import learn_windows, partition_windows
     cfg = exp.Exp(str(args.config.resolve()))
     end = cfg.EXP.init_date+timedelta(days=args.days) if args.days is not None else cfg.EXP.final_date
     windows = partition_windows(cfg.EXP.init_date,end,args.window_days,args.overlap_days)
@@ -64,7 +64,7 @@ def main():
     with np.load(bootstrap/'basis_metadata.npz') as saved:
         records=saved['records'].copy()
         statistics={key:saved[key].copy() for key in ('std','tdec','mean')}
-    sources = [ROOT/'mapping/src/sw_learning_windowed.py',ROOT/'mapping/src/sw_learning_moments.py',
+    sources = [ROOT/'mapping/learning_local/sw_learning_windowed.py',ROOT/'mapping/learning_local/sw_learning_moments.py',
                Path(__file__), ROOT/'mapping/scripts/learn_sw_daily.py']
     provenance = hashlib.sha256(json.dumps(json.loads((bootstrap/'provenance.json').read_text()),sort_keys=True).encode()
         +(bootstrap/'resolved_config.json').read_bytes()+b''.join(p.read_bytes() for p in sources)).hexdigest()

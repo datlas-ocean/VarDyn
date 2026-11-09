@@ -1,12 +1,14 @@
 """The pilot preserves Gaussian MAP inference and rejects incompatible resumes."""
+import pytest
+pytest.importorskip("learning_local.sw_learning", reason="Optional local SW learning sources are absent")
+
 from types import SimpleNamespace
 import json
 import numpy as np
 import jax.numpy as jnp
-import pytest
 from src.basis import DailyAR1Covariance
-from src.sw_learning_pilot import run_pilot
-from src.sw_learning_cg_audit import audit
+from learning_local.sw_learning_pilot import run_pilot
+from learning_local.sw_learning_cg_audit import audit
 
 
 def test_pilot_dense_map_and_restart(tmp_path):
@@ -46,7 +48,7 @@ def test_incomplete_map_is_saved_but_does_not_start_cg(tmp_path):
 
 def test_spectral_inverse_matches_dense_precision():
     import jax
-    from src.sw_learning_spectral import spectral_inverse
+    from learning_local.sw_learning_spectral import spectral_inverse
     rng = np.random.default_rng(4)
     q, _ = np.linalg.qr(rng.normal(size=(20, 20)))
     precision = (q*np.geomspace(1., 1000., 20))@q.T
@@ -59,7 +61,7 @@ def test_spectral_inverse_matches_dense_precision():
 
 def test_host_spectral_inverse_and_compiled_cg():
     import jax
-    from src.sw_learning_host_spectral import host_spectral_inverse
+    from learning_local.sw_learning_host_spectral import host_spectral_inverse
     q, _ = np.linalg.qr(np.random.default_rng(4).normal(size=(20, 20)))
     precision = (q*np.geomspace(1., 1000., 20))@q.T
     hessian = jax.jit(lambda v: jnp.asarray(precision)@v)

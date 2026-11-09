@@ -79,8 +79,8 @@ def main():
     import numpy as np
     import xarray as xr
     from src import exp, state, mod, basis, obs, obsop
-    from src.sw_learning import learn, LearningOptions
-    from src.sw_learning_forward import make_daily_residual
+    from learning_local.sw_learning import learn, LearningOptions
+    from learning_local.sw_learning_forward import make_daily_residual
     if not args.prepare_only:
         print('Device:', jax.devices('gpu')[0], flush=True)
     cfg = exp.Exp(str(args.config.resolve()))
@@ -104,15 +104,15 @@ def main():
     cfg.BASIS.initial_tdec_days = args.initial_tdec
     resolved = json.dumps(dict(cfg), default=str, sort_keys=True)
     source_paths = [args.config.resolve(), ROOT/'mapping/src/basis.py',
-        ROOT/'mapping/src/sw_learning.py', ROOT/'mapping/src/sw_learning_moments.py',
-        ROOT/'mapping/src/sw_learning_spectral.py', ROOT/'mapping/src/sw_learning_host_spectral.py',
-        ROOT/'mapping/src/sw_learning_forward.py',
-        ROOT/'mapping/src/covariance.py', ROOT/'mapping/src/mod.py',
+        ROOT/'mapping/learning_local/sw_learning.py', ROOT/'mapping/learning_local/sw_learning_moments.py',
+        ROOT/'mapping/learning_local/sw_learning_spectral.py', ROOT/'mapping/learning_local/sw_learning_host_spectral.py',
+        ROOT/'mapping/learning_local/sw_learning_forward.py',
+        ROOT/'mapping/src/tools.py', ROOT/'mapping/src/mod.py',
         ROOT/'mapping/models/model_qgsw/sw.py', ROOT/'mapping/src/obsop.py']
     if args.map_only or args.physical_prior or cfg.BASIS.get('initial_physical_rms'):
-        source_paths += [ROOT/'mapping/src/sw_learning_empirical.py', Path(__file__).resolve()]
+        source_paths += [ROOT/'mapping/learning_local/sw_learning_empirical.py', Path(__file__).resolve()]
     if args.reduced_temporal:
-        source_paths += [ROOT/'mapping/src/sw_reduced_temporal.py', ROOT/'mapping/src/covariance.py']
+        source_paths += [ROOT/'mapping/learning_local/sw_reduced_temporal.py', ROOT/'mapping/src/tools.py']
     sources = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths}
     inputs = set(item.path for item in cfg.OBS.values())
     inputs.update(item['file'] for item in cfg.MOD.bc_files.values())
@@ -162,7 +162,7 @@ def main():
     daily = basis.Basis(cfg, grid)
     daily.set_basis(times/86400.)
     if args.physical_prior or cfg.BASIS.get('initial_physical_rms'):
-        from src.sw_learning_empirical import physical_scale_prior
+        from learning_local.sw_learning_empirical import physical_scale_prior
         amplitudes = dict(cfg.BASIS.get('initial_physical_rms') or dict(
             divergent=.1, rotational=.1, height=1., height_mean=1.))
         if args.momentum_rms is not None:
@@ -188,11 +188,11 @@ def main():
             # used as an AR1 parameter in reduced mode.
             tau = saved['tdec']
             daily.update_statistics(saved['std'], np.where(np.isfinite(tau),tau,daily.tdec), saved['mean'])
-    from src.sw_learning_windowed import atomic_npz
+    from learning_local.sw_learning_windowed import atomic_npz
     atomic_npz(args.output/'basis_metadata.npz', records=daily.records, std=daily.std, tdec=daily.tdec, mean=daily.mean)
     temporal = None
     if args.reduced_temporal:
-        from src.sw_reduced_temporal import ReducedTemporalBasis
+        from learning_local.sw_reduced_temporal import ReducedTemporalBasis
         temporal = ReducedTemporalBasis(times/86400., daily.std, daily.tdec, daily.mean,
             cfg.BASIS.temporal_facnlt, cfg.BASIS.temporal_min_spacing_days, window_width=window_width)
         atomic_npz(args.output/'temporal_basis.npz', records=daily.records, **temporal.metadata())
@@ -225,7 +225,7 @@ def main():
     selected[args.holdout_days] = False
     residual = make_daily_residual(model, grid, daily, operator, times, selected)
     if args.map_only:
-        from src.sw_learning_empirical import MapOptions, map_only, estimate_statistics, compare_fields, validate_trajectory
+        from learning_local.sw_learning_empirical import MapOptions, map_only, estimate_statistics, compare_fields, validate_trajectory
         if args.initial_trajectory:
             raise ValueError('Annual MAP uses one continuous trajectory from its original initial state')
         initial = np.tile(daily.mean, (daily.ntime, 1)).astype('float32')
@@ -243,7 +243,7 @@ def main():
         else:
             groups=None
             if args.map_preconditioner=='component_scale':
-                from src.sw_learning_empirical import scale_groups
+                from learning_local.sw_learning_empirical import scale_groups
                 _,atom_groups=scale_groups(daily.records)
                 groups=np.repeat(atom_groups,temporal.counts)
             elif args.map_preconditioner=='local_atom':
@@ -261,7 +261,7 @@ def main():
             estimated, empirical_report = estimate_statistics(analysis, daily.records, daily.std, daily.tdec,
                 args.acf_max_lag, args.std_floor_fraction)
         else:
-            from src.sw_reduced_temporal import local_statistics, summarize_local_statistics
+            from learning_local.sw_reduced_temporal import local_statistics, summarize_local_statistics
             local = local_statistics(analysis, local_reference_std, daily.tdec,
                                      args.acf_max_lag, args.std_floor_fraction,
                                      facnlt=cfg.BASIS.temporal_facnlt,
@@ -305,7 +305,7 @@ def main():
         print(json.dumps(diagnostics), flush=True)
         return
     if args.e_step:
-        from src.sw_learning import posterior_step
+        from learning_local.sw_learning import posterior_step
         options = LearningOptions(map_maxiter=args.map_maxiter, map_maxcor=args.map_maxcor,
             probes=args.probes, seed=args.seed, cg_maxiter=args.cg_maxiter, cg_rtol=args.cg_rtol,
             cg_preconditioner=args.cg_preconditioner, cg_spectral_rank=args.cg_spectral_rank)
@@ -332,15 +332,15 @@ def main():
         print(json.dumps(diagnostics),flush=True)
         return
     if args.pilot_pcg:
-        from src.sw_learning_cg_audit import audit
+        from learning_local.sw_learning_cg_audit import audit
         audit(residual, daily, args.output, args.probes, args.seed, provenance, args.pilot_preconditioner, args.pilot_spectral_rank)
         return
     if args.pilot_map_cg:
-        from src.sw_learning_pilot import run_pilot
+        from learning_local.sw_learning_pilot import run_pilot
         run_pilot(residual, daily, args.output, args.map_maxiter, args.probes, args.seed, provenance)
         return
     if args.profile:
-        from src.sw_learning_profile import profile_problem
+        from learning_local.sw_learning_profile import profile_problem
         profile_problem(residual, daily, args.output, args.profile_repeats,
                         args.profile_max_gib, args.profile_cg_maxiter)
         return

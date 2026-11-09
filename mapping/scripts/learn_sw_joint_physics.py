@@ -41,11 +41,11 @@ def main():
     import jax
     import jax.numpy as jnp
     from src import exp,state,mod,basis,obs,obsop,config_default as defaults
-    from src.sw_learning_empirical import map_only,MapOptions,validate_trajectory
-    from src.sw_learning_joint_forward import make_daily_residual
-    from src.sw_joint_control import JointControl
-    from src.sw_reduced_temporal import ReducedTemporalBasis,local_statistics,summarize_local_statistics
-    from src.sw_learning_windowed import atomic_npz
+    from learning_local.sw_learning_empirical import map_only,MapOptions,validate_trajectory
+    from learning_local.sw_learning_joint_forward import make_daily_residual
+    from learning_local.sw_joint_control import JointControl
+    from learning_local.sw_reduced_temporal import ReducedTemporalBasis,local_statistics,summarize_local_statistics
+    from learning_local.sw_learning_windowed import atomic_npz
     out=args.output.resolve();out.mkdir(parents=True,exist_ok=True)
     print('Device',jax.devices()[0] if args.prepare_only else jax.devices('gpu')[0],flush=True)
     cfg=exp.Exp(str(args.config.resolve()))
@@ -65,9 +65,9 @@ def main():
         cfg.EXP[name]=str(out/subdir);Path(cfg.EXP[name]).mkdir(exist_ok=True)
     for op in cfg.OBSOP.values():op.path_save=str(out/'operators')
     resolved=json.dumps(dict(cfg),default=str,sort_keys=True)
-    sources=[Path(__file__),args.config,ROOT/'mapping/src/sw_learning_joint_forward.py',
-        ROOT/'mapping/src/sw_joint_control.py',ROOT/'mapping/src/sw_learning_empirical.py',
-        ROOT/'mapping/src/basis.py',ROOT/'mapping/src/sw_reduced_temporal.py',
+    sources=[Path(__file__),args.config,ROOT/'mapping/learning_local/sw_learning_joint_forward.py',
+        ROOT/'mapping/learning_local/sw_joint_control.py',ROOT/'mapping/learning_local/sw_learning_empirical.py',
+        ROOT/'mapping/src/basis.py',ROOT/'mapping/learning_local/sw_reduced_temporal.py',
         ROOT/'mapping/src/mod.py',ROOT/'mapping/src/basis.py',ROOT/'mapping/models/model_qgsw/sw.py',
         ROOT/'mapping/src/obsop.py']
     inputs={x.path for x in cfg.OBS.values()}|{v['file'] for v in cfg.MOD.bc_files.values()}
@@ -77,7 +77,7 @@ def main():
         configuration=json.loads(resolved),physics_options=physics_options,
         preconditioner=args.preconditioner,floor_fraction=1.e-6)
     if args.use_config_optimizer:
-        for x in (ROOT/'mapping/src/sw_joint_optax.py',ROOT/'mapping/src/inv.py'):
+        for x in (ROOT/'mapping/learning_local/sw_joint_optax.py',ROOT/'mapping/src/inv.py'):
             provenance['sources'][str(x)]=hashlib.sha256(x.read_bytes()).hexdigest()
         provenance['optimizer_dispatch']='config.INV'
     if args.restart_from:
@@ -157,7 +157,7 @@ def main():
         return residual(forcing,parameters)
     initial=control.initial()[None]
     if args.use_config_optimizer:
-        from src.sw_joint_optax import joint_optax_map
+        from learning_local.sw_joint_optax import joint_optax_map
         if args.preconditioner!='component_scale':raise ValueError('Expected component_scale')
         fitted,diagnostics=joint_optax_map(objective_residual,initial,control.groups(args.preconditioner),
             out,signature,cfg.INV,restart_from=args.restart_from,resume=args.resume)

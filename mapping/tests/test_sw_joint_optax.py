@@ -1,13 +1,15 @@
 """Joint MAP driver must preserve the Gaussian optimum and resumable controls."""
+import pytest
+pytest.importorskip("learning_local.sw_learning", reason="Optional local SW learning sources are absent")
+
 import json
 
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from src import config_default as defaults
 from src.exp import Config
-from src.sw_joint_optax import joint_optax_map
+from learning_local.sw_joint_optax import joint_optax_map
 
 
 @pytest.mark.parametrize('grouped', [False, True])

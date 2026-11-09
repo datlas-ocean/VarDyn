@@ -9,7 +9,7 @@ import numpy as np
 
 from src import config_default as defaults
 from src.basis import Basis
-from src.covariance import DiagonalCovariance
+from src.tools import DiagonalCovariance
 from src.exp import Config
 from src.inv import Variational
 from src.mod import Model_qgsw

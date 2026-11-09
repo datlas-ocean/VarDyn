@@ -1,4 +1,7 @@
 """Daily covariance, posterior moments, EM, and SW forward regression checks."""
+import pytest
+pytest.importorskip("learning_local.sw_learning", reason="Optional local SW learning sources are absent")
+
 from copy import deepcopy
 from datetime import datetime
 from types import SimpleNamespace
@@ -13,7 +16,7 @@ from src import config_default as defaults
 from src.basis import Basis
 from src.exp import Config
 from src.basis import DailyAR1Covariance
-from src.sw_learning import LearningOptions, posterior_step, maximize_statistics, learn
+from learning_local.sw_learning import LearningOptions, posterior_step, maximize_statistics, learn
 
 
 class DailyLearningTests(unittest.TestCase):
@@ -104,7 +107,7 @@ class DailyLearningTests(unittest.TestCase):
         from datetime import timedelta
         from src.mod import Model_qgsw
         from src.state import State
-        from src.sw_learning_forward import make_daily_residual
+        from learning_local.sw_learning_forward import make_daily_residual
         with tempfile.TemporaryDirectory() as directory:
             cfg = Config()
             cfg.EXP = Config(defaults.EXP | dict(path_save=directory, tmp_DA_path=directory,

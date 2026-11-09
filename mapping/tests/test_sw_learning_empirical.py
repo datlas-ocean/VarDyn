@@ -1,14 +1,16 @@
 """Scientific invariants for continuous MAP-only empirical calibration."""
+import pytest
+pytest.importorskip("learning_local.sw_learning", reason="Optional local SW learning sources are absent")
+
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from scipy import sparse
 
-from src.sw_learning_empirical import (MapOptions, compare_fields, estimate_statistics,
+from learning_local.sw_learning_empirical import (MapOptions, compare_fields, estimate_statistics,
                                       fit_decay, map_only, physical_scale_prior, validate_trajectory)
 
 
@@ -75,7 +77,7 @@ def test_map_only_matches_dense_solution_and_never_runs_cg(tmp_path):
         a, report = map_only(residual, [sigma], [tau], [0.], np.zeros((n, 1)), tmp_path, 'test', options)
     np.testing.assert_allclose(a.ravel(), exact, atol=5.e-5)
     assert report['posterior_covariance'] is False
-    with patch('src.sw_learning_empirical.minimize', side_effect=AssertionError('Reuse successful MAP')):
+    with patch('learning_local.sw_learning_empirical.minimize', side_effect=AssertionError('Reuse successful MAP')):
         resumed, _ = map_only(residual, [sigma], [tau], [0.], np.zeros((n, 1)), tmp_path, 'test', options, True)
     np.testing.assert_array_equal(a, resumed)
     with pytest.raises(ValueError, match='signature'):
@@ -129,7 +131,7 @@ def test_map_invalid_initial_point_fails_with_diagnostic(tmp_path):
 
 @pytest.mark.parametrize('strategy', ['prior','component_scale','local_atom'])
 def test_preconditioners_preserve_physical_map_and_initial_prior(tmp_path,strategy):
-    from src.sw_learning_empirical import gradient_group_scaling
+    from learning_local.sw_learning_empirical import gradient_group_scaling
     matrix=np.array([[20.,2.,0.],[0.,1.,.3],[1.,0.,.1]])
     target=np.array([2.,-.5,.4]);std=np.array([.4,1.2,2.]);mean=np.array([.3,-.7,.2])
     precision=np.diag(1/std**2)
@@ -146,7 +148,7 @@ def test_preconditioners_preserve_physical_map_and_initial_prior(tmp_path,strate
     if strategy!='prior':
         with np.load(tmp_path/'map_preconditioner.npz') as saved:
             scale=saved['scale'];assert np.all((scale>=.1)&(scale<=10))
-    with patch('src.sw_learning_empirical.minimize',side_effect=AssertionError('Reuse result')):
+    with patch('learning_local.sw_learning_empirical.minimize',side_effect=AssertionError('Reuse result')):
         resumed,_=map_only(lambda a:a,std,None,mean,np.zeros((1,3)),tmp_path,
             'preconditioner-invariance',options,True,independent=True,preconditioner_groups=groups)
     np.testing.assert_array_equal(resumed,result)

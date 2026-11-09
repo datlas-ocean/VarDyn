@@ -1,11 +1,13 @@
+import pytest
+pytest.importorskip("learning_local.sw_learning", reason="Optional local SW learning sources are absent")
+
 from datetime import datetime,timedelta
 from pathlib import Path
 import json
 import numpy as np
-import pytest
-from src.sw_learning import LearningOptions, maximize_window_statistics
-from src.sw_learning_moments import window_moments, combine_moments, common_mean, expected_ar1
-from src.sw_learning_windowed import partition_windows, learn_windows, atomic_npz
+from learning_local.sw_learning import LearningOptions, maximize_window_statistics
+from learning_local.sw_learning_moments import window_moments, combine_moments, common_mean, expected_ar1
+from learning_local.sw_learning_windowed import partition_windows, learn_windows, atomic_npz
 
 
 def test_partition_overlaps_and_unique_core_dates():
@@ -90,7 +92,7 @@ def test_window_resume_reuses_completed_workers_and_chains_initial_state(tmp_pat
 def test_preconditioner_preserves_same_posterior_draws_and_reuses_map(tmp_path,mode):
     import jax.numpy as jnp
     from unittest.mock import patch
-    from src.sw_learning import posterior_step
+    from learning_local.sw_learning import posterior_step
     y=jnp.arange(6).reshape(6,1)/10
     residual=lambda a:(a-y)/.4
     std=np.array([2.]);tau=np.array([3.]);mean=np.zeros(1);initial=np.zeros((6,1))
@@ -98,7 +100,7 @@ def test_preconditioner_preserves_same_posterior_draws_and_reuses_map(tmp_path,m
     baseline=posterior_step(residual,std,tau,mean,initial,options,12,
                             tmp_path/'map.npz','same-objective')
     options.cg_preconditioner=mode;options.cg_spectral_rank=6
-    with patch('src.sw_learning.minimize',side_effect=AssertionError('MAP must be reused')):
+    with patch('learning_local.sw_learning.minimize',side_effect=AssertionError('MAP must be reused')):
         conditioned=posterior_step(residual,std,tau,mean,initial,options,12,
                                     tmp_path/'map.npz','same-objective')
     for a,b in zip(baseline[:3],conditioned[:3]):

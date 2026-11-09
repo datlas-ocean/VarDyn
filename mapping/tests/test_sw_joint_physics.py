@@ -1,12 +1,14 @@
 """Joint static physical fields, canonical control packing and derivatives."""
+import pytest
+pytest.importorskip("learning_local.sw_learning", reason="Optional local SW learning sources are absent")
+
 from datetime import datetime
 from types import SimpleNamespace
 import numpy as np
 import jax
 import jax.numpy as jnp
-import pytest
-from src.sw_joint_control import JointControl
-from src.sw_reduced_temporal import ReducedTemporalBasis
+from learning_local.sw_joint_control import JointControl
+from learning_local.sw_reduced_temporal import ReducedTemporalBasis
 
 
 
@@ -53,7 +55,7 @@ def test_joint_forward_physics_gradients_and_fixed_transfer(tmp_path,names):
     from src.state import State
     from src.mod import Model_qgsw
     from src.basis import Basis
-    from src.sw_learning_joint_forward import make_daily_residual
+    from learning_local.sw_learning_joint_forward import make_daily_residual
     cfg=Config(EXP=Config(defaults.EXP|dict(path_save=str(tmp_path),tmp_DA_path=str(tmp_path),
         flag_plot=0,init_date=datetime(2024,1,1),final_date=datetime(2024,1,3))),
         GRID=Config(defaults.GRID_GEO|dict(super='GRID_GEO',lon_min=-2.,lon_max=2.,lat_min=-2.,lat_max=2.,
