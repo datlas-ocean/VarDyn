@@ -84,6 +84,12 @@ GRID_FROM_FILE = dict(
 
     path_init_grid = '', 
 
+    # True: restore available controlled parameters from the file's
+    # *_control fields; parameters absent from the file start at their neutral
+    # values. False: use the file only for the grid/initial state and start
+    # every controlled parameter from its neutral value.
+    load_control_parameters_from_file = True,
+
     name_init_lon = 'lon',
 
     name_init_lat = 'lat',
@@ -414,7 +420,7 @@ MOD_QGSW = dict(
 
     var_to_save = None,
 
-    name_params = None, # Controlled parameters. 'H' and 'g_prime' are positive dimensionless log-controls.
+    name_params = None, # Controlled parameters. 'c' (bounded log-speed), or 'H'/'g_prime'; 'h_wind', 'diff_coef', and 'visc_coef' use dimensionless log-controls.
 
     nl = 1, # number of layers in the model (for nl>1, set H and g_prime as lists/arrays)
 
@@ -434,12 +440,34 @@ MOD_QGSW = dict(
 
     cmax = None, # Maximum value of phase velocity to consider
 
+    # Direct first-baroclinic c control at fixed g_prime, via H=c**2/g_prime.
+    # c/c_ref = exp(log(r)*tanh(alpha/log(r))); also bounds the CFL speed.
+    c_control_max_ratio = 2.,
+
     H = None, # Reference layer depth [m]. With g_prime set, c is diagnosed; otherwise g_prime is diagnosed from c**2/H.
+
+    phase_speed_squared_floor = None, # Optional hard floor on H*g_prime for joint H/g_prime controls [m2 s-2].
 
     constant_H = False, # if True and H is None (nl=1), use the spatial mean of c to derive a
                         # spatially constant H = mean(c)^2 / g_prime instead of the full 2-D field
 
     g_prime = None, # Reference reduced gravity [m s^-2]. With H set, c is diagnosed; with H unset, H is diagnosed from c**2/g_prime.
+
+    # Optional static physical-parameter maps.  A file may be one model-output
+    # snapshot (including a singleton time dimension) or a glob; for a glob,
+    # the lexicographically last file is used.  Mapped values override the
+    # scalar H, g_prime, h_wind, diff_coef, and visc_coef references below.
+    file_params_aux = None,
+
+    name_var_params_aux = {
+        'lon': 'lon', 'lat': 'lat', 'time': 'time',
+        'H': 'H', 'g_prime': None, 'h_wind': 'h_wind',
+        'diff_coef': 'diff_coef', 'visc_coef': 'visc_coef',
+    },
+
+    params_aux_time_index = -1, # Time record used when the selected file has more than one record.
+
+    params_aux_file_index = -1, # File used when file_params_aux is a glob.
 
     # Meaning of the 2-D state field named by name_var['SSH']:
     # 'ssh' keeps the historical direct-height formulation.
@@ -451,6 +479,12 @@ MOD_QGSW = dict(
     # interface-displacement representations. Multilayer and Ekman machinery
     # belongs to the internal SW core and is not publicly configurable here.
     height_representation = 'ssh',
+
+    # Thickness regularization is evaluated in equivalent SSH units in both
+    # representations (minimum 0.01 m, softplus sharpness 5 / m). In interface
+    # mode the core converts thickness by g_prime/physical_gravity before
+    # limiting and converts back afterwards. This does not rescale h_wind
+    # or its physical-metre safety floor.
 
     # Restart coordinate for the field mapped to name_init_var['SSH'] in
     # interface_displacement mode. The default is the physical `ssh` written
@@ -465,9 +499,13 @@ MOD_QGSW = dict(
 
     cfl = .25,
 
-    bottom_drag_coef = 0.,
+    bottom_drag_coef = 0.,  # s^-1; scalar or h-grid map, optional logarithmic control
 
     slip_coef = 1., # Lateral wall slip coefficient (dimensionless, in [0,1]): 1 = free-slip, 0 = no-slip, in-between = partial slip. Use 1 when use_sponge_on_coast=True so the sponge is the sole near-coast damping mechanism (no double damping).
+
+    open_boundary_y = 'closed', # 'closed' or 'characteristic' on wet south/north outer faces (one-layer SW only).
+
+    open_boundary_x = 'closed', # 'closed' or 'characteristic' on wet west/east outer faces (one-layer SW only).
 
     path_mdt = None, # path of MDT
 
@@ -873,6 +911,44 @@ BASIS_GAUSS2D = dict(
 
 )
 
+BASIS_SW_DAILY = dict(
+    name_mod_var=('u', 'v', 'ssh'),
+    wavelengths_km=(971.428571, 680., 476., 333.2, 233.24, 163.268, 114.2876, 80.00132),
+    center_spacing_factor=1.,
+    include_height_mean=True,
+    calibration_file=None,
+    use_state_background=False,
+    # Generic initial values, not the previous learned calibration.
+    # phi/psi: m²/s/day; height: m interface/day, support RMS normalization.
+    initial_std=dict(divergent=1000., rotational=1000., height=1., height_mean=1.),
+    # Optional physical RMS per component, constant across spatial scales.
+    # Converted to coefficient amplitudes using the constructed spatial basis.
+    initial_physical_rms=None,
+    initial_tdec_days=10.,
+    # MAP2 windows fitted to their own ACF; spacing=window_width/facnlt.
+    temporal_facnlt=2,
+    temporal_min_spacing_days=1.,
+)
+
+BASIS_SW_FORCING = dict(
+    name_mod_var=('u', 'v', 'ssh'), # C-grid momentum and model-height forcing targets
+    calibration_file=None, # Optional native-grid local multiscale calibration artifact
+    include_height_mean=True, # Calibrated mode: include basin mean controls and prescribed mean bias
+    use_state_background=False,
+    spatial_radius_km=300., # Compact potential half-width; coefficient RMS normalized
+    height_radius_km=600., # Height uses compensated patches extending to twice this radius
+    center_spacing_factor=1.,
+    slow_halfwidth_days=10.,
+    wave_envelope_halfwidth_days=10.,
+    wave_period_days=(), # Explicitly choose periods after diagnosing the target band
+    # Standard deviations of physical coefficients: (m/s)/day for momentum,
+    # model-height m/day for height. Zero disables the corresponding block.
+    # These illustrative priors require calibration with withheld SSH blocks.
+    slow_std=dict(divergent=.02, rotational=.01, height=.02, height_mean=0.),
+    wave_std=dict(divergent=.02, rotational=.005, height=.005, height_mean=0.),
+    bias_std=dict(divergent=.002, rotational=.001, height=.002, height_mean=0.),
+)
+
 BASIS_GAUSS3D = dict(
 
     name_mod_var = '', # String or list of related model parameter names 
@@ -1088,7 +1164,16 @@ NAME_INV = None
 # 4-Dimensional Variational 
 INV_4DVAR = dict(
 
-    minimizer = 'scipy', # 'scipy': host L-BFGS-B; 'optax-decoupled': device vectors/Python line search; 'optax-full-gpu': compiled device optimizer
+    forcing_window_days = None, # If set, share controlled model parameters across the experiment and give each aligned time window independent forcing-basis coefficients. State and adjoint remain continuous.
+
+    forcing_window_taper_days = 0., # Smoothly ramp local forcing to zero at both window edges; 0 disables the ramp.
+
+    forcing_window_overlap_days = 0., # Blend neighboring forcing bases over this many days before each window boundary; incompatible with taper.
+
+    minimizer = 'scipy', # 'scipy', 'optax-decoupled', 'optax-full-gpu',
+
+    lbfgs_history_size = 10, # Number of L-BFGS correction pairs retained on device; reduce for very large controls.
+
 
     compute_test = False, # TLM, ADJ & GRAD tests
 
@@ -1126,7 +1211,7 @@ INV_4DVAR = dict(
 
     path_save_control_vectors = None, # Path where to save the control vector at each 4Dvar iteration 
 
-    timestep_checkpoint = timedelta(hours=12), # timestep separating two consecutive analysis 
+    timestep_checkpoint = timedelta(hours=12), # timestep separating two consecutive analysis states
 
     sigma_R = None, # Observational standard deviation
 

@@ -12,9 +12,11 @@ import sys
 import xarray as xr
 import numpy as np
 import os
+import glob
 from math import pi
 from datetime import timedelta
 import matplotlib.pylab as plt 
+from matplotlib.colors import LogNorm
 import pyinterp
 import pyinterp.fill
 import jax
@@ -3073,23 +3075,38 @@ class Model_qgsw(M):
             self.height_representation == 'interface_displacement'
         )
         self._configured_name_params = config.MOD.name_params if config.MOD.name_params is not None else []
-        if 'c' in self._configured_name_params:
-            raise ValueError(
-                "MOD_QGSW phase speed c is diagnosed from H and g_prime; "
-                "control H and/or g_prime instead of configuring 'c' in name_params.")
+        self._controls_c = 'c' in self._configured_name_params
+        if self._controls_c and {'H', 'g_prime'}.intersection(self._configured_name_params):
+            raise ValueError("Control c with fixed g_prime; do not also control H or g_prime.")
+        self._depth_control_name = 'c' if self._controls_c else 'H'
+        self.c_control_max_ratio = float(getattr(config.MOD, 'c_control_max_ratio', 2.))
+        if self._controls_c:
+            if not np.isfinite(self.c_control_max_ratio) or self.c_control_max_ratio <= 1.:
+                raise ValueError('c_control_max_ratio must be finite and greater than one.')
+            if any(getattr(config.MOD, key, None) is not None
+                   for key in ('H_min', 'H_max', 'H_floor')):
+                raise ValueError('For c control use c_control_max_ratio instead of H bounds.')
         self._controls_H = 'H' in self._configured_name_params
         self._controls_g_prime = 'g_prime' in self._configured_name_params
+        self._controls_diff_coef = 'diff_coef' in self._configured_name_params
+        self._controls_visc_coef = 'visc_coef' in self._configured_name_params
+        self._params_aux_path = getattr(config.MOD, 'file_params_aux', None)
+        self._params_aux_names = getattr(config.MOD, 'name_var_params_aux', None) or {}
+        self._has_params_aux = self._params_aux_path is not None
         self.wind_use_instantaneous_top_depth = getattr(
             config.MOD, 'wind_use_instantaneous_top_depth', False)
         self._controls_h_wind = 'h_wind' in self._configured_name_params
-        self._prescribes_h_wind = getattr(config.MOD, 'h_wind', None) is not None
+        self._prescribes_h_wind = (
+            getattr(config.MOD, 'h_wind', None) is not None
+            or (self._has_params_aux and self._params_aux_names.get('h_wind'))
+        )
         # In the one-layer physical representation, a controlled H is also the
         # default wind-forcing depth unless an independent h_wind is selected.
         # Keep this decision as configuration state: testing ``h_wind is None``
         # inside a traced step cannot distinguish a prescribed h_wind from an
         # absent h_wind control.
         self._wind_depth_from_H = (
-            self._controls_H
+            (self._controls_H or self._controls_c)
             and not self._controls_h_wind
             and not self._prescribes_h_wind
             and not self.wind_use_instantaneous_top_depth
@@ -3097,7 +3114,9 @@ class Model_qgsw(M):
 
         model = model_sw
         if self._physical_interface_height:
-            if config.MOD.H is None and config.MOD.g_prime is None:
+            has_aux_H = self._has_params_aux and self._params_aux_names.get('H')
+            has_aux_g_prime = self._has_params_aux and self._params_aux_names.get('g_prime')
+            if config.MOD.H is None and config.MOD.g_prime is None and not (has_aux_H or has_aux_g_prime):
                 raise ValueError(
                     'interface_displacement requires MOD.H or MOD.g_prime; '
                     'the missing field is diagnosed from the reference phase speed.'
@@ -3130,6 +3149,8 @@ class Model_qgsw(M):
         self.Yh = State.Y
         self.Xu, self.Yu = grid.dxdy2xy(self.dx_on_u, self.dy_on_u)
         self.Xv, self.Yv = grid.dxdy2xy(self.dx_on_v, self.dy_on_v)
+
+        self.parameter_maps = self._load_parameter_maps(config, State)
 
         # Open MDT map if provided
         if config.MOD.path_mdt is not None and os.path.exists(config.MOD.path_mdt):
@@ -3253,10 +3274,12 @@ class Model_qgsw(M):
             print(f'MOD_QGSW observation height mode: SLA (MDT prescribed: {config.MOD.path_mdt})')
 
         # Open Rossby Radius if provided
+        H_reference_value = self.parameter_maps.get('H', config.MOD.H)
+        g_prime_reference_value = self.parameter_maps.get('g_prime', config.MOD.g_prime)
         phase_speed_required = not (
             config.MOD.nl == 1
-            and config.MOD.H is not None
-            and config.MOD.g_prime is not None
+            and H_reference_value is not None
+            and g_prime_reference_value is not None
         )
         if (phase_speed_required and config.MOD.filec_aux is not None
                 and os.path.exists(config.MOD.filec_aux)):
@@ -3345,8 +3368,8 @@ class Model_qgsw(M):
                 raise ValueError(f'MOD.{label} must contain finite positive values.')
             return array
 
-        H_configured = config.MOD.H is not None
-        g_prime_configured = config.MOD.g_prime is not None
+        H_configured = H_reference_value is not None
+        g_prime_configured = g_prime_reference_value is not None
         if self.c is not None:
             if self.c.shape != (State.ny, State.nx):
                 raise ValueError(
@@ -3359,11 +3382,11 @@ class Model_qgsw(M):
             c_sw = None
 
         if H_configured:
-            H = _reference_field(config.MOD.H, 'H')
+            H = _reference_field(H_reference_value, 'H')
         else:
             H = None
         if g_prime_configured:
-            g_prime = _reference_field(config.MOD.g_prime, 'g_prime')
+            g_prime = _reference_field(g_prime_reference_value, 'g_prime')
         else:
             g_prime = None
 
@@ -3387,6 +3410,9 @@ class Model_qgsw(M):
         
 
         self.g_prime = np.asarray(g_prime, dtype=float)
+        # Keep the resolved reference in State coordinates for forcing-basis
+        # validation, including maps and references diagnosed from H and c.
+        State.qgsw_reference_g_prime = np.array(self.g_prime[0].T, copy=True)
         if self._physical_interface_height:
             # Both factors have State's (ny, nx) layout. The state stores eta;
             # external BCs, observations, and output use physical SSH.
@@ -3414,13 +3440,23 @@ class Model_qgsw(M):
         self.H_floor = self._as_H_model_array(H_floor, State, 'H_floor')
         self.H_floor = self._zero_H_floor_on_mask(self.H_floor, State)
         self._validate_H_floor(self.H0, self.H_floor)
+        self.phase_speed_squared_floor = getattr(config.MOD, 'phase_speed_squared_floor', None)
+        if self.phase_speed_squared_floor is not None:
+            floor = float(self.phase_speed_squared_floor)
+            if (not np.isfinite(floor) or floor <= 0.
+                    or not self._physical_interface_height
+                    or not {'H', 'g_prime'} <= set(self._configured_name_params)
+                    or self.H_max_bound is not None):
+                raise ValueError('phase_speed_squared_floor requires joint H/g_prime '
+                                 'interface controls, a positive finite floor, and no H_max.')
+            if np.any(np.asarray(self.H0 * self.g_prime) <= floor):
+                raise ValueError('Reference H*g_prime must exceed phase_speed_squared_floor.')
 
-        # Keep controlled wind depth in SW layout so its transformation is
-        # differentiated within the same JAX forward kernel as H.
-        if self._controls_h_wind:
-            h_wind_ref = getattr(config.MOD, 'h_wind', None)
-            if h_wind_ref is None:
-                raise ValueError("Controlling 'h_wind' requires MOD.h_wind to define a positive reference depth.")
+        # Keep wind depth in SW layout.  A controlled field is represented as
+        # a logarithmic perturbation around this scalar or mapped reference.
+        h_wind_ref = self.parameter_maps.get(
+            'h_wind', getattr(config.MOD, 'h_wind', None))
+        if h_wind_ref is not None:
             h_wind_ref = np.asarray(h_wind_ref, dtype=float)
             if h_wind_ref.ndim == 0:
                 h_wind_ref = np.full((State.ny, State.nx), float(h_wind_ref))
@@ -3449,12 +3485,42 @@ class Model_qgsw(M):
                 self.h_wind_max_bound_sw = None
             self.h_wind_ref_sw = jnp.asarray(h_wind_ref.T, dtype=self.dtype)
             self.h_wind_floor_sw = jnp.asarray(h_wind_floor.T, dtype=self.dtype)
+        elif self._controls_h_wind:
+            raise ValueError(
+                "Controlling 'h_wind' requires MOD.h_wind or an auxiliary "
+                "'h_wind' map to define a positive reference depth.")
+
+        for coef_name in ('diff_coef', 'visc_coef', 'bottom_drag_coef'):
+            reference = np.asarray(
+                self.parameter_maps.get(coef_name, getattr(config.MOD, coef_name)),
+                dtype=float)
+            if reference.ndim == 0:
+                reference_sw = reference
+            elif reference.shape == (State.ny, State.nx):
+                reference_sw = reference.T
+            else:
+                raise ValueError(
+                    f'MOD.{coef_name} must be scalar or have State shape '
+                    f'(ny, nx)=({State.ny}, {State.nx}); got {reference.shape}.')
+            if not np.all(np.isfinite(reference_sw)) or np.any(reference_sw < 0.):
+                raise ValueError(
+                    f'MOD.{coef_name} must contain finite non-negative values.')
+            if coef_name in self._configured_name_params and np.any(reference_sw <= 0.):
+                raise ValueError(
+                    f"Controlling '{coef_name}' requires a strictly positive reference.")
+            setattr(self, f'{coef_name}_ref', reference_sw)
         
         # CFL
         if config.MOD.cfl is not None:
-            grid_spacing = min(np.nanmin(State.DX), np.nanmin(State.DY)) 
-            c_max = float(np.nanmax(self.c))
-            dt = config.MOD.cfl * grid_spacing / c_max
+            # Apply the constraint locally.  The extrema of the grid spacing
+            # and wave speed need not occur at the same cell, so
+            # min(grid_spacing) / max(c) is overly restrictive in general.
+            # A static timestep must remain safe for every admissible c control.
+            c_cfl = self.c * (self.c_control_max_ratio if self._controls_c else 1.)
+            dt_x = np.nanmin(np.asarray(State.DX) / c_cfl)
+            dt_y = np.nanmin(np.asarray(State.DY) / c_cfl)
+            c_max = float(np.nanmax(c_cfl))
+            dt = config.MOD.cfl * min(dt_x, dt_y)
             divisors = [i for i in range(1, 3600 + 1) if 3600 % i == 0]  # Find all divisors of one hour in seconds
             lower_divisors = [d for d in divisors if d <= dt]
             self.dt = max(lower_divisors)  # Get closest
@@ -3562,6 +3628,10 @@ class Model_qgsw(M):
         self.sponge_width = config.MOD.dist_sponge_bc  # km
         self.sponge_coef = config.MOD.sponge_coef
 
+        # Wind is tapered only at the outer domain edges, not at coastlines.
+        self.wind_taper_u = np.ones((State.ny, State.nx+1))
+        self.wind_taper_v = np.ones((State.ny+1, State.nx))
+
         if self.sponge_width is not None and self.sponge_width>0:
             lon_h = State.lon
             lat_h = State.lat
@@ -3616,6 +3686,9 @@ class Model_qgsw(M):
             wc_v, wNS_v, wWE_v = grid.compute_sponge_components(lon_v, lat_v, mask_v, config.MOD.dist_sponge_bc)
             sponge_v = 1.0 - (1.0 - wc_v) * (1.0 - wNS_v) * (1.0 - alpha * wWE_v)
 
+            self.wind_taper_u = (1.0 - alpha * wNS_u) * (1.0 - wWE_u)
+            self.wind_taper_v = (1.0 - wNS_v) * (1.0 - alpha * wWE_v)
+
             _, (ax1,ax2,ax3) = plt.subplots(1, 3, figsize=(15, 5))
             im1 = ax1.pcolormesh(sponge_h)
             plt.colorbar(im1, ax=ax1)
@@ -3649,24 +3722,30 @@ class Model_qgsw(M):
             "H": H,
             "g_prime": g_prime,
             "f": np.pad(self.f.T, ((0, 1), (0, 1)), mode='edge'),
+            # Apply the same thickness regularization in SSH units in either
+            # public height representation. Wind depth remains in metres.
+            "thickness_to_ssh": g_prime / self.g if self._physical_interface_height else 1.,
             "taux": 0.,
             "tauy": 0.,
-            "bottom_drag_coef": config.MOD.bottom_drag_coef,
+            "bottom_drag_coef": self.bottom_drag_coef_ref,
             "rho_water": getattr(config.MOD, 'rho_water', 1025.0),
-            "h_wind": getattr(config.MOD, 'h_wind', None),
+            "h_wind": (self.h_wind_ref_sw
+                       if self._prescribes_h_wind else None),
             "wind_depth_from_H": self._wind_depth_from_H,
             "dtype": self.dtype,
             "mask": (1-State.mask.astype(int).T),
             "compile": True,
             "slip_coef": config.MOD.slip_coef,
-            "visc_coef": config.MOD.visc_coef,
-            "diff_coef": config.MOD.diff_coef,
+            "open_boundary_x": getattr(config.MOD, 'open_boundary_x', 'closed'),
+            "open_boundary_y": getattr(config.MOD, 'open_boundary_y', 'closed'),
+            "visc_coef": self.visc_coef_ref,
+            "diff_coef": self.diff_coef_ref,
             "dt": self.dt,
             "barotropic_filter": False,
             'barotropic_filter_spectral': False,
             'sponge_coef': self.sponge_coef,
             'forcing_momentum': getattr(config.MOD, 'forcing_momentum', 'direct'),
-            'H_min': None if self._controls_H else getattr(config.MOD, 'H_min', None),
+            'H_min': None if (self._controls_H or self._controls_c) else getattr(config.MOD, 'H_min', None),
             'H_max': getattr(config.MOD, 'H_max', None),
             'diff_coef_trac': getattr(config.MOD, 'diff_coef_trac', 0.),
             'time_scheme':    getattr(config.MOD, 'time_scheme',    'rk3'),
@@ -3795,40 +3874,45 @@ class Model_qgsw(M):
 
         # Control parameters
         self.name_params = self._configured_name_params
-        if 'H' in self.name_params:
-            if (config.GRID.super == 'GRID_FROM_FILE'):
+        load_controls_from_file = getattr(
+            config.GRID, 'load_control_parameters_from_file', True)
+        if config.GRID.super == 'GRID_FROM_FILE' and not isinstance(load_controls_from_file, (bool, np.bool_)):
+            raise ValueError(
+                'GRID_FROM_FILE.load_control_parameters_from_file must be a boolean.')
+        if self._depth_control_name in self.name_params:
+            if (config.GRID.super == 'GRID_FROM_FILE'
+                    and load_controls_from_file):
                 dsin = grid.open_grid_restart(config)
-                if 'H_control' in dsin:
-                    State.params['H'] = dsin['H_control'].values.squeeze()
-                    State.params['H'][np.isnan(State.params['H'])] = 0.
+                if self._depth_control_name + '_control' in dsin:
+                    State.params[self._depth_control_name] = dsin[self._depth_control_name + '_control'].values.squeeze()
+                    State.params[self._depth_control_name][np.isnan(State.params[self._depth_control_name])] = 0.
                 else:
-                    dsin.close()
-                    raise ValueError(
-                        'Controlled H restarts require H_control, the dimensionless equivalent-depth control.'
-                    )
+                    State.params[self._depth_control_name] = np.zeros((State.ny, State.nx))
                 dsin.close()
                 del dsin
             else:
-                State.params['H'] = np.zeros((State.ny,State.nx))
+                State.params[self._depth_control_name] = np.zeros((State.ny,State.nx))
 
         if 'g_prime' in self.name_params:
-            if config.GRID.super == 'GRID_FROM_FILE':
+            if (config.GRID.super == 'GRID_FROM_FILE'
+                    and load_controls_from_file):
                 dsin = xr.open_dataset(config.GRID.path_init_grid)
                 try:
-                    if 'g_prime_control' not in dsin:
-                        raise ValueError(
-                            'Controlled g_prime restarts require g_prime_control, '
-                            'the dimensionless reduced-gravity log-control.')
-                    value = np.asarray(dsin['g_prime_control'].values.squeeze(), dtype=float)
-                    State.params['g_prime'] = np.nan_to_num(
-                        value, nan=0., posinf=0., neginf=0.)
+                    if 'g_prime_control' in dsin:
+                        value = np.asarray(
+                            dsin['g_prime_control'].values.squeeze(), dtype=float)
+                        State.params['g_prime'] = np.nan_to_num(
+                            value, nan=0., posinf=0., neginf=0.)
+                    else:
+                        State.params['g_prime'] = np.zeros((State.ny, State.nx))
                 finally:
                     dsin.close()
             else:
                 State.params['g_prime'] = np.zeros((State.ny, State.nx))
 
         if 'h_wind' in self.name_params:
-            if (config.GRID.super == 'GRID_FROM_FILE'):
+            if (config.GRID.super == 'GRID_FROM_FILE'
+                    and load_controls_from_file):
                 dsin = grid.open_grid_restart(config)
                 if 'h_wind_control' in dsin:
                     State.params['h_wind'] = dsin['h_wind_control'].values.squeeze()
@@ -3848,8 +3932,26 @@ class Model_qgsw(M):
             else:
                 State.params['h_wind'] = np.zeros((State.ny,State.nx))
 
+        for coef_name in ('diff_coef', 'visc_coef', 'bottom_drag_coef'):
+            if coef_name not in self.name_params:
+                continue
+            State.params[coef_name] = np.zeros((State.ny, State.nx))
+            if (config.GRID.super == 'GRID_FROM_FILE'
+                    and load_controls_from_file):
+                dsin = grid.open_grid_restart(config)
+                try:
+                    control_name = f'{coef_name}_control'
+                    if control_name in dsin:
+                        value = np.asarray(
+                            dsin[control_name].values.squeeze(), dtype=float)
+                        State.params[coef_name] = np.nan_to_num(
+                            value, nan=0., posinf=0., neginf=0.)
+                finally:
+                    dsin.close()
+
         if 'wind_strength' in self.name_params:
-            if (config.GRID.super == 'GRID_FROM_FILE'):
+            if (config.GRID.super == 'GRID_FROM_FILE'
+                    and load_controls_from_file):
                 dsin = grid.open_grid_restart(config)
                 if 'wind_strength' in dsin:
                     State.params['wind_strength'] = dsin['wind_strength'].values.squeeze()
@@ -3880,6 +3982,133 @@ class Model_qgsw(M):
             #self.adjoint_test_jstep(nstep=10)
             adjoint_test(self,State,nstep=10)#, ampl=1e-3)
     
+    def _load_parameter_maps(self, config, State):
+        """Read static QGSW parameter references on the model h-grid."""
+        path_pattern = getattr(config.MOD, 'file_params_aux', None)
+        if path_pattern is None:
+            return {}
+
+        paths = sorted(glob.glob(path_pattern))
+        if not paths and os.path.exists(path_pattern):
+            paths = [path_pattern]
+        if not paths:
+            raise FileNotFoundError(
+                f'MOD_QGSW parameter-map file not found: {path_pattern}')
+        file_index = int(getattr(config.MOD, 'params_aux_file_index', -1))
+        try:
+            path = paths[file_index]
+        except IndexError as exc:
+            raise IndexError(
+                f'MOD.params_aux_file_index={file_index} is outside the '
+                f'{len(paths)} files matching {path_pattern}.') from exc
+
+        names = getattr(config.MOD, 'name_var_params_aux', None) or {}
+        for coordinate in ('lon', 'lat'):
+            if not names.get(coordinate):
+                raise ValueError(
+                    f"MOD.name_var_params_aux requires a '{coordinate}' entry.")
+
+        ds = xr.open_dataset(path)
+        try:
+            time_name = names.get('time')
+            if time_name and time_name in ds:
+                time_dim = ds[time_name].dims[0] if ds[time_name].dims else None
+                if time_dim is not None and time_dim in ds.dims:
+                    time_index = int(getattr(
+                        config.MOD, 'params_aux_time_index', -1))
+                    ds = ds.isel({time_dim: time_index}, drop=True)
+
+            lon_name = names['lon']
+            lat_name = names['lat']
+            if lon_name not in ds or lat_name not in ds:
+                raise KeyError(
+                    f'Parameter map {path} must contain coordinates '
+                    f'{lon_name!r} and {lat_name!r}.')
+
+            lon = ds[lon_name]
+            if np.sign(float(lon.min())) == -1 and State.lon_unit == '0_360':
+                ds = ds.assign_coords({lon_name: lon % 360})
+            elif (float(lon.min()) >= 0 or float(lon.max()) > 180) and State.lon_unit == '-180_180':
+                ds = ds.assign_coords({lon_name: (lon + 180) % 360 - 180})
+            if ds[lon_name].ndim == 1:
+                ds = ds.sortby(lon_name)
+
+            maps = {}
+            for parameter in ('H', 'g_prime', 'h_wind', 'diff_coef', 'visc_coef', 'bottom_drag_coef'):
+                variable = names.get(parameter)
+                if not variable:
+                    continue
+                if variable not in ds:
+                    raise KeyError(
+                        f'Parameter map {path} has no variable {variable!r} '
+                        f'configured for {parameter}.')
+                field = grid.interp2d(
+                    ds,
+                    {'lon': lon_name, 'lat': lat_name, 'var': variable},
+                    State.lon,
+                    State.lat,
+                )
+                field = _fill_nan_nearest(field)
+                if field.shape != (State.ny, State.nx):
+                    raise ValueError(
+                        f'Interpolated {parameter} map has shape {field.shape}; '
+                        f'expected ({State.ny}, {State.nx}).')
+                if not np.all(np.isfinite(field)):
+                    raise ValueError(
+                        f'Interpolated {parameter} map contains non-finite values.')
+                maps[parameter] = field
+                print(
+                    f'{parameter} read from {path}:{variable} '
+                    f'(min={field.min():.6g}, max={field.max():.6g})')
+
+            if config.EXP.flag_plot >= 1 and maps:
+                units = {
+                    'H': 'm',
+                    'g_prime': r'm s$^{-2}$',
+                    'bottom_drag_coef': r's$^{-1}$',
+                    'h_wind': 'm',
+                    'diff_coef': r'm$^2$ s$^{-1}$',
+                    'visc_coef': r'm$^2$ s$^{-1}$',
+                }
+                fig, axes = plt.subplots(2, 3, figsize=(18, 8), constrained_layout=True)
+                for axis, parameter in zip(axes.ravel(),
+                                           ('H', 'g_prime', 'h_wind', 'diff_coef', 'visc_coef', 'bottom_drag_coef')):
+                    if parameter not in maps:
+                        axis.set_visible(False)
+                        continue
+                    plotted = np.where(
+                        State.mask | (maps[parameter] <= 0.),
+                        np.nan,
+                        maps[parameter],
+                    )
+                    finite = plotted[np.isfinite(plotted)]
+                    if finite.size == 0:
+                        raise ValueError(
+                            f'{parameter} has no positive ocean value to plot '
+                            'on a logarithmic colour scale.')
+                    vmin = finite.min()
+                    vmax = finite.max()
+                    if vmax <= vmin:
+                        vmax = np.nextafter(vmin, np.inf)
+                    image = axis.pcolormesh(
+                        State.lon,
+                        State.lat,
+                        plotted,
+                        shading='auto',
+                        norm=LogNorm(vmin=vmin, vmax=vmax),
+                    )
+                    colorbar = fig.colorbar(image, ax=axis)
+                    colorbar.set_label(units[parameter])
+                    axis.set_title(parameter)
+                    axis.set_xlabel('Longitude')
+                    axis.set_ylabel('Latitude')
+                fig.suptitle(
+                    f'MOD_QGSW parameter maps — {os.path.basename(path)}')
+                plt.show()
+            return maps
+        finally:
+            ds.close()
+
     def _H_from_init_file(self, config, State):
         if config.GRID.super != 'GRID_FROM_FILE':
             return None
@@ -3979,23 +4208,43 @@ class Model_qgsw(M):
             f'(1, nl, nx, ny); got {H_control.shape}.'
         )
 
-    def _H_control_to_total(self, H_control, apply_bounds=True):
+    def _log_control_to_total(self, reference, control, floor=0., maximum=None):
+        """Apply a dimensionless log-control around a positive reference."""
+        if control is None:
+            return jnp.asarray(reference, dtype=self.dtype)
+        total = floor + (reference - floor) * jnp.exp(control)
+        return total if maximum is None else jnp.minimum(total, maximum)
+
+    def _H_control_to_total(self, H_control, apply_bounds=True, g_prime_control=None):
         H_control_sw = self._H_control_to_sw(H_control)
         H_ref = jnp.asarray(self.H0, dtype=self.dtype)
+        if getattr(self, '_controls_c', False):
+            # The existing depth argument carries alpha_c in this mode.
+            # c = c_ref * exp(L*tanh(alpha_c/L)); H = c**2/g_prime.
+            # Smooth bounds give positive speeds, slope d(log c)/dalpha=1
+            # at the prior, and a fixed CFL envelope throughout minimization.
+            limit = jnp.log(self.c_control_max_ratio)
+            return H_ref * jnp.exp(2. * limit * jnp.tanh(H_control_sw / limit))
+        if self.phase_speed_squared_floor is not None:
+            g_total = self._g_prime_control_to_total(g_prime_control)
+            reference_product = H_ref * jnp.asarray(self.g_prime, dtype=self.dtype)
+            product = self.phase_speed_squared_floor + (
+                reference_product - self.phase_speed_squared_floor) * jnp.exp(H_control_sw)
+            H_total = product / g_total
+            return jnp.maximum(H_total, jnp.asarray(self.H_floor, dtype=self.dtype))
         H_floor = jnp.asarray(self.H_floor, dtype=self.dtype)
-        H_total = H_floor + (H_ref - H_floor) * jnp.exp(H_control_sw)
-        if apply_bounds and self.H_max_bound is not None:
-            H_total = jnp.minimum(H_total, self.H_max_bound)
-        return H_total
+        return self._log_control_to_total(
+            H_ref, H_control_sw, H_floor,
+            self.H_max_bound if apply_bounds else None)
 
-    def _H_control_to_model_increment(self, H_control):
+    def _H_control_to_model_increment(self, H_control, g_prime_control=None):
         if H_control is None:
             return None
         H_ref = jnp.asarray(self.H0, dtype=self.dtype)
-        return self._H_control_to_total(H_control) - H_ref
+        return self._H_control_to_total(H_control, g_prime_control=g_prime_control) - H_ref
 
-    def _H_control_to_total_state(self, H_control):
-        H_total = (self._H_control_to_total(H_control) if H_control is not None
+    def _H_control_to_total_state(self, H_control, g_prime_control=None):
+        H_total = (self._H_control_to_total(H_control, g_prime_control=g_prime_control) if H_control is not None
                    else jnp.asarray(self.H0, dtype=self.dtype))
         if H_total.shape[0] != 1:
             raise ValueError('Controlled H must have exactly one layer.')
@@ -4019,7 +4268,7 @@ class Model_qgsw(M):
         reference = jnp.asarray(self.g_prime, dtype=self.dtype)
         if control is None:
             return reference
-        return reference * jnp.exp(self._g_prime_control_to_sw(control))
+        return self._log_control_to_total(reference, self._g_prime_control_to_sw(control))
 
     def _g_prime_control_to_total_state(self, control):
         total = self._g_prime_control_to_total(control)
@@ -4029,9 +4278,9 @@ class Model_qgsw(M):
 
     def _controlled_phase_speed_state(self, State):
         """Diagnose c=sqrt(g_prime*H) in State's (ny, nx) layout."""
-        H_control = State.params['H'] if 'H' in self.name_params else None
+        H_control = State.params[self._depth_control_name] if self._depth_control_name in self.name_params else None
         g_control = State.params['g_prime'] if 'g_prime' in self.name_params else None
-        H_total = (self._H_control_to_total(H_control) if H_control is not None
+        H_total = (self._H_control_to_total(H_control, g_prime_control=g_control) if H_control is not None
                    else jnp.asarray(self.H0, dtype=self.dtype))
         g_total = self._g_prime_control_to_total(g_control)
         return np.array(jnp.sqrt(g_total[0] * H_total[0]).T)
@@ -4039,10 +4288,9 @@ class Model_qgsw(M):
     def _h_wind_control_to_total_sw(self, h_wind_control):
         """Map a 2-D logarithmic wind-depth control to total depth in SW layout."""
         h_wind_control = jnp.asarray(h_wind_control, dtype=self.dtype)
-        h_wind_total = self.h_wind_floor_sw + (self.h_wind_ref_sw - self.h_wind_floor_sw) * jnp.exp(h_wind_control)
-        if self.h_wind_max_bound_sw is not None:
-            h_wind_total = jnp.minimum(h_wind_total, self.h_wind_max_bound_sw)
-        return h_wind_total
+        return self._log_control_to_total(
+            self.h_wind_ref_sw, h_wind_control,
+            self.h_wind_floor_sw, self.h_wind_max_bound_sw)
 
     def _h_wind_control_to_model_increment(self, h_wind_control):
         if h_wind_control is None:
@@ -4056,7 +4304,19 @@ class Model_qgsw(M):
         h_wind_control_sw = jnp.asarray(h_wind_control, dtype=self.dtype).T
         return np.array(self._h_wind_control_to_total_sw(h_wind_control_sw).T)
 
-    def _wind_depth_to_model(self, H_control, h_wind_control):
+    def _coefficient_control_to_total_sw(self, name, control):
+        """Map a dimensionless log-control to a positive coefficient field."""
+        reference = jnp.asarray(getattr(self, f'{name}_ref'), dtype=self.dtype)
+        if control is None:
+            return reference
+        total = self._log_control_to_total(reference, jnp.asarray(control, dtype=self.dtype))
+        return jnp.maximum(total, jnp.finfo(self.dtype).tiny)
+
+    def _coefficient_control_to_total_state(self, name, control):
+        control_sw = jnp.asarray(control, dtype=self.dtype).T
+        return np.array(self._coefficient_control_to_total_sw(name, control_sw).T)
+
+    def _wind_depth_to_model(self, H_control, h_wind_control, g_prime_control=None):
         """Select the one configured wind-forcing depth for the SW kernel.
 
         The returned value is either a total physical depth or an additive
@@ -4073,7 +4333,7 @@ class Model_qgsw(M):
             return None
 
         if self._wind_depth_from_H and H_control is not None:
-            return self._H_control_to_total(H_control)[0]
+            return self._H_control_to_total(H_control, g_prime_control=g_prime_control)[0]
 
         return None
 
@@ -4209,14 +4469,15 @@ class Model_qgsw(M):
     def _get_wind_stress(self, t):
         """
         Return (taux, tauy) as jnp arrays for time t (seconds from init).
+        Taper at outer domain edges only; coastal sponge does not reduce wind.
         Returns (None, None) when no wind file was loaded.
         """
         if self.taux_wind is None:
             return None, None
         it = int(np.floor(t / self.wind_dt)) if self.wind_dt > 0 else 0
         it = int(np.clip(it, 0, len(self.taux_wind) - 1))
-        taux = (1 - self.sponge_u) * jnp.asarray(self.taux_wind[it], dtype=self.dtype)  # (ny, nx+1)
-        tauy = (1 - self.sponge_v) * jnp.asarray(self.tauy_wind[it], dtype=self.dtype)  # (ny+1, nx)
+        taux = self.wind_taper_u * jnp.asarray(self.taux_wind[it], dtype=self.dtype)  # (ny, nx+1)
+        tauy = self.wind_taper_v * jnp.asarray(self.tauy_wind[it], dtype=self.dtype)  # (ny+1, nx)
         return taux, tauy
 
     def _ssh_to_model_height(self, ssh):
@@ -4284,6 +4545,19 @@ class Model_qgsw(M):
 
         _name_var = [self.name_var['U'], self.name_var['V'], self.name_var['SSH']] if name_var is None else list(name_var)
 
+        # Persist the external forcing controls alongside the prognostic
+        # variables.  Keep their native C-grid shapes so the saved fields are
+        # exactly those consumed by jstep_core (before its unit conversion).
+        forcing_names = {
+            'Fu': self.name_var['U'],
+            'Fv': self.name_var['V'],
+            'Fh': self.name_var['SSH'],
+        }
+        for output_name, parameter_name in forcing_names.items():
+            State0.var[output_name] = +State.params[parameter_name]
+            if output_name not in _name_var:
+                _name_var.append(output_name)
+
         if self._physical_interface_height:
             ssh_name = self.name_var['SSH']
             interface_displacement = +State0.var[ssh_name]
@@ -4302,16 +4576,25 @@ class Model_qgsw(M):
             for name in self.tracer_names:
                 _name_var.append(self.name_var[name])
 
-        if 'H' in self.name_params:
-            State0.var['H'] = self._H_control_to_total_state(State.params['H'])
-            State0.var['H_control'] = +State.params['H']
-            _name_var += ['H', 'H_control']
+        if self._depth_control_name in self.name_params:
+            State0.var['H'] = self._H_control_to_total_state(
+                State.params[self._depth_control_name], State.params.get('g_prime'))
+            control_name = self._depth_control_name + '_control'
+            State0.var[control_name] = +State.params[self._depth_control_name]
+            _name_var += ['H', control_name]
+        elif 'H' in self.parameter_maps:
+            State0.var['H'] = self._H_control_to_total_state(None)
+            _name_var += ['H']
         if 'g_prime' in self.name_params:
             State0.var['g_prime'] = self._g_prime_control_to_total_state(
                 State.params['g_prime'])
             State0.var['g_prime_control'] = +State.params['g_prime']
             _name_var += ['g_prime', 'g_prime_control']
-        if 'H' in self.name_params or 'g_prime' in self.name_params:
+        elif 'g_prime' in self.parameter_maps:
+            State0.var['g_prime'] = np.array(self.g_prime[0].T)
+            _name_var += ['g_prime']
+        if (self._depth_control_name in self.name_params or 'g_prime' in self.name_params
+                or 'H' in self.parameter_maps or 'g_prime' in self.parameter_maps):
             State0.var['c'] = self._controlled_phase_speed_state(State)
             _name_var += ['c']
 
@@ -4325,6 +4608,21 @@ class Model_qgsw(M):
             State0.var['h_wind'] = self._h_wind_control_to_total_state(State.params['h_wind'])
             State0.var['h_wind_control'] = +State.params['h_wind']
             _name_var += ['h_wind', 'h_wind_control']
+        elif 'h_wind' in self.parameter_maps:
+            State0.var['h_wind'] = np.array(self.h_wind_ref_sw.T)
+            _name_var += ['h_wind']
+
+        for coef_name in ('diff_coef', 'visc_coef', 'bottom_drag_coef'):
+            if coef_name in self.name_params:
+                State0.var[coef_name] = self._coefficient_control_to_total_state(
+                    coef_name, State.params[coef_name])
+                control_name = f'{coef_name}_control'
+                State0.var[control_name] = +State.params[coef_name]
+                _name_var += [coef_name, control_name]
+            elif coef_name in self.parameter_maps:
+                State0.var[coef_name] = np.array(
+                    jnp.asarray(getattr(self, f'{coef_name}_ref')).T)
+                _name_var += [coef_name]
         
         if 'wind_strength' in self.name_params:
             State0.var['wind_strength'] = State.params['wind_strength']
@@ -4622,7 +4920,8 @@ class Model_qgsw(M):
         return u_target[0, 0], v_target[0, 0], h_target[0, 0]
     
     def jstep_core(self, t, u0, v0, h0, H, g_prime_control, Fu, Fv, Fh, u_b, v_b, h_b,
-                taux=None, tauy=None, h_wind=None, wind_strength=None, nstep=1):
+                taux=None, tauy=None, h_wind=None, wind_strength=None,
+                diff_coef=None, visc_coef=None, bottom_drag_coef=None, nstep=1):
         """
         taux: wind stress on u-grid, shape (ny, nx+1) in State convention, or None.
         tauy: wind stress on v-grid, shape (ny+1, nx) in State convention, or None.
@@ -4668,9 +4967,15 @@ class Model_qgsw(M):
                 u, v, h, u_b_sw, v_b_sw, h_b_sw,
             )
 
-        H_model = self._H_control_to_model_increment(H)
+        H_model = self._H_control_to_model_increment(H, g_prime_control)
         h_wind_model = self._wind_depth_to_model(
-            H, h_wind)
+            H, h_wind, g_prime_control)
+        diff_coef_model = self._coefficient_control_to_total_sw(
+            'diff_coef', diff_coef)
+        visc_coef_model = self._coefficient_control_to_total_sw(
+            'visc_coef', visc_coef)
+        bottom_drag_coef_model = self._coefficient_control_to_total_sw(
+            'bottom_drag_coef', bottom_drag_coef)
 
         # The public one-layer state keeps the reference interface coordinate
         # used by observations and restarts. When g' is controlled, convert it
@@ -4693,6 +4998,8 @@ class Model_qgsw(M):
             taux=_taux, tauy=_tauy,
             h_wind=h_wind_model,
             wind_strength=wind_strength,
+            diff_coef=diff_coef_model,
+            visc_coef=visc_coef_model, bottom_drag_coef=bottom_drag_coef_model,
             **({"g_prime": g_prime_model} if g_prime_control is not None else {}),
         )
 
@@ -4709,7 +5016,8 @@ class Model_qgsw(M):
     
     def jstep_core_trac(self, t, u0, v0, h0, c0, H, g_prime_control, Fu, Fv, Fh, Fc,
                         u_b, v_b, h_b, c_b,
-                        taux=None, tauy=None, h_wind=None, wind_strength=None, nstep=1):
+                        taux=None, tauy=None, h_wind=None, wind_strength=None,
+                        diff_coef=None, visc_coef=None, bottom_drag_coef=None, nstep=1):
         """
         Joint single-step for (u, v, h) + passive tracer c.
 
@@ -4758,9 +5066,15 @@ class Model_qgsw(M):
                 u, v, h, u_b_sw, v_b_sw, h_b_sw,
             )
 
-        H_model = self._H_control_to_model_increment(H)
+        H_model = self._H_control_to_model_increment(H, g_prime_control)
         h_wind_model = self._wind_depth_to_model(
-            H, h_wind)
+            H, h_wind, g_prime_control)
+        diff_coef_model = self._coefficient_control_to_total_sw(
+            'diff_coef', diff_coef)
+        visc_coef_model = self._coefficient_control_to_total_sw(
+            'visc_coef', visc_coef)
+        bottom_drag_coef_model = self._coefficient_control_to_total_sw(
+            'bottom_drag_coef', bottom_drag_coef)
 
         if self._physical_interface_height and g_prime_control is not None:
             height_scale = (jnp.asarray(self.g_prime, dtype=self.dtype)
@@ -4780,6 +5094,8 @@ class Model_qgsw(M):
             taux=_taux, tauy=_tauy,
             h_wind=h_wind_model,
             wind_strength=wind_strength,
+            diff_coef=diff_coef_model,
+            visc_coef=visc_coef_model, bottom_drag_coef=bottom_drag_coef_model,
             **({"g_prime": g_prime_model} if g_prime_control is not None else {}),
         )
 
@@ -4798,13 +5114,16 @@ class Model_qgsw(M):
         return u1, v1, h1, c1_state
     
     def jstep(self, t, u0, v0, h0, H, g_prime_control, Fu, Fv, Fh, u_b, v_b, h_b,
-             taux=None, tauy=None, h_wind=None, wind_strength=None, nstep=1):
+             taux=None, tauy=None, h_wind=None, wind_strength=None,
+             diff_coef=None, visc_coef=None, bottom_drag_coef=None, nstep=1):
         return self.jstep_core(
             t, u0, v0, h0, H, g_prime_control, Fu, Fv, Fh,
             u_b, v_b, h_b,
             taux=taux, tauy=tauy,
             h_wind=h_wind,
             wind_strength=wind_strength,
+            diff_coef=diff_coef,
+            visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef,
             nstep=nstep,
         )
     
@@ -4813,16 +5132,20 @@ class Model_qgsw(M):
                 u_b, v_b, h_b, taux=None, tauy=None,
                 h_wind=None, dh_wind=None,
                 wind_strength=None, dwind_strength=None,
+                diff_coef=None, ddiff_coef=None,
+                visc_coef=None, bottom_drag_coef=None, dvisc_coef=None, dbottom_drag_coef=None,
                 du_b=None, dv_b=None, dh_b=None, nstep=1):
 
         # Define a partial function that fixes constant parameters
         # taux/tauy are prescribed forcings: closed over, not differentiated
         # u_b/v_b/h_b are now in the differentiable tuple
-        f = lambda u, v, h, H, gp, Fu, Fv, Fh, hw, ws, ub, vb, hb: self.jstep_core_jit(
+        f = lambda u, v, h, H, gp, Fu, Fv, Fh, hw, ws, dc, vc, bd, ub, vb, hb: self.jstep_core_jit(
             t, u, v, h, H, gp, Fu, Fv, Fh, ub, vb, hb,
             taux=taux, tauy=tauy,
             h_wind=hw,
             wind_strength=ws,
+            diff_coef=dc,
+            visc_coef=vc, bottom_drag_coef=bd,
             nstep=nstep,
         )
 
@@ -4837,8 +5160,10 @@ class Model_qgsw(M):
         # JVP (forward mode)
         (u1, v1, h1), (du1, dv1, dh1) = jax.jvp(
             f,
-            (u0, v0, h0, H, g_prime_control, Fu, Fv, Fh, h_wind, wind_strength, u_b, v_b, h_b),
-            (du0, dv0, dh0, dH, dg_prime, dFu, dFv, dFh, dh_wind, dwind_strength, du_b, dv_b, dh_b)
+            (u0, v0, h0, H, g_prime_control, Fu, Fv, Fh, h_wind,
+             wind_strength, diff_coef, visc_coef, bottom_drag_coef, u_b, v_b, h_b),
+            (du0, dv0, dh0, dH, dg_prime, dFu, dFv, dFh, dh_wind,
+             dwind_strength, ddiff_coef, dvisc_coef, dbottom_drag_coef, du_b, dv_b, dh_b)
         )
 
         return du1, dv1, dh1
@@ -4848,26 +5173,31 @@ class Model_qgsw(M):
                 taux=None, tauy=None,
                 h_wind=None, adh_wind=None,
                 wind_strength=None, adwind_strength=None,
+                diff_coef=None, addiff_coef=None,
+                visc_coef=None, bottom_drag_coef=None, advisc_coef=None, adbottom_drag_coef=None,
                 adu_b=None, adv_b=None, adh_b=None, nstep=1):
 
         # taux/tauy are prescribed forcings: closed over, not differentiated
         # u_b/v_b/h_b are now in the differentiable tuple
-        f = lambda u, v, h, H, gp, Fu, Fv, Fh, hw, ws, ub, vb, hb: self.jstep_core_jit(
+        f = lambda u, v, h, H, gp, Fu, Fv, Fh, hw, ws, dc, vc, bd, ub, vb, hb: self.jstep_core_jit(
             t, u, v, h, H, gp, Fu, Fv, Fh, ub, vb, hb,
             taux=taux, tauy=tauy,
             h_wind=hw,
             wind_strength=ws,
+            diff_coef=dc,
+            visc_coef=vc, bottom_drag_coef=bd,
             nstep=nstep,
         )
 
         # Build the VJP function
         (u1, v1, h1), vjp_fun = jax.vjp(
             f, u0, v0, h0, H, g_prime_control, Fu, Fv, Fh,
-            h_wind, wind_strength, u_b, v_b, h_b)
+            h_wind, wind_strength, diff_coef, visc_coef, bottom_drag_coef, u_b, v_b, h_b)
 
         # Apply adjoints at output
         (adu0, adv0, adh0, _adH, _adg_prime, _adFu, _adFv, _adFh,
-         _adh_wind, _adwind_strength, _adu_b, _adv_b, _adh_b) = vjp_fun((adu1, adv1, adh1))
+         _adh_wind, _adwind_strength, _addiff_coef, _advisc_coef, _adbottom_drag_coef,
+         _adu_b, _adv_b, _adh_b) = vjp_fun((adu1, adv1, adh1))
         if adH is not None:
             adH += _adH
         if adg_prime is not None:
@@ -4879,6 +5209,12 @@ class Model_qgsw(M):
             adh_wind += _adh_wind
         if adwind_strength is not None:
             adwind_strength += _adwind_strength
+        if addiff_coef is not None:
+            addiff_coef += _addiff_coef
+        if advisc_coef is not None:
+            advisc_coef += _advisc_coef
+        if adbottom_drag_coef is not None:
+            adbottom_drag_coef += _adbottom_drag_coef
         if adu_b is not None:
             adu_b += _adu_b
         if adv_b is not None:
@@ -4887,7 +5223,8 @@ class Model_qgsw(M):
             adh_b += _adh_b
         
         return (adu0, adv0, adh0, adH, adg_prime, adFu, adFv, adFh,
-                adh_wind, adwind_strength, adu_b, adv_b, adh_b)
+                adh_wind, adwind_strength, addiff_coef, advisc_coef, adbottom_drag_coef,
+                adu_b, adv_b, adh_b)
 
     def jstep_tgl_trac(self, t, du0, dv0, dh0, dc0, dH, dg_prime, dFu, dFv, dFh, dFc,
                        u0, v0, h0, c0, H, g_prime_control, Fu, Fv, Fh, Fc,
@@ -4895,12 +5232,15 @@ class Model_qgsw(M):
                        taux=None, tauy=None,
                        h_wind=None, dh_wind=None,
                        wind_strength=None, dwind_strength=None,
+                       diff_coef=None, ddiff_coef=None,
+                       visc_coef=None, bottom_drag_coef=None, dvisc_coef=None, dbottom_drag_coef=None,
                        du_b=None, dv_b=None, dh_b=None, dc_b=None, nstep=1):
         """TGL for joint (u, v, h, c) step via JAX forward-mode AD."""
-        f = lambda u, v, h, c, H, gp, Fu, Fv, Fh, Fc, hw, ws, ub, vb, hb, cb: \
+        f = lambda u, v, h, c, H, gp, Fu, Fv, Fh, Fc, hw, ws, dc, vc, bd, ub, vb, hb, cb: \
             self.jstep_core_trac_jit(
                 t, u, v, h, c, H, gp, Fu, Fv, Fh, Fc, ub, vb, hb, cb,
-                taux=taux, tauy=tauy, h_wind=hw, wind_strength=ws, nstep=nstep)
+                taux=taux, tauy=tauy, h_wind=hw, wind_strength=ws,
+                diff_coef=dc, visc_coef=vc, bottom_drag_coef=bd, nstep=nstep)
 
         if du_b is None: du_b = jnp.zeros_like(u_b)
         if dv_b is None: dv_b = jnp.zeros_like(v_b)
@@ -4910,8 +5250,11 @@ class Model_qgsw(M):
 
         (u1, v1, h1, c1), (du1, dv1, dh1, dc1) = jax.jvp(
             f,
-            (u0, v0, h0, c0, H, g_prime_control, Fu, Fv, Fh, Fc, h_wind, wind_strength, u_b, v_b, h_b, c_b),
-            (du0, dv0, dh0, dc0, dH, dg_prime, dFu, dFv, dFh, dFc, dh_wind, dwind_strength, du_b, dv_b, dh_b, dc_b),
+            (u0, v0, h0, c0, H, g_prime_control, Fu, Fv, Fh, Fc,
+             h_wind, wind_strength, diff_coef, visc_coef, bottom_drag_coef, u_b, v_b, h_b, c_b),
+            (du0, dv0, dh0, dc0, dH, dg_prime, dFu, dFv, dFh, dFc,
+             dh_wind, dwind_strength, ddiff_coef, dvisc_coef, dbottom_drag_coef,
+             du_b, dv_b, dh_b, dc_b),
         )
         return du1, dv1, dh1, dc1
 
@@ -4921,20 +5264,23 @@ class Model_qgsw(M):
                        taux=None, tauy=None,
                        h_wind=None, adh_wind=None,
                        wind_strength=None, adwind_strength=None,
+                       diff_coef=None, addiff_coef=None,
+                       visc_coef=None, bottom_drag_coef=None, advisc_coef=None, adbottom_drag_coef=None,
                        adu_b=None, adv_b=None, adh_b=None, adc_b=None, nstep=1):
         """ADJ for joint (u, v, h, c) step via JAX reverse-mode AD."""
-        f = lambda u, v, h, c, H, gp, Fu, Fv, Fh, Fc, hw, ws, ub, vb, hb, cb: \
+        f = lambda u, v, h, c, H, gp, Fu, Fv, Fh, Fc, hw, ws, dc, vc, bd, ub, vb, hb, cb: \
             self.jstep_core_trac_jit(
                 t, u, v, h, c, H, gp, Fu, Fv, Fh, Fc, ub, vb, hb, cb,
-                taux=taux, tauy=tauy, h_wind=hw, wind_strength=ws, nstep=nstep)
+                taux=taux, tauy=tauy, h_wind=hw, wind_strength=ws,
+                diff_coef=dc, visc_coef=vc, bottom_drag_coef=bd, nstep=nstep)
 
         (u1, v1, h1, c1), vjp_fun = jax.vjp(
             f, u0, v0, h0, c0, H, g_prime_control, Fu, Fv, Fh, Fc,
-            h_wind, wind_strength, u_b, v_b, h_b, c_b)
+            h_wind, wind_strength, diff_coef, visc_coef, bottom_drag_coef, u_b, v_b, h_b, c_b)
 
         (adu0, adv0, adh0, adc0,
          _adH, _adg_prime, _adFu, _adFv, _adFh, _adFc,
-         _adh_wind, _adwind_strength,
+         _adh_wind, _adwind_strength, _addiff_coef, _advisc_coef, _adbottom_drag_coef,
          _adu_b, _adv_b, _adh_b, _adc_b) = vjp_fun((adu1, adv1, adh1, adc1))
 
         if adH is not None:            adH            += _adH
@@ -4942,6 +5288,9 @@ class Model_qgsw(M):
         if adFc is not None:           adFc           += _adFc
         if adh_wind is not None:       adh_wind       += _adh_wind
         if adwind_strength is not None: adwind_strength += _adwind_strength
+        if addiff_coef is not None:      addiff_coef      += _addiff_coef
+        if advisc_coef is not None:      advisc_coef      += _advisc_coef
+        if adbottom_drag_coef is not None:      adbottom_drag_coef      += _adbottom_drag_coef
         if adu_b is not None:          adu_b          += _adu_b
         if adv_b is not None:          adv_b          += _adv_b
         if adh_b is not None:          adh_b          += _adh_b
@@ -4952,7 +5301,7 @@ class Model_qgsw(M):
 
         return (adu0, adv0, adh0, adc0,
                 adH, adg_prime, adFu, adFv, adFh, adFc,
-                adh_wind, adwind_strength,
+                adh_wind, adwind_strength, addiff_coef, advisc_coef, adbottom_drag_coef,
                 adu_b, adv_b, adh_b, adc_b)
 
     def step(self,State,nstep=1,t=0,Xb=None):
@@ -4968,8 +5317,8 @@ class Model_qgsw(M):
         Fu = State.params[self.name_var['U']]
         Fv = State.params[self.name_var['V']]
         Fh = State.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
-            H = State.params['H']
+        if self._depth_control_name in self.name_params:
+            H = State.params[self._depth_control_name]
             H = jnp.expand_dims(H.astype(self.dtype).T, axis=0)
         else:
             H = None
@@ -4987,6 +5336,12 @@ class Model_qgsw(M):
             wind_strength = State.params['wind_strength'].astype(self.dtype).T  # (nx, ny)
         else:
             wind_strength = None
+        diff_coef = (State.params['diff_coef'].astype(self.dtype).T
+                     if 'diff_coef' in self.name_params else None)
+        visc_coef = (State.params['visc_coef'].astype(self.dtype).T
+                     if 'visc_coef' in self.name_params else None)
+        bottom_drag_coef = (State.params['bottom_drag_coef'].astype(self.dtype).T
+                     if 'bottom_drag_coef' in self.name_params else None)
 
         # BC perturbation from params
         if 'bc' in self.name_params:
@@ -5020,10 +5375,12 @@ class Model_qgsw(M):
                     t_chunk, u, v, h, c, H, g_prime_control, Fu, Fv, Fh, Fc,
                     u_b, v_b, h_b, c_b,
                     taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength,
+                    diff_coef=diff_coef, visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef,
                     nstep=n_chunk)
             else:
                 u, v, h = self.jstep_jit(t_chunk, u, v, h, H, g_prime_control, Fu, Fv, Fh, u_b, v_b, h_b,
-                                          taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength, nstep=n_chunk)
+                                          taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength,
+                                          diff_coef=diff_coef, visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef, nstep=n_chunk)
             step_done += n_chunk
 
         u = u[0,0].T
@@ -5062,9 +5419,9 @@ class Model_qgsw(M):
         dFu = dState.params[self.name_var['U']]
         dFv = dState.params[self.name_var['V']]
         dFh = dState.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
-            H = State.params['H']
-            dH = dState.params['H']
+        if self._depth_control_name in self.name_params:
+            H = State.params[self._depth_control_name]
+            dH = dState.params[self._depth_control_name]
             H = jnp.expand_dims(H.astype(self.dtype ).T, axis=0)
             dH = jnp.expand_dims(dH.astype(self.dtype).T, axis=0)
         else:
@@ -5086,6 +5443,21 @@ class Model_qgsw(M):
             dwind_strength = dState.params['wind_strength'].astype(self.dtype).T  # (nx, ny)
         else:
             wind_strength = dwind_strength = None
+        if 'diff_coef' in self.name_params:
+            diff_coef = State.params['diff_coef'].astype(self.dtype).T
+            ddiff_coef = dState.params['diff_coef'].astype(self.dtype).T
+        else:
+            diff_coef = ddiff_coef = None
+        if 'visc_coef' in self.name_params:
+            visc_coef = State.params['visc_coef'].astype(self.dtype).T
+            dvisc_coef = dState.params['visc_coef'].astype(self.dtype).T
+        else:
+            visc_coef = dvisc_coef = None
+        if 'bottom_drag_coef' in self.name_params:
+            bottom_drag_coef = State.params['bottom_drag_coef'].astype(self.dtype).T
+            dbottom_drag_coef = dState.params['bottom_drag_coef'].astype(self.dtype).T
+        else:
+            bottom_drag_coef = dbottom_drag_coef = None
         if 'bc' in self.name_params:
             bc_du = State.params['u_b'].astype(self.dtype)
             bc_dv = State.params['v_b'].astype(self.dtype)
@@ -5131,6 +5503,8 @@ class Model_qgsw(M):
                     taux=taux, tauy=tauy,
                     h_wind=h_wind, dh_wind=dh_wind,
                     wind_strength=wind_strength, dwind_strength=dwind_strength,
+                    diff_coef=diff_coef, ddiff_coef=ddiff_coef,
+                    visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef, dvisc_coef=dvisc_coef, dbottom_drag_coef=dbottom_drag_coef,
                     du_b=dbc_du, dv_b=dbc_dv, dh_b=dbc_dh,
                     nstep=n_chunk)
                 # Propagate forward state for next chunk
@@ -5138,6 +5512,7 @@ class Model_qgsw(M):
                     t_chunk, u, v, h, c, H, g_prime_control, Fu, Fv, Fh, Fc,
                     u_b, v_b, h_b, c_b,
                     taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength,
+                    diff_coef=diff_coef, visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef,
                     nstep=n_chunk)
             else:
                 # Propagate tangent (JVP includes forward internally)
@@ -5146,11 +5521,14 @@ class Model_qgsw(M):
                                                 taux=taux, tauy=tauy,
                                                 h_wind=h_wind, dh_wind=dh_wind,
                                                 wind_strength=wind_strength, dwind_strength=dwind_strength,
+                                                diff_coef=diff_coef, ddiff_coef=ddiff_coef,
+                                                visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef, dvisc_coef=dvisc_coef, dbottom_drag_coef=dbottom_drag_coef,
                                                 du_b=dbc_du, dv_b=dbc_dv, dh_b=dbc_dh,
                                                 nstep=n_chunk)
                 # Propagate forward state for next chunk
                 u, v, h = self.jstep_jit(t_chunk, u, v, h, H, g_prime_control, Fu, Fv, Fh, u_b, v_b, h_b,
-                                          taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength, nstep=n_chunk)
+                                          taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength,
+                                          diff_coef=diff_coef, visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef, nstep=n_chunk)
             step_done += n_chunk
 
         du = du[0,0].T
@@ -5178,8 +5556,8 @@ class Model_qgsw(M):
         Fu = State.params[self.name_var['U']]
         Fv = State.params[self.name_var['V']]
         Fh = State.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
-            H = State.params['H']
+        if self._depth_control_name in self.name_params:
+            H = State.params[self._depth_control_name]
             H = jnp.expand_dims(H.astype(self.dtype).T, axis=0)
         else:
             H = None
@@ -5196,13 +5574,19 @@ class Model_qgsw(M):
             wind_strength = State.params['wind_strength'].astype(self.dtype).T  # (nx, ny)
         else:
             wind_strength = None
+        diff_coef = (State.params['diff_coef'].astype(self.dtype).T
+                     if 'diff_coef' in self.name_params else None)
+        visc_coef = (State.params['visc_coef'].astype(self.dtype).T
+                     if 'visc_coef' in self.name_params else None)
+        bottom_drag_coef = (State.params['bottom_drag_coef'].astype(self.dtype).T
+                     if 'bottom_drag_coef' in self.name_params else None)
         
         # Get adjoint parameters (2D)
         adFu = adState.params[self.name_var['U']]
         adFv = adState.params[self.name_var['V']]
         adFh = adState.params[self.name_var['SSH']]
-        if 'H' in self.name_params:
-            adH = adState.params['H']
+        if self._depth_control_name in self.name_params:
+            adH = adState.params[self._depth_control_name]
             adH = jnp.expand_dims(adH.astype(self.dtype).T, axis=0)
         else:
             adH = None
@@ -5219,6 +5603,12 @@ class Model_qgsw(M):
             adwind_strength = adState.params['wind_strength'].astype(self.dtype).T  # (nx, ny)
         else:
             adwind_strength = None
+        addiff_coef = (adState.params['diff_coef'].astype(self.dtype).T
+                       if 'diff_coef' in self.name_params else None)
+        advisc_coef = (adState.params['visc_coef'].astype(self.dtype).T
+                       if 'visc_coef' in self.name_params else None)
+        adbottom_drag_coef = (adState.params['bottom_drag_coef'].astype(self.dtype).T
+                       if 'bottom_drag_coef' in self.name_params else None)
         if 'bc' in self.name_params:
             bc_du = State.params['u_b'].astype(self.dtype)
             bc_dv = State.params['v_b'].astype(self.dtype)
@@ -5270,13 +5660,15 @@ class Model_qgsw(M):
                         Fu, Fv, Fh, Fc,
                         u_b, v_b, h_b, c_b,
                         taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength,
+                        diff_coef=diff_coef, visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef,
                         nstep=n_chunk)
                     fwd_states.append((u_fwd, v_fwd, h_fwd, c_fwd))
                 else:
                     u_fwd, v_fwd, h_fwd = self.jstep_jit(
                         t_chunk, u_fwd, v_fwd, h_fwd, H, g_prime_control,
                         Fu, Fv, Fh, u_b, v_b, h_b,
-                        taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength, nstep=n_chunk)
+                        taux=taux, tauy=tauy, h_wind=h_wind, wind_strength=wind_strength,
+                        diff_coef=diff_coef, visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef, nstep=n_chunk)
                     fwd_states.append((u_fwd, v_fwd, h_fwd))
 
         # Reverse adjoint through chunks
@@ -5293,7 +5685,7 @@ class Model_qgsw(M):
                 u_i, v_i, h_i, c_i = fwd_states[i]
                 (adu, adv, adh, adc,
                  adH, adg_prime, adFu, adFv, adFh, adFc,
-                 adh_wind, adwind_strength,
+                 adh_wind, adwind_strength, addiff_coef, advisc_coef, adbottom_drag_coef,
                  adu_b_acc, adv_b_acc, adh_b_acc, adc_b_acc) = self.jstep_adj_trac_jit(
                     t_chunk, adu, adv, adh, adc, adH, adg_prime,
                     adFu, adFv, adFh, adFc,
@@ -5302,18 +5694,23 @@ class Model_qgsw(M):
                     taux=taux, tauy=tauy,
                     h_wind=h_wind, adh_wind=adh_wind,
                     wind_strength=wind_strength, adwind_strength=adwind_strength,
+                    diff_coef=diff_coef, addiff_coef=addiff_coef,
+                    visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef, advisc_coef=advisc_coef, adbottom_drag_coef=adbottom_drag_coef,
                     adu_b=adu_b_acc, adv_b=adv_b_acc, adh_b=adh_b_acc,
                     nstep=n_chunk)
             else:
                 u_i, v_i, h_i = fwd_states[i]
                 (adu, adv, adh, adH, adg_prime, adFu, adFv, adFh,
-                 adh_wind, adwind_strength, adu_b_acc, adv_b_acc, adh_b_acc) = self.jstep_adj_jit(
+                 adh_wind, adwind_strength, addiff_coef, advisc_coef, adbottom_drag_coef,
+                 adu_b_acc, adv_b_acc, adh_b_acc) = self.jstep_adj_jit(
                     t_chunk, adu, adv, adh, adH, adg_prime, adFu, adFv, adFh,
                     u_i, v_i, h_i, H, g_prime_control, Fu, Fv, Fh,
                     u_b, v_b, h_b,
                     taux=taux, tauy=tauy,
                     h_wind=h_wind, adh_wind=adh_wind,
                     wind_strength=wind_strength, adwind_strength=adwind_strength,
+                    diff_coef=diff_coef, addiff_coef=addiff_coef,
+                    visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef, advisc_coef=advisc_coef, adbottom_drag_coef=adbottom_drag_coef,
                     adu_b=adu_b_acc, adv_b=adv_b_acc, adh_b=adh_b_acc,
                     nstep=n_chunk)
 
@@ -5324,15 +5721,21 @@ class Model_qgsw(M):
         adState.setvar(adv,self.name_var['V'])
         adState.setvar(adh,self.name_var['SSH'])
 
-        if 'H' in self.name_params:
+        if self._depth_control_name in self.name_params:
             adH = adH[0].T
-            adState.params['H'] = adH
+            adState.params[self._depth_control_name] = adH
         if 'g_prime' in self.name_params:
             adState.params['g_prime'] = adg_prime[0].T
         if 'h_wind' in self.name_params:
             adState.params['h_wind'] = adh_wind.T  # back to State convention (ny, nx)
         if 'wind_strength' in self.name_params:
             adState.params['wind_strength'] = adwind_strength.T  # back to State convention (ny, nx)
+        if 'diff_coef' in self.name_params:
+            adState.params['diff_coef'] = addiff_coef.T
+        if 'visc_coef' in self.name_params:
+            adState.params['visc_coef'] = advisc_coef.T
+        if 'bottom_drag_coef' in self.name_params:
+            adState.params['bottom_drag_coef'] = adbottom_drag_coef.T
         if 'bc' in self.name_params:
             adState.params['u_b'] = adu_b_acc
             adState.params['v_b'] = adv_b_acc
@@ -5400,7 +5803,7 @@ class Model_qgsw(M):
         v0 = v0 * mask_v
         h0 = h0 * mask_h
 
-        has_H = 'H' in self.name_params
+        has_H = self._depth_control_name in self.name_params
         if has_H:
             key, H = rand(key, H_shape)
         else:
@@ -5417,6 +5820,22 @@ class Model_qgsw(M):
             key, h_wind = rand(key, hw_shape)
         else:
             h_wind = None
+        has_diff_coef = 'diff_coef' in self.name_params
+        has_visc_coef = 'visc_coef' in self.name_params
+        has_bottom_drag_coef = 'bottom_drag_coef' in self.name_params
+        if has_diff_coef:
+            key, diff_coef = rand(key, hw_shape)
+        else:
+            diff_coef = None
+        if has_visc_coef:
+            key, visc_coef = rand(key, hw_shape)
+        else:
+            visc_coef = None
+
+        if has_bottom_drag_coef:
+            key, bottom_drag_coef = rand(key, hw_shape)
+        else:
+            bottom_drag_coef = None
 
         key, Fu = rand(key, Fu_shape)
         key, Fv = rand(key, Fv_shape)
@@ -5445,6 +5864,18 @@ class Model_qgsw(M):
             key, dh_wind = rand(key, hw_shape)
         else:
             dh_wind = None
+        if has_diff_coef:
+            key, ddiff_coef = rand(key, hw_shape)
+        else:
+            ddiff_coef = None
+        if has_visc_coef:
+            key, dvisc_coef = rand(key, hw_shape)
+        else:
+            dvisc_coef = None
+        if has_bottom_drag_coef:
+            key, dbottom_drag_coef = rand(key, hw_shape)
+        else:
+            dbottom_drag_coef = None
         if has_bc:
             key, du_b = rand(key, ub_shape)
             key, dv_b = rand(key, vb_shape)
@@ -5466,6 +5897,8 @@ class Model_qgsw(M):
             u0, v0, h0, H, g_prime_control, Fu, Fv, Fh,
             u_b, v_b, h_b,
             h_wind=h_wind, dh_wind=dh_wind,
+            diff_coef=diff_coef, ddiff_coef=ddiff_coef,
+            visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef, dvisc_coef=dvisc_coef, dbottom_drag_coef=dbottom_drag_coef,
             du_b=du_b, dv_b=dv_b, dh_b=dh_b, nstep=nstep)
 
         # --- Run ADJ --------------------------------------------------------
@@ -5476,16 +5909,22 @@ class Model_qgsw(M):
         adFv_in = jnp.zeros(Fv_shape, dtype=dtype)
         adFh_in = jnp.zeros(Fh_shape, dtype=dtype)
         adh_wind_in = jnp.zeros(hw_shape, dtype=dtype) if has_hw else None
+        addiff_coef_in = jnp.zeros(hw_shape, dtype=dtype) if has_diff_coef else None
+        advisc_coef_in = jnp.zeros(hw_shape, dtype=dtype) if has_visc_coef else None
+        adbottom_drag_coef_in = jnp.zeros(hw_shape, dtype=dtype) if has_bottom_drag_coef else None
         adu_b_in = jnp.zeros(ub_shape, dtype=dtype) if has_bc else None
         adv_b_in = jnp.zeros(vb_shape, dtype=dtype) if has_bc else None
         adh_b_in = jnp.zeros(hb_shape, dtype=dtype) if has_bc else None
 
         (adu0, adv0, adh0, adH_out, adg_prime_out, adFu_out, adFv_out, adFh_out,
-         adh_wind_out, _, adu_b_out, adv_b_out, adh_b_out) = self.jstep_adj(
+         adh_wind_out, _, addiff_coef_out, advisc_coef_out, adbottom_drag_coef_out,
+         adu_b_out, adv_b_out, adh_b_out) = self.jstep_adj(
             0, wu, wv, wh, adH_in, adg_prime_in, adFu_in, adFv_in, adFh_in,
             u0, v0, h0, H, g_prime_control, Fu, Fv, Fh,
             u_b, v_b, h_b,
             h_wind=h_wind, adh_wind=adh_wind_in,
+            diff_coef=diff_coef, addiff_coef=addiff_coef_in,
+            visc_coef=visc_coef, bottom_drag_coef=bottom_drag_coef, advisc_coef=advisc_coef_in, adbottom_drag_coef=adbottom_drag_coef_in,
             adu_b=adu_b_in, adv_b=adv_b_in, adh_b=adh_b_in, nstep=nstep)
 
         # --- Check NaN ------------------------------------------------------
@@ -5518,6 +5957,12 @@ class Model_qgsw(M):
             ps2 += jnp.sum(to64(dg_prime) * to64(adg_prime_out))
         if has_hw:
             ps2 += jnp.sum(to64(dh_wind) * to64(adh_wind_out))
+        if has_diff_coef:
+            ps2 += jnp.sum(to64(ddiff_coef) * to64(addiff_coef_out))
+        if has_visc_coef:
+            ps2 += jnp.sum(to64(dvisc_coef) * to64(advisc_coef_out))
+        if has_bottom_drag_coef:
+            ps2 += jnp.sum(to64(dbottom_drag_coef) * to64(adbottom_drag_coef_out))
         if has_bc:
             ps2 += (jnp.sum(to64(du_b) * to64(adu_b_out))
                   + jnp.sum(to64(dv_b) * to64(adv_b_out))
@@ -5526,6 +5971,7 @@ class Model_qgsw(M):
         ratio = float(ps1 / ps2)
         print(f'  jstep adjoint test (dtype={dtype}, {nstep=}): '
               f'<Mdx,y>/<dx,M*y> = {ratio}')
+        return ratio
 
 
 class Model_bmit(_ITOpenBoundaryExtensionMixin, M):

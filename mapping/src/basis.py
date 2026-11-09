@@ -7,15 +7,28 @@ Builds reduced-basis operators and related helper models.
 """
 from .config import USE_FLOAT64
 import os, sys
+import hashlib
+import json
 import numpy as np
 import logging
 import datetime 
+from dataclasses import dataclass
+from pathlib import Path
 import xarray as xr
 import scipy
 from scipy.sparse import csc_matrix
 from scipy.integrate import quad
+from scipy.special import j0
+from scipy.spatial import cKDTree
+from scipy.ndimage import label as _label_sw_basins
 import jax.numpy as jnp 
 from jax.experimental import sparse as sparse
+from .covariance import (
+    BlockDiagonalCovariance,
+    CovarianceOperator,
+    DiagonalCovariance,
+)
+
 from jax import jit
 import jax
 
@@ -288,6 +301,10 @@ def Basis(config, State, verbose=True, multi_mode=False, *args, **kwargs):
         return 
     
     elif config.BASIS.super is None:
+        window_days = getattr(getattr(config, 'INV', None),
+                              'forcing_window_days', None)
+        if window_days is not None:
+            return Basis_windowed_forcing(config, State, verbose=verbose)
         return Basis_multi(config, State, verbose=verbose)
 
     else:
@@ -296,6 +313,15 @@ def Basis(config, State, verbose=True, multi_mode=False, *args, **kwargs):
 
         if config.BASIS.super=='BASIS_GAUSS3D':
             basis_obj = Basis_gauss3d(config,State,multi_mode=multi_mode)
+
+        elif config.BASIS.super == 'BASIS_SW_DAILY':
+            basis_obj = DailySWForcing(config, State, multi_mode=multi_mode)
+
+        elif config.BASIS.super == 'BASIS_SW_FORCING':
+            if getattr(config.BASIS, 'calibration_file', None):
+                basis_obj = CalibratedSWForcing(config, State, multi_mode=multi_mode)
+            else:
+                basis_obj = Basis_sw_forcing(config, State, multi_mode=multi_mode)
 
         elif config.BASIS.super=='BASIS_GAUSS2D':
             basis_obj = Basis_gauss2d(config,State,multi_mode=multi_mode)
@@ -322,6 +348,754 @@ def Basis(config, State, verbose=True, multi_mode=False, *args, **kwargs):
 #                3D Gaussian (time/spatial components)                        #
 ###############################################################################    
 # Old version of the basis class, kept for reference. The new Basis_gauss3d class is preferred.
+class DailyAR1Covariance(CovarianceOperator):
+    """Time-major stationary AR(1), independent between spatial atoms."""
+    def __init__(self, std, tdec, ntime, step_days=1.):
+        std, tdec = np.broadcast_arrays(np.atleast_1d(std), np.atleast_1d(tdec))
+        if (std.ndim != 1 or not np.isfinite(std).all() or not np.isfinite(tdec).all()
+                or np.any(std <= 0) or np.any(tdec <= 0) or ntime < 2 or step_days <= 0):
+            raise ValueError('AR1 needs positive finite parameters and at least two nodes')
+        self.std = jnp.asarray(std)
+        self.rho = jnp.asarray(np.exp(-step_days/tdec))
+        self.innovation = jnp.asarray(std*np.sqrt(-np.expm1(-2*step_days/tdec)))
+        self.shape = (int(ntime), std.size)
+
+    def sqrt(self, x):
+        z = x.reshape(self.shape)
+        first = self.std*z[0]
+        def step(previous, noise):
+            value = self.rho*previous+self.innovation*noise
+            return value, value
+        _, tail = jax.lax.scan(step, first, z[1:])
+        return jnp.concatenate((first[None], tail)).ravel()
+
+    def sqrt_transpose(self, x):
+        values = x.reshape(self.shape)
+        def step(future, value):
+            current = value+self.rho*future
+            return current, current
+        _, accumulated = jax.lax.scan(step, jnp.zeros_like(values[0]), values, reverse=True)
+        return jnp.concatenate((self.std*accumulated[:1], self.innovation*accumulated[1:])).ravel()
+
+    def inverse_sqrt(self, x):
+        a = x.reshape(self.shape)
+        return jnp.concatenate((a[:1]/self.std,
+            (a[1:]-self.rho*a[:-1])/self.innovation)).ravel()
+
+    def inverse(self, x):
+        white = self.inverse_sqrt(x)
+        return jax.linear_transpose(self.inverse_sqrt, jnp.zeros_like(x))(white)[0]
+
+    def astype(self, dtype):
+        other = object.__new__(type(self))
+        other.shape = self.shape
+        for key in ('std', 'rho', 'innovation'):
+            setattr(other, key, getattr(self, key).astype(dtype))
+        return other
+
+
+_SW_FORCING_COMPONENTS = ('divergent', 'rotational', 'height', 'height_mean')
+
+
+def _sw_forcing_window(distance):
+    """Compact cosine-squared spatial potential, zero outside unit radius."""
+    return np.where(abs(distance) < 1, np.cos(np.pi*np.clip(distance, -1, 1)/2)**2, 0)
+
+
+def _sw_forcing_corners(a):
+    a = np.pad(a, ((1, 1), (1, 1)), mode='reflect', reflect_type='odd')
+    return .25*(a[:-1, :-1]+a[1:, :-1]+a[:-1, 1:]+a[1:, 1:])
+
+
+def _sw_forcing_geometry(state):
+    wet = np.ones((state.ny, state.nx), bool) if state.mask is None else ~np.asarray(state.mask, bool)
+    dx, dy = (np.broadcast_to(np.asarray(a, float), wet.shape).copy() for a in (state.DX, state.DY))
+    x, y = np.asarray(state.X, float), np.asarray(state.Y, float)
+    if not wet.any() or not all(np.isfinite(a).all() for a in (dx, dy, x, y)) or min(dx.min(), dy.min()) <= 0:
+        raise ValueError('Invalid SW calibration grid')
+    wu = np.pad(wet[:, :-1] & wet[:, 1:], ((0, 0), (1, 1)))
+    wv = np.pad(wet[:-1] & wet[1:], ((1, 1), (0, 0)))
+    wq = np.pad(wet[:-1, :-1] & wet[1:, :-1] & wet[:-1, 1:] & wet[1:, 1:], ((1, 1), (1, 1)))
+    area = dx*dy
+    au = np.pad(.5*(area[:, 1:]+area[:, :-1]), ((0, 0), (1, 1)), mode='edge')
+    av = np.pad(.5*(area[1:]+area[:-1]), ((1, 1), (0, 0)), mode='edge')
+    fy = np.pad(.5*(dy[:, 1:]+dy[:, :-1]), ((0, 0), (1, 1)), mode='edge')
+    fx = np.pad(.5*(dx[1:]+dx[:-1]), ((1, 1), (0, 0)), mode='edge')
+    basins, nb = _label_sw_basins(wet)
+    return dict(wet=wet, dx=dx, dy=dy, x=x, y=y, xq=_sw_forcing_corners(x), yq=_sw_forcing_corners(y),
+                wu=wu, wv=wv, wq=wq, area=area, au=au, av=av, fy=fy, fx=fx, basins=basins, nbasin=nb)
+
+
+def _sw_forcing_grid_hash(g):
+    digest = hashlib.sha256(b'sw-local-atoms-v1')
+    for key in ('wet', 'dx', 'dy', 'x', 'y'):
+        digest.update(np.ascontiguousarray(g[key]).tobytes())
+    return digest.hexdigest()
+
+
+def _build_sw_forcing_atoms(g, wavelengths, radii, spacing_factor=1., min_support=.5, normalization='forcing'):
+    """Build the gradient/curl/compensated SW atoms.
+
+    Crop each atom before evaluating it, retaining a halo so finite differences
+    agree with whole-grid evaluation. Disconnected basins never share height mass.
+    ``normalization='potential'`` keeps unit-peak scalar potentials for the
+    momentum atoms; the default preserves historical forcing-RMS normalization.
+    """
+    if normalization not in ('forcing', 'potential'):
+        raise ValueError('Unknown atom normalization')
+    ny, nx = g['wet'].shape
+    shapes = ((ny, nx+1), (ny+1, nx), (ny, nx))
+    offsets = np.r_[0, np.cumsum([np.prod(s) for s in shapes])]
+    rows, cols, data, records = [], [], [], []
+    for ci, component in enumerate(_SW_FORCING_COMPONENTS):
+        scales = [(0., 0.)] if ci == 3 else zip(wavelengths, radii['height' if ci == 2 else 'momentum'])
+        for wavelength, radius_km in scales:
+            radius = radius_km*1000
+            centers = [(0., 0., b) for b in range(1, g['nbasin']+1)] if ci == 3 else (
+                (cx, cy, 0) for cy in np.arange(g['y'].min(), g['y'].max()+radius*spacing_factor*.5, radius*spacing_factor)
+                for cx in np.arange(g['x'].min(), g['x'].max()+radius*spacing_factor*.5, radius*spacing_factor))
+            before = len(records)
+            for cx, cy, basin in centers:
+                if ci == 3:
+                    yy, xx = np.where(g['basins'] == basin)
+                else:
+                    extent = radius*(2 if ci == 2 else 1)+2*max(g['dx'].max(), g['dy'].max())
+                    yy, xx = np.where((abs(g['x']-cx) <= extent) & (abs(g['y']-cy) <= extent))
+                if not len(yy):
+                    continue
+                yl, yh, xl, xh = max(0, yy.min()-1), min(ny, yy.max()+2), max(0, xx.min()-1), min(nx, xx.max()+2)
+                hsl, usl, vsl = np.s_[yl:yh, xl:xh], np.s_[yl:yh, xl:xh+1], np.s_[yl:yh+1, xl:xh]
+                u, v, h = np.zeros((yh-yl, xh-xl+1)), np.zeros((yh-yl+1, xh-xl)), np.zeros((yh-yl, xh-xl))
+                wet = g['wet'][hsl]
+                if ci == 3:
+                    h[g['basins'][hsl] == basin] = 1
+                    support = 1.
+                    cx = float(np.average(g['x'][hsl], weights=h*g['area'][hsl]))
+                    cy = float(np.average(g['y'][hsl], weights=h*g['area'][hsl]))
+                else:
+                    r = np.hypot(g['x'][hsl]-cx, g['y'][hsl]-cy)/radius
+                    phi = _sw_forcing_window(r)
+                    footprint = _sw_forcing_window(r/(2 if ci == 2 else 1))**2
+                    support = float(np.sum(footprint*wet*g['area'][hsl])/max(np.sum(footprint*g['area'][hsl]), 1e-30))
+                    # Keep coastal atoms, but flag their calibration support.
+                    if ci == 0:
+                        u[:, 1:-1] = np.diff(phi, axis=1)/(.5*(g['dx'][hsl][:, 1:]+g['dx'][hsl][:, :-1]))
+                        v[1:-1] = np.diff(phi, axis=0)/(.5*(g['dy'][hsl][1:]+g['dy'][hsl][:-1]))
+                        u *= g['wu'][usl]; v *= g['wv'][vsl]
+                    elif ci == 1:
+                        qsl = np.s_[yl:yh+1, xl:xh+1]
+                        psi = _sw_forcing_window(np.hypot(g['xq'][qsl]-cx, g['yq'][qsl]-cy)/radius)*g['wq'][qsl]
+                        u = -np.diff(psi, axis=0)/g['fy'][usl]
+                        v = np.diff(psi, axis=1)/g['fx'][vsl]
+                    else:
+                        broad = _sw_forcing_window(r/2)
+                        for b in np.unique(g['basins'][hsl][wet]):
+                            mask = g['basins'][hsl] == b
+                            denominator = np.sum(g['area'][hsl]*mask*broad)
+                            if denominator:
+                                h += mask*(phi-broad*np.sum(g['area'][hsl]*mask*phi)/denominator)
+                if ci >= 2:
+                    norm = np.sqrt(np.sum(g['area'][hsl]*h*h)/max(np.sum(g['area'][hsl]*(h != 0)), 1.))
+                else:
+                    norm = np.sqrt((np.sum(g['au'][usl]*u*u)+np.sum(g['av'][vsl]*v*v))/max(
+                        np.sum(g['au'][usl]*(u != 0))+np.sum(g['av'][vsl]*(v != 0)), 1.))
+                if norm < 1e-15:
+                    continue
+                if normalization == 'potential' and ci < 2:
+                    norm = 1.  # Scalar potential has unit peak before differentiation.
+                atom = len(records)
+                for i, field in enumerate((u, v, h)):
+                    iy, ix = np.nonzero(field)
+                    rows.append(offsets[i]+(iy+yl)*shapes[i][1]+ix+xl)
+                    cols.append(np.full(len(iy), atom, np.int32))
+                    data.append((field[iy, ix]/norm).astype('float32'))
+                records.append((ci, wavelength, radius_km, cx, cy, basin, support, support >= min_support))
+            print(f'{component} wavelength={wavelength:.1f} km: {len(records)-before} atoms', flush=True)
+    matrix = scipy.sparse.coo_matrix((np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
+                              shape=(offsets[-1], len(records))).tocsr()
+    matrix.eliminate_zeros()
+    return matrix, np.asarray(records, float), shapes
+
+
+def _daily_sw_spectral_radii(wavelengths):
+    """Continuum spectral-peak matching; independent of learned statistics."""
+    r, q = np.linspace(0, 1, 2049), np.geomspace(.01, 4, 1500)
+    def transform(k):
+        return 2*np.pi*np.trapezoid(r*np.cos(np.pi*r/2)**2*j0(2*np.pi*k[:, None]*r), r, axis=1)
+    phi = transform(q)
+    return dict(momentum=wavelengths*q[np.argmax(q**4*phi**2)],
+                height=wavelengths*q[np.argmax(q**2*(phi-transform(2*q))**2)])
+
+
+@dataclass
+class _SWTemporalModes:
+    """Smooth envelopes with an explicit, separate constant Forcing Bias.
+
+    Nonconstant families have zero time mean and unit time-averaged Gram
+    matrix. Removing null directions avoids the redundant partition-of-unity
+    coefficient. Oscillatory carriers are not differentiated/penalized as if
+    they were an unwanted rapidly varying envelope.
+    """
+    start: float
+    end: float
+    halfwidth: float
+    periods: tuple = ()
+    bias: bool = False
+
+    def __post_init__(self):
+        duration = self.end-self.start
+        self.centers = np.arange(0, duration+self.halfwidth, self.halfwidth)+self.start
+        self.periods = tuple(self.periods)
+        if self.bias:
+            self.size = 1
+            return
+        resolution = min((self.halfwidth, *self.periods))
+        # Integrate each smooth piece accurately: trapezoidal errors are
+        # amplified when normalizing the weaker oscillatory directions.
+        breaks = np.unique(np.clip(np.r_[self.centers-self.halfwidth,
+            self.centers, self.centers+self.halfwidth, self.start, self.end],
+            self.start, self.end))
+        nodes, quadrature = np.polynomial.legendre.leggauss(
+            max(32, int(np.ceil(8*self.halfwidth/resolution))))
+        widths = np.diff(breaks)
+        grid = (breaks[:-1, None]+.5*widths[:, None]*(nodes+1)).ravel()
+        weights = (.5*widths[:, None]*quadrature/duration).ravel()
+        values = self._raw_numpy(grid)
+        self.mean = weights @ values
+        centered = values-self.mean
+        gram = centered.T @ (weights[:, None]*centered)
+        eig, vec = np.linalg.eigh(gram)
+        keep = eig > max(float(eig.max())*1e-8, 1e-12)
+        self.transform = vec[:, keep]/np.sqrt(eig[keep])
+        # Deterministic eigenvector signs for reproducible control files.
+        for j in range(self.transform.shape[1]):
+            i = np.argmax(abs(self.transform[:, j]))
+            self.transform[:, j] *= np.sign(self.transform[i, j])
+        self.size = self.transform.shape[1]
+
+    def _raw_numpy(self, times):
+        env = _sw_forcing_window((times[:, None]-self.centers)/self.halfwidth)
+        if not self.periods:
+            return env
+        phase = 2*np.pi*(times[:, None]-self.start)/np.asarray(self.periods)
+        carrier = np.stack((np.cos(phase), np.sin(phase)), axis=-1).reshape(len(times), -1)
+        return (env[:, :, None]*carrier[:, None, :]).reshape(len(times), -1)
+
+    def at(self, t):
+        if self.bias:
+            return jnp.ones(1)
+        delta = (t-jnp.asarray(self.centers))/self.halfwidth
+        env = jnp.where(abs(delta) < 1, jnp.cos(np.pi*jnp.clip(delta, -1, 1)/2)**2, 0)
+        if self.periods:
+            phase = 2*np.pi*(t-self.start)/jnp.asarray(self.periods)
+            carrier = jnp.stack((jnp.cos(phase), jnp.sin(phase)), axis=-1).reshape(-1)
+            env = (env[:, None]*carrier[None, :]).reshape(-1)
+        return jnp.matmul(env-jnp.asarray(self.mean), jnp.asarray(self.transform), precision="highest")
+
+
+class Basis_sw_forcing:
+    """Joint C-grid potential forcing, closed at solid and outer faces.
+
+    The rotational field is the curl of a corner streamfunction that vanishes
+    on coastal corners, hence has exactly zero finite-volume divergence.
+    The gradient field uses wet-cell scalar potentials and zero normal flux.
+    This is a restricted potential representation, not a complete Hodge
+    decomposition: independent circulations around islands are not included.
+    """
+    components = ("divergent", "rotational", "height", "height_mean")
+
+    def __init__(self, config, State, multi_mode=False):
+        self.options = dict(config.BASIS)
+        self.name_mod_var = list(config.BASIS.name_mod_var)
+        if len(self.name_mod_var) != 3 or len(set(self.name_mod_var)) != 3:
+            raise ValueError("BASIS_SW_FORCING name_mod_var must be three distinct u,v,h names")
+        self.multi_mode = multi_mode
+        self.ny, self.nx = State.ny, State.nx
+        self.shapes = ((self.ny, self.nx+1), (self.ny+1, self.nx), (self.ny, self.nx))
+        for name, shape in zip(self.name_mod_var, self.shapes):
+            if name not in State.params or np.shape(State.params[name]) != shape:
+                raise ValueError(f"SW forcing target {name!r} must have C-grid shape {shape}")
+        self.dtype = np.float64 if USE_FLOAT64 else np.float32
+        self.wet = np.ones(self.shapes[2], bool) if State.mask is None else ~np.asarray(State.mask, bool)
+        if not self.wet.any():
+            raise ValueError("SW forcing needs wet cells")
+        self.dx = np.broadcast_to(np.asarray(State.DX, float), self.shapes[2])
+        self.dy = np.broadcast_to(np.asarray(State.DY, float), self.shapes[2])
+        if not np.all(np.isfinite(self.dx) & np.isfinite(self.dy) & (self.dx > 0) & (self.dy > 0)):
+            raise ValueError("SW forcing requires positive finite grid metrics")
+        self.area = self.dx*self.dy
+        self.face_y = np.pad(.5*(self.dy[:, 1:]+self.dy[:, :-1]), ((0, 0), (1, 1)), mode="edge")
+        self.face_x = np.pad(.5*(self.dx[1:]+self.dx[:-1]), ((1, 1), (0, 0)), mode="edge")
+        self.wet_u = np.pad(self.wet[:, :-1] & self.wet[:, 1:], ((0, 0), (1, 1)))
+        self.wet_v = np.pad(self.wet[:-1] & self.wet[1:], ((1, 1), (0, 0)))
+        self.wet_q = np.pad(self.wet[:-1, :-1] & self.wet[1:, :-1]
+                            & self.wet[:-1, 1:] & self.wet[1:, 1:], ((1, 1), (1, 1)))
+        self.basins, self.nbasin = _label_sw_basins(self.wet)
+        self.X, self.Y = np.asarray(State.X, float), np.asarray(State.Y, float)
+        if self.X.shape != self.wet.shape or not np.isfinite(self.X).all() or not np.isfinite(self.Y).all():
+            raise ValueError("SW forcing requires finite 2-D Cartesian grid coordinates")
+        self.Xq, self.Yq = self._corners(self.X), self._corners(self.Y)
+        self.spatial = {}
+        for key in ("spatial_radius_km", "height_radius_km", "center_spacing_factor",
+                    "slow_halfwidth_days", "wave_envelope_halfwidth_days"):
+            if not np.isfinite(self.options[key]) or self.options[key] <= 0:
+                raise ValueError(f"{key} must be positive and finite")
+        periods = np.asarray(self.options["wave_period_days"], float)
+        if periods.ndim != 1 or np.any(~np.isfinite(periods)) or np.any(periods <= 0) or len(np.unique(periods)) != len(periods):
+            raise ValueError("wave_period_days must contain unique positive finite periods")
+        for family in ("slow", "wave", "bias"):
+            values = self.options[family+"_std"]
+            if set(values) != set(self.components):
+                raise ValueError(f"{family}_std must specify {self.components}")
+            if any(not np.isfinite(v) or v < 0 for v in values.values()):
+                raise ValueError("Forcing standard deviations must be finite and nonnegative")
+        if self.options["wave_std"]["height_mean"]:
+            raise ValueError("Wave forcing of the basin mean is disabled; use a slow mean or bias")
+        for component in self.components:
+            if any(self.options[f+"_std"][component] > 0 for f in ("slow", "bias")) or (
+                    len(periods) and self.options["wave_std"][component] > 0):
+                self.spatial[component] = self._make_spatial(component)
+
+    @staticmethod
+    def _corners(a):
+        padded = np.pad(a, ((1, 1), (1, 1)), mode="reflect", reflect_type="odd")
+        return .25*(padded[:-1, :-1]+padded[1:, :-1]+padded[:-1, 1:]+padded[1:, 1:])
+
+    def _make_spatial(self, component):
+        radius = 1000*self.options["height_radius_km" if component.startswith("height") else "spatial_radius_km"]
+        spacing = radius*self.options["center_spacing_factor"]
+        centers = [(x, y) for y in np.arange(self.Y.min(), self.Y.max()+spacing*.5, spacing)
+                   for x in np.arange(self.X.min(), self.X.max()+spacing*.5, spacing)]
+        if component == "height_mean":
+            centers = list(range(1, self.nbasin+1))
+        row, col, data = [[] for _ in range(3)], [[] for _ in range(3)], [[] for _ in range(3)]
+        count = 0
+        for center in centers:
+            u, v, h = (np.zeros(s) for s in self.shapes)
+            if component == "height_mean":
+                h[self.basins == center] = 1
+            else:
+                x, y = center
+                r = np.hypot(self.X-x, self.Y-y)/radius
+                phi = _sw_forcing_window(r)
+                if component == "divergent":
+                    u[:, 1:-1] = np.diff(phi, axis=1)/(.5*(self.dx[:, 1:]+self.dx[:, :-1]))
+                    v[1:-1] = np.diff(phi, axis=0)/(.5*(self.dy[1:]+self.dy[:-1]))
+                    u *= self.wet_u
+                    v *= self.wet_v
+                elif component == "rotational":
+                    psi = _sw_forcing_window(np.hypot(self.Xq-x, self.Yq-y)/radius)*self.wet_q
+                    u = -np.diff(psi, axis=0)/self.face_y
+                    v = np.diff(psi, axis=1)/self.face_x
+                else:
+                    broad = _sw_forcing_window(r/2)
+                    for basin in range(1, self.nbasin+1):
+                        wet = self.basins == basin
+                        denominator = np.sum(self.area*wet*broad)
+                        if denominator:
+                            h += wet*(phi-broad*np.sum(self.area*wet*phi)/denominator)
+            if component.startswith("height"):
+                support = (h != 0) & self.wet
+                norm = np.sqrt(np.sum(self.area*h*h)/max(np.sum(self.area*support), 1.))
+            else:
+                au = np.pad(.5*(self.area[:, 1:]+self.area[:, :-1]), ((0, 0), (1, 1)), mode="edge")
+                av = np.pad(.5*(self.area[1:]+self.area[:-1]), ((1, 1), (0, 0)), mode="edge")
+                norm = np.sqrt((np.sum(au*u*u)+np.sum(av*v*v)) /
+                               max(np.sum(au*(u != 0))+np.sum(av*(v != 0)), 1.))
+            if norm < 1e-15:
+                continue
+            for index, field in enumerate((u, v, h)):
+                flat = (field/norm).ravel()
+                indices = np.flatnonzero(flat)
+                row[index].extend(indices)
+                col[index].extend([count]*len(indices))
+                data[index].extend(flat[indices])
+            count += 1
+        if count == 0:
+            raise ValueError(f"No active spatial support for {component}")
+        matrices = tuple(sparse.BCOO.from_scipy_sparse(scipy.sparse.coo_matrix(
+            (np.asarray(d, self.dtype), (r, c)), shape=(np.prod(shape), count)))
+            for d, r, c, shape in zip(data, row, col, self.shapes))
+        return matrices, count
+
+    def set_basis(self, time, return_q=False, State=None, **kwargs):
+        times = np.asarray(time, float)
+        if times.ndim != 1 or len(times) < 2 or not np.isfinite(times).all() or np.any(np.diff(times) <= 0):
+            raise ValueError("SW forcing needs at least two strictly increasing finite times in days")
+        periods = tuple(self.options["wave_period_days"])
+        active_wave = periods and any(self.options["wave_std"].values())
+        if active_wave and np.max(np.diff(times)) > min(periods)/8*(1+1e-6):
+            raise ValueError("Wave forcing needs at least 8 basis updates per shortest period")
+        self.temporal = {
+            "bias": _SWTemporalModes(times[0], times[-1], self.options["slow_halfwidth_days"], bias=True),
+            "slow": _SWTemporalModes(times[0], times[-1], self.options["slow_halfwidth_days"]),
+        }
+        if active_wave:
+            self.temporal["wave"] = _SWTemporalModes(times[0], times[-1], self.options["wave_envelope_halfwidth_days"], periods)
+        self.blocks, stds, offset = [], [], 0
+        for family, temporal in self.temporal.items():
+            for component, (_, ns) in self.spatial.items():
+                std = float(self.options[family+"_std"][component])
+                if std == 0 or temporal.size == 0:
+                    continue
+                size = ns*temporal.size
+                self.blocks.append(dict(family=family, component=component,
+                                        start=offset, stop=offset+size, spatial_size=ns,
+                                        temporal_size=temporal.size, std=std))
+                offset += size
+                stds.extend([std]*size)
+        self.nbasis = offset
+        if offset == 0:
+            raise ValueError("SW forcing has no enabled controls")
+        self.time_bounds = (times[0], times[-1])
+        stds = np.asarray(stds, self.dtype)
+        self.covariance_operator = DiagonalCovariance(stds)
+        digest = hashlib.sha256(b'sw-forcing-v1')
+        digest.update(json.dumps(self.options, sort_keys=True, default=str).encode())
+        for array in (times, self.wet, self.X, self.Y, self.dx, self.dy):
+            digest.update(np.ascontiguousarray(array).tobytes())
+        for temporal in self.temporal.values():
+            if not temporal.bias:
+                digest.update(temporal.mean.tobytes())
+                digest.update(temporal.transform.tobytes())
+        self.layout_signature = digest.hexdigest()
+        if return_q:
+            return np.zeros(offset, self.dtype), stds
+
+    def control_layout_descriptor(self, path):
+        return dict(path=path, size=self.nbasis, signature=self.layout_signature,
+                    component_order="|".join(self.components), covariance_kind="sw_forcing_diagonal",
+                    covariance_source="inline:BASIS_SW_FORCING", covariance_source_hash=self.layout_signature,
+                    basis_order="|".join(self.name_mod_var))
+
+    def project(self, t, control, family=None):
+        coefficients = {c: jnp.zeros(n, dtype=control.dtype) for c, (_, n) in self.spatial.items()}
+        for block in self.blocks:
+            if family is not None and block["family"] != family:
+                continue
+            values = control[block["start"]:block["stop"]].reshape(block["spatial_size"], block["temporal_size"])
+            coefficients[block["component"]] += jnp.matmul(
+                values, self.temporal[block["family"]].at(t), precision="highest")
+        fields = [jnp.zeros(np.prod(s), dtype=control.dtype) for s in self.shapes]
+        for component, weights in coefficients.items():
+            for i, matrix in enumerate(self.spatial[component][0]):
+                fields[i] = fields[i] + matrix @ weights
+        active = (t >= self.time_bounds[0]) & (t <= self.time_bounds[1])
+        return tuple(jnp.where(active, f.reshape(s), 0) for f, s in zip(fields, self.shapes))
+
+    def operg(self, t, X, State=None):
+        fields = self.project(t, X)
+        if State is None:
+            return jnp.concatenate([f.ravel() for f in fields])
+        for name, value in zip(self.name_mod_var, fields):
+            State[name] = State[name]+value if self.multi_mode else value
+
+    def operg_transpose(self, t, adState):
+        spatial = {}
+        for component, (matrices, _) in self.spatial.items():
+            spatial[component] = sum(matrix.T @ jnp.nan_to_num(adState[name]).ravel()
+                                     for matrix, name in zip(matrices, self.name_mod_var))
+        parts = []
+        for block in self.blocks:
+            parts.append((spatial[block["component"]][:, None]
+                          * self.temporal[block["family"]].at(t)[None, :]).ravel())
+        if not self.multi_mode:
+            for name in self.name_mod_var:
+                adState[name] = jnp.zeros_like(adState[name])
+        active = (t >= self.time_bounds[0]) & (t <= self.time_bounds[1])
+        return jnp.where(active, jnp.concatenate(parts), 0)
+
+
+class CalibratedSWForcing:
+    """Native-grid reader of the local calibration and its sparse operators."""
+    components = _SW_FORCING_COMPONENTS
+
+    def __init__(self, config, State, multi_mode=False):
+        self.options = dict(config.BASIS)
+        if self.options.get('use_state_background', False):
+            raise ValueError('Calibrated SW forcing already includes its prescribed bias; use_state_background must be False')
+        self.name_mod_var = list(config.BASIS.name_mod_var)
+        self.multi_mode = multi_mode
+        if len(self.name_mod_var) != 3 or len(set(self.name_mod_var)) != 3:
+            raise ValueError('Calibrated SW forcing requires three distinct u,v,h targets')
+        path = Path(self.options['calibration_file']).resolve()
+        with xr.open_dataset(path) as source:
+            ds = source.load()
+        if ds.attrs.get('schema') != 'sw-local-atoms-v1':
+            raise ValueError('Unsupported SW calibration schema')
+        model = getattr(config, 'MOD', None)
+        if getattr(model, 'super', None) == 'MOD_QGSW':
+            if getattr(model, 'height_representation', None) != 'interface_displacement':
+                raise ValueError('Calibrated Fh requires interface_displacement model coordinates')
+            reference = ds.attrs.get('reference_g_prime')
+            if reference is not None:
+                resolved = getattr(State, 'qgsw_reference_g_prime', model.g_prime)
+                if resolved is None:
+                    raise ValueError('Initialize MOD_QGSW before validating a calibrated '
+                                     'basis with mapped or diagnosed g_prime')
+                if not np.allclose(np.asarray(resolved), reference, rtol=1e-6, atol=0):
+                    raise ValueError('Calibrated Fh uses a different reference g_prime; convert/recalibrate before use')
+        self.g = _sw_forcing_geometry(State)
+        if ds.attrs['grid_hash'] != _sw_forcing_grid_hash(self.g):
+            raise ValueError('SW calibration grid/mask differs; recalibrate on the target grid')
+        matrix_path = path.parent/ds.attrs['matrix_file']
+        if hashlib.sha256(matrix_path.read_bytes()).hexdigest() != ds.attrs['matrix_sha256']:
+            raise ValueError('SW calibration spatial matrix checksum mismatch')
+        matrix = scipy.sparse.load_npz(matrix_path).tocsr()
+        self.ny, self.nx = self.g['wet'].shape
+        self.shapes = ((self.ny, self.nx+1), (self.ny+1, self.nx), (self.ny, self.nx))
+        for name, shape in zip(self.name_mod_var, self.shapes):
+            if name not in State.params or np.shape(State.params[name]) != shape:
+                raise ValueError(f'Calibrated forcing target {name} must have shape {shape}')
+        self.offsets = np.r_[0, np.cumsum([np.prod(s) for s in self.shapes])]
+        if matrix.shape != (self.offsets[-1], ds.sizes['atom']):
+            raise ValueError('SW calibration matrix dimensions mismatch')
+        self.matrix = sparse.BCSR.from_scipy_sparse(matrix)
+        self.transpose = sparse.BCSR.from_scipy_sparse(matrix.T.tocsr())
+        self.natom = matrix.shape[1]
+        self.component = ds.component.values.astype(int)
+        self.std = {f: ds[f+'_std'].values.astype(float) for f in ('slow', 'wave')}
+        self.width = {f: ds[f+'_halfwidth_days'].values.astype(float) for f in ('slow', 'wave')}
+        self.period = ds.wave_period_days.values.astype(float)
+        for family in self.std:
+            if np.any(~np.isfinite(self.std[family])) or np.any(self.std[family] < 0):
+                raise ValueError('Invalid calibrated standard deviations')
+            active = self.std[family] > 0
+            if np.any(~np.isfinite(self.width[family][active])) or np.any(self.width[family][active] <= 0):
+                raise ValueError('Invalid calibrated temporal halfwidths')
+        wave = self.std['wave'] > 0
+        if np.any(self.period[wave] <= 0) or np.any(~np.isfinite(self.period[wave])) or np.any(wave & (self.component == 3)):
+            raise ValueError('Invalid calibrated wave periods or oscillatory height_mean')
+        self.background = jnp.asarray(np.concatenate([ds[k].values.ravel() for k in ('bias_u', 'bias_v', 'bias_h')]))
+        if not self.options.get('include_height_mean', True):
+            for family in self.std:
+                self.std[family][self.component == 3] = 0
+            h = np.asarray(ds.bias_h).copy()
+            for b in range(1, self.g['nbasin']+1):
+                mask = self.g['basins'] == b
+                h[mask] -= np.average(h[mask], weights=self.g['area'][mask])
+            self.background = self.background.at[self.offsets[2]:].set(jnp.asarray(h.ravel()))
+        exp = getattr(config, 'EXP', None)
+        initial = getattr(exp, 'init_date', None)
+        self.origin = 0. if initial is None else (initial-datetime.datetime(1970, 1, 1)).total_seconds()/86400
+        self.artifact_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.path = str(path)
+
+    def set_basis(self, time, return_q=False, State=None, **kwargs):
+        times = np.asarray(time, float)
+        if times.ndim != 1 or len(times) < 2 or not np.isfinite(times).all() or np.any(np.diff(times) <= 0):
+            raise ValueError('SW forcing needs increasing finite times in days')
+        self.time_bounds = times[0], times[-1]
+        active_wave = self.std['wave'] > 0
+        if active_wave.any() and np.max(np.diff(times)) > np.min(self.period[active_wave])/8*(1+1e-6):
+            raise ValueError('Wave forcing needs at least 8 basis updates per shortest period')
+        indices, centers, widths, periods, phases, sigmas, families = [[] for _ in range(7)]
+        # cos² envelope centers spaced by T/2 have sum of squared weights 3/2.
+        # sqrt(2/3) gives unit variance at every time, including window ends.
+        for family_id, family in enumerate(('slow', 'wave')):
+            for atom in np.flatnonzero(self.std[family] > 0):
+                width = self.width[family][atom]
+                step = width/2
+                first = int(np.floor((times[0]+self.origin-width)/step))
+                last = int(np.ceil((times[-1]+self.origin+width)/step))
+                c = np.arange(first, last+1)*step-self.origin
+                c = c[(c+width > times[0]) & (c-width < times[-1])]
+                for phase in ([0] if family == 'slow' else [0, 1]):
+                    indices.extend([atom]*len(c)); centers.extend(c); widths.extend([width]*len(c))
+                    periods.extend([0. if family == 'slow' else self.period[atom]]*len(c))
+                    phases.extend([phase]*len(c)); sigmas.extend([self.std[family][atom]]*len(c))
+                    families.extend([family_id]*len(c))
+        self.nbasis = len(indices)
+        if not self.nbasis:
+            raise ValueError('No active calibrated SW controls')
+        self.atom = jnp.asarray(indices, dtype=jnp.int32)
+        self.centers, self.widths, self.periods = map(jnp.asarray, (centers, widths, periods))
+        self.phases, self.families = jnp.asarray(phases), jnp.asarray(families)
+        sigmas = np.asarray(sigmas, dtype='float32')
+        self.covariance_operator = DiagonalCovariance(sigmas)
+        digest = hashlib.sha256((self.artifact_hash+str(self.origin)+str(self.options.get('include_height_mean', True))).encode())
+        digest.update(np.ascontiguousarray(times).tobytes())
+        self.layout_signature = digest.hexdigest()
+        if return_q:
+            return np.zeros(self.nbasis, dtype='float32'), sigmas
+
+    def _temporal(self, t, family=None):
+        distance = (t-self.centers)/self.widths
+        values = jnp.where(abs(distance) < 1, jnp.cos(jnp.pi*jnp.clip(distance, -1, 1)/2)**2, 0)*np.sqrt(2/3)
+        angle = 2*jnp.pi*(t-self.centers)/jnp.where(self.periods > 0, self.periods, 1)
+        carrier = jnp.where(self.phases == 0, jnp.cos(angle), jnp.sin(angle))
+        values *= jnp.where(self.periods > 0, carrier, 1)
+        if family is not None:
+            if family not in ('slow', 'wave'):
+                raise ValueError('Calibrated temporal family must be slow or wave')
+            values *= self.families == ('slow', 'wave').index(family)
+        return values*((t >= self.time_bounds[0]) & (t <= self.time_bounds[1]))
+
+    def project(self, t, control, family=None, include_background=True):
+        coefficients = jnp.zeros(self.natom, dtype=control.dtype).at[self.atom].add(control*self._temporal(t, family))
+        field = self.matrix @ coefficients
+        if include_background and family is None:
+            field += self.background*((t >= self.time_bounds[0]) & (t <= self.time_bounds[1]))
+        return tuple(field[a:b].reshape(s) for a, b, s in zip(self.offsets[:-1], self.offsets[1:], self.shapes))
+
+    def operg(self, t, X, State=None):
+        fields = self.project(t, X)
+        if State is None:
+            return jnp.concatenate([f.ravel() for f in fields])
+        for name, value in zip(self.name_mod_var, fields):
+            State[name] = State[name]+value if self.multi_mode else value
+
+    def operg_transpose(self, t, adState):
+        values = jnp.concatenate([jnp.nan_to_num(adState[n]).ravel() for n in self.name_mod_var])
+        projected = self.transpose @ values
+        result = projected[self.atom]*self._temporal(t)
+        if not self.multi_mode:
+            for n in self.name_mod_var:
+                adState[n] = jnp.zeros_like(adState[n])
+        return result
+
+    def control_layout_descriptor(self, path):
+        return dict(path=path, size=self.nbasis, signature=self.layout_signature,
+                    component_order='|'.join(_SW_FORCING_COMPONENTS), covariance_kind='sw_local_diagonal',
+                    covariance_source=self.path, covariance_source_hash=self.artifact_hash,
+                    basis_order='|'.join(self.name_mod_var))
+
+
+class DailySWForcing:
+    """Fixed SW potential atoms with daily, linearly interpolated controls.
+
+    Momentum potentials use m²/s/day and compensated height atoms use
+    m interface/day. A per-atom AR(1) prior preserves temporal correlation;
+    no statistics or bias from a previous calibration are read.
+    """
+    components = _SW_FORCING_COMPONENTS
+
+    def __init__(self, config, State, multi_mode=False):
+        self.options = dict(config.BASIS)
+        if self.options.get('calibration_file') or self.options.get('use_state_background'):
+            raise ValueError('Daily learning cannot import an old calibration or background')
+        self.multi_mode = multi_mode
+        self.name_mod_var = list(config.BASIS.name_mod_var)
+        if len(self.name_mod_var) != 3 or len(set(self.name_mod_var)) != 3:
+            raise ValueError('Daily SW forcing needs three distinct u,v,height targets')
+        self.g = _sw_forcing_geometry(State)
+        wavelengths = np.asarray(self.options['wavelengths_km'], float)
+        if wavelengths.ndim != 1 or not wavelengths.size or np.any(wavelengths <= 0) or not np.isfinite(wavelengths).all():
+            raise ValueError('Invalid spatial wavelengths')
+        matrix, records, self.shapes = _build_sw_forcing_atoms(self.g, wavelengths, _daily_sw_spectral_radii(wavelengths),
+            spacing_factor=self.options['center_spacing_factor'], normalization='potential')
+        if not self.options['include_height_mean']:
+            keep = records[:, 0] != 3
+            matrix, records = matrix[:, keep], records[keep]
+        # Assign local statistics to the nearest wet basin for spatial smoothing.
+        wet = self.g['wet']
+        nearest = cKDTree(np.column_stack((self.g['x'][wet], self.g['y'][wet]))).query(records[:, 3:5])[1]
+        local = records[:, 0] != 3
+        records[local, 5] = self.g['basins'][wet][nearest[local]]
+        self.records = records
+        self.natom = len(records)
+        self.spatial_matrix = matrix
+        self.matrix = sparse.BCSR.from_scipy_sparse(matrix)
+        self.transpose = sparse.BCSR.from_scipy_sparse(matrix.T.tocsr())
+        self.offsets = np.r_[0, np.cumsum([np.prod(s) for s in self.shapes])]
+        self.mean = np.zeros(self.natom)
+        self.std = np.array([self.options['initial_std'][self.components[int(c)]] for c in records[:, 0]])
+        self.tdec = np.full(self.natom, self.options['initial_tdec_days'], dtype=float)
+        if self.options.get('initial_physical_rms') is not None:
+            self._set_initial_physical_amplitudes()
+        initial = config.EXP.init_date
+        self.origin = (initial-datetime.datetime(1970, 1, 1)).total_seconds()/86400.
+
+    def _set_initial_physical_amplitudes(self):
+        """Convert physical RMS per scale to coefficient standard deviations.
+
+        Use the actual masked atoms, including their derivatives and overlap,
+        so the target RMS applies to the synthesized physical forcing.
+        """
+        amplitudes = self.options['initial_physical_rms']
+        if set(amplitudes) != set(self.components):
+            raise ValueError('Physical prior must specify all four forcing components')
+        if (not all(np.isfinite(x) and x > 0 for x in amplitudes.values())
+                or not np.isfinite(self.options['initial_tdec_days'])
+                or self.options['initial_tdec_days'] <= 0):
+            raise ValueError('Physical component amplitudes and tdec must be finite and positive')
+        g = self.g
+        weights = np.concatenate(((g['au'] * g['wu']).ravel(),
+                                  (g['av'] * g['wv']).ravel(),
+                                  (g['area'] * g['wet']).ravel()))
+        energy = np.asarray(
+            self.spatial_matrix.astype(np.float64).power(2).T @ weights).ravel()
+        keys = np.array([(r[0], r[1], r[5] if r[0] == 3 else 0)
+                         for r in self.records])
+        keys, groups = np.unique(keys, axis=0, return_inverse=True)
+        momentum_area = float(np.sum(g['au'] * g['wu'])
+                              + np.sum(g['av'] * g['wv']))
+        for index, (component, wavelength, basin) in enumerate(keys):
+            ids = groups == index
+            area = momentum_area if component < 2 else float(np.sum(
+                g['area'] * ((g['basins'] == basin) if component == 3 else g['wet'])))
+            response = np.sqrt(energy[ids].sum() / area) if area > 0 else 0.
+            if not np.isfinite(response) or response <= 0:
+                raise ValueError('Empty physical response in a forcing scale')
+            self.std[ids] = amplitudes[self.components[int(component)]] / response
+
+    def set_basis(self, time, return_q=False, State=None, **kwargs):
+        times = np.asarray(time, float)
+        if times.ndim != 1 or len(times) < 2 or not np.isfinite(times).all() or np.any(np.diff(times) <= 0):
+            raise ValueError('Daily basis needs increasing finite times in days')
+        self.start = np.floor(times[0]+self.origin)-self.origin
+        self.ntime = int(np.ceil(times[-1]+self.origin)-(self.start+self.origin))+1
+        self.nbasis = self.ntime*self.natom
+        self.update_statistics(self.std, self.tdec, self.mean)
+        digest = hashlib.sha256((_sw_forcing_grid_hash(self.g)+'daily-potential-v1').encode())
+        digest.update(self.records.tobytes())
+        digest.update(np.asarray([self.origin, self.start, self.ntime]).tobytes())
+        self.layout_signature = digest.hexdigest()
+        if return_q:
+            return np.tile(self.mean, self.ntime).astype('float32'), np.tile(self.std, self.ntime).astype('float32')
+
+    def update_statistics(self, std, tdec, mean=None):
+        self.std, self.tdec = np.broadcast_to(std, (self.natom,)).copy(), np.broadcast_to(tdec, (self.natom,)).copy()
+        if mean is not None:
+            self.mean = np.broadcast_to(mean, (self.natom,)).copy()
+            if not np.isfinite(self.mean).all():
+                raise ValueError('Nonfinite forcing mean')
+        self.covariance_operator = DailyAR1Covariance(self.std, self.tdec, self.ntime)
+
+    def coefficients(self, t, control):
+        position = jnp.clip(t-self.start, 0., self.ntime-1.)
+        left = jnp.minimum(jnp.floor(position).astype('int32'), self.ntime-2)
+        fraction = position-left
+        a = control.reshape(self.ntime, self.natom)
+        return ((1-fraction)*a[left]+fraction*a[left+1]) * ((t >= self.start) & (t <= self.start+self.ntime-1))
+
+    def project(self, t, control):
+        field = self.matrix @ self.coefficients(t, control)
+        return tuple(field[a:b].reshape(s) for a, b, s in zip(self.offsets[:-1], self.offsets[1:], self.shapes))
+
+    def operg(self, t, X, State=None):
+        fields = self.project(t, X)
+        if State is None:
+            return jnp.concatenate([f.ravel() for f in fields])
+        for name, field in zip(self.name_mod_var, fields):
+            State[name] = State[name]+field if self.multi_mode else field
+
+    def operg_transpose(self, t, adState):
+        flat = jnp.concatenate([jnp.nan_to_num(adState[name]).ravel() for name in self.name_mod_var])
+        result = jax.linear_transpose(lambda x: self.coefficients(t, x), jnp.zeros(self.nbasis, dtype=flat.dtype))(self.transpose @ flat)[0]
+        if not self.multi_mode:
+            for name in self.name_mod_var:
+                adState[name] = jnp.zeros_like(adState[name])
+        return result
+
+    def control_layout_descriptor(self, path):
+        parameters = json.dumps([self.std.tolist(), self.tdec.tolist(), self.mean.tolist()])
+        return dict(path=path, size=self.nbasis, signature=self.layout_signature,
+                    component_order='|'.join(self.components), covariance_kind='daily_ar1',
+                    covariance_source='new_learning', covariance_source_hash=hashlib.sha256(parameters.encode()).hexdigest(),
+                    basis_order='|'.join(self.name_mod_var))
+
+
 class _Basis_gauss3d:
    
     def __init__(self, config, State, multi_mode=False):
@@ -553,7 +1327,6 @@ class _Basis_gauss3d:
                     factor = np.nanmean(values) if not np.all(np.isnan(values)) else 1.0
                     spatial_facQ.append(np.sqrt(np.clip(factor, 0.0, 1.0)))
             Q *= np.tile(spatial_facQ, len(ENST))
-
 
 
         Xb = np.zeros_like(Q)
@@ -1310,7 +2083,6 @@ class Basis_gauss2d(_StateBackgroundMixin, _Basis_gauss2d):
         return adX
 
 
-
 ###############################################################################
 #                            Balanced Motions.                                #
 ###############################################################################
@@ -2051,6 +2823,34 @@ class Basis_bm(_StateBackgroundMixin, _Basis_bm):
 ###############################################################################
 # Old version of the basis class, kept for reference. The new Basis_bmaux class is preferred.
 class _Basis_bmaux:
+    @staticmethod
+    def _legacy_wavelet_frequencies(lmin, lmax, npsp, facpsp):
+        """Reproduce the pre-sparse-refactor BM/BMaux wavelength grid."""
+        values = np.asarray([lmin, lmax, npsp, facpsp], dtype=float)
+        if (not np.all(np.isfinite(values)) or lmin <= 0 or lmax <= 0
+                or lmin > lmax or npsp <= 0 or facpsp <= 0):
+            raise ValueError('Invalid legacy wavelet scale parameters.')
+        log_step = np.log1p(facpsp / npsp)
+        logff = np.arange(
+            np.log(1. / lmin),
+            np.log(1. / lmax) - log_step,
+            -log_step,
+        )[::-1]
+        ff = np.exp(logff)
+        if ff.size < 2:
+            raise ValueError(
+                'At least two wavelength bands are required to define wavelet '
+                'directions; increase lmax/lmin or reduce facpsp/npsp.')
+        return ff
+
+    @staticmethod
+    def _bmaux_uses_legacy_background_layout(config):
+        """Whether BMaux must match controls written before the sparse refactor."""
+        inv_background = getattr(
+            getattr(config, 'INV', None), 'path_background', None)
+        basis_background = getattr(config.BASIS, 'path_background', None)
+        return inv_background is not None or basis_background is not None
+
 
     def __init__(self,config,State,multi_mode=False):
 
@@ -2075,6 +2875,8 @@ class _Basis_bmaux:
         self.path_background = config.BASIS.path_background
         self.var_background = config.BASIS.var_background
         self.norm_time = config.BASIS.norm_time
+        self.legacy_background_layout = (
+            self._bmaux_uses_legacy_background_layout(config))
 
         # C-grid variable type (None, 'U', or 'V')
         self.c_grid_var = getattr(config.BASIS, 'c_grid_var', None)
@@ -2245,9 +3047,16 @@ class _Basis_bmaux:
             if (LON_MAX<LON_MIN): LON_MAX = LON_MAX+360.
 
             # Ensemble of pseudo-frequencies for the wavelets (spatial)
-            ff = _bounded_wavelet_frequencies(
+            frequency_builder = (
+                self._legacy_wavelet_frequencies
+                if self.legacy_background_layout
+                else _bounded_wavelet_frequencies)
+            ff = frequency_builder(
                 self.lmin, self.lmax, self.npsp, self.facpsp)
             dff = ff[1:] - ff[:-1]
+
+        if self.legacy_background_layout:
+            print('BMaux background compatibility: using legacy control layout')
 
         # Ensemble of directions for the wavelets (2D plane)
         theta = np.linspace(0, np.pi, int(np.pi * ff[0] / dff[0] * self.facpsp))[:-1]
@@ -2319,12 +3128,28 @@ class _Basis_bmaux:
                 _ENSLON = np.arange(lon0, lon1, dlon)
                 _ENSLAT = np.repeat(ENSLAT1[I],len(_ENSLON))
 
-                _ENSLON1 = []
-                _ENSLAT1 = []
-                for lon, lat in zip(_ENSLON, _ENSLAT):
-                    if _wavelet_center_has_support(self, lon, lat, DX[iff]):
-                        _ENSLON1.append(lon)
-                        _ENSLAT1.append(lat)
+                if self.legacy_background_layout and self.mask1d is None:
+                    _ENSLON1 = _ENSLON
+                    _ENSLAT1 = _ENSLAT
+                else:
+                    _ENSLON1 = []
+                    _ENSLAT1 = []
+                    radius = 1. / ff[iff] if self.legacy_background_layout else DX[iff]
+                    for lon, lat in zip(_ENSLON, _ENSLAT):
+                        if self.legacy_background_layout:
+                            indphys = np.where(
+                                (np.abs((self.lon1d - lon) / self.km2deg
+                                        * np.cos(lat * np.pi / 180.)) <= radius)
+                                & (np.abs((self.lat1d - lat) / self.km2deg)
+                                   <= radius)
+                            )[0]
+                            keep = not np.all(self.mask1d[indphys])
+                        else:
+                            keep = _wavelet_center_has_support(
+                                self, lon, lat, radius)
+                        if keep:
+                            _ENSLON1.append(lon)
+                            _ENSLAT1.append(lat)
 
                 ENSLAT[iff] = np.concatenate(([ENSLAT[iff],_ENSLAT1]))
                 ENSLON[iff] = np.concatenate(([ENSLON[iff],_ENSLON1]))
@@ -3695,16 +4520,311 @@ class Basis_offset(_StateBackgroundMixin, _Basis_offset):
 #                              Multi-Basis                                    #
 ###############################################################################      
 
+class Basis_windowed_forcing:
+    """One set of static parameter controls and independent forcing per window.
+
+    The model state is never reset here. The usual Variational forward and
+    adjoint scans carry it across every window boundary.
+    """
+
+    def __init__(self, config, State, verbose=True):
+        self.window_days = float(config.INV.forcing_window_days)
+        if not np.isfinite(self.window_days) or self.window_days <= 0:
+            raise ValueError('INV.forcing_window_days must be positive and finite.')
+        self.taper_days = float(getattr(config.INV,
+                                        'forcing_window_taper_days', 0.) or 0.)
+        if not np.isfinite(self.taper_days) or self.taper_days < 0:
+            raise ValueError(
+                'INV.forcing_window_taper_days must be nonnegative and finite.')
+        self.overlap_days = float(getattr(config.INV,
+                                          'forcing_window_overlap_days', 0.) or 0.)
+        if not np.isfinite(self.overlap_days) or self.overlap_days < 0:
+            raise ValueError(
+                'INV.forcing_window_overlap_days must be nonnegative and finite.')
+        if self.overlap_days and self.taper_days:
+            raise ValueError(
+                'Use either forcing_window_overlap_days or '
+                'forcing_window_taper_days, not both.')
+        controlled = _controlled_model_parameter_names(config)
+        global_names, forcing_names = [], []
+        for key in config.BASIS:
+            block = config.BASIS[key]
+            targets = set(_as_name_list(block.name_mod_var))
+            if not targets or None in targets:
+                raise ValueError(f'Windowed forcing basis {key!r} needs name_mod_var.')
+            if targets <= controlled:
+                if block.super not in ('BASIS_GAUSS2D', 'BASIS_OFFSET'):
+                    raise ValueError(
+                        f'Shared parameter basis {key!r} must be static '
+                        '(BASIS_GAUSS2D or BASIS_OFFSET).')
+                global_names.append(key)
+            elif targets.isdisjoint(controlled):
+                forcing_names.append(key)
+            else:
+                raise ValueError(
+                    f'Windowed forcing basis {key!r} mixes model parameters '
+                    'and time-local forcing targets.')
+        if not global_names or not forcing_names:
+            raise ValueError('Windowed forcing requires both parameter and forcing bases.')
+        self.control_basis_order = tuple(global_names + forcing_names)
+
+        def subset(names):
+            local_config = config.copy()
+            local_config.BASIS = type(config.BASIS)(
+                {name: config.BASIS[name] for name in names})
+            return local_config
+
+        self.global_basis = Basis_multi(subset(global_names), State, verbose=verbose)
+        self.forcing_config = subset(forcing_names)
+        self.State = State
+        self.verbose = verbose
+        self.local_bases = []
+        self.local_slices = []
+        self.shared_space_cache = {}
+
+    def set_basis(self, time, return_q=False, State=None, **kwargs):
+        time = np.asarray(time, dtype=float)
+        if time.ndim != 1 or time.size < 2 or np.any(np.diff(time) <= 0):
+            raise ValueError('Windowed forcing requires increasing basis times.')
+        cadence = float(time[1] - time[0])
+        if not np.allclose(np.diff(time), cadence):
+            raise ValueError('Windowed forcing requires uniform basis times.')
+        steps = int(round(self.window_days / cadence))
+        if steps < 1 or not np.isclose(steps * cadence, self.window_days):
+            raise ValueError(
+                'INV.forcing_window_days must be an integer multiple of '
+                'INV.timestep_checkpoint.')
+        overlap_steps = int(round(self.overlap_days / cadence))
+        if (not np.isclose(overlap_steps * cadence, self.overlap_days)
+                or overlap_steps >= steps):
+            raise ValueError(
+                'INV.forcing_window_overlap_days must be an integer multiple '
+                'of INV.timestep_checkpoint and shorter than a window.')
+        indices = list(range(0, time.size - 1, steps))
+        if (len(indices) > 1
+                and time.size - 1 - indices[-1] < 0.5 * steps):
+            indices.pop()  # Avoid a very short final window.
+        indices.append(time.size - 1)
+        self.bounds = np.asarray(time[indices])
+        self.bounds_jax = jnp.asarray(self.bounds[1:-1])
+        support_indices = [indices[0]] + [index - overlap_steps
+                                           for index in indices[1:-1]]
+        self.support_starts = np.asarray(time[support_indices])
+        self.local_bases = []
+        self.local_slices = []
+        Xg, Qg = self.global_basis.set_basis(
+            time, return_q=True, State=State, **kwargs)
+        x_parts, q_parts = [Xg], [Qg]
+        offset = self.global_basis.nbasis
+        for start_index, end_index in zip(support_indices, indices[1:]):
+            local = Basis_multi(
+                self.forcing_config, self.State, verbose=self.verbose,
+                shared_space_cache=self.shared_space_cache)
+            local_time = time[start_index:end_index + 1] - time[start_index]
+            X, Q = local.set_basis(
+                local_time, return_q=True, State=State, **kwargs)
+            self.local_bases.append(local)
+            self.local_slices.append(slice(offset, offset + local.nbasis))
+            offset += local.nbasis
+            x_parts.append(X)
+            q_parts.append(Q)
+        self.nbasis = offset
+        self.name_mod_var = list(dict.fromkeys(
+            self.global_basis.name_mod_var +
+            self.local_bases[0].name_mod_var))
+        covariance_bases = [self.global_basis] + self.local_bases
+        covariance_operators = [
+            getattr(basis, 'covariance_operator', None)
+            for basis in covariance_bases
+        ]
+        if any(operator is not None for operator in covariance_operators):
+            covariance_operators = [
+                operator if operator is not None
+                else DiagonalCovariance(q)
+                for operator, q in zip(covariance_operators, q_parts)
+            ]
+            self.covariance_operator = BlockDiagonalCovariance.from_sizes(
+                covariance_operators,
+                [basis.nbasis for basis in covariance_bases])
+        if self.verbose:
+            print(f'Windowed forcing: {len(self.local_bases)} windows, '
+                  f'{self.global_basis.nbasis} shared parameter controls, '
+                  f'{self.nbasis - self.global_basis.nbasis} forcing controls, '
+                  f'{self.overlap_days:g}-day overlap')
+        if return_q:
+            return np.concatenate(x_parts), np.concatenate(q_parts)
+
+    def _window_index(self, t):
+        return jnp.sum(jnp.asarray(t) >= self.bounds_jax).astype(jnp.int32)
+
+    def _taper(self, local_t, duration):
+        if self.taper_days == 0:
+            return 1.
+        width = min(self.taper_days, 0.5 * duration)
+        edge = jnp.minimum(local_t, duration - local_t)
+        phase = jnp.clip(edge / width, 0., 1.)
+        return jnp.sin(0.5 * jnp.pi * phase) ** 2
+
+    def _next_weight(self, t, next_start):
+        phase = jnp.clip((t - next_start) / self.overlap_days, 0., 1.)
+        return jnp.sin(0.5 * jnp.pi * phase) ** 2
+
+    def _project_blended(self, index, t, X, state):
+        current = dict(state)
+        self.local_bases[index].operg(
+            t - self.support_starts[index], X[self.local_slices[index]],
+            State=current)
+        if index == len(self.local_bases) - 1:
+            return current
+
+        def blend(fields):
+            following = dict(state)
+            self.local_bases[index + 1].operg(
+                t - self.support_starts[index + 1],
+                X[self.local_slices[index + 1]], State=following)
+            next_weight = self._next_weight(t, self.support_starts[index + 1])
+            result = dict(fields)
+            for name in self.local_bases[index].name_mod_var:
+                result[name] = ((1. - next_weight) * fields[name]
+                                + next_weight * following[name])
+            return result
+
+        return jax.lax.cond(
+            jnp.asarray(t) >= self.support_starts[index + 1],
+            blend, lambda fields: fields, current)
+
+    def _transpose_blended(self, index, t, state):
+        current_state = dict(state)
+        current = self.local_bases[index].operg_transpose(
+            t - self.support_starts[index], current_state)
+        gradient = jnp.zeros((self.nbasis,), dtype=current.dtype)
+        gradient = gradient.at[self.local_slices[index]].set(current)
+        if index == len(self.local_bases) - 1:
+            return gradient, current_state
+
+        def blend(_):
+            following_state = dict(state)
+            following = self.local_bases[index + 1].operg_transpose(
+                t - self.support_starts[index + 1], following_state)
+            next_weight = self._next_weight(t, self.support_starts[index + 1])
+            result = gradient.at[self.local_slices[index]].set(
+                (1. - next_weight) * current)
+            return result.at[self.local_slices[index + 1]].set(
+                next_weight * following)
+
+        gradient = jax.lax.cond(
+            jnp.asarray(t) >= self.support_starts[index + 1],
+            blend, lambda _: gradient, operand=None)
+        return gradient, current_state
+
+    def operg(self, t, X, State=None):
+        if State is None:
+            raise ValueError('Windowed forcing projection requires State.')
+        self.global_basis.operg(t, X[:self.global_basis.nbasis], State=State)
+        if self.overlap_days:
+            branches = tuple(
+                lambda state, index=index: self._project_blended(
+                    index, t, X, state)
+                for index in range(len(self.local_bases)))
+            State.update(jax.lax.switch(self._window_index(t), branches, State))
+            return
+        branches = tuple(
+            (lambda state, basis=basis, slc=slc, start=start, end=end:
+             self._project_local(
+                 basis, t - start, X[slc] * self._taper(t - start, end - start),
+                 state))
+            for basis, slc, start, end in zip(
+                self.local_bases, self.local_slices,
+                self.bounds[:-1], self.bounds[1:]))
+        State.update(jax.lax.switch(self._window_index(t), branches, State))
+
+    def operg_for_output(self, t, X, State=None):
+        """Project at a concrete time without tracing every forcing window."""
+        if State is None:
+            raise ValueError('Windowed forcing projection requires State.')
+        t = float(t)
+        index = int(np.searchsorted(self.bounds[1:-1], t, side='right'))
+        self.global_basis.operg(t, X[:self.global_basis.nbasis], State=State)
+
+        current = dict(State)
+        local_t = t - self.support_starts[index]
+        if self.overlap_days:
+            self.local_bases[index].operg(
+                local_t, X[self.local_slices[index]], State=current)
+            if (index + 1 < len(self.local_bases)
+                    and t >= self.support_starts[index + 1]):
+                following = dict(State)
+                self.local_bases[index + 1].operg(
+                    t - self.support_starts[index + 1],
+                    X[self.local_slices[index + 1]], State=following)
+                phase = np.clip(
+                    (t - self.support_starts[index + 1]) / self.overlap_days,
+                    0., 1.)
+                weight = np.sin(0.5 * np.pi * phase) ** 2
+                for name in self.local_bases[index].name_mod_var:
+                    current[name] = ((1. - weight) * current[name]
+                                     + weight * following[name])
+        else:
+            local_x = X[self.local_slices[index]]
+            if self.taper_days:
+                duration = self.bounds[index + 1] - self.bounds[index]
+                width = min(self.taper_days, 0.5 * duration)
+                edge = min(local_t, duration - local_t)
+                phase = np.clip(edge / width, 0., 1.)
+                local_x = local_x * np.sin(0.5 * np.pi * phase) ** 2
+            self.local_bases[index].operg(local_t, local_x, State=current)
+        State.update(current)
+
+    @staticmethod
+    def _project_local(basis, t, X, state):
+        basis.operg(t, X, State=state)
+        return state
+
+    def operg_transpose(self, t, adState):
+        global_gradient = self.global_basis.operg_transpose(t, adState)
+        if self.overlap_days:
+            branches = tuple(
+                lambda state, index=index: self._transpose_blended(
+                    index, t, state)
+                for index in range(len(self.local_bases)))
+            local_gradient, updated_state = jax.lax.switch(
+                self._window_index(t), branches, adState)
+            adState.update(updated_state)
+            gradient = jnp.zeros((self.nbasis,), dtype=global_gradient.dtype)
+            gradient = gradient.at[:self.global_basis.nbasis].set(global_gradient)
+            return gradient + local_gradient
+        branches = tuple(
+            (lambda state, basis=basis, slc=slc, start=start, end=end:
+             self._transpose_local(
+                 basis, t - start, slc,
+                 self._taper(t - start, end - start), state))
+            for basis, slc, start, end in zip(
+                self.local_bases, self.local_slices,
+                self.bounds[:-1], self.bounds[1:]))
+        local_gradient, updated_state = jax.lax.switch(
+            self._window_index(t), branches, adState)
+        adState.update(updated_state)
+        gradient = jnp.zeros((self.nbasis,), dtype=global_gradient.dtype)
+        gradient = gradient.at[:self.global_basis.nbasis].set(global_gradient)
+        return gradient + local_gradient
+
+    def _transpose_local(self, basis, t, slc, taper, state):
+        local = taper * basis.operg_transpose(t, state)
+        full = jnp.zeros((self.nbasis,), dtype=local.dtype)
+        return full.at[slc].set(local), state
+
+
 class Basis_multi:
 
-    def __init__(self,config,State,verbose=True):
+    def __init__(self,config,State,verbose=True,shared_space_cache=None):
 
         self.Basis = []
         _config = config.copy()
         # Identical basis blocks often target different model variables.  Their
         # immutable spatial operators depend only on the shared State/grid and
         # spatial parameters, so compute them once per Basis_multi instance.
-        shared_space_cache = {}
+        if shared_space_cache is None:
+            shared_space_cache = {}
 
         self.name_mod_var = []
         for _BASIS in config.BASIS:
@@ -3778,6 +4898,10 @@ class Basis_multi:
             for component in self.Basis
         ]
 
+        covariance_operators = []
+        covariance_sizes = []
+        has_implicit_covariance = False
+
         for B, (_Xb, _Q) in zip(self.Basis, results):
             self.slice_basis.append(
                 slice(self.nbasis, self.nbasis + B.nbasis)
@@ -3787,6 +4911,16 @@ class Basis_multi:
             if return_q:
                 Xb = np.concatenate((Xb, _Xb))
                 Q = np.concatenate((Q, _Q))
+                operator = getattr(B, 'covariance_operator', None)
+                has_implicit_covariance |= operator is not None
+                covariance_operators.append(
+                    operator if operator is not None
+                    else DiagonalCovariance(_Q))
+                covariance_sizes.append(B.nbasis)
+
+        if return_q and has_implicit_covariance:
+            self.covariance_operator = BlockDiagonalCovariance.from_sizes(
+                covariance_operators, covariance_sizes)
         
         if return_q:
             return Xb,Q

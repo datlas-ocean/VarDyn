@@ -1,0 +1,90 @@
+{
+  "source": "/home/flo/VarDyn/mapping",
+  "excluded_replaced": {
+    "sw_daily_forcing.py": "DailySWForcing and DailyAR1Covariance are in basis.py",
+    "sw_forcing_basis.py": "Basis_sw_forcing is in basis.py",
+    "sw_forcing_calibrated.py": "CalibratedSWForcing and atom construction are in basis.py"
+  },
+  "files": {
+    "mapping/src/sw_barotropic_component.py": {
+      "original_sha256": "ee2b88c65bee502158fc3645f0c8274121d5a21889dbed534a78a3758021aea6",
+      "local_sha256": "ee2b88c65bee502158fc3645f0c8274121d5a21889dbed534a78a3758021aea6"
+    },
+    "mapping/src/sw_barotropic_joint_forward.py": {
+      "original_sha256": "86a4c0b17ec57dffd80574d0030cc17726acfcbfa7ac78fa3a03a81df6c266e2",
+      "local_sha256": "86a4c0b17ec57dffd80574d0030cc17726acfcbfa7ac78fa3a03a81df6c266e2"
+    },
+    "mapping/src/sw_joint_control.py": {
+      "original_sha256": "d8c7f5e6133110feb0b7b7f932e674a8e368530b727b0489f313f59f04e22646",
+      "local_sha256": "5a3d10e214a879dcb711807b253e3852d1ee9b3cd5d6794f4191032092a5db8d"
+    },
+    "mapping/src/sw_joint_optax.py": {
+      "original_sha256": "346c7c968af861f09c817f103930fb864fa017c73566664e60f809ec7fa9d80e",
+      "local_sha256": "4b76b2351ac28b604263d8e122a1dac914a4897e044aac54514adef5d57513a8"
+    },
+    "mapping/src/sw_learning.py": {
+      "original_sha256": "0b0ebb49d3a9b4632c2702c3dc9dfef31c1bc280203100ab61df9072699866fd",
+      "local_sha256": "22f008d4738bf2f330d3d9788758071d2631e8921cbf991d850bc87449da7a81"
+    },
+    "mapping/src/sw_learning_cg_audit.py": {
+      "original_sha256": "f2fd7ab8f13a1f59262e98608a0fcbcc82572d77f4d575e3ff99546e75f33cef",
+      "local_sha256": "9ef0a48375d0e9e85087c9c18da2acf977609656d267a758657121c27b341b6e"
+    },
+    "mapping/src/sw_learning_empirical.py": {
+      "original_sha256": "d87551fe69bb6c1788335646ef8155fd9399783e3c64dbf409b16d3a08b2cb73",
+      "local_sha256": "5cd3f7f71ff78c80946957b6a00221b3afaa6f8a89f0e8650e8da303d972a144"
+    },
+    "mapping/src/sw_learning_forward.py": {
+      "original_sha256": "7c4ebc2c7c2fc3eeb686a71d9e413ac4f2bc9ec262a5093e5311ee6132ee533f",
+      "local_sha256": "7c4ebc2c7c2fc3eeb686a71d9e413ac4f2bc9ec262a5093e5311ee6132ee533f"
+    },
+    "mapping/src/sw_learning_host_spectral.py": {
+      "original_sha256": "fceed7149ddbd47cb8d6c201b25f5a99787cbc3e8b6a9460fcf50a2de4f506da",
+      "local_sha256": "fceed7149ddbd47cb8d6c201b25f5a99787cbc3e8b6a9460fcf50a2de4f506da"
+    },
+    "mapping/src/sw_learning_joint_forward.py": {
+      "original_sha256": "a18624905c3e51863f756cdf486ae3e1782c2778738a9cbeae679bbad8d199f1",
+      "local_sha256": "a18624905c3e51863f756cdf486ae3e1782c2778738a9cbeae679bbad8d199f1"
+    },
+    "mapping/src/sw_learning_moments.py": {
+      "original_sha256": "487eb0084b8ec5802bfdd6c7bc49c9eb4a33f509fe9edf8ac067542e7da185c5",
+      "local_sha256": "487eb0084b8ec5802bfdd6c7bc49c9eb4a33f509fe9edf8ac067542e7da185c5"
+    },
+    "mapping/src/sw_learning_pilot.py": {
+      "original_sha256": "65be3ab3bdb4ffe4aaffb2ee373c72c3b83d66a89e2eaedd2a8b8c258f0c6481",
+      "local_sha256": "0091348b74a6ace9f044a81efe36d0a153f0e4ad35b3b00ecedac17cbac9eb93"
+    },
+    "mapping/src/sw_learning_profile.py": {
+      "original_sha256": "96b63df2a35521e856c6a7df7333109adb95a064daf85e1a35831bd5c1b11517",
+      "local_sha256": "96b63df2a35521e856c6a7df7333109adb95a064daf85e1a35831bd5c1b11517"
+    },
+    "mapping/src/sw_learning_spectral.py": {
+      "original_sha256": "28208a66eebb521e02dcbaeb129a94e8cbd71b2a13461dd6e6212b2a4f19a147",
+      "local_sha256": "28208a66eebb521e02dcbaeb129a94e8cbd71b2a13461dd6e6212b2a4f19a147"
+    },
+    "mapping/src/sw_learning_windowed.py": {
+      "original_sha256": "bcbc8c2cdaf5229c6a519e0adba1219f6614c12bc9680155c5b013d78d5ab794",
+      "local_sha256": "bcbc8c2cdaf5229c6a519e0adba1219f6614c12bc9680155c5b013d78d5ab794"
+    },
+    "mapping/src/sw_reduced_temporal.py": {
+      "original_sha256": "5b186924ae572d3146f4d39b0ec2ef11625eca3b94618df53c089563ea2b7e80",
+      "local_sha256": "5b186924ae572d3146f4d39b0ec2ef11625eca3b94618df53c089563ea2b7e80"
+    },
+    "mapping/scripts/learn_sw_daily.py": {
+      "original_sha256": "823ab0e047d55910709504b6d2e6bc3dba6e2e66679cc2cfea3b75cf52b561ed",
+      "local_sha256": "95caca7bc74f29a92e602ba8b320ee86b0df6f256852f3e0ec8b2d47b36d5e15"
+    },
+    "mapping/scripts/learn_sw_joint_physics.py": {
+      "original_sha256": "837a2becc6900c3830d89a3539d59d1661ad9cb4f8b74d214cae7e0440be3f95",
+      "local_sha256": "fbf9ac29b096c8096333a21eb6e6e639b78d75484ac4fc77b343f18572060ba7"
+    },
+    "mapping/scripts/learn_sw_reduced_joint_physics.py": {
+      "original_sha256": "897f966f4873d4e77a5950436286cc62bf9f4b2e28da3149891c65440beed034",
+      "local_sha256": "272e858664c1e7bb6b01e8f4ac83e262c07311e0b358e09d44352cbf4a4af77d"
+    },
+    "mapping/scripts/learn_sw_windowed.py": {
+      "original_sha256": "cad826f458269895dc153e4fd776fb5563f7c1e751f3825e8a555ae604fa96f0",
+      "local_sha256": "d5a7a26762ba7897ad40cc9679640b43a7e5d87a0defa8cea04e905ebd5cce9b"
+    }
+  }
+}

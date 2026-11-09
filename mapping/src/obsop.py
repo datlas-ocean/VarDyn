@@ -1248,7 +1248,7 @@ class Obsop_interp_l4(Obsop_interp):
         increment = jnp.where(
             jnp.isnan(inverr * misfit),
             0.,
-            inverr * misfit,
+            self.model_to_observation_scale * (inverr * misfit),
         )
         field = self._observation_model_field(State_var)
         result = dict(adState_var)

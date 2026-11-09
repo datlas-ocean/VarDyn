@@ -31,7 +31,7 @@ from jax.lax import scan
 jax.config.update("jax_enable_x64", USE_FLOAT64)
 
 from . import tools as grid
-
+from .covariance import DiagonalCovariance
 
 
 class ConvergenceReached(Exception):
@@ -39,6 +39,25 @@ class ConvergenceReached(Exception):
 
 class CrazyGradient(Exception):
     pass
+
+
+def _analysis_to_minimizer_control(analysis, background, covariance,
+                                   preconditioned):
+    """Convert a saved ``Xres`` analysis to optimizer coordinates."""
+    background = np.asarray(jax.device_get(background))
+    analysis = np.asarray(analysis).ravel()
+    if analysis.size > background.size:
+        raise ValueError(
+            f'Saved analysis has {analysis.size} controls, but the current '
+            f'basis has only {background.size}.')
+
+    complete_analysis = np.zeros(background.shape, dtype=np.float64)
+    complete_analysis[:analysis.size] = analysis
+    increment = complete_analysis - background
+    if preconditioned:
+        increment = covariance.inverse_sqrt(increment)
+    return np.asarray(increment, dtype=np.float64)
+
 
 def _block_until_ready(obj):
     """Wait for pending JAX work before reporting wall-clock timings."""
@@ -77,14 +96,19 @@ def _criterion_reached(
     ftol,
     patience,
     minimum_iterations,
+    convergence_mode="any",
+    gradient_reference_norm=None,
 ):
+    if convergence_mode not in ("any", "all"):
+        raise ValueError("Unknown convergence mode")
     iterations_completed = len(cost_history) - 1
     if iterations_completed < minimum_iterations:
         return False
     if len(cost_history) - 1 < patience:
         return False
 
-    initial_gradient_norm = max(float(gradient_norm_history[0]), 1e-30)
+    initial_gradient_norm = max(float(gradient_norm_history[0] if gradient_reference_norm is None
+                                      else gradient_reference_norm), 1e-30)
     criteria = []
     if gtol is not None:
         recent_gradients = gradient_norm_history[-patience:]
@@ -108,7 +132,7 @@ def _criterion_reached(
                 for previous, current in recent_pairs
             )
         )
-    return any(criteria)
+    return bool(criteria) and (all(criteria) if convergence_mode == "all" else any(criteria))
 
 
 def minimize_optax_decoupled(
@@ -126,6 +150,8 @@ def minimize_optax_decoupled(
     initial_value=None,
     initial_gradient=None,
     start_callback=None,
+    convergence_mode="any",
+    gradient_reference_norm=None,
 ):
     """Run L-BFGS on device with a scalar Python Armijo line search.
 
@@ -140,6 +166,10 @@ def minimize_optax_decoupled(
             "minimizer='optax-decoupled' requires the 'optax' package"
         ) from exc
 
+    if convergence_mode not in ("any", "all"):
+        raise ValueError("Unknown convergence mode")
+    if convergence_mode == "all" and (gtol is None or ftol is None):
+        raise ValueError("Strict cost-and-gradient convergence requires ftol and gtol")
     if maxiter < 1:
         raise ValueError("maxiter must be >= 1")
     if history_size < 1:
@@ -352,6 +382,8 @@ def minimize_optax_decoupled(
             ftol=ftol,
             patience=convergence_patience,
             minimum_iterations=minimum_iterations,
+            convergence_mode=convergence_mode,
+            gradient_reference_norm=gradient_reference_norm,
         ):
             converged = True
             status = "convergence criterion reached"
@@ -809,7 +841,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_device)
 
     minimizer_name = getattr(config.INV, 'minimizer', 'scipy')
-    supported_minimizers = ('scipy', 'optax-decoupled', 'optax-full-gpu')
+    supported_minimizers = (
+        'scipy', 'optax-decoupled', 'optax-full-gpu')
     if minimizer_name not in supported_minimizers:
         raise ValueError(
             f"Unknown 4DVar minimizer {minimizer_name!r}; expected one of "
@@ -845,7 +878,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         # initialize Basis
         from . import basis
         Basis = basis.Basis(config, State, verbose=verbose)
-
     # Process observations
     print('process observation operators')
     Obsop.process_obs()
@@ -904,22 +936,24 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         B = Cov(config.INV.sigma_B)
         R = Cov(config.INV.sigma_R)
     else:
-        B = Cov(Q)
+        B = getattr(Basis, 'covariance_operator', None)
+        if B is None:
+            B = Cov(Q)
         R = Cov(config.INV.sigma_R)
     
     # Read Background vector 
     if config.INV.path_background is not None: 
         # Read previous minimum 
         print('Read background basis:',config.INV.path_background)
-        ds = xr.open_dataset(config.INV.path_background)
-        Xb[:len(ds.res.values)] = ds.res.values   
-        ds.close()
+        with xr.open_dataset(config.INV.path_background) as ds:
+            Xb[:len(ds.res.values)] = ds.res.values
 
     # Variational object initialization
     var = Variational(
         config=config, M=Model, H=Obsop, State=State, B=B, R=R, Basis=Basis, Xb=Xb, checkpoints=checkpoints, freq_it_plot=config.INV.freq_it_plot, print_time=config.INV.print_time)
     
-    # Initial Control vector 
+    # Initial Control vector
+    initial_control_loaded = False
     if config.INV.path_init_4Dvar is None:
         Xopt = np.zeros((Xb.size,))
     elif not os.path.exists(config.INV.path_init_4Dvar):
@@ -928,13 +962,10 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     else:
         # Read previous minimum 
         print('Read previous minimum:',config.INV.path_init_4Dvar)
-        ds = xr.open_dataset(config.INV.path_init_4Dvar)
-        Xopt = np.zeros(var.Xb.shape, dtype=np.float64)
-        Xopt[:ds.res.size] = ds.res.values
-        ds.close()
-        if config.INV.prec:
-            with var.cost_precision():
-                Xopt = B.invsqr(Xopt - var.Xb)
+        with xr.open_dataset(config.INV.path_init_4Dvar) as ds:
+            Xopt = _analysis_to_minimizer_control(
+                ds.res.values, var.Xb, B, config.INV.prec)
+        initial_control_loaded = True
     
     # Path where to save the control vector at each 4Dvar iteration 
     # (carefull, depending on the number of control variables, these files may use large disk space)
@@ -953,15 +984,30 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             print('Restart at:',tmp_files[-1])
             try:
                 ds = xr.open_dataset(tmp_files[-1])
-            except:
+            except OSError:
                 if len(tmp_files)>1:
                     ds = xr.open_dataset(tmp_files[-2])
+                else:
+                    raise
             try:
                 Xopt = ds.res.values
                 maxiter = max(config.INV.maxiter - len(tmp_files), 0)
+                initial_control_loaded = True
+            finally:
                 ds.close()
-            except:
-                Xopt = +Xopt
+        else:
+            # Iteration checkpoints are optional (save_minimization=False),
+            # whereas Xres.nc is always written after a successful analysis.
+            # Xres stores the full analysis, so convert it back to optimizer
+            # coordinates before either resuming or replaying with maxiter=0.
+            analysis_restart = os.path.join(
+                path_save_control_vectors, 'Xres.nc')
+            if os.path.exists(analysis_restart):
+                print('Restart at:', analysis_restart)
+                with xr.open_dataset(analysis_restart) as ds:
+                    Xopt = _analysis_to_minimizer_control(
+                        ds.res.values, var.Xb, B, config.INV.prec)
+                initial_control_loaded = True
 
     # The historical SciPy adapter owns a host vector. The Optax adapter
     # converts this initial/restart value once, then keeps every vector on GPU.
@@ -970,6 +1016,11 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         (config.INV.restart_4Dvar or config.INV.path_init_4Dvar is not None)
         and maxiter == 0
     )
+    if skip_minimization and not initial_control_loaded:
+        raise FileNotFoundError(
+            'Cannot replay a 4DVar trajectory with maxiter=0: no restart '
+            'control was loaded. Expected path_init_4Dvar or a control file '
+            f'in {path_save_control_vectors!r}.')
 
     if minimizer_name == 'optax-full-gpu' and not skip_minimization:
         print('\n*** Minimization (Optax L-BFGS, full GPU) ***\n')
@@ -980,7 +1031,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             var.cost_and_grad,
             jnp.asarray(Xopt, dtype=var.cost_dtype),
             maxiter=maxiter,
-            history_size=10,
+            history_size=int(getattr(
+                config.INV, 'lbfgs_history_size', None) or 10),
             gtol=getattr(config.INV, 'gtol', None),
             ftol=getattr(config.INV, 'ftol', None),
             convergence_patience=patience,
@@ -1070,7 +1122,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             var.cost_and_grad,
             Xopt_jax,
             maxiter=maxiter,
-            history_size=10,
+            history_size=int(getattr(
+                config.INV, 'lbfgs_history_size', None) or 10),
             gtol=getattr(
                 config.INV,
                 'gtol',
@@ -1303,7 +1356,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     
     with var.cost_precision():
         if config.INV.prec:
-            Xa = var.Xb + B.sqr(Xres)
+            Xa = var.Xb + B.sqrt(Xres)
         else:
             Xa = var.Xb + Xres
     Xa_model = jnp.asarray(
@@ -1320,8 +1373,10 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     # trajectory file.  Without this, the initial output contains the restart
     # window's old parameter fields while the first propagated step already
     # uses Xa_model, which looks like a discontinuity between outputs.
+    project_output = (getattr(Basis, 'operg_for_output', Basis.operg)
+                      if Basis is not None else None)
     if Basis is not None:
-        Basis.operg(0., Xa_model, State=State.params)
+        project_output(0., Xa_model, State=State.params)
     State0 = State.copy()
     State0.enable_output_batching()
     Model.init(State0)
@@ -1338,7 +1393,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         
         # Reduced basis
         if t%int(config.INV.timestep_checkpoint.total_seconds())==0:
-            Basis.operg(t/3600/24, Xa_model, State=State0.params)
+            project_output(t/3600/24, Xa_model, State=State0.params)
 
         # Forward propagation
         Model.step(t=t, State=State0, nstep=nstep)
@@ -1368,26 +1423,9 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
 # =============================================================================
 
 
+Cov = DiagonalCovariance
 
-class Cov :
-    # case of a simple diagonal covariance matrix
-    def __init__(self,sigma=None):
-        
-        if sigma is None:
-            sigma = 1
-            
-        self.sigma = sigma
-        
-    def inv(self,X):
-        return 1/self.sigma**2 * X    
-    
-    def sqr(self,X):
-        return self.sigma * X
-    
-    def invsqr(self,X):
-        return 1/self.sigma * X
-    
-    
+
 class Variational:
     
     def __init__(self, 
@@ -1442,9 +1480,9 @@ class Variational:
 
         with self.cost_precision():
             if self.B is not None:
-                self.B.sigma = jnp.asarray(self.B.sigma, dtype=self.cost_dtype)
+                self.B = self.B.astype(self.cost_dtype)
             if self.R is not None:
-                self.R.sigma = jnp.asarray(self.R.sigma, dtype=self.cost_dtype)
+                self.R = self.R.astype(self.cost_dtype)
         
         # Background state
         with self.cost_precision():
@@ -1503,14 +1541,20 @@ class Variational:
                 self._compiled_cost_and_grad = jax.jit(
                     lambda control, boundary: self._cost_and_grad_scan_impl(
                         control, scan_boundary_conditions=boundary))
+                self._compiled_cost_only = jax.jit(
+                    lambda control, boundary: self._cost_and_grad_scan_impl(
+                        control, scan_boundary_conditions=boundary,
+                        cost_only=True))
             else:
                 self._compiled_cost_and_grad = jax.jit(self._cost_and_grad_impl)
+                self._compiled_cost_only = None
             print(
                 '[cost] complete cost-and-gradient schedule: JIT enabled '
                 f'({self.cost_and_grad_schedule})'
             )
         else:
             self._compiled_cost_and_grad = None
+            self._compiled_cost_only = None
         
         # Grad test
         if config.INV.compute_test:
@@ -1519,7 +1563,7 @@ class Variational:
             if self.prec:
                 X = (np.random.random(self.basis.nbasis)-0.5)
             else:
-                X = self.B.sqr(np.random.random(self.basis.nbasis)-0.5) + self.Xb
+                X = self.B.sqrt(np.random.random(self.basis.nbasis)-0.5) + self.Xb
             
             def cost(X):
                 return self.cost_and_grad(X)[0]
@@ -1584,8 +1628,6 @@ class Variational:
             f'{scan_times.size} uniform intervals, nstep={self._scan_nstep}, '
             'unroll=1'
         )
-
-        
     def cost(self,X0):
                 
         # Initial state
@@ -1594,7 +1636,7 @@ class Variational:
         # Background cost function evaluation 
         if self.B is not None:
             if self.prec :
-                X  = self.B.sqr(X0) + self.Xb
+                X  = self.B.sqrt(X0) + self.Xb
                 Jb = X0.dot(X0) # cost of background term
             else:
                 X  = X0 + self.Xb
@@ -1678,7 +1720,7 @@ class Variational:
         
         if self.B is not None:
             if self.prec :
-                X  = self.B.sqr(X0) + self.Xb
+                X  = self.B.sqrt(X0) + self.Xb
                 gb = X0      # gradient of background term
             else:
                 X  = X0 + self.Xb
@@ -1722,7 +1764,7 @@ class Variational:
                 self.H.adj(timestamp,adState,self.R)
 
         if self.prec :
-            adX = np.transpose(self.B.sqr(adX)) 
+            adX = self.B.sqrt_transpose(adX)
         
         g = adX + gb  # total gradient
 
@@ -1751,6 +1793,13 @@ class Variational:
         self.it_plot += 1
         return J, G
 
+    def cost_only(self, X0):
+        """Evaluate the compiled forward cost without retaining the adjoint."""
+        if self._compiled_cost_only is None:
+            return self.cost_and_grad(X0)[0]
+        X0 = jnp.asarray(X0, dtype=self.cost_dtype)
+        return self._compiled_cost_only(X0, self._scan_boundary_conditions)
+
     def _state_from_scan_trees(self, var, params):
         """Build a trace-time State facade around device pytree leaves."""
         state = self.State.copy()
@@ -1758,7 +1807,10 @@ class Variational:
         state.params = dict(params)
         return state
 
-    def _cost_and_grad_scan_impl(self, X0, scan_boundary_conditions=None):
+
+    def _cost_and_grad_scan_impl(
+        self, X0, scan_boundary_conditions=None, *, cost_only=False,
+    ):
         """Cost and explicit adjoint with rolled checkpoint loops.
 
         The historical implementation below deliberately remains available as
@@ -1770,7 +1822,7 @@ class Variational:
             X0 = jnp.asarray(X0, dtype=self.cost_dtype)
             if self.B is not None:
                 if self.prec:
-                    X = self.B.sqr(X0) + self.Xb
+                    X = self.B.sqrt(X0) + self.Xb
                     Jb = jnp.vdot(X0, X0)
                 else:
                     X = X0 + self.Xb
@@ -1848,10 +1900,8 @@ class Variational:
         )
         trajectory_var, trajectory_params, trajectory_misfit = trajectory
 
-        final_misfit = self.H.scan_misfit(
-            self._scan_final_time,
-            final_var,
-        )
+        final_time = self._scan_final_time
+        final_misfit = self.H.scan_misfit(final_time, final_var)
         with self.cost_precision():
             final_weighted = jnp.asarray(
                 final_misfit,
@@ -1866,6 +1916,9 @@ class Variational:
             )
             J = jnp.asarray(0.5 * (Jo + Jb), dtype=self.cost_dtype)
 
+        if cost_only:
+            return J
+
         if self.B is not None:
             gb = X0 if self.prec else self.B.inv(X0)
         else:
@@ -1873,7 +1926,7 @@ class Variational:
 
         adjoint_state = self.State.copy(free=True)
         adjoint_var = self.H.scan_adj(
-            self._scan_final_time,
+            final_time,
             dict(adjoint_state.var),
             final_var,
             final_misfit,
@@ -1966,7 +2019,7 @@ class Variational:
         with self.cost_precision():
             adX = jnp.asarray(adX, dtype=self.cost_dtype)
             if self.prec:
-                adX = jnp.transpose(self.B.sqr(adX))
+                adX = self.B.sqrt_transpose(adX)
             G = jnp.asarray(adX + gb, dtype=self.cost_dtype)
 
         return J, G
@@ -1987,7 +2040,7 @@ class Variational:
         with self.cost_precision():
             if self.B is not None:
                 if self.prec :
-                    X  = self.B.sqr(X0) + self.Xb
+                    X  = self.B.sqrt(X0) + self.Xb
                     Jb = jnp.vdot(X0, X0) # cost of background term
                 else:
                     X  = X0 + self.Xb
@@ -2168,7 +2221,7 @@ class Variational:
         with self.cost_precision():
             adX = jnp.asarray(adX, dtype=self.cost_dtype)
             if self.prec :
-                adX = jnp.transpose(self.B.sqr(adX))
+                adX = self.B.sqrt_transpose(adX)
 
             G = jnp.asarray(adX + gb, dtype=self.cost_dtype)
 
