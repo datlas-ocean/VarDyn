@@ -1,3 +1,5 @@
 
-# Optional SW learning sources kept locally outside the tracked core.
-/mapping/learning_local/
+# Local experiment tools kept outside the versioned mapping tree.
+/learning_local/
+/scripts/
+/tests/

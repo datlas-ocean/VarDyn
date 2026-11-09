@@ -1537,7 +1537,8 @@ class SW:
         Performs nstep time-integration for (u, v, h) *and* passive tracer c.
 
         c0: (1, n_trac, nx, ny)  physical tracer values (e.g. °C, PSU).
-        c_b: boundary value for tracer, same shape as c0 (or None → no nudging).
+        c_b: boundary value for tracer, same shape as c0. None or non-finite
+             entries extrapolate the current interior and disable nudging.
         Fc: external tracer forcing per time step (same shape as c0, or None).
 
         Tracer c is stored internally in area-scaled form (c_area = c_phys * area)
@@ -1566,7 +1567,14 @@ class SW:
 
         # Prepare tracer in area-scaled form (mirrors h = h_phys * area)
         c = jnp.asarray(c0, dtype=self.dtype) * self.masks.h * self.area  # (1, n_trac, nx, ny)
-        _c_b = jnp.asarray(c_b, dtype=self.dtype) * self.masks.h * self.area if c_b is not None else c
+        if c_b is not None:
+            c_b = jnp.asarray(c_b, dtype=self.dtype)
+            c_b_valid = jnp.isfinite(c_b)
+            # Remove missing-data sentinels before arithmetic, including AD.
+            _c_b = jnp.where(c_b_valid, c_b, 0.) * self.masks.h * self.area
+        else:
+            c_b_valid = jnp.zeros_like(c, dtype=bool)
+            _c_b = jnp.zeros_like(c)
         _Fc  = jnp.asarray(Fc, dtype=self.dtype) * self.area if Fc is not None else jnp.zeros_like(c)
 
         # Ref values
@@ -1606,8 +1614,9 @@ class SW:
                 dt_u, dt_v, dt_h = self.filter_barotropic_waves(
                     dt_u, dt_v, dt_h, u, v, h_tot_ugrid, h_tot_vgrid)
             # Tracer: reuse U, V from above — no extra diagnostic call
+            exterior = jnp.where(c_b_valid, _c_b, c) if c_b is not None else None
             dt_c = self.advection_tracer(
-                U, V, c, c_b=_c_b if c_b is not None else None) + self.add_tracer_diffusion(c)
+                U, V, c, c_b=exterior) + self.add_tracer_diffusion(c)
             return dt_u, dt_v, dt_h, dt_c
 
         def single_step(carry, _):
@@ -1628,7 +1637,7 @@ class SW:
                 dtu = dtu + _gamma_u * (_u_b - u_)
                 dtv = dtv + _gamma_v * (_v_b - v_)
                 dth = dth + _gamma_h * (_h_b - h_)
-                dtc = dtc + _gamma_c * (_c_b - c_)
+                dtc = dtc + _gamma_c * jnp.where(c_b_valid, _c_b - c_, 0.)
                 return dtu, dtv, dth, dtc
 
             if self.time_scheme == 'rk2':

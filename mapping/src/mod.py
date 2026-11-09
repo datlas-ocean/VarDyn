@@ -4711,12 +4711,17 @@ class Model_qgsw(M):
         return u_b, v_b, ssh_b
     
     def _apply_bc_tracer(self, t0, t1):
-        """Return stacked tracer BC array of shape (n_trac, ny, nx)."""
+        """Return (n_trac, ny, nx) BCs; NaN marks absent exterior data.
+
+        Keep a fixed array shape for checkpoint scans while distinguishing a
+        missing tracer boundary from an explicitly prescribed zero value.
+        The SW core resolves missing values against its current stage state.
+        """
         if not self.advect_tracer:
             return None
         c_b_list = []
         for name in self.tracer_names:
-            cb_i = np.zeros((self.ny, self.nx), dtype='float32')
+            cb_i = np.full((self.ny, self.nx), np.nan, dtype='float32')
             if name in self.bc and len(self.bc[name]) > 0:
                 if t0 in self.bc[name]:
                     cb_i = self.bc[name][t0]
