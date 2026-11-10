@@ -17,9 +17,50 @@ import datetime
 import re
 from scipy import signal
 import glob 
+import hashlib
+import json
 
 from .tools import detrendn, read_auxdata
 from .exp import Config
+
+
+def _lwe_signature(value):
+    """Deterministic cache identity, including exact dates and configuration."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _lwe_file_inventory(paths):
+    return [(os.path.abspath(path), os.stat(path).st_size, os.stat(path).st_mtime_ns)
+            for path in sorted(set(paths))]
+
+
+def _lwe_source_inventory(source):
+    path = os.fspath(source['path'])
+    paths = glob.glob(path if '*' in path or path.endswith('.nc') else path + '*.nc')
+    paths.extend(os.fspath(source[key]) for key in ('path_err', 'path_mdt')
+                 if source.get(key) is not None and os.path.exists(source[key]))
+    return _lwe_file_inventory(paths)
+
+
+class _LweGeometryMissing(ValueError):
+    """A prepared file must be rebuilt from its native input."""
+
+
+def _lwe_native_rows(ds, source, signature=None, input_signature=None, source_signature=None):
+    """Validate prepared nadir geometry without rounding time through JAX."""
+    required = ('lwe_time_ns', 'lwe_row_id')
+    if (ds.attrs.get('lwe_geometry_version') != 1
+            or ds.attrs.get('lwe_source') != source
+            or (signature is not None and ds.attrs.get('lwe_signature') != signature)
+            or (input_signature is not None and ds.attrs.get('lwe_input_signature') != input_signature)
+            or (source_signature is not None and ds.attrs.get('lwe_source_signature') != source_signature)
+            or any(key not in ds for key in required)):
+        raise _LweGeometryMissing('Missing or stale LWE native geometry; rebuild observations from source')
+    rows = {key: np.asarray(ds[key].values) for key in required}
+    if any(value.ndim != 1 or value.dtype != np.dtype('int64')
+           for value in rows.values()) or rows['lwe_time_ns'].shape != rows['lwe_row_id'].shape:
+        raise _LweGeometryMissing('Invalid LWE native geometry shape or dtype')
+    return rows
 
 
 def _atomic_to_netcdf(dataset, path, **kwargs):
@@ -424,6 +465,29 @@ def Obs(config, State, obs_datasets=None, *args, **kwargs):
     box = f'{int(lon_obs_min)}_{int(lon_obs_max)}_{int(lat_obs_min)}_{int(lat_obs_max)}'
     
     name_dict_obs = f'dict_obs_{"_".join(config.OBS.keys())}_{date1}_{date2}_{box}_{int(config.EXP.assimilation_time_step.total_seconds())}.txt'
+    lwe_active = any(source.get('lwe_enabled', False) for source in config.OBS.values())
+    lwe_signature = None
+    if lwe_active:
+        inventory = []
+        supplied = {}
+        for name, source in config.OBS.items():
+            if source.get('lwe_enabled', False):
+                _validate_lwe_sampling(source)
+            if obs_datasets is not None and name in obs_datasets:
+                # Supplied datasets can differ from files under the same config.
+                ds_input = obs_datasets[name]
+                supplied[name] = {key: hashlib.sha256(
+                    np.ascontiguousarray(value.values).tobytes()).hexdigest()
+                    for key, value in ds_input.variables.items()}
+            else:
+                inventory.extend(entry[0] for entry in _lwe_source_inventory(source))
+        lwe_signature = _lwe_signature(dict(
+            schema=1, sources=config.OBS, inventory=_lwe_file_inventory(inventory),
+            supplied=supplied, start=time_obs_min, end=time_obs_max,
+            cadence=config.EXP.assimilation_time_step.total_seconds(),
+            bbox=compute_bbox(config, State), lon_unit=State.lon_unit,
+        ))
+        name_dict_obs = name_dict_obs[:-4] + '_lwe_v1_' + lwe_signature + '.txt'
     print('Observation information will be saved in',name_dict_obs)
     
     # Check if previous *dict_obs* has been computed
@@ -435,6 +499,17 @@ def Obs(config, State, obs_datasets=None, *args, **kwargs):
         print(f'Reading {name_dict_obs} from previous run')
         with open(os.path.join(path_save_obs,name_dict_obs), 'rb') as f:
             dict_obs = eval(f.read())
+        valid = True
+        if lwe_active:
+            try:
+                for batch in dict_obs.values():
+                    for name, source, path in zip(batch['obs_name'], batch['attributes'], batch['obs_path']):
+                        if source.get('lwe_enabled', False):
+                            with xr.open_dataset(path) as prepared:
+                                _lwe_native_rows(prepared, name, lwe_signature)
+            except (OSError, ValueError, KeyError):
+                valid = False
+        if valid:
             return _new_dict_obs(dict_obs,config.EXP.tmp_DA_path)
         
     # Read grid
@@ -473,12 +548,15 @@ def Obs(config, State, obs_datasets=None, *args, **kwargs):
         
         # Name of obs files
         out_name = f'obs_{box}_{int(config.EXP.assimilation_time_step.total_seconds())}'
+        if lwe_active:
+            out_name += '_lwe_v1_' + lwe_signature
 
         # Run subfunction specific to the kind of satellite
         if OBS.super in ['OBS_SSH_NADIR','OBS_SSH_SWATH']:
             _obs_alti(ds, assim_dates, dict_obs, name_obs, OBS, 
                                 config.EXP.assimilation_time_step, 
-                                config.EXP.tmp_DA_path,out_name,State.lon_unit,bbox)
+                                config.EXP.tmp_DA_path,out_name,State.lon_unit,bbox,
+                                lwe_signature=lwe_signature)
         elif OBS.super=='OBS_L4':
             _obs_l4(ds, assim_dates, dict_obs, name_obs, OBS, 
                                 config.EXP.assimilation_time_step, 
@@ -496,7 +574,14 @@ def Obs(config, State, obs_datasets=None, *args, **kwargs):
             
     return dict_obs
 
-def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, out_name, lon_unit='0_360', bbox=None):
+def _validate_lwe_sampling(source):
+    if source.get('super') != 'OBS_SSH_NADIR':
+        raise ValueError('LWE native geometry requires OBS_SSH_NADIR')
+    if source.get('subsampling') not in (None, 1):
+        raise ValueError('LWE requires native observations: subsampling must be None or 1')
+
+
+def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, out_name, lon_unit='0_360', bbox=None, lwe_signature=None):
     """
     NAME
         _obs_alti
@@ -507,6 +592,15 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
     """
 
     
+    native = obs_attr.get('lwe_enabled', False)
+    if native:
+        _validate_lwe_sampling(obs_attr)
+        time = ds[obs_attr.name_time]
+        if time.ndim != 1 or time.dtype.kind != 'M':
+            raise ValueError('LWE requires one-dimensional native datetime observations')
+        input_signature = _lwe_signature(_lwe_source_inventory(obs_attr))
+        ds = ds.assign(lwe_row_id=(time.dims, np.arange(time.size, dtype=np.int64)),
+                       lwe_time_ns=(time.dims, time.values.astype('datetime64[ns]').astype(np.int64)))
     ds = ds.assign_coords({obs_attr.name_time:ds[obs_attr.name_time]})
     ds = ds.swap_dims({ds[obs_attr.name_time].dims[0]:obs_attr.name_time})
 
@@ -539,6 +633,10 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
     if _reduce_dims:
         time_mask = bbox_mask.any(dim=_reduce_dims).compute()
         ds = ds.isel({obs_attr.name_time: time_mask.values})
+    elif native:
+        # xr.where introduces NaN and casts integer IDs/epoch nanoseconds to
+        # float64, losing native precision even when every retained row is valid.
+        ds = ds.isel({obs_attr.name_time: np.flatnonzero(bbox_mask.values)})
     else:
         ds = ds.where(bbox_mask.compute(), drop=True)
     ds = ds.load()
@@ -569,7 +667,13 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
         dt2 = np.datetime64(dt_curr+dt_timestep/2)
 
         try:
-            _ds = ds.sel({obs_attr.name_time:slice(dt1,dt2)})
+            if native:
+                # A midpoint belongs to the following checkpoint, exactly once.
+                _ds = ds.isel({obs_attr.name_time: np.flatnonzero(
+                    (ds[obs_attr.name_time].values >= dt1) &
+                    (ds[obs_attr.name_time].values < dt2))})
+            else:
+                _ds = ds.sel({obs_attr.name_time:slice(dt1,dt2)})
         except:
             try:
                 _ds = ds.where((ds[obs_attr.name_time]<dt2) &\
@@ -614,7 +718,7 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
                 if 'varmax' in obs_attr and obs_attr.varmax is not None:
                     varobs[name] = varobs[name].where(np.abs(varobs[name]) <= obs_attr.varmax, np.nan)
                 # Subsampling
-                if obs_attr.subsampling is not None:
+                if obs_attr.subsampling is not None and not native:
                     d = {}
                     for dim in varobs[name].dims:
                         d[dim] = obs_attr.subsampling
@@ -635,7 +739,7 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
             if obs_attr.super=='OBS_SSH_SWATH' and obs_attr.name_xac is not None:
                 name_coords.append(obs_attr.name_xac)
             for name in name_coords:
-                if obs_attr.subsampling is not None:
+                if obs_attr.subsampling is not None and not native:
                     d = {}
                     for dim in _ds[name].dims:
                         d[dim] = obs_attr.subsampling
@@ -645,9 +749,18 @@ def _obs_alti(ds, dt_list, dict_obs, obs_name, obs_attr, dt_timestep, out_path, 
             dsout = xr.Dataset(varobs,
                                 coords=coords
                                 )
+            if native:
+                for key in ('lwe_time_ns', 'lwe_row_id'):
+                    dsout[key] = _ds[key]
+                dsout.attrs.update(lwe_geometry_version=1, lwe_source=obs_name,
+                                   lwe_signature=lwe_signature or '',
+                                   lwe_input_signature=input_signature,
+                                   lwe_source_signature=_lwe_signature(obs_attr))
 
             # Write netcdf
             date = dt_curr.strftime('%Y%m%d_%Hh%M')
+            if native:
+                date = dt_curr.strftime('%Y%m%d_%Hh%Mm%Ss%f')
             path = f"{out_path}/{out_name}_{obs_name}_{'_'.join(obs_attr.name_var)}_{date}"
             if finterpmdt is not None:
                 if obs_attr.add_mdt:

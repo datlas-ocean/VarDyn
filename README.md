@@ -191,6 +191,266 @@ plusieurs opérateurs peuvent être combinés. Les conversions entre hauteur
 interne et SSH physique sont prises en compte. Un opérateur L4 sans observation
 est neutre dans les chemins compilés de coût et d'adjoint.
 
+### Configuration, coût conjoint et sorties LWE MIOST — étapes 1–5
+
+Les paramètres propres aux missions sont déclarés dans les blocs `OBS`
+de type `OBS_SSH_NADIR` : `lwe_enabled` (désactivé par défaut), `sad_path`,
+`path_lwe` et `name_var_lwe` (coordonnées et variable de la carte std).
+Les paramètres communs appartiennent au nouvel opérateur `OBSOP_INTERP_LWE_L3`.
+`exp.py` et son mécanisme de fusion restent inchangés.
+
+```python
+C2N = dict(
+    super='OBS_SSH_NADIR',
+    # Ajouter path, name_time, name_lon, name_lat et les erreurs de mesure.
+    name_var={'SSH': ['sla_unfiltered', 'lwe']},
+    combine_var={'SSH': [1, -1]},
+    lwe_enabled=True,
+    sad_path='/path/to/miost_sad',
+    path_lwe='std_lwe_c2n_v2024.zarr.zip', # nom explicite propre à cette mission
+    # name_var_lwe={'lon': 'lon', 'lat': 'lat', 'var': 'std_lwe'},
+)
+NAME_OBSOP = 'SSH_LWE'
+SSH_LWE = dict(
+    super='OBSOP_INTERP_LWE_L3',
+    name_obs=['C2N'],
+    facQ_file='/path/to/miost_sad/facQ_lwe.zarr.zip',
+)
+```
+
+Seule la convention **avant correction DUACS** est admise :
+`sla_unfiltered - lwe`, via `name_var`/`combine_var`. Le chargeur existant
+évalue cette expression ; aucune correction supplémentaire n'est soustraite.
+L'ajout éventuel de MDT reste indépendant. Employer des caches d'observations
+propres à cette expression, comme pour les expériences SLA−LWE existantes.
+
+Les valeurs communes reprennent MIOST : `tdec_lw=0.001` **jour**, demi-largeur
+86,4 s ; `facnlt=4`, soit un espacement de 21,6 s ; `gap_seconds=600` et
+`min_segment_size=7`. Fenêtres cos² compactes non renormalisées, terme nadir
+`p_param=0`. La fenêtre cos² et la convention avant correction DUACS sont
+fixées, sans options `window` ou `input_convention`. Aucun paramètre de temps n'est exprimé en pas du modèle.
+
+Chaque source fournit explicitement le fichier `path_lwe`. Un chemin relatif
+est joint au répertoire `sad_path` de cette source, lorsqu'il est renseigné ;
+un chemin absolu est utilisé directement. Aucun nom n'est déduit de la mission.
+L'opérateur reçoit le chemin explicite `facQ_file` de la carte commune ;
+`name_var_facQ` vaut `{'lon':'lon','lat':'lat','var':'facQ'}`.
+Les écarts-types sont en mètres de SSH et facQ est sans dimension ; le prior
+attendu est `Q = facQ * std_lwe**2`, distinct du bruit des observations.
+La validation et la résolution des chemins se font dans
+`Obsop_interp_lwe_l3.resolve_config(config)`, pour les sources sélectionnées
+par `name_obs`. Le contenu scientifique des cartes sera contrôlé lors du
+raccordement de la projection.
+
+Dans les auxiliaires MIOST locaux, les fichiers std_lwe utilisent les labels
+`alg`, `c2n`, `h2b`, `j3n`, `s3a`, `s3b`, `s6a` et `swon`.
+C2N est un alias de C2 ; J3N, S6A et SWON réutilisent la carte J3.
+Ces alias ne représentent pas des calibrations indépendantes. Le choix du
+fichier reste explicite dans chaque source VarDyn.
+
+Le constructeur standard et le factory préparent désormais le coût conjoint,
+y compris dans `Obsop_multi`. `prepare_joint` reste utilisable directement.
+Un opérateur L3 ordinaire refuse une source sélectionnée avec `lwe_enabled=True`.
+Les expériences existantes restent exécutables avec LWE désactivé. La validation
+scientifique par un pilote court puis une OSE comparative appartient à l’étape 6.
+
+L’étape 2 fournit une préparation explicite sans inversion :
+
+```python
+from src.obs import Obs
+from src.obsop import Obsop_interp_lwe_l3
+
+observations = Obs(cfg, ocean)
+geometry = Obsop_interp_lwe_l3.prepare_geometry(cfg, ocean, observations, model)
+# geometry.source_names : table des missions (clés des blocs OBS)
+# geometry.native_geometry[t] : lignes réelles du checkpoint modèle t
+# geometry.native_geometry_arr : tableaux hôte complétés + masque "valid"
+```
+
+Chaque ligne conserve `time_ns` (int64, nanosecondes depuis l’époque Unix),
+`source_id`, `row_id`, `segment_id`, `lwe_eligible`, `lon` et `lat`.
+Pour une mission LWE active, `row_id` est l’index dans son jeu d’entrée signé,
+avant sélection spatiale et découpage temporel ; le couple mission/ligne
+identifie l’observation. Les métadonnées restent sur CPU NumPy, sans passage
+par les flottants JAX. Les fichiers NetCDF préparés gardent `lwe_time_ns`,
+`lwe_row_id`, le nom de source et les signatures de provenance.
+
+La date du checkpoint sélectionne l’état océanique ; elle ne remplace jamais
+le temps natif. Les lots LWE utilisent `[checkpoint − Δt/2, checkpoint + Δt/2[` :
+un point exactement au milieu appartient uniquement au checkpoint suivant.
+Deux observations distinctes au même temps sont conservées. `subsampling`
+est limité à `None` ou `1` lorsque `lwe_enabled=True`.
+
+La préparation de l’opérateur réunit tous les lots retenus d’une mission
+avant de définir les segments sur les temps uniques triés : séparation
+strictement au-delà de `gap_seconds`, même entre fichiers/checkpoints.
+`min_segment_size` compte les temps uniques. Les observations des segments
+courts restent présentes, avec `lwe_eligible=False` ; aucune base LWE n’est
+construite par `prepare_geometry`. Les missions désactivées ont `segment_id=-1`.
+
+Les caches LWE préparés, par checkpoint et empilés ont un espace distinct et
+un schéma versionné. Les signatures couvrent les définitions des sources,
+l’inventaire des fichiers (chemin, taille, mtime), les sélections et, pour H,
+les coordonnées/masques de grille, les checkpoints et les paramètres de
+l’opérateur. Les jeux fournis directement en mémoire sont aussi empreintés.
+Les caches d’opérateur valident dimensions, identité et empreinte des tableaux,
+y compris la géométrie et le masque de padding. Une géométrie préparée absente
+ou obsolète est reconstruite depuis les sources ; aucun temps natif n’est
+déduit du checkpoint. `prepare_geometry` expose uniquement la préparation :
+un appel de coût depuis cette préparation reste refusé. Le constructeur
+standard prépare également la projection et le coût décrits ci-dessous.
+
+L’étape 3 expose une préparation séparée de la projection, sans inversion :
+
+```python
+operator = Obsop_interp_lwe_l3.prepare_projection(cfg, ocean, observations, model)
+z = np.zeros(operator.n_lwe)  # coefficients blanchis, sans unité
+correction = operator.project_lwe(z)  # mètres SSH, tableau complété comme varobs_arr
+gradient = operator.adjoint_lwe(residual)  # même forme que z
+# Vues par checkpoint : correction réelle, sans padding ; adjoint global.
+correction_t = operator.project_lwe(z, t=operator.t_obs[0])
+gradient_t = operator.adjoint_lwe(residual_t, t=operator.t_obs[0])
+```
+
+`project_lwe(z)` applique `L sqrt(Q) z` ; `adjoint_lwe(r)` applique
+`sqrt(Q) L.T r`. Ces deux fonctions sont compatibles avec JIT et autodiff JAX.
+Elles n’appliquent pas les erreurs d’observation : la division par sigma et le
+prior `0.5 * ||z||²` appartiennent au coût conjoint (étape 4). Les lignes de padding,
+missions désactivées et segments courts contribuent zéro. Chaque couple
+mission/segment possède ses coefficients ; aucune fenêtre ne contribue à un
+autre segment, même si son support temporel le recouvre.
+
+`lwe_matrix` est la matrice CSR hôte **L non blanchie**, dont les lignes sont les
+lignes réelles concaténées dans l’ordre des checkpoints (sans padding).
+`lwe_sqrtq` et `lwe_coefficients` exposent la racine du prior, les temps des
+centres (nanosecondes Unix), leurs coordonnées, source, segment et variance.
+Les calculs temporels utilisent des différences locales depuis les temps natifs.
+Le placement suit MIOST : phase fixe au 31 août 1982 (jour 11930 depuis 1950),
+extension historique de trois espacements et sélection avec quatre espacements.
+Ce dernier seuil égale la demi-largeur de la fenêtre uniquement si `facnlt=4`.
+Les fenêtres cos² ne sont pas renormalisées.
+
+Les positions des centres sont interpolées/extrapolées linéairement le long de
+chaque trace, après déroulement des longitudes, puis longitude modulo 360 et
+latitude bornée à ±90°, comme dans le `lwe.py` fourni. La première occurrence de
+chaque temps unique définit cette géométrie ; toutes les observations, y compris
+les doublons temporels, conservent leur propre ligne de projection.
+
+Les cartes NetCDF ou Zarr v2 ZIP MIOST sont interpolées bilinéairement. La lecture
+ZIP accepte les attributs `dimensions` et `_ARRAY_DIMENSIONS`, les chunks
+compressés et les masques optionnels, en préservant les zéros physiques. Une
+carte globale est périodique en longitude ; une carte régionale n’est pas
+extrapolée. Un centre hors domaine ou une valeur std_lwe/facQ négative ou non
+finie produit une erreur précisant source, carte et centre. Une valeur nulle
+retire le coefficient. Les cartes ne sont pas renormalisées selon la densité
+des fenêtres : `Q = facQ * std_lwe**2`.
+
+Le cache de projection est séparé/versionné/signé par la géométrie, la
+configuration et le SHA-256 du contenu des cartes. Son intégrité et les identités
+des lignes/coefficients sont vérifiées ; un cache absent ou abîmé est reconstruit.
+Les signatures sont vérifiées même à chaud ; les cartes ne sont pas décodées
+lorsque le cache est valide. Aucun import runtime du paquet MIOST.
+
+L’étape 4 prépare explicitement un opérateur pour évaluer le coût et les gradients :
+
+```python
+operator = Obsop_interp_lwe_l3.prepare_joint(cfg, ocean, observations, model)
+# Fournir operator comme H à Variational, avec les bases/prior océaniques habituels.
+# evaluator.X0 : initialisation nulle du contrôle optimisé complet.
+# evaluator.ocean_size : nombre de contrôles océaniques.
+# evaluator.control_size : nombre total, incluant evaluator.lwe.size.
+# value, gradient = evaluator.cost_and_grad(control)
+```
+
+Le vecteur est `[contrôles océaniques, z_lwe]`, tous optimisés conjointement.
+`LweControl` dans obsop.py attribue les blocs LWE dans l’ordre des opérateurs,
+avec des offsets explicites ; les contrôles océaniques conservent leurs indices.
+Seul le préfixe océanique passe dans B et les bases physiques. Le suffixe LWE
+est toujours blanchi par son propre prior et reçoit `0.5 * ||z_lwe||²` une seule
+fois, quel que soit `prec` ou `sigma_B` pour l’océan.
+
+La correction `L sqrt(Q_lwe) z_lwe` est ajoutée **en mètres SSH**, après la
+conversion de hauteur océanique, avant division par `errobs` :
+`r = (H(x) + L sqrt(Q_lwe) z_lwe - y) / errobs`.
+`sigma_noise` par satellite alimente `errobs` en l’absence d’un champ d’erreur
+configuré. `INV.sigma_R` est une covariance supplémentaire sur ces résidus
+déjà normalisés ; la laisser à `None` (identité) pour utiliser seulement les
+erreurs par satellite. Coût et adjoints Python/scan appliquent le même R inverse.
+Le gradient LWE est `z_lwe + sqrt(Q_lwe) L.T ((R.inv(r)) / errobs)`.
+
+Dans le mode LWE actif, le résidu océanique, la correction normalisée et son
+adjoint utilisent le même masque : ligne native réelle, observation finie et
+erreur finie strictement positive. Les lignes rejetées par `varmax` ou avec
+valeurs manquantes ne créent aucune contrainte sur le LWE. Leurs identités et
+leur correction physique restent disponibles dans les diagnostics, avec
+`assimilated=0` et des résidus NaN.
+
+Les projections complétées sont calculées une fois par évaluation, puis
+sélectionnées par indices JAX aux checkpoints. Les transposes creuses utilisent
+le temps tracé sans dictionnaire Python. L’ordre de concaténation multi-opérateurs,
+les temps absents et les lignes de padding sont respectés. Les blocs de variance
+nulle n’ajoutent aucun coefficient ; un opérateur désactivé garde le contrôle ordinaire.
+
+Dans le chemin SW local, `JointControl(..., observations=operator)` ajoute les
+blocs après les contrôles de forçage et de physique ; `initial()` initialise le
+suffixe à zéro, `decode()` conserve sa sortie océanique et `lwe_coefficients(z)`
+extrait le suffixe. `make_daily_residual` accepte un troisième argument explicite
+`z_lwe` et ajoute la correction avant la sélection des jours. `control.bind_residual`
+relie ces deux interfaces en un résidu fonction du contrôle complet ; la fonction
+coût canonique conserve son unique prior identité sur tout le vecteur.
+`return_states=True` fournit la trajectoire physique sans argument LWE.
+
+L’étape 5 raccorde `Inv_4Dvar` (SciPy et les deux chemins Optax) et le driver
+local `joint_optax_map` aux sorties et reprises signées. Aucun état océanique
+ne contient le LWE.
+
+`Xres.nc` contient dans `res` l’analyse océanique dans les coordonnées
+historiques, puis le suffixe **blanchi** `z_lwe`. `X_it.nc` contient le vecteur
+du minimiseur. Coût, export et reprise partagent la même conversion ; pour
+l’évaluateur sans prior océanique (`B=None`), la convention historique est
+`X = X0 - Xb` et son inverse est `X0 = X + Xb`, indépendamment de `prec`.
+Les attributs `lwe_control_layout`, `control_coordinates` et
+`lwe_ocean_signature` décrivent blocs/offsets, sources, signatures des
+observations/projection/cartes, coordonnées et prior océanique ; les checkpoints
+précisent aussi le préconditionnement de l’océan. La lecture refuse les fichiers
+non signés, les dispositions ou conventions différentes, les coefficients non
+finis, les changements de données/erreurs/cartes ou d’ordre des opérateurs,
+y compris à nombre de coefficients identique. Les métadonnées BMaux restent
+vérifiées sur le préfixe océanique. Un contrôle joint s’utilise en initialisation
+ou reprise ; il est refusé comme `path_background` pour ne pas déplacer le
+prior LWE centré en zéro. Les anciennes reprises sans LWE gardent leur format.
+
+`lwe_diagnostics.nc`, écrit atomiquement dans le dossier des contrôles, est
+séparé des sorties physiques. Il contient deux dimensions sans padding :
+
+- `observation_row` : `time_ns` int64 exact (ns Unix), `source_name`, `source_id`,
+  `row_id`, `segment_id`, `operator_id`, coordonnées et checkpoint, observation
+  préparée et sigma, `lwe_error=e`, `lwe_correction=-e`, `residual_before=H(x)-y`,
+  `residual_after=H(x)+e-y` en mètres, résidu après normalisation par sigma et
+  masque `assimilated` ;
+- `coefficient` : `coefficient_z_lwe`, amplitude physique `sqrt(Q)*z`, variance,
+  temps/position du centre, identités mission/segment/opérateur et index dans
+  le contrôle complet.
+
+Les résidus suivent exactement les checkpoints du coût. Les lignes exclues ou
+absentes de la trajectoire évaluée restent identifiables, avec `assimilated=0`
+et résidus NaN. Leur correction projetée reste disponible. Les sources
+désactivées et segments courts ont une correction nulle. Les temps natifs ne
+passent jamais par JAX float32. Le champ `observation` suit les transformations
+configurées, dont MDT et retrait de frontière en mode anomalie ; la correction
+DUACS n’est pas soustraite une seconde fois.
+
+Dans le chemin local, utiliser `control.bind_residual(raw_residual)` : cette
+fonction transmet disposition signée, sélection journalière et export natif au
+driver. `map_checkpoint.npz` conserve le vecteur joint blanchi, et
+`map_preconditioner.npz` ses coordonnées numériques ; les deux portent la même
+disposition et la signature de provenance fournie au driver. Cette signature
+reste la responsabilité du pilote pour ses bases et sa physique. `resume=True`
+ou `restart_from` vérifient ces métadonnées pour LWE. `maxiter=0` exige un
+checkpoint et rejoue sans optimisation ; son statut de convergence est conservé.
+Un arrêt non convergé peut aussi exporter les diagnostics sans être déclaré
+convergé. Le pilote scientifique appartient à l’étape 6.
+
 `DIAG_OSSE` compare une reconstruction à une simulation de référence.
 `DIAG_OSE` permet l'évaluation avec observations réelles et produits de
 référence, selon les données fournies : erreurs, cartes, séries temporelles,
@@ -228,6 +488,19 @@ Les contrôles sauvegardés permettent la reprise ou le rejeu d'une trajectoire.
 Le rejeu avec `maxiter=0` exige un contrôle chargé ; il ne relance pas une
 optimisation. Un vecteur incompatible avec la base, le prior ou la convention
 d'état ne doit pas être réutilisé comme une reprise valide.
+
+Pour BMaux, renseigner un chemin de fond ne change plus la grille de bandes.
+La disposition bornée actuelle est conservée, sauf indication explicite d’une
+disposition historique dans les métadonnées du fichier. Les nouveaux fichiers
+`Xres.nc` et `X_it.nc` portent `bmaux_control_layouts` : disposition, signature
+des fonctions spatiales/temporelles, variables ciblées, tailles et offsets des
+composantes. Le chargement d’un fond, d’une initialisation ou d’une reprise
+vérifie ces informations avant d’affecter les coefficients, y compris dans
+une base composée. Un fond propre à une composante est extrait par ses
+offsets validés, sans sélection implicite des derniers coefficients.
+Les anciens fichiers BMaux sans ces métadonnées sont refusés explicitement :
+leur compatibilité doit être établie avant migration ; aucun format n’est
+déduit de la seule présence du chemin ou du seul nombre de coefficients.
 
 La cartographie peut être découpée en tuiles spatiales et fenêtres temporelles
 chevauchantes. `run_assimilation.py` gère la préparation, les processus,

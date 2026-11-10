@@ -1,6 +1,458 @@
 # Contexte du projet VarDyn Tropics
 
-Dernière mise à jour : 2026-11-09.
+Dernière mise à jour : 2026-11-10.
+
+## Corrections de la revue LWE du 2026-11-10 — validées
+
+L’utilisateur a explicitement demandé la correction des deux constats.
+Masque commun aux résidus océaniques/LWE, adjoint et diagnostics : SSH finie,
+erreur finie strictement positive et ligne native valide. Les lignes exclues
+conservent leurs identités et leur correction physique, mais ne contribuent
+pas au coût et sont exportées non assimilées avec résidus NaN.
+Conversion du contrôle océanique partagée entre coûts et export ; B=None
+conserve X0−Xb et la lecture d’analyse applique son inverse X+Xb.
+**236 tests CPU réussis en 262,02 s**, dont 19 nouvelles régressions sur les
+deux corrections. full_final.exit=0, unité inactive/success, invocation
+`8b338e0d04b1401ea5a6b735652bc426`. Les 13 premiers cas échouaient avant
+correction ; 20 contrôles ciblés ont ensuite validé ces cas, les erreurs
+nulles/négatives/infinies et la parité exacte LWE nul/L3. L’ordre arithmétique
+historique (inverse de sigma puis multiplication) est préservé.
+Le rejeu original donne un coût égal au prior et un gradient LWE sans erreur
+pour des SSH manquantes ; sigma NaN ne rend plus le coût NaN. L’écart d’export
+sans prior passe de 0,12 m à 2,93e−7 m, avec reprise réussie.
+Rapport de validation, patch limité aux corrections, snapshots des sources,
+empreintes, jobs/logs/PID/XML dans `runs/lwe_review_fixes_20261110/`.
+Compilation de trois fichiers, bash -n, exp.py inchangé et git diff --check
+vérifiés. Changements antérieurs préservés. Intégration LWE et reprises BMaux
+enregistrées dans un commit local à la demande de l’utilisateur ; aucun push.
+Aucune assimilation scientifique ni validation GPU. Étape 6 : pilote scientifique.
+
+Revue des modifications non committées contre HEAD `5e414dfc`, incluant le
+chemin SW local. **125 tests CPU existants réussis en 71,15 s**, mais deux cas
+supplémentaires reproduisent des défauts non couverts : la correction LWE
+réintroduit les lignes dont la SSH est NaN/rejetée par varmax, et une erreur
+d’observation NaN rend le coût NaN ; l’export générique utilise X0+Xb au lieu
+du X0−Xb du coût lorsque B=None et Xb non nul (écart de résidu de 0,12 m dans
+le cas synthétique). Aucun correctif source effectué dans cette revue.
+Preuves, journaux/PID/XML, références et empreintes dans
+`runs/lwe_review_20261110/`. Aucune violation documentaire bloquante relevée ;
+deux duplications de code signalées comme pistes de maintenance.
+Ces constats sont désormais corrigés et couverts par la validation ci-dessus ;
+les validations synthétiques antérieures restent acquises sur leur couverture propre.
+
+## Étape 5 LWE — sorties et reprises implémentées et validées
+
+Demande explicite d’implémentation reçue le 2026-11-10. Le constructeur actif
+est raccordé à prepare_joint ; les gardes étape 5 sont remplacées par une
+persistance signée et sa validation. Xres conserve les coordonnées historiques
+de l’analyse océanique, suivies de z_lwe blanchi ; X_it/checkpoints locaux
+conservent les coordonnées du minimiseur. Les reprises vérifient ordre des
+opérateurs, géométrie/projection/cartes, données/erreurs/conversion, tailles,
+offsets et coordonnées ; le cœur vérifie aussi le prior océanique.
+Le chemin local porte la disposition et la sélection journalière en plus de
+sa signature de provenance fournie par le pilote. Un fichier joint ne sert
+pas de fond océanique ; utiliser path_init_4Dvar pour le réutiliser.
+Export atomique séparé lwe_diagnostics.nc : observations natives sans padding,
+temps Unix int64 ns, identités mission/ligne/segment et opérateur, erreur
+additive e et correction −e, résidus H(x)−y puis H(x)+e−y en mètres,
+coefficients blanchis/physiques. Les checkpoints absents/exclus sont marqués
+non assimilés avec résidus NaN. Les états physiques reçoivent seulement le
+contrôle océanique. Rejeu local maxiter=0 ajouté avec contrôle chargé obligatoire.
+**Validation achevée : 143 cas CPU distincts validés** : 123 régressions de
+la passe élargie et les 20 tests de sorties/reprises de la passe finale réussie
+en 10,18 s (outputs.exit=0, unité inactive/success, invocation
+0afb8fd8b1f545b6a3c28e4e5e056d6f). La passe élargie conservée rapportait
+142 succès et un échec de montage du cas vide, corrigé puis validé dans les
+20 tests finaux ; ce ne sont pas 143 tests dans une seule invocation sans échec.
+Rapport, validation.json passed, hashes, jobs et XML/log/PID dans
+runs/lwe_outputs_20261110. Neuf fichiers compilés, git diff --check et identité
+exp.py/HEAD vérifiés. Les trois minimiseurs génériques ont été optimisés puis
+rejoués sur des cas synthétiques. Un import local redondant de time masquait
+l’import global dans le chemin SciPy ; il est retiré. Le chargeur historique
+de fichiers bruts physiquement vides reste hors périmètre ; un opérateur sans
+lots retenus est validé. Les limites de construction des comptes rendus des
+étapes 1–4 ci-dessous sont historiques et levées à l’étape 5.
+Aucun pilote scientifique, assimilation réelle ni test GPU ; étape 6 reste à
+réaliser. Changements antérieurs préservés, aucun commit/push.
+
+## Vérification Obsop_multi — validée
+
+Demande utilisateur : vérifier la compatibilité de l’opérateur LWE avec
+Obsop_multi. Tests d’intégration ajoutés localement : deux opérateurs LWE
+préparés, L3 ordinaire, L4 actif/vide, ordre permuté et composition imbriquée ;
+coût/adjoints Python/JIT/scan confrontés à l’autodiff des feuilles. **22 tests
+CPU réussis en 56,47 s**, puis **1 test de prétraitement réussi en 3,09 s** :
+Obsop_multi.process_obs conserve exactement les tableaux et projections LWE
+préparés. Cette vérification précédait le constructeur LWE actif livré à l’étape 5 ;
+constructeur/factory désactivé également testé. Cette validation composait des instances LWE déjà préparées via prepare_joint ;
+la construction standard active est désormais raccordée à l’étape 5. Aucune
+assimilation scientifique LWE n’est encore validée.
+Rapport/validation.json passed, hashes/PID/logs/XML et jobs.json dans
+`runs/lwe_multi_check_20261110/` ; invocations
+`6047ae7447c34904a272601e5b36364c` et `9c213e5da53b42b3a2ab9f1a85108ff0`,
+deux unités inactive/success avec ExecMainStatus=0. Aucun changement source :
+empreintes du cœur et des modules locaux identiques à la validation étape 4.
+
+## Étape 4 LWE — coût conjoint implémenté et validé
+
+L’utilisateur invoque grill-me/grilling pour l’étape 4. Périmètre confirmé
+(Q1, « ok ») : raccorder le contrôle LWE blanchi au coût conjoint et à ses
+gradients dans le cœur générique (adjoint explicite Python/scan) et le chemin
+SW annuel local (autodiff), avec validation synthétique. Formulation prévue
+par le plan : résidu `(H(x) + L sqrt(Q_lwe) z_lwe - y)/sigma_obs` et prior
+indépendant `0.5 * ||z_lwe||²`. Les sorties/reprises et le pilote scientifique
+restent aux étapes 5–6. Inspection en lecture seule déléguée conformément au
+skill achevée. Q2 confirmée après clarification : un seul vecteur optimisé
+conjointement, contrôles océaniques existants suivis des blocs LWE identifiés
+par opérateur ; coefficients LWE initialement nuls et blanchis par leur propre
+prior. L’ordre est une disposition des coefficients, pas une séquence d’optimisation.
+Q3 confirmée : corriger la pondération des adjoints Python/scan ;
+l’utilisateur précise que le protocole pratique utilise seulement sigma_noise
+par satellite (sigma_R supplémentaire laissé à l’identité). Q4 confirmée :
+évaluations coût/gradient et optimisations synthétiques uniquement avant
+persistance signée à l’étape 5. Le contrôle LWE est déjà blanchi par Q_lwe ;
+le choix prec du bloc océanique ne doit pas
+changer son prior physique. Cela n’interdit pas un préconditionnement numérique
+commun et ne suppose pas une indépendance postérieure.
+L’inspection a révélé l’absence de R.inv dans les adjoints explicites du coût
+générique, incohérente pour sigma_R non identité ; la correction autorisée
+transmet désormais les résidus pondérés aux adjoints Python/scan.
+Contrat Q1–Q4 récapitulé puis confirmé explicitement
+(« ok ») ; implémentation autorisée dans obsop.py/inv.py et les modules SW
+locaux, sans nouveau module src ni changement des noyaux. API explicite
+`Obsop_interp_lwe_l3.prepare_joint` ; disposition et transposes dans `LweControl`.
+`Variational.X0` contient le vecteur complet ; `ocean_size`, `control_size` et
+`lwe.size` exposent les tailles. Les bases et le modèle reçoivent seulement le
+préfixe océanique. Le chemin local `JointControl(..., observations=operator)`
+et `bind_residual` ajoutent les coefficients au résidu journalier avant sélection
+des jours, avec prior identité unique ; les états physiques restent séparés.
+Validation finale CPU détachée : **103 tests réussis en 81,07 s**,
+verify.exit=0, unité `vardyn-lwe-joint-final-20261110.service`
+inactive/dead, Result=success et ExecMainStatus=0 ; invocation
+`c0b118ebb6e4496daba5a370a8c76461`. Rapport, hashes, validation.json,
+jobs.json et logs/PID/XML dans `runs/lwe_joint_cost_20261110/` ; passes
+initiale et corrigée conservées. Couvre optimum MAP analytique, gradients,
+Python/JIT/scan/autodiff et parité locale, erreurs par satellite et R non identité,
+padding/multi-opérateurs/jours exclus, LWE nul/désactivé, précision mixte,
+absence de prior océanique et régressions SW réelles/configuration/projection.
+Compilation de huit fichiers, bash -n et git diff --check réussis ; exp.py
+inchangé. Aucune assimilation scientifique ni validation GPU ; factory/driver
+générique et résidu joint déclaré au driver Optax local restent bloqués avant
+sorties/reprises signées (étape 5), puis pilote scientifique (étape 6).
+Modules locaux/tests supplémentaires toujours ignorés par Git, aucun commit/push.
+
+## Étape 3 LWE — projection implémentée
+
+L’utilisateur invoque grill-me/grilling pour l’étape 3. Périmètre confirmé par
+l’utilisateur : construire la projection temporelle creuse et son adjoint, lire
+le prior diagonal des cartes et exposer le contrôle blanchi, à partir de la
+géométrie de l’étape 2. Raccordement au coût, sorties/reprises et assimilation
+restent aux étapes suivantes. Tests d’équivalence MIOST, d’alignement et
+d’adjoint inclus. Contrat Q1–Q7 récapitulé puis confirmé par l’utilisateur ;
+implémentation réalisée et validée dans obsop.py.
+Choix confirmés : placement des centres identique à MIOST, y compris
+l’extension historique ±3 espacements ; interpolation bilinéaire des cartes,
+périodique en longitude pour les cartes globales, erreur explicite hors
+domaine ou sur valeur manquante ; coefficients de variance nulle retirés,
+std_lwe/facQ négatifs ou non finis refusés.
+Q5–Q7 également confirmées : positions interpolées/extrapolées linéairement
+le long de la trace, longitudes déroulées puis remises modulo 360 et latitude
+bornée à ±90° comme dans lwe.py fourni ; première ligne de chaque temps unique
+pour la géométrie des centres, toutes les observations conservées dans L ;
+blocs de coefficients indépendants par mission/segment, sans contribution
+entre segments. API préparatoire dédiée dans obsop.py, projection L√Q z et
+adjoint en mètres SSH sans pondération sigma, métadonnées, représentation
+creuse avec vues par checkpoint et cache signé incluant les cartes.
+API `Obsop_interp_lwe_l3.prepare_projection`, `project_lwe(z, t=None)` et
+`adjoint_lwe(residual, t=None)` : sortie complétée alignée à native_geometry_arr
+par défaut, lignes réelles pour un checkpoint explicite. `lwe_matrix` est L
+CSR hôte sur les lignes réelles concaténées ; `lwe_sqrtq`, `n_lwe` et
+`lwe_coefficients` exposent le prior et les métadonnées. Chaque carte est
+décodée une fois par préparation, puis réutilisée entre segments ; le cache
+de projection versionné signe aussi le contenu SHA-256 des cartes.
+Validation finale : **85 tests CPU réussis en 8,75 s**, verify.exit=0 ;
+unité inactive/dead avec Result=success et ExecMainStatus=0. Rapport,
+validation.json, logs/PID/XML dans `runs/lwe_projection_20261110/`.
+Compilation obsop/test et git diff --check réussis ; exp.py inchangé.
+L’avertissement binaire NumPy/NetCDF connu persiste sans échec.
+Les tests couvrent les helpers MIOST réels
+(facnlt 2/4/6), cartes SAD réelles et synthétiques, JIT/autodiff/adjoint,
+positions aux bords/doublons/longitude 0°, isolation mission/segment, cas
+vides/nuls/invalides et caches chauds/abîmés/cartes modifiées. Cette validation
+d’étape 3 porte sur la projection ; le coût joint est désormais livré à
+l’étape 4 ci-dessus. Assimilation et export de correction restent à réaliser.
+
+## Corrections de revue — 2026-11-10
+
+Deux corrections explicitement demandées après revue déléguée contre origin/main.
+BMaux conserve sa disposition bornée lorsqu’un chemin de fond est renseigné ;
+le format historique exige une indication explicite. Les sorties de contrôles
+portent des métadonnées versionnées de disposition/signature et les chargements
+fond/initialisation/reprise vérifient taille, identité et offsets, y compris
+pour les bases composées. Les fichiers BMaux anciens non signés sont refusés
+avant affectation ; leur migration exige une compatibilité établie.
+LWE : un NetCDF préparé physiquement manquant déclenche désormais la même
+reconstruction depuis les données brutes que des métadonnées natives absentes.
+Validation finale : **71 tests CPU réussis** en 11,04 s, final.exit=0 ;
+compilation de cinq fichiers, unité inactive/success et git diff --check
+réussis. Rapports dans `runs/review_two_fixes_20261110/`. Aucune assimilation relancée.
+
+## Référence LWE MIOST — lecture du 2026-11-10
+
+Les fichiers fournis `default.py` et `lwe.py` décrivent une composante
+d’erreur SLA propre à chaque mission, estimée conjointement aux composantes
+océaniques. Base de fenêtres en temps le long des traces, centres espacés de
+`tdec_lw/facnlt` ; défauts `tdec_lw=0.001` jour et `facnlt=4`.
+Variance diagonale des coefficients `facQ * std_lwe**2`, interpolée depuis
+des cartes auxiliaires aux centres ; extensions transversales polynomiales
+possibles avec `x_ac`.
+Code complet local : `/home/flo/miost/miost_core/miost_core` (branche
+`g_fragmentation`, modifications locales préexistantes, consultation seule).
+Window(None) est cos²(pi*u/2) sur |u|<=1 : tdec_lw est la demi-largeur,
+soit support total 172,8 s par défaut. Le PCG résout les équations normales
+avec prior diagonal Q et bruit diagonal R, préconditionnées par sqrt(Q).
+L’exemple `examples/miost_valid_60_lwe.py` assimile `sla_unfiltered - lwe`
+et compare `-e_MIOST` au champ de correction DUACS : l’erreur additive est
+soustraite aux observations pour les corriger. Les sorties restent séparées
+par composante, sélectionnables via only_components ; aucune exclusion
+automatique générale du LWE des exports grille n’est démontrée.
+Cette lecture fournit la référence du portage ; aucune nouvelle expérience
+scientifique LWE n’a été réalisée.
+
+**Plan d’intégration (étapes 1–5 réalisées et validées, étape 6 restante) :** intégrer un contrôle
+LWE blanchi séparé des contrôles dynamiques, avec résidu
+`(H(x) + L sqrt(Q_lwe) z_lwe - y)/sigma_obs` et prior `||z_lwe||²/2`.
+Première version nadir p=0 ; fenêtres cos² MIOST non renormalisées, cartes
+par mission et convention y=sla_unfiltered−lwe explicitement configurées.
+Préserver temps natifs, identifiants mission/segment et alignement des lignes
+dans obsop et ses caches avant calcul des projections creuses. L’API du coût
+générique utilise un adjoint explicite (inv.py), tandis que l’OSE annuelle
+locale utilise sw_learning_joint_forward et sw_joint_optax avec autodiff :
+les deux chemins nécessitent un raccordement cohérent. Aucun LWE dans les
+états physiques exportés ; correction et résidus sauvegardés séparément.
+Suite proposée : géométrie des observations, opérateur LWE, raccordement des
+coûts, sorties/reprises, tests d’équivalence MIOST et gradients, pilote court
+puis OSE comparative. L’étape 2 est maintenant implémentée et validée après
+confirmation du contrat par l’utilisateur : temps natifs conservés (int64 ns
+Unix sur hôte), mission, identité de ligne, segments globaux par mission et
+alignement aux lignes H et aux caches. Affectation unique aux checkpoints
+par intervalles semi-ouverts, égalité au checkpoint suivant ; temps natif
+distinct de la date du checkpoint. Sous-échantillonnage >1 refusé lorsque
+LWE est actif. Caches LWE distincts/versionnés/signés et reconstruction depuis
+les sources si les métadonnées manquent ou sont obsolètes.
+API préparatoire `Obsop_interp_lwe_l3.prepare_geometry` : H spatial et
+`native_geometry`/`native_geometry_arr` avec `time_ns`, `source_id`, `row_id`,
+`segment_id`, `lwe_eligible`, coordonnées et masque `valid` de padding.
+Segmentation sur tous les lots retenus, séparation strictement >600 s,
+minimum sept temps uniques ; lignes doublées en temps et segments courts
+conservés. Les NetCDF préparés portent temps exacts, IDs et provenance ;
+les segments sont définis lors de la préparation globale de l’opérateur.
+Validation : **59 tests CPU réussis**, dont 21 géométrie, 23 configuration et
+15 de référence ; `runs/lwe_geometry_20261110/pytest.xml`, verify.exit=0.
+L’avertissement binaire NumPy/NetCDF connu persiste sans échec.
+La création standard LWE active reste refusée avant sorties/reprises signées.
+La géométrie, la projection et le prior diagonal sont préparables séparément ;
+l’étape 4 ci-dessus fournit désormais le coût joint via prepare_joint.
+Aucune assimilation relancée ; sorties/reprises et pilote restent aux étapes 5–6.
+
+**Étape 1 corrigée après revue Plannotator le 2026-11-10 :**
+les quatre corrections ont été explicitement validées par l’utilisateur.
+Les paramètres par mission sont dans les blocs `OBS` de type
+`OBS_SSH_NADIR` : `lwe_enabled=False`, `sad_path`, `path_lwe`,
+`name_var_lwe={'lon':'lon','lat':'lat','var':'std_lwe'}`.
+Chaque fichier std est nommé explicitement dans `path_lwe` : relatif au
+`sad_path` propre à la mission s’il est fourni, ou chemin absolu utilisé
+directement. Suppression de `lwe_mission` et de la déduction des noms de cartes.
+Le chemin de la carte commune est toujours fourni explicitement par
+`facQ_file` dans `OBSOP_INTERP_LWE_L3`, avec `name_var_facQ`.
+Les autres paramètres communs sont `tdec_lw=0.001` jour (demi-largeur),
+`facnlt=4`, coupure 600 s, minimum sept points, `p_param=0`.
+Fenêtre cos² non renormalisée et entrée avant correction DUACS fixées ;
+les options `window` et `input_convention` sont supprimées.
+Le bloc séparé `LWE_MIOST` reste supprimé. `exp.py` correspond strictement
+à HEAD, sans ajout LWE ; son merger existant charge les nouveaux champs.
+Validation dans `Obsop_interp_lwe_l3.resolve_config`, uniquement pour les
+sources sélectionnées par `name_obs`, sans mutation des blocs d’entrée.
+L’opérateur exige `name_var['SSH']=['sla_unfiltered','lwe']` et
+`combine_var['SSH']=[1,-1]` à l’activation, sans nouvelle soustraction.
+L’exécution LWE reste explicitement refusée tant que projection LWE et coût
+ne sont pas raccordés ; l’opérateur L3 ordinaire refuse une source
+sélectionnée activant LWE. Aucun noyau dynamique modifié.
+Validation actuelle : **38 tests CPU réussis** (23 de configuration et
+15 de référence), dont fusion avec Exp inchangé, fichiers explicitement
+requis, noms arbitraires, répertoires indépendants et chemins absolus.
+Rapport `runs/lwe_config_review_20261110/pytest.xml`, code de sortie 0.
+Un avertissement de compatibilité binaire NumPy dans un test NetCDF,
+aucun échec ; contenu scientifique des cartes hors périmètre.
+Sources et documentation non committées ; aucune assimilation relancée.
+Étapes 3–6 restent proposées ; l’étape 2 est décrite ci-dessus.
+
+## Relance demandée le 2026-11-10 — observations SLA−LWE
+
+Nouvelle OSE identique à la référence ci-dessous, sauf la variable assimilée :
+`sla_unfiltered - lwe` pour les sept missions ; AL reste exclue. Dossier
+`runs/ose_surface_2024_minus_lwe_cfl01_20261110/`. Le chargeur existant combine
+les deux champs avec `[1, -1]` ; nouveaux caches observations/opérateurs.
+Même initialisation MAP1 et forçages physiques nuls, sans reprise du résultat
+SLA brute. Frontières, vent, bases/prior, paramètres et minimiseur identiques.
+Les empreintes du cœur et des modules locaux correspondent à la provenance
+annuelle précédente ; seules les configurations/orchestrations du nouveau
+run sont écrites. Pilote trois jours puis annuel automatique via nohup sous
+unité `vardyn-ose-surface-2024-minus-lwe-20261110.service`, invocation
+`cbe39318bf824e7f842b744aab16d8ca`, GPU 0. Pilote réussi (66 922 observations, coût 91 500,34 → 65 313,89 en deux
+itérations, états marins finis, épaisseur minimale 238,595 m, g′ inchangé).
+**Statut annuel vérifié le 2026-11-10 : échec de recherche de pas.**
+Unité failed, launch.exit=1 ; 352 itérations, 629 évaluations, optimisation
+3882,47 s (64,7 min). Coût 52 523 984 → 4 854 996,5 (−90,76 %), gradient
+infini 315 860,78. Les dix reprises automatiques après réinitialisation de
+l’historique L-BFGS échouent sans itération acceptée supplémentaire. Aucune
+convergence ; checkpoint et historique conservés, aucun export annuel final,
+validation de trajectoire finale ni diagnostic AL/MIOST de cette variante.
+Audit des observations réussi sur les sept missions (11 523 points pilotes).
+Rapport `PROGRESS.md`, logs et statut `jobs.json` dans le dossier. Prochaine
+étape : diagnostiquer la recherche de pas avant de choisir une reprise.
+Aucune relance ni modification de configuration/source au rapport d’avancement.
+L’utilisateur demande ensuite l’écriture des sorties : rejeu du dernier checkpoint
+accepté (itération 352) sans optimisation, export_checkpoint.py et unité détachée
+vardyn-ose-minus-lwe-export-20261110.service, invocation
+5586c28219b14c0095290aee51dcf5e3. Export achevé et vérifié : export.exit=0, unité inactive/success ; sorties
+annual/daily_reconstruction.nc (367 dates, SLA/U/V), reconstruction.npz et
+physical_parameters.npz. États océaniques finis, épaisseur minimale 97,14745 m,
+g′ fixe vérifié, réouverture NetCDF réussie. Empreintes du checkpoint, historique,
+résultat et provenance inchangées. Non-convergence conservée dans les métadonnées ;
+marqueur séparé annual/export_complete.json, aucun complete.json de convergence.
+Diagnostics du skill **achevés et validés** sur cette trajectoire non convergée :
+`performance_skill_20261110/REPORT.md` et `index.html` ; figures/NetCDF/JSON dans
+`annual/diag_datachallenge_lat15/`, animation dans
+`annual/animations_glorys_miost_vardyn_2024/`. Même protocole 60°W–14°E,
+15°S–15°N, 15 janvier–15 décembre 2024 ; référence AL SLA−LWE.
+580 548 points AL et 38 805 drifters communs, coordonnées/dates/références exactement
+identiques au diagnostic du 9 novembre. RMSE VarDyn/MIOST : SLA 3,172408/3,111595 cm
+(dégradation 1,9544 %) ; u 11,573694/11,190908 cm/s (dégradation 3,4205 %) ;
+v 11,882630/11,118013 cm/s (dégradation 6,8773 %). Résolution médiane appariée
++11,96276 km sur 1603 cases (294 améliorées, 1309 dégradées) ; 1581 cases SLA
+et 144 cases par courant. Scores SLA à 200/300/500 km :
+0,069672/0,474394/0,760963, inférieurs à MIOST.
+Par rapport à l’OSE assimilant SLA brute, même support vérifié : RMSE AL +3,3639 %,
+u −0,8911 %, v +8,5572 % ; comparaison descriptive, variante non convergée.
+Vidéo vérifiée : 366 images à 12 fps, 30,5 s ; mention non-converged visible.
+Validation finale passed (empreintes des entrées/du checkpoint, absence de nouvelle
+optimisation, champs à douze dates, appariement et RMSE, segments/PSD référence,
+ffprobe). Contrôleur corrigé pour les identifiants drifters textuels ; aucun recalcul
+scientifique. Les courants ne couvrent que 15,58 % des candidats ; gains sans test
+de significativité, dépendance aux frontières MIOST conservée. Logs/PID/invocations
+et statuts dans le dossier performance ; sources originales, cœur, checkpoint et
+expérience du 9 novembre préservés.
+
+## Demande en cours — expérience annuelle 2024
+
+L’utilisateur demande une expérience tropicale sur l’année 2024 avec des bases
+SW apprises sur GLORYS, en invoquant la compétence de questionnement
+`grill-me`/`grilling`. Choix confirmés : OSE du 1er janvier au 31 décembre
+2024, AL exclue du coût pour validation, Atlantique 70°W–15°E,
+20°S–20°N à 0,25°. Restent à choisir la calibration et le protocole.
+Les calculs sont lancés (statut détaillé ci-dessous). Artefacts MAP1 présents dans le checkout
+historique pour les cibles surface, moyenne des 30 m sous MLD et MLD + 50 m.
+La cible SSH + courants de surface et la réutilisation des statistiques et
+paramètres de l’apprentissage 2020–2021 sont confirmées. La carte g′ apprise
+sera figée ; H, Hwind et traînée restent ajustables autour du MAP1 avec des
+écarts-types multipliés par 0,5. Viscosité et diffusion de l’épaisseur sont
+fixées chacune à 1 000 m²/s. Transfert des champs et géométrie vérifié par le pilote.
+Le protocole est confirmé : sla_unfiltered sans soustraction LWE supplémentaire,
+AL réservée à la validation, SLA MIOST et courants GLORYS filtrés à 10 jours
+aux frontières, vent ERA5 à 6 h, trajectoire annuelle continue. L’utilisateur
+fixe explicitement CFL=0,1 (message « clf » interprété comme CFL), en remplacement
+du pas historique proposé de 225 s. Optax découplé : plafond de 3000 itérations,
+ftol=5e-5 pendant 10 itérations, gtol désactivé. Préparation et pilote de trois
+jours sur la grille complète dans runs/ose_surface_2024_cfl01_20261109/ validés :
+dt=900 s, 66 922 observations, coût 79 086,64 → 55 745,70 en deux itérations,
+gradients/états marins finis, épaisseur minimale 239,64 m et g′ inchangé.
+L’export NetCDF a nécessité une correction des dimensions des coordonnées 2D
+dans le seul pilote expérimental ; export et réouverture vérifiés ensuite sans
+répéter l’optimisation. L’annuel est lancé par l’unité détachée
+vardyn-ose-surface-2024-cfl01-continue-20261109 (invocation
+2960a8cfa3ae4def87820e60998ed2c6), GPU 0. Log/PID dans annual/run.log et
+annual/run.pid. **Achèvement vérifié le 2026-11-09 :** continue.exit=0,
+complete.json présent et unité inactive sans erreur. OSE annuelle terminée,
+6 862 517 observations, 499 itérations et 826 évaluations ; convergence sur
+variation du coût (ftol 5e-5 pendant 10 itérations), pas sur le gradient.
+Coût 50 783 544 → 3 595 770,5 ; gradient infini final 45 796,55, gtol désactivé.
+Temps d’optimisation 5038,6 s ; temps du pilote annuel complet 5307,8 s.
+SSH/U/V finis en mer, épaisseur minimale 112,84 m, g′ fixe vérifié.
+Sorties annual/daily_reconstruction.nc, reconstruction.npz et
+physical_parameters.npz. Les diagnostics AL/MIOST sont maintenant terminés
+(détails ci-dessous). Aucun code source du modèle ou de learning_local modifié.
+
+**Diagnostics demandés ensuite (2026-11-09) :** comparaison AL/MIOST selon les
+modules locaux de 2026_DC_SSH_mapping_SWOT_OSE, avec deux références explicites,
+sla_unfiltered et sla_unfiltered−lwe. Calcul CPU détaché exécuté dans
+runs/ose_surface_2024_cfl01_20261109/al_miost_datachallenge_20261109/ : mêmes
+points natifs et prédictions pour les deux cibles, MIOST quotidien non filtré,
+statistiques/cartes/séries/régimes, bande 65–200 km et segments spectraux
+1000 km. La référence est harmonisée à l’entrée des fonctions Datachallenge
+pour que statistiques, filtrage et spectres évaluent exactement la même cible
+et ne soustraient pas LWE deux fois. Le diagnostic de variance expliquée
+invoqué est ajouté sur un support intérieur commun hors éponges.
+
+**Résultats vérifiés :** calcul CPU terminé sans erreur (run.exit=0),
+validation.json passed et figures anglaises inspectées. Même support de
+876 285 points AL natifs du 1 janvier au 30 décembre 2024 pour les quatre
+comparaisons ; 2363 points postérieurs au support MIOST et 11221 sans prédiction
+finie commune exclus. RMSE native : VarDyn 2,42434 cm, MIOST 2,48890 cm
+(gain 2,5938 %). RMSE SLA−LWE : 2,96711 contre 3,00227 cm (gain 1,1710 %).
+La résolution spectrale ne s’améliore pas : différence médiane **appariée**
+VarDyn−MIOST +2,622 km (2450 cellules communes) et +3,492 km (2448) ; les
+scores spectraux à 200/300/500 km sont légèrement inférieurs à MIOST.
+Les médianes régionales séparées ne doivent pas être soustraites pour interpréter
+ce changement apparié. Sur 708 516 points hors éponges, les quatre centrages
+de variance expliquée sont disponibles et validés ; les poids locaux sont
+les comptes de points natifs. Reproduction indépendante du MIOST archivé sur
+366 517 points : écart maximal 9,99e-17 m. Rapport, figures PNG/PDF et CSV dans
+le dossier du diagnostic ; références/couverture/hashes documentés. Gains
+descriptifs, sans test de significativité ; les frontières VarDyn utilisent MIOST.
+
+**Restitution précisée par l’utilisateur :** employer aussi les fonctions de
+tracé/tableaux natives des notebooks Datachallenge. Le dossier
+al_miost_datachallenge_20261109/native_datachallenge contient la restitution
+principale pour les deux références AL : comparaison statistique à huit
+panneaux, comparaison de résolution absolue/relative, cartes par méthode,
+séries temporelles et tableaux par régime, spectres PSD/bruit/rapport/score/
+cohérence. Les figures du helper à quatre centrages restent un supplément.
+Les huit NetCDF statistiques/spectraux existants sont réutilisés sans recalcul.
+Fonctions mod_plot.py inchangées ; seules l’emprise, les légendes explicites et
+la compatibilité de mise en page/axes des exports sont adaptées. Rapport
+HTML natif et exports PNG/PDF/CSV dans ce nouveau dossier.
+Les cartes utilisent les valeurs et limites de couleur natives contrôlées ;
+les empreintes des huit NetCDF et de mod_plot.py sont conservées dans
+native_datachallenge/validation.json. Les exports corrigent uniquement la
+compatibilité Cartopy/HoloViews (labels, aspect, axes logarithmiques).
+
+## Diagnostics du skill OSE tropical — achevés le 2026-11-10
+
+Cible confirmée : OSE achevée du 9 novembre, `runs/ose_surface_2024_cfl01_20261109/annual`.
+Copies des trois scripts adaptées avec autorisation dans `performance_skill_20261110/` :
+SLA physique du NetCDF validé, centrage des vitesses C-grid, textes anglais et marges
+corrigées ; originaux, modules DataChallenge et cœur inchangés.
+Comparaison 60°W–14°E, 15°S–15°N, 15 janvier–15 décembre 2024 : **580 548 points AL**
+communs, référence SLA−LWE ; **38 805 échantillons drifters** communs sur 249 112
+candidats (15,58 %, restriction à prendre en compte). RMSE SLA VarDyn/MIOST :
+3,06916/3,11159 cm (gain 1,3636 %) ; u : 11,67776/11,19091 cm/s (dégradation 4,3504 %) ;
+v : 10,94596/11,11801 cm/s (gain 1,5475 %). Résolution médiane **appariée** dégradée
+de +2,93209 km sur 1603 cases (657 améliorées, 946 dégradées) ; 1581 cases SLA RMSE
+et 144 cases pour chaque courant, minimum 30 observations/segments. Scores SLA
+à 200/300/500 km : VarDyn 0,07566/0,49775/0,78381 ; MIOST 0,07245/0,50587/0,79931.
+Les médianes régionales séparées de résolution ne mesurent pas ce changement apparié.
+Animation GLORYS/MIOST/VarDyn achevée : 366 images à 12 fps, 30,5 s vérifiés par ffprobe,
+60°W–12°E et 15°S–15°N. Aperçu, cartes et spectres inspectés, textes anglais.
+Rapport et galerie : `performance_skill_20261110/REPORT.md` et `index.html` ;
+JSON/NetCDF/figures dans `annual/diag_datachallenge_lat15/`, MP4/aperçu/manifest
+sous `annual/animations_glorys_miost_vardyn_2024/`. Validation finale passed :
+empreintes, champs sur douze dates, appariement, RMSE indépendantes, segments/PSD
+référence identiques et propriétés vidéo. Logs/PID/invocations/exit dans le dossier
+performance. Une erreur de chemin relatif du premier contrôleur est corrigée,
+sans recalcul scientifique. Unités diagnostics/vidéo/finition terminées avec succès.
+Gains descriptifs sans test de significativité ; MIOST contribue aux frontières,
+convergence de l’OSE sur coût uniquement. Diagnostics du domaine complet préservés.
 
 ## Objectif scientifique
 
@@ -24,7 +476,7 @@ Ajouter également l'advection de traceurs de température de surface (SST) et d
 
 ## État actuel
 
-**Suivi de revue du 2026-11-09 :** à la demande de l’utilisateur, seul le point 2 (traceurs sans données extérieures aux frontières ouvertes) est corrigé. L’interface conserve l’absence de donnée par traceur dans les tableaux de frontières ; le cœur extrapole alors la concentration intérieure à chaque étape et désactive la relaxation correspondante. Une concentration extérieure explicitement nulle reste imposée. Validation ciblée terminée : **28 tests CPU réussis**, dont 16 cas nouveaux (frontières x/y, données absentes ou partiellement présentes, zéro explicite, éponge, JIT et gradients), plus les régressions SW existantes. Rapports dans `runs/fix_missing_tracer_bc_20261109/`. Le point 1, concernant le passage automatique au format BMaux historique lors du chargement d’un fond, reste en suspens et son code est inchangé.
+**Suivi de revue du 2026-11-09 :** à la demande de l’utilisateur, seul le point 2 (traceurs sans données extérieures aux frontières ouvertes) est corrigé. L’interface conserve l’absence de donnée par traceur dans les tableaux de frontières ; le cœur extrapole alors la concentration intérieure à chaque étape et désactive la relaxation correspondante. Une concentration extérieure explicitement nulle reste imposée. Validation ciblée terminée : **28 tests CPU réussis**, dont 16 cas nouveaux (frontières x/y, données absentes ou partiellement présentes, zéro explicite, éponge, JIT et gradients), plus les régressions SW existantes. Rapports dans `runs/fix_missing_tracer_bc_20261109/`. Le point 1 BMaux a depuis été corrigé le 2026-11-10 : aucun basculement historique par simple chemin, chargement soumis aux métadonnées de disposition/signature (voir correction ci-dessous).
 
 Le projet est un worktree Git dans `/home/flo/Workspace/VarDyn_Tropics`. La branche active est désormais **`VarDyn_Tropics`**, à la demande de fusion du 2026-11-09. La fusion de **`Dev-SW`** est validée sans conflit : 81 tests CPU de la suite complète et 2 tests supplémentaires du pilote Optax réussis. Les corrections locales SW précédentes ont été enregistrées sur `Dev-SW` au commit `66c8aded` pour les préserver avant fusion. Les correctifs propres à Tropics, notamment L4 vide, sont conservés. Le dépôt principal `/home/flo/VarDyn` reste indépendant dans ses fichiers de travail.
 
@@ -138,6 +590,10 @@ actuel après rebase. Aucun nouveau test scientifique n'a été lancé après re
 - Formulation de la couche de mélange et traitement des traceurs SST et SSS lors des évolutions futures.
 
 ## Organisation documentaire
+
+Deux skills locaux copiés à l’identique depuis `/home/flo/VarDyn/.agents/skills/`
+le 2026-11-10 sont disponibles dans `.agents/skills/` :
+`vardyn-perf-ose-tropics` et `vardyn-progress-report` (script de rapport inclus).
 
 - Règle de présentation : tous les textes des figures sont en anglais (titres, axes, légendes, barres de couleurs, annotations et captions), conformément à `AGENTS.md`. Les scripts et figures de l'analyse spectrale ont été traduits en ce sens.
 

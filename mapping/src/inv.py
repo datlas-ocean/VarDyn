@@ -942,29 +942,36 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         R = Cov(config.INV.sigma_R)
     
     # Read Background vector 
+    from .basis import _Basis_bmaux
     if config.INV.path_background is not None: 
         # Read previous minimum 
         print('Read background basis:',config.INV.path_background)
         with xr.open_dataset(config.INV.path_background) as ds:
+            if 'lwe_control_layout' in ds.attrs:
+                raise ValueError('Use a joint LWE analysis as path_init_4Dvar, not as an ocean background')
+            _Basis_bmaux.validate_control_file(ds, Basis, ds.res.values)
             Xb[:len(ds.res.values)] = ds.res.values
 
     # Variational object initialization
     var = Variational(
         config=config, M=Model, H=Obsop, State=State, B=B, R=R, Basis=Basis, Xb=Xb, checkpoints=checkpoints, freq_it_plot=config.INV.freq_it_plot, print_time=config.INV.print_time)
     
+    # Hash large observation arrays once; optimization never changes their layout.
+    minimizer_file_attributes = var.control_file_attributes('minimizer')
+    analysis_file_attributes = var.control_file_attributes('analysis')
+
     # Initial Control vector
     initial_control_loaded = False
     if config.INV.path_init_4Dvar is None:
-        Xopt = np.zeros((Xb.size,))
+        Xopt = np.zeros((var.control_size,))
     elif not os.path.exists(config.INV.path_init_4Dvar):
         print(f"File {config.INV.path_init_4Dvar} does not exist. We take the default initialization.")
-        Xopt = np.zeros((Xb.size,))
+        Xopt = np.zeros((var.control_size,))
     else:
         # Read previous minimum 
         print('Read previous minimum:',config.INV.path_init_4Dvar)
         with xr.open_dataset(config.INV.path_init_4Dvar) as ds:
-            Xopt = _analysis_to_minimizer_control(
-                ds.res.values, var.Xb, B, config.INV.prec)
+            Xopt = var.load_control(ds, 'analysis')
         initial_control_loaded = True
     
     # Path where to save the control vector at each 4Dvar iteration 
@@ -990,7 +997,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
                 else:
                     raise
             try:
-                Xopt = ds.res.values
+                Xopt = var.load_control(ds, 'minimizer')
                 maxiter = max(config.INV.maxiter - len(tmp_files), 0)
                 initial_control_loaded = True
             finally:
@@ -1005,8 +1012,7 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             if os.path.exists(analysis_restart):
                 print('Restart at:', analysis_restart)
                 with xr.open_dataset(analysis_restart) as ds:
-                    Xopt = _analysis_to_minimizer_control(
-                        ds.res.values, var.Xb, B, config.INV.prec)
+                    Xopt = var.load_control(ds, 'analysis')
                 initial_control_loaded = True
 
     # The historical SciPy adapter owns a host vector. The Optax adapter
@@ -1078,11 +1084,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
             if config.INV.save_minimization:
                 control_host = np.asarray(jax.device_get(control))
                 dataset = xr.Dataset({'res': (('x',), control_host)})
-                dataset.to_netcdf(os.path.join(
-                    path_save_control_vectors,
-                    'X_it.nc',
-                ))
-                dataset.close()
+                dataset.attrs.update(minimizer_file_attributes)
+                var.lwe.write_dataset(dataset, os.path.join(path_save_control_vectors, 'X_it.nc'))
 
         patience = getattr(config.INV, 'convergence_nit', None)
         if patience is None:
@@ -1199,8 +1202,8 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         def callback(XX):
             if config.INV.save_minimization:
                 ds = xr.Dataset({'res':(('x',),XX)})
-                ds.to_netcdf(os.path.join(path_save_control_vectors,'X_it.nc'))
-                ds.close()
+                ds.attrs.update(minimizer_file_attributes)
+                var.lwe.write_dataset(ds, os.path.join(path_save_control_vectors, 'X_it.nc'))
                 
         # Minimization options
         options = {}
@@ -1230,7 +1233,6 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
         
         # Run minimization 
         from decimal import Decimal
-        import time
         class Wrapper:
             def __init__(self):
                 J0, G0 = fun(Xopt)
@@ -1354,20 +1356,18 @@ def Inv_4Dvar(config=None,State=None,Model=None,dict_obs=None,Obsop=None,Basis=N
     ########################
     print('\n*** Saving trajectory ***\n')
     
-    with var.cost_precision():
-        if config.INV.prec:
-            Xa = var.Xb + B.sqrt(Xres)
-        else:
-            Xa = var.Xb + Xres
+    Xa = var.analysis_control(Xres)
     Xa_model = jnp.asarray(
-        Xa,
+        Xa[:var.ocean_size],
         dtype=jnp.float64 if USE_FLOAT64 else jnp.float32,
     )
         
     # Save minimum for next experiments
     ds = xr.Dataset({'res':(('x',), np.asarray(jax.device_get(Xa)))})
-    ds.to_netcdf(os.path.join(path_save_control_vectors, 'Xres.nc'))
-    ds.close()
+    ds.attrs.update(analysis_file_attributes)
+    var.lwe.write_dataset(ds, os.path.join(path_save_control_vectors, 'Xres.nc'))
+    if var.lwe.operators:
+        var.export_lwe(Xres, os.path.join(path_save_control_vectors, 'lwe_diagnostics.nc'))
 
     # Init.  Apply the converged control at t=0 before writing the first
     # trajectory file.  Without this, the initial output contains the restart
@@ -1487,6 +1487,11 @@ class Variational:
         # Background state
         with self.cost_precision():
             self.Xb = jnp.asarray(Xb, dtype=self.cost_dtype)
+
+        from .obsop import LweControl
+        self.lwe = LweControl(H)
+        self.ocean_size = self.Xb.size
+        self.control_size = self.ocean_size + self.lwe.size
         
         # Temporary path where to save model trajectories
         self.tmp_DA_path = config.EXP.tmp_DA_path
@@ -1509,7 +1514,7 @@ class Variational:
             self.G = []
         
         # For incremental 4Dvar only
-        self.X0 = self.Xb*0
+        self.X0 = jnp.zeros(self.control_size, dtype=self.cost_dtype)
 
         self.freq_it_plot = freq_it_plot
         self.it_plot = 0
@@ -1560,10 +1565,9 @@ class Variational:
         if config.INV.compute_test:
             print('Gradient test:')
             np.random.seed(0)
-            if self.prec:
-                X = (np.random.random(self.basis.nbasis)-0.5)
-            else:
-                X = self.B.sqrt(np.random.random(self.basis.nbasis)-0.5) + self.Xb
+            X = jnp.asarray(np.random.random(self.control_size)-0.5)
+            if not self.prec and self.B is not None:
+                X = X.at[:self.ocean_size].set(self.B.sqrt(X[:self.ocean_size]))
             
             def cost(X):
                 return self.cost_and_grad(X)[0]
@@ -1628,7 +1632,93 @@ class Variational:
             f'{scan_times.size} uniform intervals, nstep={self._scan_nstep}, '
             'unroll=1'
         )
+
+    def control_file_attributes(self, coordinates):
+        from .basis import _Basis_bmaux
+        from .obs import _lwe_signature
+        import hashlib
+        attrs = _Basis_bmaux.control_file_attributes(self.basis)
+        attrs.update(self.lwe.control_file_attributes(self.ocean_size, coordinates))
+        if self.lwe.operators:
+            # Preserve exact arrays rather than NumPy's truncated string repr.
+            def describe(value):
+                if value is None or isinstance(value, (str, bool, int, float)):
+                    return value
+                if isinstance(value, (list, tuple)):
+                    return [describe(item) for item in value]
+                if isinstance(value, dict):
+                    return {key: describe(item) for key, item in value.items()}
+                if not hasattr(value, 'dtype') and hasattr(value, '__dict__'):
+                    return dict(kind=type(value).__name__, fields={
+                        key: describe(item) for key, item in vars(value).items()})
+                array = np.asarray(value)
+                return dict(shape=array.shape, dtype=array.dtype.str,
+                            digest=hashlib.sha256(array.tobytes()).hexdigest())
+            attrs['lwe_ocean_signature'] = _lwe_signature(dict(
+                background=describe(self.Xb), covariance=describe(self.B),
+                residual_covariance=describe(self.R),
+                checkpoints=np.asarray(self.checkpoints).tolist(),
+                basis_layout=attrs.get('bmaux_control_layouts')))
+            if coordinates == 'minimizer':
+                attrs['ocean_preconditioned'] = int(self.prec)
+        return attrs
+
+    def _ocean_control(self, control):
+        """Ocean coordinates shared by the cost, analysis and diagnostic replay."""
+        if self.B is None:
+            return control - self.Xb
+        return self.Xb + (self.B.sqrt(control) if self.prec else control)
+
+    def analysis_control(self, control):
+        """Xres coordinates: ocean analysis followed by unchanged whitened LWE."""
+        if np.shape(control) != (self.control_size,):
+            raise ValueError('Incompatible joint control shape')
+        with self.cost_precision():
+            control = jnp.asarray(control, dtype=self.cost_dtype)
+            ocean = self._ocean_control(control[:self.ocean_size])
+            return jnp.concatenate((ocean, control[self.ocean_size:]))
+
+    def load_control(self, dataset, coordinates):
+        from .basis import _Basis_bmaux
+        values = np.asarray(dataset.res.values)
+        if values.ndim != 1 or values.size > self.control_size:
+            raise ValueError('Saved control size is incompatible with the current basis')
+        self.lwe.validate_control_file(dataset.attrs, values, self.ocean_size, coordinates)
+        if self.lwe.operators:
+            expected = self.control_file_attributes(coordinates)
+            for key in ('lwe_ocean_signature', 'ocean_preconditioned'):
+                if key in expected and dataset.attrs.get(key) != expected[key]:
+                    raise ValueError('Incompatible LWE ocean prior or minimizer coordinates')
+        ocean = values[:self.ocean_size]
+        _Basis_bmaux.validate_control_file(dataset, self.basis, ocean)
+        if coordinates == 'analysis':
+            if self.B is None:
+                ocean = ocean + np.asarray(self.Xb)
+            else:
+                ocean = _analysis_to_minimizer_control(ocean, self.Xb, self.B, self.prec)
+        return np.concatenate((ocean, values[self.ocean_size:]))
+
+    def export_lwe(self, control, path):
+        """Replay the cost's checkpoint schedule for native observation diagnostics."""
+        analysis = self.analysis_control(control)
+        ocean = jnp.asarray(analysis[:self.ocean_size], dtype=self.model_control_dtype)
+        state = self.State.copy()
+        residuals = {id(op): {} for op in self.lwe.operators}
+        for i, checkpoint in enumerate(self.checkpoints):
+            t = self.M.T[checkpoint]
+            for op in self.lwe.operators:
+                if op.is_obs_time(t):
+                    residuals[id(op)][t] = np.asarray(op.scan_misfit(t, state.var))
+            if i + 1 < len(self.checkpoints):
+                if checkpoint % self.dtbasis == 0:
+                    self.basis.operg(t/86400., ocean, State=state.params)
+                self.M.step(t=t, State=state, nstep=self.checkpoints[i+1] - checkpoint)
+        self.lwe.write_dataset(self.lwe.diagnostics(
+            np.asarray(control)[self.ocean_size:], residuals, self.ocean_size), path)
+
     def cost(self,X0):
+        if self.lwe.operators:
+            return self.cost_only(X0)
                 
         # Initial state
         State = self.State.copy()
@@ -1714,6 +1804,8 @@ class Variational:
         return J
     
     def grad(self,X0): 
+        if self.lwe.operators:
+            return self.cost_and_grad(X0)[1]
                 
         X = +X0 
         
@@ -1781,6 +1873,8 @@ class Variational:
 
     def cost_and_grad(self, X0):
         """Evaluate through either the compiled or legacy adapter."""
+        if jnp.shape(X0) != (self.control_size,):
+            raise ValueError(f'Control must have shape {(self.control_size,)}')
         if self._compiled_cost_and_grad is not None:
             X0 = jnp.asarray(X0, dtype=self.cost_dtype)
             if self.cost_and_grad_schedule == 'scan':
@@ -1795,6 +1889,8 @@ class Variational:
 
     def cost_only(self, X0):
         """Evaluate the compiled forward cost without retaining the adjoint."""
+        if jnp.shape(X0) != (self.control_size,):
+            raise ValueError(f'Control must have shape {(self.control_size,)}')
         if self._compiled_cost_only is None:
             return self.cost_and_grad(X0)[0]
         X0 = jnp.asarray(X0, dtype=self.cost_dtype)
@@ -1820,18 +1916,21 @@ class Variational:
         """
         with self.cost_precision():
             X0 = jnp.asarray(X0, dtype=self.cost_dtype)
+            z_lwe = X0[self.ocean_size:]
+            X0 = X0[:self.ocean_size]
+            projected_lwe = self.lwe.project(z_lwe)
+            X = self._ocean_control(X0)
             if self.B is not None:
                 if self.prec:
-                    X = self.B.sqrt(X0) + self.Xb
                     Jb = jnp.vdot(X0, X0)
                 else:
-                    X = X0 + self.Xb
                     Jb = jnp.vdot(X0, self.B.inv(X0))
             else:
-                X = X0 - self.Xb
                 Jb = jnp.asarray(0., dtype=self.cost_dtype)
             Jo0 = jnp.asarray(0., dtype=self.cost_dtype)
 
+        with self.cost_precision():
+            Jb = Jb + jnp.vdot(z_lwe, z_lwe)
         X_model = jnp.asarray(X, dtype=self.model_control_dtype)
         initial_state = self.State.copy()
         initial_var = dict(initial_state.var)
@@ -1848,6 +1947,8 @@ class Variational:
             state = self._state_from_scan_trees(state_var, state_params)
 
             misfit = self.H.scan_misfit(t, state.var)
+            if self.lwe.operators:
+                misfit = misfit + self.lwe.correction(t, projected_lwe)
             with self.cost_precision():
                 weighted = jnp.asarray(misfit, dtype=self.cost_dtype)
                 Jo = Jo + jnp.vdot(
@@ -1902,6 +2003,8 @@ class Variational:
 
         final_time = self._scan_final_time
         final_misfit = self.H.scan_misfit(final_time, final_var)
+        if self.lwe.operators:
+            final_misfit = final_misfit + self.lwe.correction(final_time, projected_lwe)
         with self.cost_precision():
             final_weighted = jnp.asarray(
                 final_misfit,
@@ -1929,10 +2032,11 @@ class Variational:
             final_time,
             dict(adjoint_state.var),
             final_var,
-            final_misfit,
+            self.R.inv(final_misfit),
         )
         adjoint_params = dict(adjoint_state.params)
         adX0 = jnp.zeros_like(X_model)
+        ad_lwe = self.lwe.adjoint(final_time, self.R.inv(final_misfit)) if self.lwe.operators else z_lwe
 
         def transpose_basis(t, operands):
             ad_params, ad_control = operands
@@ -1944,7 +2048,7 @@ class Variational:
             return projected_params, ad_control + increment
 
         def backward_body(carry, inputs):
-            ad_var, ad_params, ad_control = carry
+            ad_var, ad_params, ad_control, ad_lwe = carry
             t, basis_active, boundary, state_var, state_params, misfit = inputs
             state = self._state_from_scan_trees(state_var, state_params)
             adjoint = self._state_from_scan_trees(ad_var, ad_params)
@@ -1996,9 +2100,11 @@ class Variational:
                 t,
                 dict(adjoint.var),
                 state.var,
-                misfit,
+                self.R.inv(misfit),
             )
-            return (ad_var, ad_params, ad_control), None
+            if self.lwe.operators:
+                ad_lwe = ad_lwe + self.lwe.adjoint(t, self.R.inv(misfit))
+            return (ad_var, ad_params, ad_control, ad_lwe), None
 
         reverse_inputs = (
             self._scan_times,
@@ -2008,9 +2114,9 @@ class Variational:
             trajectory_params,
             trajectory_misfit,
         )
-        (adjoint_var, adjoint_params, adX), _ = lax.scan(
+        (adjoint_var, adjoint_params, adX, ad_lwe), _ = lax.scan(
             backward_body,
-            (adjoint_var, adjoint_params, adX0),
+            (adjoint_var, adjoint_params, adX0, ad_lwe),
             reverse_inputs,
             reverse=True,
             unroll=1,
@@ -2018,9 +2124,10 @@ class Variational:
 
         with self.cost_precision():
             adX = jnp.asarray(adX, dtype=self.cost_dtype)
-            if self.prec:
+            if self.prec and self.B is not None:
                 adX = self.B.sqrt_transpose(adX)
-            G = jnp.asarray(adX + gb, dtype=self.cost_dtype)
+            G = jnp.concatenate((jnp.asarray(adX + gb, dtype=self.cost_dtype),
+                                 jnp.asarray(ad_lwe + z_lwe, dtype=self.cost_dtype)))
 
         return J, G
 
@@ -2032,22 +2139,25 @@ class Variational:
 
         with self.cost_precision():
             X0 = jnp.asarray(X0, dtype=self.cost_dtype)
+            z_lwe = X0[self.ocean_size:]
+            X0 = X0[:self.ocean_size]
+            projected_lwe = self.lwe.project(z_lwe)
 
         # Initial state
         State = self.State.copy()
 
         # Background cost function
         with self.cost_precision():
+            X = self._ocean_control(X0)
             if self.B is not None:
                 if self.prec :
-                    X  = self.B.sqrt(X0) + self.Xb
                     Jb = jnp.vdot(X0, X0) # cost of background term
                 else:
-                    X  = X0 + self.Xb
                     Jb = jnp.vdot(X0,self.B.inv(X0)) # cost of background term
             else:
-                X  = X0 - self.Xb
                 Jb = jnp.asarray(0., dtype=self.cost_dtype)
+        with self.cost_precision():
+            Jb = Jb + jnp.vdot(z_lwe, z_lwe)
         X_model = jnp.asarray(X, dtype=self.model_control_dtype)
         
         cost_misfit = []
@@ -2072,7 +2182,9 @@ class Variational:
             if self.H.is_obs_time(t):
                 if self.print_time:
                     time0 = time.time()
-                misfit = self.H.misfit(t,State) # d=Hx-xobs   
+                misfit = self.H.misfit(t,State)
+                if self.lwe.operators:
+                    misfit = misfit + self.lwe.correction(t, projected_lwe, scan=False)
                 if self.print_time:
                     _block_until_ready(misfit)
                 misfit_dict[t] = misfit
@@ -2110,10 +2222,12 @@ class Variational:
                     State.plot(title='State variables at the middle of cost function evaluation', name_save=f'state_cost_it{self.it_plot}')
                     State.plot(title='State params at the middle of cost function evaluation', params=True, name_save=f'state_params_cost_it{self.it_plot}')
 
-        t = self.M.T[-1]
+        t = self.M.T[self.checkpoints[-1]]
         State_dict[t] = State.copy()
         if self.H.is_obs_time(t):
-            misfit = self.H.misfit(t,State) # d=Hx-xobsx
+            misfit = self.H.misfit(t,State)
+            if self.lwe.operators:
+                misfit = misfit + self.lwe.correction(t, projected_lwe, scan=False)
             if self.print_time:
                 _block_until_ready(misfit)
             misfit_dict[t] = misfit
@@ -2145,11 +2259,14 @@ class Variational:
         # Ajoint initialization   
         adState = self.State.copy(free=True)
         adX = jnp.zeros_like(X_model)
+        ad_lwe = jnp.zeros_like(z_lwe)
 
         # Last timestamp
         t = self.M.T[self.checkpoints[-1]]
         if self.H.is_obs_time(t):
-            self.H.adj(t, adState, State_dict[t], misfit_dict[t])
+            self.H.adj(t, adState, State_dict[t], self.R.inv(misfit_dict[t]))
+            if self.lwe.operators:
+                ad_lwe = ad_lwe + self.lwe.adjoint(t, self.R.inv(misfit_dict[t]), scan=False)
             if self.print_time:
                 _block_until_ready((adState.var, adState.params))
     
@@ -2187,7 +2304,9 @@ class Variational:
             if self.H.is_obs_time(t):
                 if self.print_time:
                     time0 = time.time()
-                self.H.adj(t,adState,State_dict[t],misfit_dict[t])
+                self.H.adj(t,adState,State_dict[t],self.R.inv(misfit_dict[t]))
+                if self.lwe.operators:
+                    ad_lwe = ad_lwe + self.lwe.adjoint(t, self.R.inv(misfit_dict[t]), scan=False)
                 if self.print_time:
                     _block_until_ready((adState.var, adState.params))
                     grad_misfit.append(time.time()-time0)
@@ -2220,10 +2339,11 @@ class Variational:
 
         with self.cost_precision():
             adX = jnp.asarray(adX, dtype=self.cost_dtype)
-            if self.prec :
+            if self.prec and self.B is not None:
                 adX = self.B.sqrt_transpose(adX)
 
-            G = jnp.asarray(adX + gb, dtype=self.cost_dtype)
+            G = jnp.concatenate((jnp.asarray(adX + gb, dtype=self.cost_dtype),
+                                 jnp.asarray(ad_lwe + z_lwe, dtype=self.cost_dtype)))
 
         return J, G  
    

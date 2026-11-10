@@ -2844,12 +2844,113 @@ class _Basis_bmaux:
         return ff
 
     @staticmethod
+    def _read_control_layouts(dataset):
+        encoded = dataset.attrs.get('bmaux_control_layouts')
+        if encoded is None:
+            return None
+        try:
+            metadata = json.loads(encoded)
+            if metadata['version'] != 1 or not isinstance(metadata['components'], list):
+                raise ValueError
+            return metadata
+        except (ValueError, TypeError, KeyError) as error:
+            raise ValueError('Invalid BMaux control layout metadata') from error
+
+    @staticmethod
     def _bmaux_uses_legacy_background_layout(config):
-        """Whether BMaux must match controls written before the sparse refactor."""
-        inv_background = getattr(
-            getattr(config, 'INV', None), 'path_background', None)
-        basis_background = getattr(config.BASIS, 'path_background', None)
-        return inv_background is not None or basis_background is not None
+        """Only an explicitly labelled background can select historical geometry."""
+        inv = getattr(config, 'INV', None)
+        paths = [getattr(inv, 'path_background', None),
+                 getattr(inv, 'path_init_4Dvar', None), config.BASIS.path_background]
+        modes = set()
+        target = _as_name_list(config.BASIS.name_mod_var)
+        for path in paths:
+            if path is None or not os.path.exists(path):
+                continue
+            with xr.open_dataset(path) as dataset:
+                metadata = _Basis_bmaux._read_control_layouts(dataset)
+                if metadata is not None:
+                    modes.update(item['layout'] for item in metadata['components']
+                                 if item['target'] == target)
+                elif 'bmaux_layout' in dataset.attrs:
+                    # Explicit marker for inspecting/migrating historical files.
+                    # Loading still requires full layout metadata below.
+                    modes.add(dataset.attrs['bmaux_layout'])
+        if not modes <= {'bounded-v1', 'legacy-v1'} or len(modes) > 1:
+            raise ValueError('Conflicting or unknown BMaux background layouts')
+        return modes == {'legacy-v1'}
+
+    @staticmethod
+    def _control_layout_components(basis, offset=0):
+        children = getattr(basis, 'Basis', None)
+        if children is not None:
+            result = []
+            for child in children:
+                result.extend(_Basis_bmaux._control_layout_components(child, offset))
+                offset += child.nbasis
+            return result
+        if not isinstance(basis, _Basis_bmaux):
+            return []
+        return [dict(start=offset, stop=offset + basis.nbasis,
+                     target=_as_name_list(basis.name_mod_var),
+                     layout='legacy-v1' if basis.legacy_background_layout else 'bounded-v1',
+                     signature=basis.bmaux_control_signature)]
+
+    @staticmethod
+    def control_file_attributes(basis):
+        components = _Basis_bmaux._control_layout_components(basis)
+        if not components:
+            return {}
+        return {'bmaux_control_layouts': json.dumps(dict(
+            version=1, size=basis.nbasis, components=components), sort_keys=True)}
+
+    @staticmethod
+    def validate_control_file(dataset, basis, values):
+        expected = _Basis_bmaux._control_layout_components(basis)
+        if not expected:
+            return
+        metadata = _Basis_bmaux._read_control_layouts(dataset)
+        if metadata is None:
+            raise ValueError('BMaux background/restart lacks control layout metadata; '
+                             'compatibility cannot be verified')
+        if (np.asarray(values).ndim != 1 or np.size(values) != basis.nbasis
+                or metadata.get('size') != basis.nbasis
+                or metadata['components'] != expected):
+            raise ValueError('BMaux background/restart control layout is incompatible with the current basis')
+
+    def _set_control_signature(self):
+        """Hash the ordered physical/temporal functions represented by controls."""
+        digest = hashlib.sha256(b'bmaux-control-v1')
+        for name in ('lon1d', 'lat1d', 'mask1d', 'depth', 'ff', 'DX', 'theta',
+                     'ENSLON', 'ENSLAT', 'enst', 'tdec', 'norm_fact'):
+            values = getattr(self, name)
+            digest.update(name.encode())
+            for value in values if isinstance(values, list) else [values]:
+                array = np.asarray(value)
+                digest.update(str((array.shape, array.dtype.str)).encode())
+                # None must not hash object pointers, which change every process.
+                digest.update(b'None' if value is None else np.ascontiguousarray(array).tobytes())
+        digest.update(str((self.delta_time_ref, self.npsp, self.flux, self.norm_time,
+                           self.c_grid_var, self.legacy_background_layout,
+                           getattr(self, 'depth1', None), getattr(self, 'depth2', None))).encode())
+        self.bmaux_control_signature = digest.hexdigest()
+
+    def _read_component_background(self, dataset):
+        values = np.asarray(dataset[self.var_background].values)
+        metadata = self._read_control_layouts(dataset)
+        if metadata is None:
+            raise ValueError('BMaux background lacks control layout metadata; compatibility cannot be verified')
+        expected = self._control_layout_components(self)[0]
+        matching = [entry for entry in metadata['components']
+                    if all(entry.get(key) == expected[key] for key in ('target', 'layout', 'signature'))]
+        if (values.ndim != 1 or metadata.get('size') != values.size or len(matching) != 1):
+            raise ValueError('BMaux background control layout is incompatible with the current basis')
+        entry = matching[0]
+        start, stop = entry['start'], entry['stop']
+        if start < 0 or stop > values.size or stop - start != self.nbasis:
+            raise ValueError('BMaux background control size is incompatible with the current basis')
+        return values[start:stop].copy()
+
 
 
     def __init__(self,config,State,multi_mode=False):
@@ -3319,16 +3420,6 @@ class _Basis_bmaux:
         self.iff_wavebounds[-1] = iwave
 
         Xb = np.zeros_like(Q)
-        # Background
-        if self.path_background is not None and os.path.exists(self.path_background):
-            with xr.open_dataset(self.path_background) as ds:
-                print('bmaux np.shape(Xb)',np.shape(Xb))
-                print('bmaux np.shape(ds[self.var_background].values)',np.shape(ds[self.var_background].values))
-                print(f'Load background from file: {self.path_background}') 
-                Xb = ds[self.var_background].values[-len(Xb):] 
-
-            
-
         self.DX=DX_eff
         self.ENSLON=ENSLON_eff
         self.ENSLAT=ENSLAT_eff
@@ -3348,6 +3439,10 @@ class _Basis_bmaux:
         self.Gx, self.Nx = self._compute_component_space() # in space
         print('Computing Time components')
         self.Gt, self.Nt = self._compute_component_time(time) # in time
+        self._set_control_signature()
+        if self.path_background is not None:
+            with xr.open_dataset(self.path_background) as dataset:
+                Xb = self._read_component_background(dataset)
         
         print(f'reduced order: {time.size * self.nphys} --> {self.nbasis}\n reduced factor: {int(time.size * self.nphys/self.nbasis)}')
             

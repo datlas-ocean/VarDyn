@@ -737,6 +737,11 @@ OBS_L4 = dict(
 # Nadir altimetry
 OBS_SSH_NADIR = dict(
 
+    lwe_enabled = False, # Estimate mission-specific along-track error
+    sad_path = None, # Mission auxiliary directory for a relative path_lwe
+    path_lwe = None, # Explicit std map filename or absolute path
+    name_var_lwe = {'lon': 'lon', 'lat': 'lat', 'var': 'std_lwe'},
+
     path = '', # path of observation netcdf file(s)
 
     name_time = '', # name of time coordinate
@@ -831,6 +836,19 @@ OBSOP_INTERP_L3 = dict(
 
     mask_borders = False,
 
+)
+
+# Common MIOST LWE settings; mission-specific settings belong to OBS_SSH_NADIR.
+# Configuration contract only: projection and joint inversion are not wired yet.
+OBSOP_INTERP_LWE_L3 = dict(
+    OBSOP_INTERP_L3,
+    tdec_lw=0.001, # days; cos² window HALF-width (86.4 s)
+    facnlt=4.0, # centre spacing = tdec_lw / facnlt (21.6 s)
+    gap_seconds=600.0,
+    min_segment_size=7,
+    p_param=0, # nadir constant across-track term
+    facQ_file=None, # Explicit path to the common facQ map
+    name_var_facQ={'lon': 'lon', 'lat': 'lat', 'var': 'facQ'},
 )
 
 OBSOP_INTERP_L4 = dict(
