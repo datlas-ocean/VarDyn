@@ -31,8 +31,12 @@ more specific instructions.
   constraints, or next steps change. Keep the chronological history in the
   journal and distinguish verified results from assumptions.
 - Before finishing a significant step, check that the journal reflects the
-  completed work and the context remains accurate. Keep these documents
-  versionable with the project; follow the user's instructions for commits.
+  completed work and the context remains accurate.
+- `CONTEXT.md` et `JOURNAL.md` restent locaux à chaque projet/worktree et sont
+  exclus du suivi Git via `.gitignore`. Conserver leurs copies locales lors
+  du retrait du suivi ; ne pas les committer ni les publier sur GitHub.
+- Si ces fichiers sont absents dans un nouveau checkout, les initialiser
+  localement avant de poursuivre la lecture et la mise à jour du contexte.
 
 ## Running experiments
 

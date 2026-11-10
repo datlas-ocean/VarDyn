@@ -3,3 +3,7 @@
 /learning_local/
 /scripts/
 /tests/
+
+# Project context and journal stay local to each checkout.
+/CONTEXT.md
+/JOURNAL.md
