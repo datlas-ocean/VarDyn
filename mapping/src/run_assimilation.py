@@ -2074,8 +2074,6 @@ def merge_time_windows_outputs(
         # blended vectorially.
         window_datasets = []
         combined = None
-        temporary_path = None
-        backup_path = None
         try:
             for middle in list_date_middle:
                 window_datasets.append(xr.open_zarr(
@@ -2156,54 +2154,25 @@ def merge_time_windows_outputs(
                 if np.issubdtype(combined[name].dtype, np.floating):
                     combined[name] = combined[name].astype(output_dtype)
 
-            output_path = _build_output_path(all_dates[0])
-            temporary_path = f'{output_path}.tmp-{os.getpid()}'
-            backup_path = f'{output_path}.backup-{os.getpid()}'
-            if os.path.exists(temporary_path):
-                shutil.rmtree(temporary_path)
-            if os.path.exists(backup_path):
-                shutil.rmtree(backup_path)
-            state._set_zarr_time_encoding(combined)
-            state._write_new_zarr(
-                combined, temporary_path,
+            from .zarr_merge import write_merged_zarr
+            write_merged_zarr(
+                combined, _build_output_path(all_dates[0]),
+                [_build_path(middle, all_dates[0]) for middle in list_date_middle],
                 zarr_time_chunk=zarr_time_chunk,
                 zarr_spatial_chunk=zarr_spatial_chunk,
-                zarr_compression_level=zarr_compression_level)
-
-            with xr.open_zarr(
-                    temporary_path, consolidated=False) as candidate:
-                candidate_times = pd.DatetimeIndex(
-                    pd.to_datetime(candidate.time.values))
-                expected_times = pd.DatetimeIndex(pd.to_datetime(all_dates))
-                if (candidate_times.has_duplicates
-                        or not candidate_times.equals(expected_times)):
-                    raise RuntimeError(
-                        'Batched time-window archive has invalid timestamps')
-                _ = candidate.sizes
-
-            had_output = os.path.exists(output_path)
-            if had_output:
-                os.replace(output_path, backup_path)
-            try:
-                os.replace(temporary_path, output_path)
-            except Exception:
-                if had_output and not os.path.exists(output_path):
-                    os.replace(backup_path, output_path)
-                raise
-            else:
-                if os.path.exists(backup_path):
-                    shutil.rmtree(backup_path)
+                zarr_compression_level=zarr_compression_level,
+                merge_plan={
+                    'blend': 'hann-first-two-v1',
+                    'starts': [str(date) for date in list_date_start],
+                    'middles': [str(date) for date in list_date_middle],
+                    'ends': [str(date) for date in list_date_end],
+                })
             return
         finally:
             if combined is not None:
                 combined.close()
             for dataset in window_datasets:
                 dataset.close()
-            if temporary_path and os.path.exists(temporary_path):
-                shutil.rmtree(temporary_path)
-            if (backup_path and os.path.exists(backup_path)
-                    and os.path.exists(_build_output_path(all_dates[0]))):
-                shutil.rmtree(backup_path)
 
     for date in all_dates:
         try:

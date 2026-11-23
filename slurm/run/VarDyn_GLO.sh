@@ -75,6 +75,7 @@ NUM_TILES_PER_GPU="${NUM_TILES_PER_GPU:-4}"
 ZARR_OUTPUT="${ZARR_OUTPUT:-false}"
 OUTPUT_FLOAT64="${OUTPUT_FLOAT64:-false}"
 CLEANUP_TILE_ZARR="${CLEANUP_TILE_ZARR:-true}"
+CLEANUP_SUBWINDOW_OUTPUTS="${CLEANUP_SUBWINDOW_OUTPUTS:-false}"
 ZARR_TIME_CHUNK="${ZARR_TIME_CHUNK:-4}"
 ZARR_SPATIAL_CHUNK="${ZARR_SPATIAL_CHUNK:-256}"
 ZARR_COMPRESSION_LEVEL="${ZARR_COMPRESSION_LEVEL:-3}"
@@ -92,7 +93,7 @@ for setting in NUM_MERGE_WORKERS NUM_TILES_PER_GPU BARRIER_TIMEOUT TILE_TIMEOUT 
                STAGE_TIMEOUT ZARR_TIME_CHUNK ZARR_SPATIAL_CHUNK; do
     [[ "${!setting}" =~ ^[1-9][0-9]*$ ]] || die "$setting must be a positive integer"
 done
-for setting in ZARR_OUTPUT OUTPUT_FLOAT64 CLEANUP_TILE_ZARR FLAG_INIT FLAG_BACKGROUND; do
+for setting in ZARR_OUTPUT OUTPUT_FLOAT64 CLEANUP_TILE_ZARR CLEANUP_SUBWINDOW_OUTPUTS FLAG_INIT FLAG_BACKGROUND; do
     [[ "${!setting}" = true || "${!setting}" = false ]] || die "$setting must be true or false"
 done
 [[ "$ZARR_COMPRESSION_LEVEL" =~ ^[0-9]$ ]] || die "ZARR_COMPRESSION_LEVEL must be 0..9"
@@ -987,7 +988,9 @@ fi # assimilation and spatial merging
 if claim_stage "${BARRIER_DIR}/final_merge.lock"; then
     finish_merge_stage "${BARRIER_DIR}/final_merge.ok" "${BARRIER_DIR}/run.failed" "$FINAL_MARKER" \
         --skip_spatial_merge --merge_time_windows "${FORCE_ARGS[@]}" "${CLEANUP_ARGS[@]}"
-    if merge_outputs --skip_spatial_merge --cleanup_subwindow_outputs; then
+    if ! $CLEANUP_SUBWINDOW_OUTPUTS; then
+        echo "$(date '+%F %T') | Retaining merged time-window archives for final-merge recovery"
+    elif merge_outputs --skip_spatial_merge --cleanup_subwindow_outputs; then
         echo "$(date '+%F %T') | Subwindow merged outputs removed"
     else
         echo "$(date '+%F %T') | WARNING: post-completion subwindow cleanup failed" >&2

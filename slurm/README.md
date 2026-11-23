@@ -77,6 +77,7 @@ Reusable SLURM launcher. Supply experiment settings with `--config path/to/confi
 | `ZARR_OUTPUT` | If this shell option or `EXP.saveoutputs_zarr` is `true`, store each merged temporal window in one Zarr archive and the final experiment in one global Zarr archive |
 | `OUTPUT_FLOAT64` | If `true`, save merged floating-point data as float64; otherwise float32 (default: false) |
 | `CLEANUP_TILE_ZARR` | If `true` (default), compact validated tile trajectories to the single record needed to restart the following window |
+| `CLEANUP_SUBWINDOW_OUTPUTS` | If `true`, remove merged time-window archives after final publication. Default: `false`, retaining these sources for final-merge retries and experiments. |
 | `ZARR_TIME_CHUNK` | Number of time records per Zarr chunk (default: 4) |
 | `ZARR_SPATIAL_CHUNK` | Maximum size of each spatial Zarr chunk dimension (default: 256) |
 | `ZARR_COMPRESSION_LEVEL` | Zstd compression level from 0 to 9 (default: 3); bitshuffle is always enabled |
@@ -92,6 +93,23 @@ Reusable SLURM launcher. Supply experiment settings with `--config path/to/confi
 | `--merge-time-only` | Merge existing time-window outputs only, retaining final-stage locks, continuation, Zarr options and cleanup |
 | `--tile-scope all\|equatorial` | Restrict assimilation dispatch to all tiles (default) or only tiles crossing latitude 0; spatial and temporal merges still use every tile output |
 | `--name_exp <name>` | Override experiment name (default: read from config or filename) |
+
+The final Zarr merge reads existing time-window archives with their original
+chunk layouts. It writes bounded temporal lots, aligned to the configured output
+chunks, with safe parallel writes. Each completed lot logs its timestamps,
+elapsed time, percentage and uncompressed throughput; a running lot emits a
+heartbeat every 30 seconds.
+
+Progress lives in `<name>.zarr.merge-work/progress.json` beside the output. After
+an interruption, rerun the same `--merge-time-only` command with the same settings:
+completed lots are reused and the unfinished lot is overwritten. Existing final
+output is retained until the replacement has finished and passed schema/time
+validation. Source windows must remain unchanged during the merge. Changed source
+metadata or output settings cause an explicit error rather than reuse of an
+incompatible checkpoint; move or remove only the `.merge-work` directory to start
+a different final merge. Source windows do not need to be regenerated, even when
+changing final chunk sizes. Old `.zarr.tmp-<PID>` products from the former writer
+cannot be resumed by this implementation.
 
 **`EXP_NAME` resolution order:**
 1. `--name_exp` CLI flag

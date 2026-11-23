@@ -43,6 +43,8 @@ def _run_lock_scenario(tmp_path: Path, scenario: str) -> subprocess.CompletedPro
     script = tmp_path / "scenario.sh"
     script.write_text(
         "#!/bin/bash\nset -u\n"
+        "MERGE_TIME_ONLY=false\nMERGE_RECOVERY_ARGS=()\n"
+        "CLEANUP_SUBWINDOW_OUTPUTS=false\n"
         + _tile_lock_functions()
         + "\n"
         + scenario,
@@ -693,6 +695,7 @@ done
 touch "$FINAL_MARKER"
 DIR_SAVE_PICKLE="$BASE_DIR"
 CONFIG_PATH="$BASE_DIR/config.pkl"
+MERGE_CONFIG_PATH="$CONFIG_PATH"
 NAME_VAR=sla
 NUM_ARRAY=1
 NUM_TILES_PER_GPU=1
@@ -757,7 +760,8 @@ init_merge_args
 
 @pytest.mark.parametrize('zarr', [False, True])
 @pytest.mark.parametrize('already_done', [False, True])
-def test_merge_flow_preserves_options_and_publication_order(tmp_path, zarr, already_done):
+@pytest.mark.parametrize('cleanup', [False, True])
+def test_merge_flow_preserves_options_and_publication_order(tmp_path, zarr, already_done, cleanup):
     base = tmp_path / 'experiment with spaces'
     window = base / 'subwindow_2023-01-26'
     (window / 'subwindow_0_0').mkdir(parents=True)
@@ -770,6 +774,7 @@ BASE_DIR={shlex.quote(str(base))}
 BARRIER_DIR={shlex.quote(str(tmp_path))}
 DIR_SAVE_PICKLE="$BASE_DIR"
 CONFIG_PATH="$BASE_DIR/config.pkl"
+MERGE_CONFIG_PATH="$CONFIG_PATH"
 SRC_DIR="$BASE_DIR/source code"
 FINAL_MARKER="$BASE_DIR/experiment_complete.ok"
 NAME_VAR=sla,ug
@@ -783,6 +788,7 @@ ZARR_COMPRESSION_LEVEL=3
 ZARR_OUTPUT={str(zarr).lower()}
 OUTPUT_FLOAT64=true
 CLEANUP_TILE_ZARR=true
+CLEANUP_SUBWINDOW_OUTPUTS={str(cleanup).lower()}
 FORCE_ARGS=()
 RESTART=""
 FORCE_MERGE=false
@@ -801,17 +807,21 @@ init_merge_args
     assert result.returncode == 0, result.stderr
     calls = (tmp_path / 'calls').read_text().split('CALL\n')[1:]
     args = [call.splitlines() for call in calls]
-    assert len(args) == (2 if already_done else (6 if zarr else 3))
+    assert len(args) == (2 if already_done else (6 if zarr else 3)) - (not cleanup)
     for call in args:
         assert str(base / 'source code' / 'merge_outputs.py') in call
         assert call[call.index('--dir_save_pickle') + 1] == str(base)
         assert '--output_float64' in call
         assert ('--zarr_output' in call) == zarr
         assert call[call.index('--zarr_time_chunk') + 1] == '10'
-    assert '--merge_time_windows' in args[-2]
-    assert '--cleanup_tile_zarr' in args[-2]
-    assert '--cleanup_subwindow_outputs' in args[-1]
-    assert '--cleanup_tile_zarr' not in args[-1]
+    final_args = args[-2] if cleanup else args[-1]
+    assert '--merge_time_windows' in final_args
+    assert '--cleanup_tile_zarr' in final_args
+    if cleanup:
+        assert '--cleanup_subwindow_outputs' in args[-1]
+        assert '--cleanup_tile_zarr' not in args[-1]
+    else:
+        assert all('--cleanup_subwindow_outputs' not in call for call in args)
     assert (base / 'experiment_complete.ok').is_file()
     assert (tmp_path / 'final_merge.ok').is_file()
     assert (window / '.window_complete_all.ok').is_file()
