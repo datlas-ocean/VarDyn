@@ -266,6 +266,13 @@ To rerun only the temporal merge with a single array task:
 sbatch --array=0 VarDyn_GLO.sh --config config_VarDyn_GLO-QG_nadirs-minus-al.sh --merge-time-only
 ```
 
-This requires the existing experiment pickle and merged time-window outputs.
+This requires the merged time-window outputs. When config.pkl or dates.pkl is
+missing, temporal-only mode reads PATH_CONFIG directly and reconstructs the
+window dates from INIT_DATE, FINAL_DATE, TIME_WIN and TIME_OVERLAP. These settings,
+the output path/prefix and the output time step must match the original run.
+No observation preparation, State construction or pickle recreation is performed.
+Temporal merging with surviving config/date pickles does not require spatial
+weights or tile-state pickles either. Without tile-path metadata, optional tile
+trajectory compaction is skipped; final window-output cleanup is retained.
 It skips preparation, assimilation and spatial merging, and retains the original
 final-stage completion markers and cleanup of intermediate outputs.

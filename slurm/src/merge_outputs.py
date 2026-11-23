@@ -4,7 +4,7 @@ import shutil
 import sys
 import pickle
 import multiprocessing as mp
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -469,6 +469,50 @@ def _finalize_spatial_zarr_parts(
         if temporary_root is not None and temporary_root.exists():
             shutil.rmtree(temporary_root)
 
+def _recover_temporal_metadata(path_config, init_date, final_date,
+                               time_window_size_proc, time_overlap):
+    """Read EXP and reproduce prepare_process windows without creating outputs."""
+    import math
+    import runpy
+    from src import config_default
+
+    if init_date is None or final_date is None or time_window_size_proc is None:
+        raise ValueError('Recovery requires init/final dates and time window size')
+    if not (math.isfinite(time_window_size_proc) and math.isfinite(time_overlap)
+            and 0 <= time_overlap < time_window_size_proc):
+        raise ValueError('Require 0 <= time_overlap < time_window_size_proc')
+    start = datetime.fromisoformat(init_date)
+    end = datetime.fromisoformat(final_date)
+    if end <= start:
+        raise ValueError('final_date must be after init_date')
+    source = Path(path_config).resolve()
+    sys.path.insert(0, str(source.parent))
+    try:
+        settings = runpy.run_path(str(source))
+    finally:
+        sys.path.pop(0)
+    # Avoid exp.Exp: it copies config.py over saved experiment configurations.
+    config = exp.Config(EXP=exp.Config(dict(config_default.EXP, **settings['EXP'])))
+    step = config.EXP.saveoutput_time_step
+    if step <= timedelta(0):
+        raise ValueError('saveoutput_time_step must be positive')
+    duration = timedelta(days=time_window_size_proc)
+    stride = duration - timedelta(days=time_overlap)
+    starts, middles, ends = [], [], []
+    window_end = start
+    while window_end < end:
+        window_start = start + len(starts) * stride
+        # Match prepare_process exactly, including output-step alignment.
+        window_start += (window_start - start) % step
+        window_end = min(window_start + duration, end)
+        if window_start >= window_end or (starts and window_start <= starts[-1]):
+            raise ValueError('Window settings produce an empty/nonadvancing window')
+        starts.append(window_start)
+        middles.append(window_start + (window_end - window_start) / 2)
+        ends.append(window_end)
+    return config, (starts, middles, ends)
+
+
 # -------------------- Main merge workflow --------------------
 def merge_outputs(
     path_config,
@@ -492,10 +536,22 @@ def merge_outputs(
     zarr_time_chunk=4,
     zarr_spatial_chunk=256,
     zarr_compression_level=3,
+    from_python_config=False,
+    init_date=None,
+    final_date=None,
+    time_window_size_proc=None,
+    time_overlap=0,
 ):
     log(f"Loading configuration from {path_config}")
-    with open(path_config, "rb") as f:
-        config = pickle.load(f)
+    if from_python_config:
+        if not skip_spatial_merge or zarr_parts or finalize_spatial_parts:
+            raise ValueError('Python configuration recovery is temporal-only')
+        config, recovered_dates = _recover_temporal_metadata(
+            path_config, init_date, final_date, time_window_size_proc, time_overlap)
+        log('Recovered temporal metadata from Python configuration; no pickles needed')
+    else:
+        with open(path_config, "rb") as f:
+            config = pickle.load(f)
 
     config.EXP.zarr_time_chunk = zarr_time_chunk
     config.EXP.zarr_spatial_chunk = zarr_spatial_chunk
@@ -512,17 +568,25 @@ def merge_outputs(
         )
     path_save_pickle = os.path.join(dir_save_pickle, config.EXP.name_experiment)
 
-    # Load precomputed pickle files
-    with open(f'{path_save_pickle}/weights.pkl', "rb") as f:
-        data = pickle.load(f)
-    weights_space_sum = data['weights_space_sum']
-    list_tile_paths = data.get('list_tile_paths')
-    # Per-tile weights/interpolators are loaded on-the-fly by merge_output_date
-
-    with open(f'{path_save_pickle}/dates.pkl', "rb") as f:
-        list_date_start, list_date_middle, list_date_end = pickle.load(f)
-    with open(f'{path_save_pickle}/list_State.pkl', "rb") as f:
-        list_State_all = pickle.load(f)
+    # Spatial weights and tile states are unnecessary for a temporal merge.
+    list_tile_paths = None
+    if from_python_config:
+        list_date_start, list_date_middle, list_date_end = recovered_dates
+    else:
+        with open(f'{path_save_pickle}/dates.pkl', "rb") as f:
+            list_date_start, list_date_middle, list_date_end = pickle.load(f)
+    if not skip_spatial_merge:
+        with open(f'{path_save_pickle}/weights.pkl', "rb") as f:
+            data = pickle.load(f)
+        weights_space_sum = data['weights_space_sum']
+        list_tile_paths = data.get('list_tile_paths')
+        with open(f'{path_save_pickle}/list_State.pkl', "rb") as f:
+            list_State_all = pickle.load(f)
+    elif cleanup_tile_zarr and not from_python_config:
+        weights_path = Path(path_save_pickle) / 'weights.pkl'
+        if weights_path.exists():
+            with weights_path.open('rb') as f:
+                list_tile_paths = pickle.load(f).get('list_tile_paths')
 
     if cleanup_subwindow_outputs:
         if merge_time_windows or not skip_spatial_merge:
@@ -739,7 +803,13 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Merge DA outputs for an experiment.")
-    parser.add_argument("path_config", type=str, help="Path to experiment config pickle")
+    parser.add_argument("path_config", type=str, help="Path to experiment config pickle (or Python config in recovery mode)")
+    parser.add_argument('--from_python_config', action='store_true',
+                        help='Recover temporal metadata from Python config without pickles')
+    parser.add_argument('--init_date')
+    parser.add_argument('--final_date')
+    parser.add_argument('--time_window_size_proc', type=float)
+    parser.add_argument('--time_overlap', type=float, default=0)
     parser.add_argument("--dir_save_pickle", type=str, required=True,
                         help="Root directory where prepare_VarDyn.py wrote its pickles (DIR_SAVE_PICKLE)")
     parser.add_argument(
@@ -811,6 +881,11 @@ if __name__ == "__main__":
     log(f"Starting merge with {args.num_workers} workers")
     merge_outputs(
         args.path_config,
+        from_python_config=args.from_python_config,
+        init_date=args.init_date,
+        final_date=args.final_date,
+        time_window_size_proc=args.time_window_size_proc,
+        time_overlap=args.time_overlap,
         dir_save_pickle=args.dir_save_pickle,
         name_var_save=name_var_save,
         num_workers=args.num_workers,

@@ -469,8 +469,17 @@ initialize_run_state() {
 
 # Temporal-only mode uses existing merged windows and the original final-merge
 # machinery below. Do not invalidate tile/window markers or inspect tile scratch.
+MERGE_RECOVERY_ARGS=()
+MERGE_CONFIG_PATH="$CONFIG_PATH"
 if $MERGE_TIME_ONLY; then
-    [ -f "$CONFIG_PATH" ] || die "Missing existing configuration: $CONFIG_PATH"
+    if [ ! -f "$CONFIG_PATH" ] || [ ! -f "${BASE_DIR}/dates.pkl" ]; then
+        [ -f "$PATH_CONFIG" ] || die "Missing Python configuration: $PATH_CONFIG"
+        MERGE_CONFIG_PATH="$PATH_CONFIG"
+        MERGE_RECOVERY_ARGS=(--from_python_config
+            --init_date "$INIT_DATE" --final_date "$FINAL_DATE"
+            --time_window_size_proc "$TIME_WIN" --time_overlap "$TIME_OVERLAP")
+        echo "Pickles unavailable: recovering temporal metadata from $PATH_CONFIG"
+    fi
 else
 initialize_run_state || exit 1
 if [ -f "$FINAL_MARKER" ] && ! $MERGE_ONLY; then
@@ -794,7 +803,7 @@ init_merge_args() {
 }
 
 merge_outputs() {
-    run_stage python -u "${SRC_DIR}/merge_outputs.py" "$CONFIG_PATH" "${MERGE_ARGS[@]}" "$@"
+    run_stage python -u "${SRC_DIR}/merge_outputs.py" "$MERGE_CONFIG_PATH" "${MERGE_ARGS[@]}" "${MERGE_RECOVERY_ARGS[@]}" "$@"
 }
 
 publish_marker() {
