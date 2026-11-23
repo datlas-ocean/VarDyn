@@ -89,6 +89,7 @@ Reusable SLURM launcher. Supply experiment settings with `--config path/to/confi
 | `--restart` | Restart selected tiles from checkpoints and rebuild their spatial and temporal merges |
 | `--force-merge` | Force re-merge even if output files already exist |
 | `--merge-only` | Skip preparation and assimilation, only run spatial and time-window merges |
+| `--merge-time-only` | Merge existing time-window outputs only, retaining final-stage locks, continuation, Zarr options and cleanup |
 | `--tile-scope all\|equatorial` | Restrict assimilation dispatch to all tiles (default) or only tiles crossing latitude 0; spatial and temporal merges still use every tile output |
 | `--name_exp <name>` | Override experiment name (default: read from config or filename) |
 
@@ -258,3 +259,13 @@ scancel <JOB_ID> <CONTINUATION_JOB_ID>
 - Tile claiming uses `mkdir` (atomic on all POSIX filesystems including Lustre/GPFS) — no NFS locking required.
 - Set `HDF5_USE_FILE_LOCKING=FALSE` if you encounter NetCDF read errors on shared filesystems (already handled inside `run_assimilation.py`).
 - Logs are written to `./logs/<EXP_NAME>_job-<JOB_ID>/gpu<ARRAY_ID>.log` and per-tile under subdirectories.
+
+To rerun only the temporal merge with a single array task:
+
+```bash
+sbatch --array=0 VarDyn_GLO.sh --config config_VarDyn_GLO-QG_nadirs-minus-al.sh --merge-time-only
+```
+
+This requires the existing experiment pickle and merged time-window outputs.
+It skips preparation, assimilation and spatial merging, and retains the original
+final-stage completion markers and cleanup of intermediate outputs.

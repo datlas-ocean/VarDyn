@@ -45,7 +45,7 @@ while (( $# )); do
             fi
             [ -n "$value" ] || die "Missing value for $option"
             CLI[$option]="$value" ;;
-        --skip-prepare|--restart|--force-merge|--merge-only)
+        --skip-prepare|--restart|--force-merge|--merge-only|--merge-time-only)
             [[ "$1" != *=* ]] || die "$option takes no value"
             CLI[$option]=true ;;
         *) die "Unknown option: $1" ;;
@@ -100,6 +100,7 @@ done
 SKIP_PREPARE="${CLI[--skip-prepare]:-false}"
 FORCE_MERGE="${CLI[--force-merge]:-false}"
 MERGE_ONLY="${CLI[--merge-only]:-false}"
+MERGE_TIME_ONLY="${CLI[--merge-time-only]:-false}"
 $MERGE_ONLY && SKIP_PREPARE=true
 RESTART=""
 [ "${CLI[--restart]:-false}" = true ] && RESTART=--restart
@@ -187,7 +188,7 @@ submit_continuation() {
     local submit_lock="${BASE_DIR}/.continuation_${JOB_ID}.lock"
     mkdir "$submit_lock" 2>/dev/null || return 0
     [ -f "${FINAL_MARKER}" ] && [ -z "$RESTART" ] \
-        && ! $FORCE_MERGE && ! $MERGE_ONLY && return 0
+        && ! $FORCE_MERGE && ! $MERGE_ONLY && ! $MERGE_TIME_ONLY && return 0
     [ "${CONTINUATION_SUBMITTED}" = true ] && return 0
 
     local dependency="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"
@@ -195,6 +196,7 @@ submit_continuation() {
     local continuation_args=(--config "${CONFIG_FILE}" --skip-prepare)
     continuation_args+=(--predecessor-job "${dependency}")
     $MERGE_ONLY && continuation_args+=(--merge-only)
+    $MERGE_TIME_ONLY && continuation_args+=(--merge-time-only)
     [ "$TILE_SCOPE" != "all" ] && continuation_args+=(--tile-scope "$TILE_SCOPE")
     [ -n "${NAME_EXP_OVERRIDE}" ] && continuation_args+=(--name_exp "${NAME_EXP_OVERRIDE}")
     [ -n "${NAME_EXP_BACKGROUND_OVERRIDE}" ] && continuation_args+=(--name_exp_background "$NAME_EXP_BACKGROUND_OVERRIDE")
@@ -465,6 +467,11 @@ initialize_run_state() {
     fi
 }
 
+# Temporal-only mode uses existing merged windows and the original final-merge
+# machinery below. Do not invalidate tile/window markers or inspect tile scratch.
+if $MERGE_TIME_ONLY; then
+    [ -f "$CONFIG_PATH" ] || die "Missing existing configuration: $CONFIG_PATH"
+else
 initialize_run_state || exit 1
 if [ -f "$FINAL_MARKER" ] && ! $MERGE_ONLY; then
     echo "$(date '+%F %T') | Experiment already complete; exiting late array task"
@@ -772,6 +779,8 @@ process_available_tiles() {
     return 0
 }
 
+fi # normal initialization, preparation and tile helpers
+
 # Keep merge options available even when every durable window is skipped.
 init_merge_args() {
     MERGE_ARGS=(--dir_save_pickle "$DIR_SAVE_PICKLE" --name_var_save "$NAME_VAR"
@@ -808,6 +817,7 @@ finish_merge_stage() {
 init_merge_args
 
 # --------------- SEQUENTIAL TIME WINDOWS, TILE DISPATCH ---------------
+if ! $MERGE_TIME_ONLY; then
 mapfile -d '' -t TIME_WINDOWS < <(find "$BASE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'subwindow_*' -print0 | LC_ALL=C sort -z)
 (( ${#TIME_WINDOWS[@]} )) || die "No time windows found in $BASE_DIR"
 IW=0
@@ -961,6 +971,8 @@ PY_TILE_SCOPE
     rm -f "$REBUILD_REQUEST" "$RESTART_REQUEST" "$RESTART_PREPARED" || exit 1
     ((IW++))
 done
+
+fi # assimilation and spatial merging
 
 # Publish durable completion before removing intermediate window products.
 if claim_stage "${BARRIER_DIR}/final_merge.lock"; then
